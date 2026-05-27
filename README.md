@@ -4,9 +4,35 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](crates/lens-sandbox-core/Cargo.toml)
 
-Core library for the Lens Sandbox runtime. Provides the in-sandbox networking stack that enforces policy on sandboxed AI agents: HTTP CONNECT proxy, MITM TLS interception with boundary credential exchange, nftables-based network lockdown, DNS filtering, and WebSocket-driven policy lifecycle.
+`lens-sandbox-core` is the Rust library used by Lens Sandbox and Lens Agents to enforce governed network, DNS, proxy, credential, and policy behavior inside sandboxed execution environments.
 
-This repository contains a Rust library/crate, not an end-user product. It is the shared core used by Lens Sandbox and Lens Agents.
+It is core runtime plumbing, not an end-user product. Applications embed it to give sandboxed workloads controlled access to external systems: DNS requests, outbound network traffic, HTTP CONNECT proxying, TLS interception paths, boundary credential exchange, policy lifecycle, and activity reporting.
+
+## What This Crate Provides
+
+- Policy-controlled outbound network access
+- DNS filtering and allowlist behavior
+- HTTP CONNECT proxy support
+- Transparent proxy routing support
+- TLS interception support for governed traffic
+- Boundary credential exchange and request signing
+- nftables-based network lockdown helpers
+- WebSocket-driven policy lifecycle integration
+- Activity and audit event primitives
+
+## What This Crate Is Not
+
+`lens-sandbox-core` is not a complete sandbox product by itself. It does not create the desktop app, enterprise platform, UI, packaging, distribution, or microVM lifecycle.
+
+The effective security boundary depends on the caller's deployment model: container, microVM, Linux capabilities, filesystem mounts, process model, and policy source.
+
+## Relationship to Lens Sandbox and Lens Agents
+
+Lens Sandbox uses this crate as the local enforcement core for sandboxed workloads on a developer machine.
+
+Lens Agents uses the same core enforcement model in organizational deployments where central IT manages policies, credentials, connections, and audit across many agents.
+
+The shared crate keeps low-level runtime behavior consistent across both products.
 
 ## Open Source
 
