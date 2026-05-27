@@ -1044,6 +1044,7 @@ fn parse_forward_certs(
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
     use std::net::SocketAddr;
