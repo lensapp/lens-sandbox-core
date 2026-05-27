@@ -1,3 +1,15 @@
+//! Core runtime library for governed sandbox execution.
+//!
+//! `lens-sandbox-core` provides the low-level enforcement primitives used by
+//! Lens Sandbox and Lens Agents inside sandboxed execution environments. It
+//! handles governed network, DNS, proxy, boundary credential exchange, policy
+//! lifecycle, and activity reporting behavior.
+//!
+//! This crate is runtime plumbing, not an end-user sandbox product. The
+//! effective security boundary depends on the caller's surrounding container,
+//! microVM, Linux capabilities, filesystem mounts, process model, and policy
+//! source.
+
 pub mod activity;
 pub mod aws_resign;
 pub mod aws_sigv4;
