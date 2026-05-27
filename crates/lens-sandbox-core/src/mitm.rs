@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use rustls::ServerConfig;
 use rustls::pki_types::ServerName;
+#[cfg(test)]
+use rustls::pki_types::pem::PemObject;
 use rustls::server::ClientHello;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -1335,7 +1337,7 @@ mod tests {
     fn ca_root_store(ca: &EphemeralCa) -> rustls::RootCertStore {
         let mut store = rustls::RootCertStore::empty();
         let pem = ca.ca_cert_pem();
-        let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_bytes())
+        let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         for cert in certs {

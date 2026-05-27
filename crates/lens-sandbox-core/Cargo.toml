@@ -24,7 +24,6 @@ async-trait = "0.1"
 rcgen = { version = "0.13", features = ["crypto"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 webpki-roots = "1"
 aws-sigv4 = { version = "1", default-features = false, features = ["http1", "sign-http"] }
 aws-credential-types = "1"
