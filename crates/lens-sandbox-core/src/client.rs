@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
@@ -842,7 +843,8 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     // and store parsed DER certs for MITM upstream TLS verification.
     if let Some(pem) = msg.proxy_ca_cert {
         crate::ca::install_ca_cert(&pem);
-        if let Ok(certs) = rustls_pemfile::certs(&mut pem.as_bytes()).collect::<Result<Vec<_>, _>>()
+        if let Ok(certs) =
+            CertificateDer::pem_slice_iter(pem.as_bytes()).collect::<Result<Vec<_>, _>>()
         {
             tracing::info!(
                 count = certs.len(),
@@ -1011,7 +1013,7 @@ fn parse_forward_certs(
 ) -> Result<crate::proxy::ClientCertConfig, String> {
     // Parse client cert chain
     let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut fwd.cert_pem.as_bytes())
+        CertificateDer::pem_slice_iter(fwd.cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("failed to parse cert_pem: {e}"))?;
     if cert_chain.is_empty() {
@@ -1019,14 +1021,13 @@ fn parse_forward_certs(
     }
 
     // Parse private key
-    let private_key = rustls_pemfile::private_key(&mut fwd.key_pem.as_bytes())
-        .map_err(|e| format!("failed to parse key_pem: {e}"))?
-        .ok_or_else(|| "no private key found in key_pem".to_string())?;
+    let private_key = PrivateKeyDer::from_pem_slice(fwd.key_pem.as_bytes())
+        .map_err(|e| format!("failed to parse key_pem: {e}"))?;
 
     // Parse CA certs (optional)
     let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
         if let Some(ca_pem) = &fwd.ca_pem {
-            rustls_pemfile::certs(&mut ca_pem.as_bytes())
+            CertificateDer::pem_slice_iter(ca_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("failed to parse ca_pem: {e}"))?
         } else {
