@@ -1076,7 +1076,8 @@ mod tests {
     fn inject_headers_injects_when_path_matches_rules() {
         use crate::policy_schema::HttpRule;
 
-        let headers = "POST /v1/projects/123/llm/bedrock/us-east-1/invoke HTTP/1.1\r\nHost: lens.example.com";
+        let headers =
+            "POST /v1/projects/123/llm/bedrock/us-east-1/invoke HTTP/1.1\r\nHost: lens.example.com";
         // This injection only applies to /v1/projects/*/llm/* paths
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
@@ -1823,10 +1824,7 @@ mod tests {
             method: Some("GET".into()),
             path: Some("/bot/*/sendMessage".into()),
         }];
-        let placeholders = vec![(
-            "__lens_cred:tg__".to_string(),
-            "123456:ABC-DEF".to_string(),
-        )];
+        let placeholders = vec![("__lens_cred:tg__".to_string(), "123456:ABC-DEF".to_string())];
         let (headers, response, _audits) = run_mitm_harness_full(
             vec![],
             rules,

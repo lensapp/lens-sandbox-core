@@ -547,9 +547,10 @@ async fn handle_http_forward(
                         .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
                         .await?;
                     emit_http_audit(state, target_host, method, &path, "error", 502);
-                    return Err(
-                        format!("HTTP forward proxy connect to Lens Sandbox {upstream_addr}: {e}").into(),
-                    );
+                    return Err(format!(
+                        "HTTP forward proxy connect to Lens Sandbox {upstream_addr}: {e}"
+                    )
+                    .into());
                 }
             };
 
@@ -842,7 +843,9 @@ async fn handle_connect(
                         .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                         .await?;
                     emit_audit(state, target_host, "error", 502);
-                    return Err(format!("connect to Lens Sandbox upstream {upstream_addr}: {e}").into());
+                    return Err(
+                        format!("connect to Lens Sandbox upstream {upstream_addr}: {e}").into(),
+                    );
                 }
             };
 
@@ -1169,7 +1172,9 @@ async fn handle_transparent_tls(
                 Ok(s) => s,
                 Err(e) => {
                     emit_audit(state, &target_host, "error", 502);
-                    return Err(format!("connect to Lens Sandbox upstream {upstream_addr}: {e}").into());
+                    return Err(
+                        format!("connect to Lens Sandbox upstream {upstream_addr}: {e}").into(),
+                    );
                 }
             };
             let mut connect_req =

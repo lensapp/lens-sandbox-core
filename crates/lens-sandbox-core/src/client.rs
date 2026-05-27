@@ -635,7 +635,9 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             );
         }
         None => {
-            tracing::warn!("Lens Sandbox did not send minProtocolDate in policy — assuming compatible");
+            tracing::warn!(
+                "Lens Sandbox did not send minProtocolDate in policy — assuming compatible"
+            );
         }
     }
 

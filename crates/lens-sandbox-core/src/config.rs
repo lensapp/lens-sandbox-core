@@ -112,8 +112,7 @@ pub fn load_core_config() -> CoreConfig {
 
     let is_root = nix::unistd::getuid().is_root();
 
-    let sandbox_user =
-        std::env::var("LENS_SANDBOX_USER").unwrap_or_else(|_| "sandbox".to_string());
+    let sandbox_user = std::env::var("LENS_SANDBOX_USER").unwrap_or_else(|_| "sandbox".to_string());
 
     CoreConfig {
         mode,
