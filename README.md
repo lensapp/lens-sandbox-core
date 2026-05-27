@@ -2,6 +2,12 @@
 
 Core library for the Lens Sandbox runtime. Provides the in-container networking stack that enforces policy on sandboxed AI agents: HTTP CONNECT proxy, MITM TLS interception with credential injection, nftables-based network lockdown, DNS filtering, and WebSocket-driven policy lifecycle.
 
+## Setup
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Building
 
 ```bash
