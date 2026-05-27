@@ -1,6 +1,6 @@
 # Security Policy
 
-`lens-sandbox-core` is security-sensitive infrastructure. It includes policy enforcement, network mediation, DNS filtering, TLS handling, credential mediation, privilege dropping, and sandbox lifecycle code used by Lens Sandbox and Lens Agents.
+`lens-sandbox-core` is security-sensitive infrastructure. It includes policy enforcement, network mediation, DNS filtering, TLS handling, boundary credential exchange, privilege dropping, and sandbox lifecycle code used by Lens Sandbox and Lens Agents.
 
 ## Reporting Vulnerabilities
 
@@ -9,7 +9,7 @@ Please do not open a public issue for suspected vulnerabilities.
 Report security issues by emailing:
 
 ```text
-security@lensapp.com
+security@lenshq.io
 ```
 
 Include as much detail as possible:
@@ -31,7 +31,7 @@ Security-sensitive areas include:
 - Transparent proxy classification and routing
 - DNS filtering and allowlist behavior
 - TLS certificate authority handling and interception paths
-- Credential mediation and request signing
+- Boundary credential exchange and request signing
 - nftables rule generation and network lockdown
 - Privilege dropping and process execution
 - WebSocket control-plane communication

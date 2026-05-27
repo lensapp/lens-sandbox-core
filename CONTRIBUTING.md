@@ -2,7 +2,7 @@
 
 Thanks for your interest in `lens-sandbox-core`.
 
-This repository contains the shared Rust library used by Lens Sandbox and Lens Agents for sandbox policy enforcement, networking controls, credential mediation, and runtime lifecycle integration. It is not an end-user application.
+This repository contains the shared Rust library used by Lens Sandbox and Lens Agents for sandbox policy enforcement, networking controls, boundary credential exchange, and runtime lifecycle integration. It is not an end-user application.
 
 ## Development Setup
 
@@ -10,7 +10,7 @@ Install a Rust toolchain compatible with the repository MSRV:
 
 ```bash
 rustup toolchain install 1.85
-rustup default 1.85
+rustup override set 1.85
 ```
 
 Set up the repository hooks:
@@ -61,7 +61,7 @@ Use concise conventional commits where possible:
 
 - `feat: add policy field`
 - `fix: handle denied DNS route`
-- `docs: explain credential mediation`
+- `docs: explain boundary credential exchange`
 - `test: cover transparent proxy classification`
 - `ci: add audit check`
 

@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](crates/lens-sandbox-core/Cargo.toml)
 
-Core library for the Lens Sandbox runtime. Provides the in-sandbox networking stack that enforces policy on sandboxed AI agents: HTTP CONNECT proxy, MITM TLS interception with credential injection, nftables-based network lockdown, DNS filtering, and WebSocket-driven policy lifecycle.
+Core library for the Lens Sandbox runtime. Provides the in-sandbox networking stack that enforces policy on sandboxed AI agents: HTTP CONNECT proxy, MITM TLS interception with boundary credential exchange, nftables-based network lockdown, DNS filtering, and WebSocket-driven policy lifecycle.
 
 This repository contains a Rust library/crate, not an end-user product. It is the shared core used by Lens Sandbox and Lens Agents.
 
