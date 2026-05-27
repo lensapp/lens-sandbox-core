@@ -1,6 +1,6 @@
 # lens-sandbox-core
 
-Core library for the Lens Sandbox runtime. Provides the in-container networking stack that enforces policy on sandboxed AI agents: HTTP CONNECT proxy, MITM TLS interception with credential injection, nftables-based network lockdown, DNS filtering, and WebSocket-driven policy lifecycle.
+Core library for the Lens Sandbox runtime. Provides the in-sandbox networking stack that enforces policy on sandboxed AI agents: HTTP CONNECT proxy, MITM TLS interception with credential injection, nftables-based network lockdown, DNS filtering, and WebSocket-driven policy lifecycle.
 
 ## Setup
 
