@@ -1,0 +1,423 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PolicyDocument",
+  "description": "The sandbox policy document.",
+  "type": "object",
+  "properties": {
+    "credentials": {
+      "description": "Credentials delivered to the sandbox. Each entry carries a `kind`\ndiscriminator: `static` for fixed-value injection (header / URI\nplaceholder), `awsSigv4` for MITM SigV4 re-signing.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "default": null,
+      "items": {
+        "$ref": "#/$defs/Credential"
+      }
+    },
+    "env": {
+      "description": "Environment variables set in the sandbox.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": null
+    },
+    "files": {
+      "description": "Files written into the sandbox before execution.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "default": null,
+      "items": {
+        "$ref": "#/$defs/TempFile"
+      }
+    },
+    "network": {
+      "description": "Network routing rules and default verdict + transport.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NetworkPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "$defs": {
+    "Credential": {
+      "description": "A credential delivered to the sandbox. The credential shape is uniform\n— what differs is HOW each of its [`injections`](Self::injections) is\napplied at the MITM (see [`CredentialInjection`]).",
+      "type": "object",
+      "properties": {
+        "envVar": {
+          "description": "Environment variable name to expose a placeholder value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Credential identifier.",
+          "type": "string"
+        },
+        "injections": {
+          "description": "Per-domain injection rules. Each entry carries its own\n`injectionType` discriminator and the fields required for that kind.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CredentialInjection"
+          }
+        },
+        "placeholder": {
+          "description": "Placeholder value set in the environment variable. For\n`awsSigv4` injections this doubles as the fake access key ID the\nsandbox SDK signs requests with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "CredentialInjection": {
+      "description": "How a credential applies to outbound requests on a specific domain.\nTagged at the JSON level by `injectionType` — each variant carries the\nfields it actually needs, required at compile time.\n\n- **`header`**: replace an HTTP header on matching requests. The MITM\n  substitutes [`value`] into [`header`].\n- **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder\n  patterns in the request URI to the real credential value.\n- **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with\n  `placeholder` on the parent [`Credential`]) and re-sign with the real\n  STS credentials below. Real creds live only in sandbox-core process\n  memory — they never touch the sandbox filesystem.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "domain": {
+              "description": "Domain this injection applies to.",
+              "type": "string"
+            },
+            "header": {
+              "description": "HTTP header name to replace.",
+              "type": "string"
+            },
+            "injectionType": {
+              "type": "string",
+              "const": "header"
+            },
+            "rules": {
+              "description": "Optional path rules. When empty, inject for all requests.",
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/HttpRule"
+              }
+            },
+            "value": {
+              "description": "Resolved header value (e.g. `Bearer <token>`).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "injectionType",
+            "domain",
+            "header",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "domain": {
+              "description": "Domain this injection applies to.",
+              "type": "string"
+            },
+            "injectionType": {
+              "type": "string",
+              "const": "uriPlaceholder"
+            },
+            "rules": {
+              "description": "Optional path rules. When empty, rewrite for all requests.",
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/HttpRule"
+              }
+            },
+            "value": {
+              "description": "Resolved credential value used for URI rewriting.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "injectionType",
+            "domain",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "accessKeyId": {
+              "description": "Real STS-derived access key ID (starts with `ASIA`).",
+              "type": "string"
+            },
+            "domain": {
+              "description": "Domain pattern this credential re-signs (e.g. `*.amazonaws.com`).",
+              "type": "string"
+            },
+            "injectionType": {
+              "type": "string",
+              "const": "awsSigv4"
+            },
+            "rules": {
+              "description": "Optional path rules. When empty, re-sign for all requests.",
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/HttpRule"
+              }
+            },
+            "secretAccessKey": {
+              "description": "Real STS-derived secret access key.",
+              "type": "string"
+            },
+            "sessionToken": {
+              "description": "Real STS session token.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "injectionType",
+            "domain",
+            "accessKeyId",
+            "secretAccessKey",
+            "sessionToken"
+          ]
+        }
+      ]
+    },
+    "ForwardConfig": {
+      "description": "TLS bridge forwarding config for tunnel-routed connections.",
+      "type": "object",
+      "properties": {
+        "caPem": {
+          "description": "CA certificate PEM for upstream verification.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "certPem": {
+          "description": "Client certificate PEM.",
+          "type": "string"
+        },
+        "dialAddr": {
+          "description": "Address to dial through the tunnel.",
+          "type": "string"
+        },
+        "keyPem": {
+          "description": "Client private key PEM.",
+          "type": "string"
+        },
+        "tlsServerName": {
+          "description": "TLS server name for upstream verification.",
+          "type": "string"
+        },
+        "upstreamHostHeader": {
+          "description": "Host header to send to upstream (for path-based gateways).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "dialAddr",
+        "tlsServerName",
+        "certPem",
+        "keyPem"
+      ]
+    },
+    "HttpRule": {
+      "description": "HTTP method/path restriction within a route rule.",
+      "type": "object",
+      "properties": {
+        "method": {
+          "description": "HTTP method (GET, POST, * for any). Omit for any method.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "URL path glob pattern (/api/v1/*, /health, ** for any). Omit for any path.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "NetworkPolicy": {
+      "description": "Network policy controlling which domains the sandbox can reach.",
+      "type": "object",
+      "properties": {
+        "allowedRoutes": {
+          "description": "Ordered list of route rules (first match wins).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RouteRule"
+          }
+        },
+        "defaultTransport": {
+          "description": "Transport applied when the default verdict is `allow`. Ignored when the\ndefault verdict is `deny`.",
+          "$ref": "#/$defs/Transport"
+        },
+        "defaultVerdict": {
+          "description": "Verdict for destinations not matching any route rule.",
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "allowedRoutes",
+        "defaultVerdict",
+        "defaultTransport"
+      ]
+    },
+    "RouteRule": {
+      "description": "A single first-match-wins route rule.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "description": "Human-readable description of this rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "forward": {
+          "description": "Forwarding config for tunnel-routed connections (mTLS bridge).\nServer-injected — not set in user-defined policies.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ForwardConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "match": {
+          "description": "Domain pattern, wildcard (*.github.com), CIDR (10.0.0.0/8), or host:port.",
+          "type": "string"
+        },
+        "rules": {
+          "description": "HTTP-level rules. When present, only matching requests are allowed (deny-by-default).\nWhen absent or empty, all HTTP requests to this destination are allowed.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/HttpRule"
+          }
+        },
+        "scheme": {
+          "description": "Restrict this rule to a specific URI scheme (`http` or `https`).\nWhen omitted, the rule matches both schemes.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Scheme"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tlsTerminate": {
+          "description": "When true, the proxy terminates client TLS and forwards through the tunnel.",
+          "type": "boolean",
+          "default": false
+        },
+        "transport": {
+          "description": "Transport for the connection when allowed. Required on every rule;\nignored when `verdict` is `deny`.",
+          "$ref": "#/$defs/Transport"
+        },
+        "verdict": {
+          "description": "Policy verdict: allow or deny.",
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "match",
+        "verdict",
+        "transport"
+      ]
+    },
+    "Scheme": {
+      "description": "URI scheme a route rule applies to. When omitted on a rule, the rule matches\nboth schemes; when set, only requests with that scheme match. CONNECT is\nalways `https`; HTTP forward-proxy requests are always `http`.",
+      "type": "string",
+      "enum": [
+        "http",
+        "https"
+      ]
+    },
+    "TempFile": {
+      "description": "A temporary file to write before executing a command.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "File content (text).",
+          "type": "string"
+        },
+        "mode": {
+          "description": "Unix file mode as integer (e.g. 384 for rw-------).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "path": {
+          "description": "Absolute path inside the sandbox.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ]
+    },
+    "Transport": {
+      "description": "How an allowed connection reaches its destination — through the Lens Sandbox\nupstream proxy or by direct egress from the sandbox.",
+      "oneOf": [
+        {
+          "description": "Route through the upstream Lens Sandbox proxy (audit, credential injection,\nusage tracking).",
+          "type": "string",
+          "const": "upstream"
+        },
+        {
+          "description": "Direct egress from the sandbox (no proxy).",
+          "type": "string",
+          "const": "direct"
+        }
+      ]
+    },
+    "Verdict": {
+      "description": "Verdict for a matched route or as default: should the connection be allowed,\nblocked, or held for developer approval?",
+      "oneOf": [
+        {
+          "description": "Allow the connection using `transport`.",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "Block the connection. `transport` is ignored.",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "Suspend the request and prompt the developer; on approval, allow using\n`transport`. Only meaningful in interactive environments (local CLI\nrelay); remote/unattended consumers should keep using `Deny` so\nrequests fail closed without waiting for a human.",
+          "type": "string",
+          "const": "ask"
+        }
+      ]
+    }
+  }
+}
