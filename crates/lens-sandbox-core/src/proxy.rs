@@ -97,7 +97,27 @@ pub struct ProxyState {
     pub aws_resign: Arc<crate::aws_resign::AwsResignInterceptor>,
     /// Just-in-time approval gate: dedup map of host → pending decision +
     /// id → host lookup for inbound `request_decision` frames.
-    pub(crate) pending: std::sync::Mutex<crate::gate::PendingTable>,
+    pub(crate) pending: std::sync::Mutex<crate::gate::PendingTable<crate::protocol::Decision>>,
+    /// Sibling table for credential dialogs — see
+    /// [`crate::gate::credential_gate_or_deny`].
+    pub(crate) credential_pending:
+        std::sync::Mutex<crate::gate::PendingTable<crate::protocol::CredentialDecisionKind>>,
+    /// Map of placeholder string → credential id, populated from the
+    /// policy frame's `credentials` array. The MITM scans outbound
+    /// request bytes against this map's keys; a placeholder that survives
+    /// injection (its credential is unarmed for the request's domain) makes
+    /// the MITM call [`crate::gate::credential_gate_or_deny`] to hold the
+    /// request and emit `credential_pending`. Updated atomically on every
+    /// policy apply.
+    pub placeholder_index: RwLock<HashMap<String, String>>,
+    /// Domain patterns of credential injections that are still unarmed
+    /// (empty `value`), sourced from [`crate::policy_schema::CredentialInjection::unarmed_domain`]
+    /// on each policy apply. A CONNECT target matching any of these is MITM'd
+    /// even with no armed injection, so the first, pre-arm use of the
+    /// placeholder is decrypted and trips the credential gate instead of
+    /// leaking. Scoped per-host via [`Self::intercept_for_unarmed`] rather
+    /// than intercepting all egress; empties once every injection is armed.
+    pub unarmed_credential_domains: RwLock<Vec<String>>,
     /// How long the gate waits for a developer response before defaulting
     /// to a deny. Mutable for tests; production callers leave it at
     /// `gate::DECISION_TIMEOUT`.
@@ -111,6 +131,17 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
+    /// Whether `target_host` matches the domain of any still-unarmed
+    /// credential and so must be MITM'd to gate its first use — see
+    /// [`Self::unarmed_credential_domains`].
+    pub(crate) fn intercept_for_unarmed(&self, target_host: &str) -> bool {
+        self.unarmed_credential_domains
+            .read()
+            .unwrap()
+            .iter()
+            .any(|pattern| crate::routing::injection_matches(pattern, target_host))
+    }
+
     /// Override the gate timeout. Test-only seam; production keeps the
     /// `gate::DECISION_TIMEOUT` default set at construction.
     #[cfg(test)]
@@ -121,12 +152,35 @@ impl ProxyState {
 
 /// Collect URI placeholder pairs (placeholder → real value) that match the
 /// given target host. Returns an empty vec if no domains match.
-fn collect_uri_placeholders(state: &ProxyState, target_host: &str) -> Vec<(String, String)> {
+pub(crate) fn collect_uri_placeholders(
+    state: &ProxyState,
+    target_host: &str,
+) -> Vec<(String, String)> {
     let map = state.uri_placeholder_injections.read().unwrap();
     let mut matched = Vec::new();
     for (pattern, pairs) in map.iter() {
         if crate::routing::injection_matches(pattern, target_host) {
             matched.extend(pairs.iter().cloned());
+        }
+    }
+    matched
+}
+
+/// Collect header credential injections whose domain pattern matches the
+/// given target host. `credential_injections` is keyed by the credential's
+/// configured domain *pattern* (wildcards, port-specific, etc.), so matching
+/// must go through `injection_matches`, not an exact key lookup — otherwise a
+/// credential armed under `*.example.com` would never satisfy a request to
+/// `api.example.com`.
+pub(crate) fn collect_header_injections(
+    state: &ProxyState,
+    target_host: &str,
+) -> Vec<CredentialInjection> {
+    let map = state.credential_injections.read().unwrap();
+    let mut matched = Vec::new();
+    for (pattern, injs) in map.iter() {
+        if crate::routing::injection_matches(pattern, target_host) {
+            matched.extend(injs.iter().cloned());
         }
     }
     matched
@@ -183,6 +237,9 @@ impl ProxyServer {
             sandbox_creds,
             aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
             pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
+            credential_pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
+            placeholder_index: RwLock::new(HashMap::new()),
+            unarmed_credential_domains: RwLock::new(Vec::new()),
             decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
             bootstrap_dns_allowlist: bootstrap_dns_allowlist
                 .into_iter()
@@ -684,18 +741,8 @@ async fn handle_connect(
     // hostname-only patterns match on hostname only (e.g. bedrock-runtime.*.amazonaws.com).
     let hostname = extract_hostname(target_host);
     let injections = {
-        let map = state.credential_injections.read().unwrap();
-        let mut matched = Vec::new();
-        for (pattern, injs) in map.iter() {
-            if crate::routing::injection_matches(pattern, target_host) {
-                matched.extend(injs.iter().cloned());
-            }
-        }
-        if matched.is_empty() {
-            None
-        } else {
-            Some(matched)
-        }
+        let matched = collect_header_injections(state, target_host);
+        (!matched.is_empty()).then_some(matched)
     };
 
     // Check if this target has a client cert config for mTLS upstream
@@ -749,7 +796,8 @@ async fn handle_connect(
             let needs_aws_resign = state.aws_resign.matches(target_host);
             let needs_mitm = injections.is_some()
                 || !domain_http_rules.is_empty()
-                || !uri_placeholders.is_empty();
+                || !uri_placeholders.is_empty()
+                || state.intercept_for_unarmed(target_host);
             if needs_aws_resign {
                 // AWS-resign path owns the MITM for this connection; any
                 // other injections configured for the same host would be
@@ -792,6 +840,8 @@ async fn handle_connect(
                     audit_tx: &audit_tx,
                     extra_ca_certs: &extra_certs,
                     placeholder_map: &uri_placeholders,
+                    state,
+                    match_host: target_host,
                 };
                 crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
             } else if let (Some(cc), Some(ca)) = (&client_cert, state.ephemeral_ca.get()) {
@@ -916,6 +966,8 @@ async fn handle_connect(
                         audit_tx: &audit_tx,
                         extra_ca_certs: &extra_certs,
                         placeholder_map: &placeholders,
+                        state,
+                        match_host: target_host,
                     };
                     crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
                 } else {
@@ -923,7 +975,10 @@ async fn handle_connect(
                     tracing::debug!(target = %target_host, "proxy LENS (passthrough, no CA)");
                     tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await?;
                 }
-            } else if !injs.is_empty() || !domain_http_rules.is_empty() || !placeholders.is_empty()
+            } else if !injs.is_empty()
+                || !domain_http_rules.is_empty()
+                || !placeholders.is_empty()
+                || state.intercept_for_unarmed(target_host)
             {
                 if let Some(ca) = state.ephemeral_ca.get() {
                     // HTTPS upstream via Lens Sandbox tunnel — MITM to inject credentials,
@@ -944,6 +999,8 @@ async fn handle_connect(
                         audit_tx: &audit_tx,
                         extra_ca_certs: &extra_certs,
                         placeholder_map: &placeholders,
+                        state,
+                        match_host: target_host,
                     };
                     crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
                 } else {
@@ -1145,6 +1202,8 @@ async fn handle_transparent_tls(
         audit_tx: &audit_tx,
         extra_ca_certs: &extra_certs,
         placeholder_map: &uri_placeholders,
+        state,
+        match_host: &target_host,
     };
 
     match effective_transport {
@@ -1987,6 +2046,9 @@ pub(crate) mod tests {
             sandbox_creds: None,
             aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
             pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
+            credential_pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
+            placeholder_index: RwLock::new(HashMap::new()),
+            unarmed_credential_domains: RwLock::new(Vec::new()),
             decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
             bootstrap_dns_allowlist: Vec::new(),
         });

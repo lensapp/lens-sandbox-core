@@ -67,7 +67,7 @@
           "type": "string"
         },
         "injections": {
-          "description": "Per-domain injection rules. Each entry carries its own\n`injectionType` discriminator and the fields required for that kind.",
+          "description": "Per-domain injection rules. Each entry carries its own\n`injectionType` discriminator and the fields required for that kind.\nAn entry whose resolved `value` is empty is *unarmed*: its domain is\ndeclared so the proxy can gate the placeholder's first use, but no\nsecret is substituted until a follow-up policy arms it. See\n[`CredentialInjection::unarmed_domain`].",
           "type": "array",
           "default": [],
           "items": {

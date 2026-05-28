@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// The protocol date this sandbox binary was built against (YYYY-MM-DD, zero-padded).
 /// Must be >= SANDBOX_MIN_PROTOCOL_DATE in packages/lens-sandbox/src/infra/sandbox-provisioner/types.ts.
 /// Bump to today's date when making breaking changes to the sandbox WebSocket protocol.
-pub const SANDBOX_PROTOCOL_DATE: &str = "2026-05-13";
+pub const SANDBOX_PROTOCOL_DATE: &str = "2026-05-26";
 
 /// A temporary file to write before executing a command.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -100,6 +100,80 @@ pub struct RequestDecision {
     pub decision: Decision,
 }
 
+/// Developer's response to a `credential_pending` dialog. Unlike
+/// [`Decision`] there is no once/always distinction — every credential
+/// decision is sticky and recorded host-side (lens-sandbox writes them
+/// to `~/.lns-credentials.json`). `Timeout` is synthesised
+/// proxy-side when no decision arrives in time.
+///
+/// On `Allow`, the host arms the matching `Credential.injections` with a
+/// `policy` frame that MUST arrive *before* the `credential_decision`: the
+/// reader applies frames in order, so the held request re-reads credential
+/// state the instant the decision wakes it. Decision-before-policy loses
+/// the race and the held request fails closed as `policy-frame-missing`.
+/// This enum does NOT carry the real credential value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialDecisionKind {
+    Allow,
+    Deny,
+    Timeout,
+}
+
+impl CredentialDecisionKind {
+    pub fn is_allow(self) -> bool {
+        matches!(self, CredentialDecisionKind::Allow)
+    }
+
+    pub fn audit_reason(self) -> &'static str {
+        match self {
+            CredentialDecisionKind::Allow => "user-allowed",
+            CredentialDecisionKind::Deny => "user-denied",
+            CredentialDecisionKind::Timeout => "decision-timeout",
+        }
+    }
+}
+
+/// Outbound frame asking the relay to open a developer dialog for an
+/// outbound request whose headers carry a value matching a registered
+/// [`crate::policy_schema::Credential::placeholder`] whose `injections`
+/// are empty. The request handler awaits the matching
+/// [`CredentialDecision`]; on `Allow`, the host must arm the credential
+/// with a `policy` frame sent *before* the decision, after which the held
+/// request is forwarded with the substitution applied.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialPending {
+    #[serde(rename = "type")]
+    pub msg_type: &'static str,
+    pub id: String,
+    pub credential_id: String,
+    pub action: String,
+    pub reason: String,
+}
+
+impl CredentialPending {
+    pub fn new(id: String, credential_id: String, action: String, reason: String) -> Self {
+        Self {
+            msg_type: "credential_pending",
+            id,
+            credential_id,
+            action,
+            reason,
+        }
+    }
+}
+
+/// Inbound frame carrying the developer's answer to a pending credential
+/// dialog. The decision gates whether the held request is forwarded; the
+/// real credential value, if any, arrives separately in a `policy` frame
+/// the host must send *before* this decision (see [`CredentialDecisionKind`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CredentialDecision {
+    pub id: String,
+    pub decision: CredentialDecisionKind,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +258,67 @@ mod tests {
         let d: RequestDecision = serde_json::from_str(raw).unwrap();
         assert_eq!(d.id, "id-1");
         assert_eq!(d.decision, Decision::AllowOnce);
+    }
+
+    #[test]
+    fn credential_decision_kind_serializes_to_snake_case() {
+        for (k, want) in [
+            (CredentialDecisionKind::Allow, "\"allow\""),
+            (CredentialDecisionKind::Deny, "\"deny\""),
+            (CredentialDecisionKind::Timeout, "\"timeout\""),
+        ] {
+            assert_eq!(serde_json::to_string(&k).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn credential_decision_kind_deserializes_from_snake_case() {
+        let k: CredentialDecisionKind = serde_json::from_str("\"deny\"").unwrap();
+        assert_eq!(k, CredentialDecisionKind::Deny);
+    }
+
+    #[test]
+    fn credential_decision_kind_is_allow_partitions_allow_vs_deny() {
+        assert!(CredentialDecisionKind::Allow.is_allow());
+        assert!(!CredentialDecisionKind::Deny.is_allow());
+        assert!(!CredentialDecisionKind::Timeout.is_allow());
+    }
+
+    #[test]
+    fn credential_decision_kind_audit_reason_per_variant() {
+        assert_eq!(CredentialDecisionKind::Allow.audit_reason(), "user-allowed");
+        assert_eq!(CredentialDecisionKind::Deny.audit_reason(), "user-denied");
+        assert_eq!(
+            CredentialDecisionKind::Timeout.audit_reason(),
+            "decision-timeout"
+        );
+    }
+
+    #[test]
+    fn credential_pending_serializes_with_envelope_type_and_camel_case_credential_id() {
+        let p = CredentialPending::new(
+            "cred-1".into(),
+            "github".into(),
+            "POST https://api.github.com/issues".into(),
+            "placeholder-unauthorized".into(),
+        );
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["type"], "credential_pending");
+        assert_eq!(json["id"], "cred-1");
+        assert_eq!(json["credentialId"], "github");
+        assert_eq!(json["action"], "POST https://api.github.com/issues");
+        assert_eq!(json["reason"], "placeholder-unauthorized");
+        assert!(
+            json.get("credential_id").is_none(),
+            "rust ident leaked: {json}"
+        );
+    }
+
+    #[test]
+    fn credential_decision_deserializes_with_snake_case_decision() {
+        let raw = r#"{"id":"cred-1","decision":"allow"}"#;
+        let d: CredentialDecision = serde_json::from_str(raw).unwrap();
+        assert_eq!(d.id, "cred-1");
+        assert_eq!(d.decision, CredentialDecisionKind::Allow);
     }
 }
