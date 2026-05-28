@@ -1,0 +1,25 @@
+name: Commit Lint
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [main]
+
+jobs:
+  pr-title:
+    name: PR title is conventional
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if ! echo "$TITLE" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+'; then
+            echo "::error::PR title does not follow Conventional Commits format."
+            echo ""
+            echo "Expected: <type>[optional scope]: <description>"
+            echo "Types:    feat fix docs style refactor perf test build ci chore revert"
+            echo ""
+            echo "Your title: $TITLE"
+            exit 1
+          fi
