@@ -16,7 +16,7 @@ use crate::activity::ActivityStream;
 use crate::config::{CoreConfig, SandboxMode};
 use crate::connector;
 use crate::gate;
-use crate::protocol::{MessagePeek, RequestDecision};
+use crate::protocol::{CredentialDecision, MessagePeek, RequestDecision};
 use crate::proxy::ProxyState;
 use crate::routing::parse_proxy_routes;
 
@@ -283,6 +283,13 @@ async fn connect_and_run(
                             tracing::warn!("request_decision received without proxy state");
                         }
                     }
+                    "credential_decision" => {
+                        if let Some(state) = proxy_state {
+                            handle_credential_decision(state, &text);
+                        } else {
+                            tracing::warn!("credential_decision received without proxy state");
+                        }
+                    }
                     _ => {
                         *last_activity.lock().await = Instant::now();
                         session.dispatch(&text, &tx).await;
@@ -376,6 +383,27 @@ fn handle_request_decision(state: &Arc<ProxyState>, raw_text: &str) {
     };
     if !gate::resolve_pending(state, &parsed.id, parsed.decision) {
         tracing::warn!(id = %parsed.id, "request_decision had no matching pending entry");
+    }
+}
+
+/// Parse a `credential_decision` frame and resolve the matching credential
+/// gate entry. Mirror of [`handle_request_decision`] — on `Allow`, the held
+/// request waits for the follow-up `policy` frame that arms
+/// `Credential.injections` for the credential before forwarding; on
+/// `Deny` / `Timeout` the held request fails closed.
+fn handle_credential_decision(state: &Arc<ProxyState>, raw_text: &str) {
+    let parsed: CredentialDecision = match serde_json::from_str(raw_text) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("failed to parse credential_decision: {e}");
+            return;
+        }
+    };
+    if !gate::resolve_credential_pending(state, &parsed.id, parsed.decision) {
+        tracing::warn!(
+            id = %parsed.id,
+            "credential_decision had no matching pending entry"
+        );
     }
 }
 
@@ -882,6 +910,8 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         let mut uri_placeholder_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
         let mut aws_config_map: HashMap<String, crate::aws_sigv4::AwsSigv4Config> = HashMap::new();
         let mut aws_domains: Vec<String> = Vec::new();
+        let mut placeholder_index: HashMap<String, String> = HashMap::new();
+        let mut unarmed_domains: Vec<String> = Vec::new();
         let mut header_count = 0;
 
         for cred in &credentials {
@@ -893,15 +923,44 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 header_count: &mut header_count,
             };
             for inj in &cred.injections {
+                // An injection with an empty `value` is unarmed: register its
+                // domain so the proxy MITMs that host to gate the placeholder's
+                // first use, but don't add it to the substitution maps (there's
+                // no secret to inject yet, and the placeholder must survive so
+                // the gate scan trips). Arming = a follow-up policy resends the
+                // same injection with the real value. See
+                // `ProxyState::unarmed_credential_domains`.
+                if let Some(domain) = inj.unarmed_domain() {
+                    unarmed_domains.push(domain.to_lowercase());
+                    continue;
+                }
                 apply_injection(&cred.id, cred.placeholder.as_deref(), inj, &mut apply);
             }
 
             if let (Some(env_var), Some(placeholder)) = (&cred.env_var, &cred.placeholder) {
                 policy_env.insert(env_var.clone(), placeholder.clone());
             }
+
+            // Index every known placeholder so the MITM scan can map a
+            // surviving placeholder back to its credential, even while the
+            // credential is unarmed. Indexed regardless of `env_var`: future
+            // credential types may surface placeholders through means other
+            // than env (config files, MCP, etc). Last-write-wins on duplicates.
+            if let Some(placeholder) = &cred.placeholder
+                && let Some(prior) = placeholder_index.insert(placeholder.clone(), cred.id.clone())
+            {
+                tracing::warn!(
+                    placeholder,
+                    prior_credential = prior,
+                    next_credential = cred.id,
+                    "duplicate placeholder across credentials; later credential wins"
+                );
+            }
         }
 
         *state.credential_injections.write().unwrap() = injection_map;
+        *state.placeholder_index.write().unwrap() = placeholder_index;
+        *state.unarmed_credential_domains.write().unwrap() = unarmed_domains;
         tracing::info!(
             count = header_count,
             "credential injections updated from policy"
@@ -1524,6 +1583,209 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].header, "Authorization");
         assert_eq!(entries[0].value, "token ghp_real");
+        // An armed credential registers no unarmed domains, so MITM stays
+        // narrowed to hosts that actually carry an injection.
+        assert!(!state.intercept_for_unarmed("api.github.com"));
+    }
+
+    // An injection with an empty `value` is unarmed — only its declared
+    // domain is MITM'd to gate the first (pre-arm) use; unrelated hosts stay
+    // passthrough, and nothing is added to the substitution map.
+    #[tokio::test]
+    async fn policy_unarmed_injection_scopes_mitm_to_its_domain() {
+        let (listener, addr) = bind_server().await;
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, _read) = ws.split();
+
+            let policy = serde_json::json!({
+                "type": "policy",
+                "credentials": [
+                    {
+                        "id": "cred-unarmed",
+                        "envVar": "GH_TOKEN",
+                        "placeholder": "__lens_cred:cred-unarmed__",
+                        "injections": [
+                            {
+                                "injectionType": "header",
+                                "domain": "api.github.com",
+                                "header": "Authorization",
+                                "value": ""
+                            }
+                        ]
+                    }
+                ]
+            });
+            write
+                .send(Message::Text(policy.to_string().into()))
+                .await
+                .unwrap();
+
+            write.send(Message::Close(None)).await.ok();
+        });
+
+        let (ws_url, token) = make_config(addr);
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let session = TestDispatcher.new_session();
+        let proxy_state = Some(state.clone());
+
+        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+
+        // The declared domain is intercepted; an unrelated host is not.
+        assert!(state.intercept_for_unarmed("api.github.com"));
+        assert!(!state.intercept_for_unarmed("example.com"));
+        // The unarmed injection must NOT enter the substitution map — there's
+        // no secret to inject, and the placeholder must survive to trip the gate.
+        assert!(
+            !state
+                .credential_injections
+                .read()
+                .unwrap()
+                .contains_key("api.github.com")
+        );
+        // The placeholder is still indexed so the MITM scan can match it.
+        assert!(
+            state
+                .placeholder_index
+                .read()
+                .unwrap()
+                .contains_key("__lens_cred:cred-unarmed__")
+        );
+    }
+
+    // A credential with no injections at all declares no domain, so there is
+    // nothing to gate — the proxy registers no unarmed domain and must not
+    // fall back to broadly intercepting all egress.
+    #[tokio::test]
+    async fn policy_credential_with_no_injections_intercepts_nothing() {
+        let (listener, addr) = bind_server().await;
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, _read) = ws.split();
+
+            let policy = serde_json::json!({
+                "type": "policy",
+                "credentials": [
+                    {
+                        "id": "cred-unarmed",
+                        "envVar": "GH_TOKEN",
+                        "placeholder": "__lens_cred:cred-unarmed__",
+                        "injections": []
+                    }
+                ]
+            });
+            write
+                .send(Message::Text(policy.to_string().into()))
+                .await
+                .unwrap();
+
+            write.send(Message::Close(None)).await.ok();
+        });
+
+        let (ws_url, token) = make_config(addr);
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let session = TestDispatcher.new_session();
+        let proxy_state = Some(state.clone());
+
+        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+
+        assert!(!state.intercept_for_unarmed("api.github.com"));
+        assert!(state.unarmed_credential_domains.read().unwrap().is_empty());
+    }
+
+    // Arming a credential on a refresh policy drops its domain from the
+    // unarmed set, so interception narrows back to armed hosts.
+    #[tokio::test]
+    async fn policy_arming_credential_clears_unarmed_domains() {
+        let (listener, addr) = bind_server().await;
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, _read) = ws.split();
+
+            let unarmed = serde_json::json!({
+                "type": "policy",
+                "credentials": [
+                    {
+                        "id": "cred-1",
+                        "envVar": "GH_TOKEN",
+                        "placeholder": "__lens_cred:cred-1__",
+                        "injections": [
+                            {
+                                "injectionType": "header",
+                                "domain": "api.github.com",
+                                "header": "Authorization",
+                                "value": ""
+                            }
+                        ]
+                    }
+                ]
+            });
+            write
+                .send(Message::Text(unarmed.to_string().into()))
+                .await
+                .unwrap();
+
+            let armed = serde_json::json!({
+                "type": "policy",
+                "credentials": [
+                    {
+                        "id": "cred-1",
+                        "envVar": "GH_TOKEN",
+                        "placeholder": "__lens_cred:cred-1__",
+                        "injections": [
+                            {
+                                "injectionType": "header",
+                                "domain": "api.github.com",
+                                "header": "Authorization",
+                                "value": "token ghp_real"
+                            }
+                        ]
+                    }
+                ]
+            });
+            write
+                .send(Message::Text(armed.to_string().into()))
+                .await
+                .unwrap();
+
+            write.send(Message::Close(None)).await.ok();
+        });
+
+        let (ws_url, token) = make_config(addr);
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let session = TestDispatcher.new_session();
+        let proxy_state = Some(state.clone());
+
+        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+
+        assert!(!state.intercept_for_unarmed("api.github.com"));
     }
 
     #[tokio::test]
@@ -2771,6 +3033,42 @@ mod tests {
             &state,
             r#"{"type":"request_decision","id":"no-such","decision":"allow_always"}"#,
         );
+    }
+
+    #[tokio::test]
+    async fn handle_credential_decision_resolves_pending_gate() {
+        use crate::protocol::CredentialDecisionKind;
+        let (state, mut rx) = crate::proxy::tests::test_state();
+        let state_for_task = state.clone();
+        let handle = tokio::spawn(async move {
+            crate::gate::credential_gate_or_deny(&state_for_task, "github", "use of github").await
+        });
+        // Drain the credential_pending frame to get the id.
+        let frame = rx.recv().await.expect("credential_pending");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let id = parsed["id"].as_str().unwrap().to_string();
+
+        let decision_frame =
+            format!(r#"{{"type":"credential_decision","id":"{id}","decision":"allow"}}"#);
+        handle_credential_decision(&state, &decision_frame);
+
+        let decision = handle.await.unwrap();
+        assert_eq!(decision, CredentialDecisionKind::Allow);
+    }
+
+    #[tokio::test]
+    async fn handle_credential_decision_ignores_unknown_id() {
+        let (state, _rx) = crate::proxy::tests::test_state();
+        handle_credential_decision(
+            &state,
+            r#"{"type":"credential_decision","id":"no-such","decision":"deny"}"#,
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_credential_decision_ignores_malformed_json() {
+        let (state, _rx) = crate::proxy::tests::test_state();
+        handle_credential_decision(&state, "not-json");
     }
 
     #[tokio::test]

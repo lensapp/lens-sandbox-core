@@ -196,6 +196,10 @@ pub struct Credential {
 
     /// Per-domain injection rules. Each entry carries its own
     /// `injectionType` discriminator and the fields required for that kind.
+    /// An entry whose resolved `value` is empty is *unarmed*: its domain is
+    /// declared so the proxy can gate the placeholder's first use, but no
+    /// secret is substituted until a follow-up policy arms it. See
+    /// [`CredentialInjection::unarmed_domain`].
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     pub injections: Vec<CredentialInjection>,
 }
@@ -254,6 +258,24 @@ pub enum CredentialInjection {
     },
 }
 
+impl CredentialInjection {
+    /// The domain this injection targets while it carries no resolved secret
+    /// (`value` empty) — the credential-gate trigger for an unarmed
+    /// credential. `None` for armed injections and for `awsSigv4`, whose
+    /// secret is resolved out-of-band and is not gated this way.
+    pub fn unarmed_domain(&self) -> Option<&str> {
+        match self {
+            CredentialInjection::Header { domain, value, .. }
+            | CredentialInjection::UriPlaceholder { domain, value, .. }
+                if value.is_empty() =>
+            {
+                Some(domain)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Generate the JSON Schema for [`PolicyDocument`].
 pub fn generate_json_schema() -> schemars::Schema {
     schemars::schema_for!(PolicyDocument)
@@ -262,6 +284,40 @@ pub fn generate_json_schema() -> schemars::Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unarmed_domain_flags_empty_value_header_and_uri_only() {
+        let armed_header = CredentialInjection::Header {
+            domain: "api.github.com".into(),
+            header: "Authorization".into(),
+            value: "Bearer real".into(),
+            rules: vec![],
+        };
+        let unarmed_header = CredentialInjection::Header {
+            domain: "api.github.com".into(),
+            header: "Authorization".into(),
+            value: String::new(),
+            rules: vec![],
+        };
+        let unarmed_uri = CredentialInjection::UriPlaceholder {
+            domain: "api.telegram.org".into(),
+            value: String::new(),
+            rules: vec![],
+        };
+        let aws = CredentialInjection::AwsSigv4 {
+            domain: "*.amazonaws.com".into(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            session_token: String::new(),
+            rules: vec![],
+        };
+
+        assert_eq!(armed_header.unarmed_domain(), None);
+        assert_eq!(unarmed_header.unarmed_domain(), Some("api.github.com"));
+        assert_eq!(unarmed_uri.unarmed_domain(), Some("api.telegram.org"));
+        // awsSigv4 is resolved out-of-band; empty fields are not a gate trigger.
+        assert_eq!(aws.unarmed_domain(), None);
+    }
 
     #[test]
     fn credential_injection_deserializes_header_variant() {

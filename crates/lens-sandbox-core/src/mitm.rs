@@ -32,6 +32,18 @@ pub struct MitmContext<'a> {
     pub extra_ca_certs: &'a [rustls::pki_types::CertificateDer<'static>],
     /// Credential placeholder → real value pairs for URI rewriting.
     pub placeholder_map: &'a [(String, String)],
+    /// Proxy state for credential-gate dispatch (placeholder index,
+    /// pending table, fresh-state reads after `Allow`).
+    pub state: &'a std::sync::Arc<crate::proxy::ProxyState>,
+    /// Port-bearing CONNECT target (`host:port`) the caller used to
+    /// collect `injections` / `placeholder_map`. Distinct from the SNI
+    /// hostname (`target_host`) passed to the MITM, which is stripped of
+    /// its port for cert generation and the upstream Host header. The
+    /// post-Allow credential-gate rebuild re-collects through
+    /// `injection_matches`, which honours port-specific patterns, so it
+    /// must match against this value — not the port-stripped hostname,
+    /// which would never satisfy a `host:port` credential pattern.
+    pub match_host: &'a str,
 }
 
 /// HTTP/1.1 request body framing, derived from the request method + headers.
@@ -573,8 +585,116 @@ async fn mitm_inject_after_accept(
     // Two request-head mutations from policy, applied in order:
     //   1. inject_headers     — type=header credential injections
     //   2. rewrite_uri_placeholders — type=uriPlaceholder credential injections
-    let header_injected = inject_headers(&header_str, ctx.injections);
-    let modified = rewrite_uri_placeholders(&header_injected, ctx.placeholder_map);
+    let mut header_injected = inject_headers(&header_str, ctx.injections);
+
+    // After a credential_gate Allow we may need a fresher URI placeholder
+    // map than the one captured in `ctx.placeholder_map`. None = use ctx
+    // (the common path, no gate hit). Some(_) = post-Allow refresh.
+    let mut refreshed_uri_placeholders: Option<Vec<(String, String)>> = None;
+
+    // Credential gate: every registered placeholder still present in the
+    // post-injection header block is a credential the host hasn't armed
+    // for `target_host` yet — hold the request, emit one
+    // `credential_pending` per distinct credential, and let the host
+    // decide on each. After all `Allow`s, the host is expected to have
+    // sent follow-up `policy` frames arming every approved credential's
+    // `injections`; we refresh header + URI maps and re-scan. If any
+    // placeholder still survives the rebuild (host sent
+    // `credential_decision` before `policy`, or never armed any injection
+    // on this host), fall into the deny path so a contract violation
+    // never leaks the placeholder upstream. The first `Deny` / `Timeout`
+    // short-circuits — 403 here, never reaching upstream — mirror of the
+    // Ask-gate path.
+    //
+    // Scope reminder: this scan inspects the request head only; bodies
+    // are streamed past unchanged. See `scan_for_unarmed_placeholders`.
+    //
+    // Scan a copy with armed URI placeholders already substituted, mirroring
+    // the header substitution `inject_headers` did above. The real URI rewrite
+    // only happens at forward time (below), so without this an already-armed
+    // `uriPlaceholder` credential still sits in the request line here and
+    // re-trips the gate on every call. `ctx.placeholder_map` carries only
+    // armed placeholders (`collect_uri_placeholders` skips unarmed ones), so a
+    // first, unarmed use still survives and trips the gate.
+    let scan_target = rewrite_uri_placeholders(&header_injected, ctx.placeholder_map);
+    let matches = scan_for_unarmed_placeholders(ctx.state, &scan_target);
+    if !matches.is_empty() {
+        let state = ctx.state;
+        let action = format!("{method} {target_host}{path}");
+
+        let mut deny_record: Option<(String, &'static str)> = None;
+        for m in &matches {
+            let decision =
+                crate::gate::credential_gate_or_deny(state, &m.credential_id, &action).await;
+            if !decision.is_allow() {
+                deny_record = Some((m.credential_id.clone(), decision.audit_reason()));
+                break;
+            }
+        }
+
+        if deny_record.is_none() {
+            let fresh_headers = crate::proxy::collect_header_injections(state, ctx.match_host);
+            let rebuilt = inject_headers(&header_str, &fresh_headers);
+            let fresh_uri = crate::proxy::collect_uri_placeholders(state, ctx.match_host);
+            // rewrite_uri_placeholders only touches the request line; the
+            // scan runs over the whole rebuilt head, so a header-resident
+            // placeholder that inject_headers failed to replace is still
+            // visible. That's the contract-violation case we want to catch.
+            let probe = rewrite_uri_placeholders(&rebuilt, &fresh_uri);
+            let still_unarmed = scan_for_unarmed_placeholders(state, &probe);
+            if let Some(m) = still_unarmed.first() {
+                tracing::warn!(
+                    target_host = %target_host,
+                    credential_id = %m.credential_id,
+                    "credential gate allowed but follow-up policy did not arm credential on this host — failing closed"
+                );
+                deny_record = Some((m.credential_id.clone(), "policy-frame-missing"));
+            } else {
+                header_injected = rebuilt;
+                refreshed_uri_placeholders = Some(fresh_uri);
+            }
+        }
+
+        if let Some((credential_id, reason)) = deny_record {
+            tracing::info!(
+                target_host = %target_host,
+                method = %method,
+                path = %path,
+                credential_id = %credential_id,
+                reason,
+                "credential gate denied — failing held request closed"
+            );
+            if let Some(tx) = ctx.audit_tx {
+                let event = serde_json::json!({
+                    "type": "audit_event",
+                    "source": "sandbox-proxy",
+                    "action": action,
+                    "result": "failure",
+                    "status_code": 403,
+                    "metadata": {
+                        "host": target_host,
+                        "mitm": true,
+                        "tunnel": is_tunnel,
+                        "credential_gate_denied": true,
+                        "credential_id": credential_id,
+                        "reason": reason,
+                    }
+                });
+                let _ = tx.send(event.to_string());
+            }
+            tls_client
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await?;
+            tls_client.shutdown().await.ok();
+            return Err("credential gate denied".into());
+        }
+    }
+    let effective_uri_placeholders: &[(String, String)] = refreshed_uri_placeholders
+        .as_deref()
+        .unwrap_or(ctx.placeholder_map);
+    let modified = rewrite_uri_placeholders(&header_injected, effective_uri_placeholders);
     if modified != header_injected {
         tracing::debug!(
             target_host = %target_host,
@@ -858,6 +978,66 @@ fn rewrite_host_header(header_block: &str, new_host: &str) -> String {
 /// Authorization header etc.
 ///
 /// Only injects headers for credentials whose rules match the request method/path.
+/// Result of a placeholder scan against the post-injection request head.
+/// One entry per distinct unarmed credential found.
+///
+/// Scope: the scan only sees the HTTP request **head** (request line +
+/// headers). A placeholder embedded in the request **body** is not
+/// detected by this scan and will be forwarded upstream untouched —
+/// `inject_headers` / `rewrite_uri_placeholders` are likewise head-only,
+/// so the substitution machinery couldn't replace a body-resident
+/// placeholder even if the gate caught it. Body-resident placeholders
+/// are out of scope for the credential gate by design; agents that
+/// surface credentials only through request bodies need explicit body
+/// support, not just a wider scan.
+pub(crate) struct UnarmedPlaceholderMatch {
+    pub credential_id: String,
+}
+
+/// Walk the registered placeholder set and return every distinct
+/// credential whose placeholder is present in the request head. Substring
+/// matching is sufficient because placeholders are randomly-shaped value
+/// strings (`ghp_LNSPLACE…`, `sk-LNSPLACE…`, etc.) that won't collide
+/// with legitimate header content by accident. An empty result means no
+/// gating is needed — the common case once the host has armed all
+/// credentials, or when the request touches no known provider.
+///
+/// A request can legitimately carry placeholders for multiple
+/// credentials (e.g. one in a header, another in the URI). Returning all
+/// of them lets the caller surface a dialog per credential rather than
+/// arbitrarily picking one and falsely 403'ing the rest as
+/// `policy-frame-missing`.
+///
+/// The scan is host-agnostic: the `placeholder_index` is keyed by
+/// placeholder string only (the policy frame doesn't carry a domain hint
+/// for unarmed credentials), so a request that carries a placeholder for
+/// a credential intended for a different host will still trip the gate.
+/// That's a useful audit signal — the dialog surfaces the mis-targeted
+/// credential and the user can deny — rather than silently forwarding
+/// the placeholder to the wrong upstream.
+pub(crate) fn scan_for_unarmed_placeholders(
+    state: &std::sync::Arc<crate::proxy::ProxyState>,
+    header_block: &str,
+) -> Vec<UnarmedPlaceholderMatch> {
+    let index = state.placeholder_index.read().unwrap();
+    let mut matches: Vec<UnarmedPlaceholderMatch> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (placeholder, credential_id) in index.iter() {
+        if !placeholder.is_empty()
+            && header_block.contains(placeholder.as_str())
+            && seen.insert(credential_id.as_str())
+        {
+            matches.push(UnarmedPlaceholderMatch {
+                credential_id: credential_id.clone(),
+            });
+        }
+    }
+    // Stable order: callers iterate dialogs by credential_id so the user
+    // sees a consistent prompt sequence across reruns of the same request.
+    matches.sort_by(|a, b| a.credential_id.cmp(&b.credential_id));
+    matches
+}
+
 pub(crate) fn inject_headers(header_block: &str, injections: &[CredentialInjection]) -> String {
     let lines: Vec<&str> = header_block.split("\r\n").collect();
     let request_line = lines.first().unwrap_or(&"");
@@ -981,6 +1161,145 @@ pub(crate) async fn connect_upstream_tls_public(
 mod tests {
     use super::*;
     use crate::proxy::CredentialInjection;
+    use std::time::Duration;
+
+    fn make_test_state_with_placeholder(
+        credential_id: &str,
+        placeholder: &str,
+    ) -> std::sync::Arc<crate::proxy::ProxyState> {
+        let (state, _rx) = crate::proxy::tests::test_state();
+        state
+            .placeholder_index
+            .write()
+            .unwrap()
+            .insert(placeholder.to_string(), credential_id.to_string());
+        state
+    }
+
+    #[test]
+    fn scan_for_unarmed_placeholders_returns_match_when_placeholder_present_in_header() {
+        // Pin: an outbound request that still carries a registered
+        // placeholder after inject_headers (because no injection was
+        // armed for this credential on this domain) trips the scan and
+        // tells the caller which credential to gate.
+        let state =
+            make_test_state_with_placeholder("github", "ghp_LNSPLACEHOLDER0000000000000000000000");
+        let header_block = "GET /issues HTTP/1.1\r\nHost: api.github.com\r\n\
+                            Authorization: Bearer ghp_LNSPLACEHOLDER0000000000000000000000\r\n\r\n";
+        let m = scan_for_unarmed_placeholders(&state, header_block);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].credential_id, "github");
+    }
+
+    #[test]
+    fn scan_for_unarmed_placeholders_returns_empty_when_no_placeholder_in_header() {
+        // Headers carry no registered placeholder — the scan returns
+        // empty so the caller proceeds with the normal forwarding path.
+        let state =
+            make_test_state_with_placeholder("github", "ghp_LNSPLACEHOLDER0000000000000000000000");
+        let header_block =
+            "GET /healthz HTTP/1.1\r\nHost: api.github.com\r\nUser-Agent: probe\r\n\r\n";
+        assert!(scan_for_unarmed_placeholders(&state, header_block).is_empty());
+    }
+
+    #[test]
+    fn scan_for_unarmed_placeholders_returns_empty_when_index_is_empty() {
+        // Pre-policy state: the host hasn't sent a credentials array
+        // yet, so placeholder_index is empty. Every request bypasses
+        // the gate — keeps boot-time traffic snappy.
+        let (state, _rx) = crate::proxy::tests::test_state();
+        let header_block = "GET / HTTP/1.1\r\nHost: api.github.com\r\n\r\n";
+        assert!(scan_for_unarmed_placeholders(&state, header_block).is_empty());
+    }
+
+    #[test]
+    fn scan_for_unarmed_placeholders_ignores_empty_placeholder_entries() {
+        // Defensive: if a (malformed) policy frame ever populated the
+        // index with an empty-string placeholder, we must not match it
+        // against every request (str::contains("") == true).
+        let (state, _rx) = crate::proxy::tests::test_state();
+        state
+            .placeholder_index
+            .write()
+            .unwrap()
+            .insert(String::new(), "broken".into());
+        let header_block = "GET / HTTP/1.1\r\nHost: api.github.com\r\n\r\n";
+        assert!(scan_for_unarmed_placeholders(&state, header_block).is_empty());
+    }
+
+    #[test]
+    fn scan_for_unarmed_placeholders_finds_match_anywhere_in_header_block() {
+        // Placeholders can appear in any header — agent libraries vary.
+        // GH SDK uses Authorization; some custom CLIs use X-API-Key.
+        // Verify the scan isn't limited to a specific header field.
+        let state =
+            make_test_state_with_placeholder("openai", "sk-LNSPLACEHOLDER000000000000000000000000");
+        let header_block = "POST /v1/chat HTTP/1.1\r\nHost: api.openai.com\r\n\
+                            X-Custom: sk-LNSPLACEHOLDER000000000000000000000000\r\n\r\n";
+        assert!(!scan_for_unarmed_placeholders(&state, header_block).is_empty());
+    }
+
+    #[test]
+    fn scan_for_unarmed_placeholders_returns_all_distinct_credentials_in_stable_order() {
+        // One request that uses two unarmed credentials must surface both
+        // so the caller can gate each independently — otherwise the user
+        // sees a dialog for one credential, Allows it, and the request
+        // gets 403'd as `policy-frame-missing` for the credential they
+        // were never asked about.
+        let (state, _rx) = crate::proxy::tests::test_state();
+        {
+            let mut idx = state.placeholder_index.write().unwrap();
+            idx.insert(
+                "ghp_LNSPLACEHOLDER0000000000000000000000".into(),
+                "github".into(),
+            );
+            idx.insert(
+                "sk-LNSPLACEHOLDER000000000000000000000000".into(),
+                "openai".into(),
+            );
+        }
+        let header_block = "POST /multi HTTP/1.1\r\nHost: api.example.com\r\n\
+                            Authorization: Bearer ghp_LNSPLACEHOLDER0000000000000000000000\r\n\
+                            X-OpenAI-Key: sk-LNSPLACEHOLDER000000000000000000000000\r\n\r\n";
+        let m = scan_for_unarmed_placeholders(&state, header_block);
+        assert_eq!(m.len(), 2);
+        // Sorted by credential_id so dialog ordering is reproducible.
+        assert_eq!(m[0].credential_id, "github");
+        assert_eq!(m[1].credential_id, "openai");
+    }
+
+    #[test]
+    fn armed_uri_placeholder_is_substituted_before_scan() {
+        // Regression: an already-armed `uriPlaceholder` credential must not
+        // re-trip the gate. `mitm_inject_after_accept` substitutes header
+        // creds (inject_headers) AND uri creds (rewrite_uri_placeholders)
+        // before scanning, so an armed placeholder is gone by scan time. If
+        // the uri rewrite ran only at forward time (after the scan), the
+        // placeholder would still sit in the request line and re-prompt on
+        // every call.
+        let placeholder = "tg_LNSPLACEHOLDER0000000000000000000000";
+        let state = make_test_state_with_placeholder("telegram", placeholder);
+        let header_block =
+            format!("GET /bot{placeholder}/sendMessage HTTP/1.1\r\nHost: api.telegram.org\r\n\r\n");
+
+        // Armed: `collect_uri_placeholders` would return this pair for the host.
+        let armed = [(placeholder.to_string(), "tg_real_secret".to_string())];
+        let header_injected = inject_headers(&header_block, &[]);
+        let pre_scan = rewrite_uri_placeholders(&header_injected, &armed);
+        assert!(
+            scan_for_unarmed_placeholders(&state, &pre_scan).is_empty(),
+            "armed URI placeholder must be substituted before the scan: {pre_scan}"
+        );
+
+        // Unarmed (no armed mapping yet): the placeholder survives the rewrite
+        // and the scan still trips, so the first use is gated.
+        let unarmed = rewrite_uri_placeholders(&header_injected, &[]);
+        assert_eq!(
+            scan_for_unarmed_placeholders(&state, &unarmed).len(),
+            1,
+            "a first, unarmed URI placeholder use must still trip the gate"
+        );
+    }
 
     #[test]
     fn inject_headers_replaces_existing() {
@@ -1396,7 +1715,8 @@ mod tests {
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let server_config = test_tls_server_config(&ca, hostname);
 
-        let (audit_tx, mut audit_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (state, mut audit_rx) = crate::proxy::tests::test_state();
+        let audit_tx_opt = state.audit_tx.lock().unwrap().clone();
 
         let upstream_handle = tokio::spawn(async move {
             let (stream, _) = upstream_listener.accept().await.unwrap();
@@ -1453,9 +1773,11 @@ mod tests {
             injections: &injections,
             http_rules: &http_rules,
             ca: &ca,
-            audit_tx: &Some(audit_tx),
+            audit_tx: &audit_tx_opt,
             extra_ca_certs: &[],
             placeholder_map: &placeholder_map,
+            state: &state,
+            match_host: hostname,
         };
         let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
         let acceptor = TlsAcceptor::from(mitm_server_config);
@@ -2493,5 +2815,807 @@ mod tests {
         );
         assert!(result.contains("Connection: Upgrade"), "{result}");
         assert!(!result.contains("Connection: close"), "{result}");
+    }
+
+    // ---------------- credential gate integration ----------------
+    //
+    // Integration coverage for the gate path through `mitm_inject_after_accept`:
+    // these tests drive a full TLS handshake against the MITM and assert how
+    // the held request resolves once the simulated host responds. They are
+    // the only tests that exercise the state-refresh + defensive-rescan
+    // logic — the unit tests above cover the scan in isolation but can't
+    // catch staleness in `ctx.placeholder_map` or contract-violation
+    // ordering of `credential_decision` vs. `policy` frames.
+    //
+    // Harness shape:
+    //   - real `ProxyState` with `audit_tx` wired so gate-emitted frames
+    //     and MITM-emitted audit events land in the same drain
+    //   - a "host" task drains `credential_pending`, optionally mutates
+    //     state to simulate the follow-up `policy` frame, then resolves
+    //     the gate via `gate::resolve_credential_pending`
+    //   - the client sees either the upstream response (Allow + armed) or
+    //     a 403 (Deny / Allow-but-unarmed)
+
+    /// Outcome a simulated host applies to a `credential_pending` it
+    /// receives during a gate test. Mirrors the three contract branches
+    /// we want to verify end-to-end.
+    enum HostResponse {
+        /// Simulate the proper host flow: install header injections for
+        /// the target domain into `credential_injections`, then resolve
+        /// the gate with Allow. The held request must rebuild headers
+        /// against the fresh state and forward to upstream.
+        ArmAndAllow {
+            domain: String,
+            injection: CredentialInjection,
+        },
+        /// Simulate a contract-violating host: resolve with Allow without
+        /// first arming any injection. The defensive re-scan must catch
+        /// this and 403 the held request.
+        AllowWithoutArming,
+        /// Simulate explicit user deny.
+        Deny,
+    }
+
+    /// Spawn a task that simulates the host: drain audit events,
+    /// dispatch `response` on the first `credential_pending`, and forward
+    /// every event seen into `sink` so the test can assert after both
+    /// sides finish. The task exits when all audit senders are dropped
+    /// (the harness coordinates that by clearing `state.audit_tx` and
+    /// dropping its own local clone — see `run_gate_harness`).
+    fn spawn_host_task(
+        state: std::sync::Arc<crate::proxy::ProxyState>,
+        mut audit_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        response: HostResponse,
+        sink: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut response = Some(response);
+            while let Some(raw) = audit_rx.recv().await {
+                let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let is_pending = v["type"] == "credential_pending";
+                sink.lock().unwrap().push(v.clone());
+                if is_pending && let Some(r) = response.take() {
+                    let id = v["id"].as_str().unwrap().to_string();
+                    match r {
+                        HostResponse::ArmAndAllow { domain, injection } => {
+                            state
+                                .credential_injections
+                                .write()
+                                .unwrap()
+                                .insert(domain, vec![injection]);
+                            crate::gate::resolve_credential_pending(
+                                &state,
+                                &id,
+                                crate::protocol::CredentialDecisionKind::Allow,
+                            );
+                        }
+                        HostResponse::AllowWithoutArming => {
+                            crate::gate::resolve_credential_pending(
+                                &state,
+                                &id,
+                                crate::protocol::CredentialDecisionKind::Allow,
+                            );
+                        }
+                        HostResponse::Deny => {
+                            crate::gate::resolve_credential_pending(
+                                &state,
+                                &id,
+                                crate::protocol::CredentialDecisionKind::Deny,
+                            );
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Full MITM gate harness: TLS client → MITM (driven by ProxyState
+    /// with `placeholder_index` populated) → TLS upstream. The host task
+    /// applies `response` when `credential_pending` lands. Returns
+    /// `(upstream_request_headers, client_response, all_audit_events)`.
+    /// On MITM-internal denial (Deny / Allow-but-unarmed) the
+    /// `upstream_request_headers` is the empty string — upstream is
+    /// never contacted.
+    async fn run_gate_harness(
+        placeholder: &str,
+        credential_id: &str,
+        request: Vec<u8>,
+        response: HostResponse,
+        match_host: &str,
+    ) -> (String, String, Vec<serde_json::Value>) {
+        use tokio::net::TcpListener;
+
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let ca = EphemeralCa::new().unwrap();
+        let hostname = "test.example.com";
+
+        // Real ProxyState — gate flow needs placeholder_index +
+        // credential_pending table + audit_tx wired.
+        let (state, audit_rx) = crate::proxy::tests::test_state();
+        state
+            .placeholder_index
+            .write()
+            .unwrap()
+            .insert(placeholder.to_string(), credential_id.to_string());
+        // 1s decision timeout keeps deny-path tests snappy.
+        state.decision_timeout_override(Duration::from_secs(1));
+
+        // Shared sink: the host task pushes every audit event it sees,
+        // and the test reads after both sides finish. The gate emits
+        // onto `state.audit_tx` and so does the MITM (via the local
+        // clone in `test_ctx`), so the host receives both
+        // `credential_pending` and downstream audit_events on the same
+        // channel.
+        let events_sink: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host_handle = spawn_host_task(state.clone(), audit_rx, response, events_sink.clone());
+
+        // TLS upstream server.
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let server_config = test_tls_server_config(&ca, hostname);
+
+        let upstream_handle = tokio::spawn(async move {
+            let (stream, _) = match upstream_listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return String::new(),
+            };
+            let acceptor = TlsAcceptor::from(server_config);
+            let mut tls = match acceptor.accept(stream).await {
+                Ok(t) => t,
+                Err(_) => return String::new(),
+            };
+
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while let Ok(n) = tls.read(&mut byte).await {
+                if n == 0 {
+                    break;
+                }
+                buf.push(byte[0]);
+                if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&buf).to_string();
+
+            let _ = tls
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+            tls.shutdown().await.ok();
+            headers
+        });
+
+        let upstream_stream = TcpStream::connect(upstream_addr).await.unwrap();
+
+        // Client.
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let root_store = ca_root_store(&ca);
+
+        let client_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(client_addr).await.unwrap();
+            let client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let server_name = ServerName::try_from(hostname.to_string()).unwrap();
+            let mut tls = connector.connect(server_name, stream).await.unwrap();
+
+            tls.write_all(&request).await.unwrap();
+
+            let mut response = Vec::new();
+            let _ = tls.read_to_end(&mut response).await;
+            String::from_utf8_lossy(&response).to_string()
+        });
+
+        // Drive MITM inside a block so the local `audit_tx` clone (and
+        // the `test_ctx` borrow over it) are dropped before we clear
+        // `state.audit_tx`. Without that ordering, the host task's
+        // `audit_rx.recv()` would never return None and we'd deadlock at
+        // `host_handle.await` below.
+        let (client_stream, _) = client_listener.accept().await.unwrap();
+        let upstream_headers: String = {
+            let audit_tx = state.audit_tx.lock().unwrap().clone();
+            let test_ctx = MitmContext {
+                injections: &[],
+                http_rules: &[],
+                ca: &ca,
+                audit_tx: &audit_tx,
+                extra_ca_certs: &[],
+                placeholder_map: &[],
+                state: &state,
+                match_host,
+            };
+            let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
+            let acceptor = TlsAcceptor::from(mitm_server_config);
+            let tls_client_stream = acceptor.accept(client_stream).await.unwrap();
+            let mitm_result =
+                mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, true).await;
+            // test_ctx and audit_tx fall out of scope at the end of this
+            // block, which releases the borrow and lets the channel close.
+
+            match mitm_result {
+                Ok((tls_client, modified, meta)) => {
+                    let ca_root_store = ca_root_store(&ca);
+                    let mut tls_upstream = connect_upstream_tls(
+                        upstream_stream,
+                        hostname,
+                        Some(ca_root_store),
+                        None,
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                    tls_upstream.write_all(modified.as_bytes()).await.unwrap();
+                    tls_upstream.write_all(b"\r\n\r\n").await.unwrap();
+                    if let Err(e) = forward_or_bridge(tls_client, tls_upstream, &meta).await {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("close_notify")
+                                || msg.contains("closed")
+                                || msg.contains("broken pipe"),
+                            "unexpected forward_or_bridge error: {msg}"
+                        );
+                    }
+                    upstream_handle.await.unwrap_or_default()
+                }
+                Err(_) => {
+                    drop(upstream_stream);
+                    upstream_handle.abort();
+                    String::new()
+                }
+            }
+            // audit_tx (local) drops here as the block ends.
+        };
+
+        let client_response = client_handle.await.unwrap();
+        // Now that the only remaining sender lives in `state.audit_tx`,
+        // dropping it closes the channel so the host task exits.
+        *state.audit_tx.lock().unwrap() = None;
+        tokio::time::timeout(Duration::from_secs(2), host_handle)
+            .await
+            .expect("host task did not exit; an audit sender is still alive")
+            .unwrap();
+
+        let events = std::mem::take(&mut *events_sink.lock().unwrap());
+        (upstream_headers, client_response, events)
+    }
+
+    #[tokio::test]
+    async fn mitm_gate_arm_and_allow_re_injects_real_credential() {
+        // End-to-end: the request carries a placeholder, the gate holds
+        // it, the host arms an Authorization header and allows, and the
+        // upstream sees the real Bearer token (placeholder gone).
+        let placeholder = "ghp_LNSPLACEHOLDER0000000000000000000000";
+        let request = format!(
+            "GET /issues HTTP/1.1\r\nHost: test.example.com\r\n\
+             Authorization: Bearer {placeholder}\r\n\r\n"
+        );
+        let (upstream_headers, client_response, events) = run_gate_harness(
+            placeholder,
+            "github",
+            request.into_bytes(),
+            HostResponse::ArmAndAllow {
+                domain: "test.example.com".to_string(),
+                injection: CredentialInjection {
+                    header: "Authorization".to_string(),
+                    value: "Bearer real-secret".to_string(),
+                    rules: vec![],
+                },
+            },
+            "test.example.com",
+        )
+        .await;
+
+        assert!(
+            upstream_headers.contains("Authorization: Bearer real-secret"),
+            "upstream should see armed credential: {upstream_headers}"
+        );
+        assert!(
+            !upstream_headers.contains(placeholder),
+            "placeholder must not reach upstream: {upstream_headers}"
+        );
+        assert!(client_response.contains("200 OK"), "{client_response}");
+
+        // Sequence: credential_pending emitted, then success audit_event.
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            kinds.contains(&"credential_pending"),
+            "credential_pending must be emitted: {kinds:?}"
+        );
+        let success = events
+            .iter()
+            .find(|e| e["type"] == "audit_event" && e["result"] == "success");
+        assert!(success.is_some(), "expected success audit_event: {kinds:?}");
+    }
+
+    #[tokio::test]
+    async fn mitm_gate_arm_and_allow_matches_wildcard_domain_injection() {
+        // Regression: the post-Allow rebuild must resolve the armed
+        // credential through the same pattern matching as the CONNECT path
+        // (wildcards, case-insensitive), not an exact host-key lookup. A
+        // credential armed under `*.example.com` must satisfy a request to
+        // `test.example.com` — otherwise the user Allows, the host arms
+        // correctly, and the request is still 403'd as policy-frame-missing.
+        let placeholder = "ghp_LNSPLACEHOLDER0000000000000000000000";
+        let request = format!(
+            "GET /issues HTTP/1.1\r\nHost: test.example.com\r\n\
+             Authorization: Bearer {placeholder}\r\n\r\n"
+        );
+        let (upstream_headers, client_response, _events) = run_gate_harness(
+            placeholder,
+            "github",
+            request.into_bytes(),
+            HostResponse::ArmAndAllow {
+                domain: "*.example.com".to_string(),
+                injection: CredentialInjection {
+                    header: "Authorization".to_string(),
+                    value: "Bearer real-secret".to_string(),
+                    rules: vec![],
+                },
+            },
+            "test.example.com",
+        )
+        .await;
+
+        assert!(
+            upstream_headers.contains("Authorization: Bearer real-secret"),
+            "wildcard-domain credential must be armed via pattern match: {upstream_headers}"
+        );
+        assert!(
+            !upstream_headers.contains(placeholder),
+            "placeholder must not reach upstream: {upstream_headers}"
+        );
+        assert!(client_response.contains("200 OK"), "{client_response}");
+    }
+
+    #[tokio::test]
+    async fn mitm_gate_arm_and_allow_matches_port_specific_domain_injection() {
+        // Regression: a credential armed under an explicit `host:port`
+        // pattern must satisfy the request whose CONNECT target carries
+        // that port. The post-Allow rebuild matches against the
+        // port-bearing `match_host`, not the port-stripped SNI hostname —
+        // otherwise `injection_matches("test.example.com:8443",
+        // "test.example.com")` is false, the placeholder survives the
+        // re-scan, and the user's Allow is wrongly 403'd as
+        // policy-frame-missing.
+        let placeholder = "ghp_LNSPLACEHOLDER0000000000000000000000";
+        let request = format!(
+            "GET /issues HTTP/1.1\r\nHost: test.example.com:8443\r\n\
+             Authorization: Bearer {placeholder}\r\n\r\n"
+        );
+        let (upstream_headers, client_response, _events) = run_gate_harness(
+            placeholder,
+            "github",
+            request.into_bytes(),
+            HostResponse::ArmAndAllow {
+                domain: "test.example.com:8443".to_string(),
+                injection: CredentialInjection {
+                    header: "Authorization".to_string(),
+                    value: "Bearer real-secret".to_string(),
+                    rules: vec![],
+                },
+            },
+            "test.example.com:8443",
+        )
+        .await;
+
+        assert!(
+            upstream_headers.contains("Authorization: Bearer real-secret"),
+            "port-specific credential must be armed via host:port match: {upstream_headers}"
+        );
+        assert!(
+            !upstream_headers.contains(placeholder),
+            "placeholder must not reach upstream: {upstream_headers}"
+        );
+        assert!(client_response.contains("200 OK"), "{client_response}");
+    }
+
+    #[tokio::test]
+    async fn mitm_gate_deny_fails_held_request_closed() {
+        // The user explicitly denies — the held request 403s and never
+        // touches upstream.
+        let placeholder = "ghp_LNSPLACEHOLDER0000000000000000000000";
+        let request = format!(
+            "GET /issues HTTP/1.1\r\nHost: test.example.com\r\n\
+             Authorization: Bearer {placeholder}\r\n\r\n"
+        );
+        let (upstream_headers, client_response, events) = run_gate_harness(
+            placeholder,
+            "github",
+            request.into_bytes(),
+            HostResponse::Deny,
+            "test.example.com",
+        )
+        .await;
+
+        assert!(
+            upstream_headers.is_empty(),
+            "upstream must not be contacted on deny: {upstream_headers}"
+        );
+        assert!(
+            client_response.contains("403 Forbidden"),
+            "client should see 403: {client_response}"
+        );
+        let denied = events.iter().find(|e| {
+            e["type"] == "audit_event" && e["metadata"]["credential_gate_denied"] == true
+        });
+        assert!(denied.is_some(), "expected credential_gate_denied audit");
+        assert_eq!(denied.unwrap()["metadata"]["reason"], "user-denied");
+    }
+
+    #[tokio::test]
+    async fn mitm_gate_allow_without_arming_fails_closed_via_rescan() {
+        // Contract violation: host resolves Allow without first arming
+        // any injection. The defensive re-scan catches the surviving
+        // placeholder and 403s the request — placeholder never reaches
+        // upstream. Pins the protective behavior added for #3.
+        let placeholder = "ghp_LNSPLACEHOLDER0000000000000000000000";
+        let request = format!(
+            "GET /issues HTTP/1.1\r\nHost: test.example.com\r\n\
+             Authorization: Bearer {placeholder}\r\n\r\n"
+        );
+        let (upstream_headers, client_response, events) = run_gate_harness(
+            placeholder,
+            "github",
+            request.into_bytes(),
+            HostResponse::AllowWithoutArming,
+            "test.example.com",
+        )
+        .await;
+
+        assert!(
+            upstream_headers.is_empty(),
+            "upstream must not be contacted when arming missing: {upstream_headers}"
+        );
+        assert!(
+            client_response.contains("403 Forbidden"),
+            "client should see 403: {client_response}"
+        );
+        let denied = events.iter().find(|e| {
+            e["type"] == "audit_event" && e["metadata"]["credential_gate_denied"] == true
+        });
+        assert!(denied.is_some(), "expected credential_gate_denied audit");
+        assert_eq!(
+            denied.unwrap()["metadata"]["reason"],
+            "policy-frame-missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn mitm_gate_arm_and_allow_refreshes_uri_placeholder_map() {
+        // The placeholder lives in the request URI (uriPlaceholder
+        // credential), not a header. Before the fix for #1,
+        // `ctx.placeholder_map` was captured at CONNECT time and never
+        // refreshed — Allow would arm `uri_placeholder_injections` in
+        // state, but rewrite_uri_placeholders would keep using the stale
+        // ctx map and forward the placeholder upstream verbatim.
+        // After the fix, the Allow path re-reads
+        // `state.uri_placeholder_injections` so the substitution actually
+        // happens.
+        let placeholder = "__lens_cred:telegram_bot__";
+        let request =
+            format!("GET /bot{placeholder}/sendMessage HTTP/1.1\r\nHost: test.example.com\r\n\r\n");
+        // Host arms a URI placeholder via state mutation; we can't reuse
+        // the HostResponse::ArmAndAllow branch (which writes header
+        // injections), so do it inline.
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let ca = EphemeralCa::new().unwrap();
+        let hostname = "test.example.com";
+
+        let (state, mut audit_rx) = crate::proxy::tests::test_state();
+        state
+            .placeholder_index
+            .write()
+            .unwrap()
+            .insert(placeholder.to_string(), "telegram_bot".to_string());
+        state.decision_timeout_override(Duration::from_secs(1));
+
+        let state_for_host = state.clone();
+        let host_handle = tokio::spawn(async move {
+            while let Some(raw) = audit_rx.recv().await {
+                let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if v["type"] == "credential_pending" {
+                    let id = v["id"].as_str().unwrap().to_string();
+                    state_for_host
+                        .uri_placeholder_injections
+                        .write()
+                        .unwrap()
+                        .insert(
+                            "test.example.com".to_string(),
+                            vec![(placeholder.to_string(), "123:REAL-TOKEN".to_string())],
+                        );
+                    crate::gate::resolve_credential_pending(
+                        &state_for_host,
+                        &id,
+                        crate::protocol::CredentialDecisionKind::Allow,
+                    );
+                    return;
+                }
+            }
+        });
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let server_config = test_tls_server_config(&ca, hostname);
+
+        let upstream_handle = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(server_config);
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = tls.read(&mut byte).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.push(byte[0]);
+                if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
+                    break;
+                }
+            }
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .ok();
+            tls.shutdown().await.ok();
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        let upstream_stream = TcpStream::connect(upstream_addr).await.unwrap();
+
+        let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let root_store = ca_root_store(&ca);
+
+        let req_bytes = request.into_bytes();
+        let client_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(client_addr).await.unwrap();
+            let client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let server_name = ServerName::try_from(hostname.to_string()).unwrap();
+            let mut tls = connector.connect(server_name, stream).await.unwrap();
+            tls.write_all(&req_bytes).await.unwrap();
+            let mut buf = Vec::new();
+            let _ = tls.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        let (client_stream, _) = client_listener.accept().await.unwrap();
+        let audit_tx = state.audit_tx.lock().unwrap().clone();
+        // ctx.placeholder_map intentionally stale (empty) — pinpointing
+        // that the Allow path refreshes from state rather than relying
+        // on this captured snapshot.
+        let test_ctx = MitmContext {
+            injections: &[],
+            http_rules: &[],
+            ca: &ca,
+            audit_tx: &audit_tx,
+            extra_ca_certs: &[],
+            placeholder_map: &[],
+            state: &state,
+            match_host: hostname,
+        };
+        let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
+        let acceptor = TlsAcceptor::from(mitm_server_config);
+        let tls_client_stream = acceptor.accept(client_stream).await.unwrap();
+        let (tls_client, modified, meta) =
+            mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, true)
+                .await
+                .expect("mitm_inject_after_accept should succeed on Allow + armed");
+
+        let ca_root_store = ca_root_store(&ca);
+        let mut tls_upstream =
+            connect_upstream_tls(upstream_stream, hostname, Some(ca_root_store), None, &[])
+                .await
+                .unwrap();
+        tls_upstream.write_all(modified.as_bytes()).await.unwrap();
+        tls_upstream.write_all(b"\r\n\r\n").await.unwrap();
+        let _ = forward_or_bridge(tls_client, tls_upstream, &meta).await;
+
+        let upstream_headers = upstream_handle.await.unwrap();
+        let client_response = client_handle.await.unwrap();
+        host_handle.abort();
+
+        assert!(
+            upstream_headers.contains("/bot123:REAL-TOKEN/sendMessage"),
+            "URL placeholder must be substituted from refreshed state: {upstream_headers}"
+        );
+        assert!(
+            !upstream_headers.contains(placeholder),
+            "stale placeholder leaked: {upstream_headers}"
+        );
+        assert!(client_response.contains("200 OK"), "{client_response}");
+    }
+
+    #[tokio::test]
+    async fn mitm_gate_multi_credential_request_arms_each_and_forwards() {
+        // One request that carries placeholders for two distinct
+        // credentials must trigger a dialog per credential, not a single
+        // dialog that arbitrarily 403s the other as `policy-frame-missing`.
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let ca = EphemeralCa::new().unwrap();
+        let hostname = "test.example.com";
+        let github_ph = "ghp_LNSPLACEHOLDER0000000000000000000000";
+        let openai_ph = "sk-LNSPLACEHOLDER000000000000000000000000";
+
+        let (state, mut audit_rx) = crate::proxy::tests::test_state();
+        {
+            let mut idx = state.placeholder_index.write().unwrap();
+            idx.insert(github_ph.into(), "github".into());
+            idx.insert(openai_ph.into(), "openai".into());
+        }
+        state.decision_timeout_override(Duration::from_secs(1));
+
+        let state_for_host = state.clone();
+        let events_sink: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_for_host = events_sink.clone();
+        let host_handle = tokio::spawn(async move {
+            // First Allow arms only github; second Allow arms openai. The
+            // gate must serialize the dialogs and the rescan must succeed
+            // only after both arms land.
+            let mut seen = 0;
+            while let Some(raw) = audit_rx.recv().await {
+                let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let is_pending = v["type"] == "credential_pending";
+                sink_for_host.lock().unwrap().push(v.clone());
+                if is_pending {
+                    seen += 1;
+                    let id = v["id"].as_str().unwrap().to_string();
+                    let cred = v["credentialId"].as_str().unwrap().to_string();
+                    let injection = if cred == "github" {
+                        CredentialInjection {
+                            header: "Authorization".into(),
+                            value: "Bearer real-github".into(),
+                            rules: vec![],
+                        }
+                    } else {
+                        CredentialInjection {
+                            header: "X-OpenAI-Key".into(),
+                            value: "real-openai".into(),
+                            rules: vec![],
+                        }
+                    };
+                    let mut map = state_for_host.credential_injections.write().unwrap();
+                    map.entry("test.example.com".to_string())
+                        .or_default()
+                        .push(injection);
+                    drop(map);
+                    crate::gate::resolve_credential_pending(
+                        &state_for_host,
+                        &id,
+                        crate::protocol::CredentialDecisionKind::Allow,
+                    );
+                    if seen == 2 {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let server_config = test_tls_server_config(&ca, hostname);
+        let upstream_handle = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(server_config);
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = tls.read(&mut byte).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.push(byte[0]);
+                if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
+                    break;
+                }
+            }
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .ok();
+            tls.shutdown().await.ok();
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        let upstream_stream = TcpStream::connect(upstream_addr).await.unwrap();
+
+        let client_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let root_store = ca_root_store(&ca);
+        let request = format!(
+            "POST /multi HTTP/1.1\r\nHost: test.example.com\r\n\
+             Authorization: Bearer {github_ph}\r\nX-OpenAI-Key: {openai_ph}\r\n\r\n"
+        );
+        let req_bytes = request.into_bytes();
+        let client_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(client_addr).await.unwrap();
+            let client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let server_name = ServerName::try_from(hostname.to_string()).unwrap();
+            let mut tls = connector.connect(server_name, stream).await.unwrap();
+            tls.write_all(&req_bytes).await.unwrap();
+            let mut buf = Vec::new();
+            let _ = tls.read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        let (client_stream, _) = client_listener.accept().await.unwrap();
+        let upstream_headers: String = {
+            let audit_tx = state.audit_tx.lock().unwrap().clone();
+            let test_ctx = MitmContext {
+                injections: &[],
+                http_rules: &[],
+                ca: &ca,
+                audit_tx: &audit_tx,
+                extra_ca_certs: &[],
+                placeholder_map: &[],
+                state: &state,
+                match_host: hostname,
+            };
+            let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
+            let acceptor = TlsAcceptor::from(mitm_server_config);
+            let tls_client_stream = acceptor.accept(client_stream).await.unwrap();
+            let (tls_client, modified, meta) =
+                mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, true)
+                    .await
+                    .expect("multi-cred allow + arm should succeed");
+
+            let ca_root_store = ca_root_store(&ca);
+            let mut tls_upstream =
+                connect_upstream_tls(upstream_stream, hostname, Some(ca_root_store), None, &[])
+                    .await
+                    .unwrap();
+            tls_upstream.write_all(modified.as_bytes()).await.unwrap();
+            tls_upstream.write_all(b"\r\n\r\n").await.unwrap();
+            let _ = forward_or_bridge(tls_client, tls_upstream, &meta).await;
+            upstream_handle.await.unwrap_or_default()
+        };
+
+        let client_response = client_handle.await.unwrap();
+        *state.audit_tx.lock().unwrap() = None;
+        let _ = tokio::time::timeout(Duration::from_secs(2), host_handle).await;
+
+        let events = std::mem::take(&mut *events_sink.lock().unwrap());
+        let pending: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["type"] == "credential_pending")
+            .collect();
+        assert_eq!(pending.len(), 2, "expected one dialog per credential");
+        let creds: std::collections::BTreeSet<&str> = pending
+            .iter()
+            .map(|e| e["credentialId"].as_str().unwrap())
+            .collect();
+        assert!(creds.contains("github") && creds.contains("openai"));
+
+        assert!(
+            upstream_headers.contains("Authorization: Bearer real-github"),
+            "github arm must reach upstream: {upstream_headers}"
+        );
+        assert!(
+            upstream_headers.contains("X-OpenAI-Key: real-openai"),
+            "openai arm must reach upstream: {upstream_headers}"
+        );
+        assert!(!upstream_headers.contains(github_ph));
+        assert!(!upstream_headers.contains(openai_ph));
+        assert!(client_response.contains("200 OK"), "{client_response}");
     }
 }
