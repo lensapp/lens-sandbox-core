@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
@@ -11,12 +11,27 @@ use crate::routing::{RouteRule, Scheme, Transport, Verdict, find_matching_route}
 use crate::sock_mark;
 use crate::transparent::{self, Protocol};
 
+/// Type-erased stream used for the Lens Sandbox upstream tunnel. Either a raw
+/// `TcpStream` (plain HTTP CONNECT proxy) or a `TlsStream<TcpStream>` when
+/// the policy URL uses `https://`. The trait alias keeps the public surface
+/// short; both `AsyncRead` and `AsyncWrite` are required so the same
+/// downstream pipeline (CONNECT handshake, MITM, copy_bidirectional) works
+/// for both.
+pub trait UpstreamStream: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> UpstreamStream for T {}
+
+pub type BoxedSandboxStream = Box<dyn UpstreamStream + Send + Unpin>;
+
 /// Lens Sandbox upstream extracted from the policy message.
 #[derive(Debug, Clone)]
 pub struct SandboxUpstream {
     pub host: String,
     pub port: u16,
     pub auth_header: Option<String>,
+    /// `true` when the policy URL used `https://`. We TLS-wrap the TCP socket
+    /// before writing the CONNECT envelope so the proxy-auth token doesn't
+    /// ride plaintext over an untrusted path (BYOA, cross-region NLB).
+    pub tls: bool,
 }
 
 /// How long to suppress duplicate audit events for the same host.
@@ -86,6 +101,11 @@ pub struct ProxyState {
     pub uri_placeholder_injections: RwLock<HashMap<String, Vec<(String, String)>>>,
     /// Extra CA certs to trust for upstream TLS (e.g. proxy CA for self-signed Lens Sandbox).
     pub extra_ca_certs: RwLock<Vec<rustls::pki_types::CertificateDer<'static>>>,
+    /// Cached `TlsConnector` for the Lens Sandbox upstream, built from webpki
+    /// roots + `extra_ca_certs` on first use. Cleared whenever `extra_ca_certs`
+    /// changes so the next CONNECT picks up the updated CA bundle. `TlsConnector`
+    /// holds `Arc<ClientConfig>` so cloning is cheap.
+    pub(crate) sandbox_tls_connector: RwLock<Option<tokio_rustls::TlsConnector>>,
     /// Paths of files written by the last policy message — cleaned up before writing new ones.
     pub previous_policy_files: RwLock<Vec<String>>,
     /// Sandbox user credentials for chowning policy files.
@@ -233,6 +253,7 @@ impl ProxyServer {
             client_certs: RwLock::new(HashMap::new()),
             uri_placeholder_injections: RwLock::new(HashMap::new()),
             extra_ca_certs: RwLock::new(Vec::new()),
+            sandbox_tls_connector: RwLock::new(None),
             previous_policy_files: RwLock::new(Vec::new()),
             sandbox_creds,
             aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
@@ -597,12 +618,16 @@ async fn handle_http_forward(
             };
 
             let upstream_addr = format!("{}:{}", upstream.host, upstream.port);
-            let mut upstream_stream = match sock_mark::connect_tcp_resolve(&upstream_addr).await {
+            let mut upstream_stream: BoxedSandboxStream = match connect_sandbox_upstream(
+                state, &upstream,
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     client
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                        .await?;
+                            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                            .await?;
                     emit_http_audit(state, target_host, method, &path, "error", 502);
                     return Err(format!(
                         "HTTP forward proxy connect to Lens Sandbox {upstream_addr}: {e}"
@@ -886,18 +911,20 @@ async fn handle_connect(
             };
 
             let upstream_addr = format!("{}:{}", upstream.host, upstream.port);
-            let mut upstream_stream = match sock_mark::connect_tcp_resolve(&upstream_addr).await {
-                Ok(s) => s,
-                Err(e) => {
-                    client
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                        .await?;
-                    emit_audit(state, target_host, "error", 502);
-                    return Err(
-                        format!("connect to Lens Sandbox upstream {upstream_addr}: {e}").into(),
-                    );
-                }
-            };
+            let mut upstream_stream: BoxedSandboxStream =
+                match connect_sandbox_upstream(state, &upstream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        client
+                            .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                            .await?;
+                        emit_audit(state, target_host, "error", 502);
+                        return Err(format!(
+                            "connect to Lens Sandbox upstream {upstream_addr}: {e}"
+                        )
+                        .into());
+                    }
+                };
 
             // Send CONNECT to Lens Sandbox upstream
             let mut connect_req =
@@ -1227,15 +1254,17 @@ async fn handle_transparent_tls(
                 }
             };
             let upstream_addr = format!("{}:{}", upstream.host, upstream.port);
-            let mut upstream_stream = match sock_mark::connect_tcp_resolve(&upstream_addr).await {
-                Ok(s) => s,
-                Err(e) => {
-                    emit_audit(state, &target_host, "error", 502);
-                    return Err(
-                        format!("connect to Lens Sandbox upstream {upstream_addr}: {e}").into(),
-                    );
-                }
-            };
+            let mut upstream_stream: BoxedSandboxStream =
+                match connect_sandbox_upstream(state, &upstream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        emit_audit(state, &target_host, "error", 502);
+                        return Err(format!(
+                            "connect to Lens Sandbox upstream {upstream_addr}: {e}"
+                        )
+                        .into());
+                    }
+                };
             let mut connect_req =
                 format!("CONNECT {target_host} HTTP/1.1\r\nHost: {target_host}\r\n");
             if let Some(auth) = &upstream.auth_header {
@@ -1751,9 +1780,12 @@ fn parse_http_forward_target(url: &str) -> Option<String> {
 
 /// Read an HTTP response status line + headers one byte at a time.
 /// Returns the status code + reason (e.g. "200 Connection Established").
-async fn read_response_status_unbuffered(
-    stream: &mut TcpStream,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+async fn read_response_status_unbuffered<S>(
+    stream: &mut S,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
     let header_bytes = read_until_double_crlf(stream).await?;
     let header_str = String::from_utf8_lossy(&header_bytes);
 
@@ -1769,12 +1801,15 @@ async fn read_response_status_unbuffered(
     Ok(status)
 }
 
-/// Read from a TcpStream one byte at a time until we see `\r\n\r\n`.
+/// Read from an `AsyncRead` one byte at a time until we see `\r\n\r\n`.
 /// Returns all bytes read (including the final `\r\n\r\n`).
 /// Caps at 8KB to prevent abuse.
-async fn read_until_double_crlf(
-    stream: &mut TcpStream,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+async fn read_until_double_crlf<S>(
+    stream: &mut S,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
     use tokio::io::AsyncReadExt;
 
     let mut buf = Vec::with_capacity(512);
@@ -1796,12 +1831,20 @@ async fn read_until_double_crlf(
     }
 }
 
-/// Parse an HTTPS_PROXY URL like `http://user:pass@host:port` into a SandboxUpstream.
+/// Parse an HTTPS_PROXY URL into a `SandboxUpstream`. Accepts both `http://` and
+/// `https://`; the scheme is recorded in [`SandboxUpstream::tls`] and drives whether
+/// [`connect_sandbox_upstream`] TLS-wraps the socket before the CONNECT envelope.
+/// Returns `None` for any other scheme or a malformed authority.
 pub fn parse_upstream_url(url: &str) -> Option<SandboxUpstream> {
-    // Strip scheme
-    let without_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
+    // Strip scheme. The scheme dictates whether the upstream connection is
+    // TLS-wrapped before the CONNECT envelope is written.
+    let (without_scheme, tls) = if let Some(rest) = url.strip_prefix("https://") {
+        (rest, true)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (rest, false)
+    } else {
+        return None;
+    };
 
     let (auth, host_port) = if let Some(at_pos) = without_scheme.rfind('@') {
         let auth_part = &without_scheme[..at_pos];
@@ -1832,7 +1875,55 @@ pub fn parse_upstream_url(url: &str) -> Option<SandboxUpstream> {
         host,
         port,
         auth_header: auth,
+        tls,
     })
+}
+
+/// Dial the Lens Sandbox upstream and (optionally) TLS-wrap the socket. Returns
+/// a type-erased stream so the caller can write the CONNECT envelope and feed
+/// the same handle into MITM / passthrough without caring whether the wire is
+/// plain HTTP or HTTPS.
+///
+/// Trust source: `state.extra_ca_certs` (populated by `client.rs:handle_policy`
+/// from the `proxyCaCert` policy field — which the TypeScript side builds by
+/// concatenating the MITM proxy CA and the Lens Sandbox self-signed CA).
+pub async fn connect_sandbox_upstream(
+    state: &ProxyState,
+    upstream: &SandboxUpstream,
+) -> Result<BoxedSandboxStream, Box<dyn std::error::Error + Send + Sync>> {
+    let addr = format!("{}:{}", upstream.host, upstream.port);
+    let tcp = sock_mark::connect_tcp_resolve(&addr).await?;
+    if !upstream.tls {
+        return Ok(Box::new(tcp));
+    }
+    let connector = get_or_build_sandbox_tls_connector(state);
+    let server_name = rustls::pki_types::ServerName::try_from(upstream.host.clone())?;
+    let tls_stream = connector.connect(server_name, tcp).await?;
+    Ok(Box::new(tls_stream))
+}
+
+/// Return the cached `TlsConnector` for the Lens Sandbox upstream, building one
+/// on first use (or after a policy refresh has cleared the cache). The trust
+/// store layers webpki publicly-trusted roots — so ALB/ACM-fronted deployments
+/// work with no extra policy plumbing — over `extra_ca_certs`, which carries the
+/// in-cluster self-signed CA from the policy frame.
+fn get_or_build_sandbox_tls_connector(state: &ProxyState) -> tokio_rustls::TlsConnector {
+    if let Some(connector) = state.sandbox_tls_connector.read().unwrap().as_ref() {
+        return connector.clone();
+    }
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for cert in state.extra_ca_certs.read().unwrap().iter() {
+        if let Err(e) = root_store.add(cert.clone()) {
+            tracing::warn!(error = %e, "skipping extra CA cert for Lens Sandbox upstream trust");
+        }
+    }
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    *state.sandbox_tls_connector.write().unwrap() = Some(connector.clone());
+    connector
 }
 
 /// Decode percent-encoded strings (e.g. `%2F` → `/`).
@@ -1896,6 +1987,7 @@ pub(crate) mod tests {
         assert_eq!(u.host, "proxy.example.com");
         assert_eq!(u.port, 8080);
         assert!(u.auth_header.as_ref().unwrap().starts_with("Basic "));
+        assert!(!u.tls);
     }
 
     #[test]
@@ -1904,6 +1996,16 @@ pub(crate) mod tests {
         assert_eq!(u.host, "proxy.example.com");
         assert_eq!(u.port, 3128);
         assert!(u.auth_header.is_none());
+        assert!(!u.tls);
+    }
+
+    #[test]
+    fn parse_upstream_https_scheme_sets_tls_flag() {
+        let u = parse_upstream_url("https://sandbox:tok@nexus.example.com:3003").unwrap();
+        assert_eq!(u.host, "nexus.example.com");
+        assert_eq!(u.port, 3003);
+        assert!(u.tls);
+        assert!(u.auth_header.is_some());
     }
 
     #[test]
@@ -2042,6 +2144,7 @@ pub(crate) mod tests {
             client_certs: RwLock::new(HashMap::new()),
             uri_placeholder_injections: RwLock::new(HashMap::new()),
             extra_ca_certs: RwLock::new(Vec::new()),
+            sandbox_tls_connector: RwLock::new(None),
             previous_policy_files: RwLock::new(Vec::new()),
             sandbox_creds: None,
             aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
