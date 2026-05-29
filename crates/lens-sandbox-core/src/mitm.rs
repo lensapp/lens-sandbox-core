@@ -20,7 +20,9 @@ pub enum UpstreamMode {
     /// Direct TCP + TLS to target (used for `action: "direct"` routes).
     DirectTls { host: String, port: u16 },
     /// Pre-established tunnel + TLS (for HTTPS services behind a tunnel).
-    TunnelTls(TcpStream),
+    /// The inner stream is type-erased so plain TCP and TLS-wrapped tunnels
+    /// (when the Lens Sandbox HTTPS port fronts the proxy) share the same path.
+    TunnelTls(crate::proxy::BoxedSandboxStream),
 }
 
 /// Policy-derived context for a MITM connection.
@@ -772,13 +774,16 @@ async fn mitm_inject_after_accept(
 /// When `client_cert` is provided, adds the CA certs to the root store and
 /// uses client certificate authentication for mTLS.
 /// `extra_ca_certs` adds additional trusted CAs (e.g. proxy CA for self-signed upstream).
-async fn connect_upstream_tls(
-    upstream: TcpStream,
+async fn connect_upstream_tls<S>(
+    upstream: S,
     target_host: &str,
     test_root_store: Option<rustls::RootCertStore>,
     client_cert: Option<&crate::proxy::ClientCertConfig>,
     extra_ca_certs: &[rustls::pki_types::CertificateDer<'static>],
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<tokio_rustls::client::TlsStream<S>, Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut root_store = test_root_store.unwrap_or_else(|| {
         let mut store = rustls::RootCertStore::empty();
         store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

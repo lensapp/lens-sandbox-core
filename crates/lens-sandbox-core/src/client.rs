@@ -880,6 +880,9 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             );
             if !certs.is_empty() {
                 *state.extra_ca_certs.write().unwrap() = certs;
+                // Drop the cached Lens Sandbox TlsConnector so the next CONNECT
+                // rebuilds it against the freshly-installed CA bundle.
+                *state.sandbox_tls_connector.write().unwrap() = None;
             }
         }
     }
