@@ -80,6 +80,12 @@ impl EphemeralCa {
 
         let mut params = CertificateParams::new(Vec::<String>::new())?;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        // Strict OpenSSL verification (X509_V_FLAG_X509_STRICT) requires a CA to
+        // carry keyUsage with keyCertSign; without it the chain is rejected.
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "Lens Sandbox CA");
@@ -123,6 +129,13 @@ impl EphemeralCa {
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, hostname);
+        // Strict OpenSSL verification (X509_V_FLAG_X509_STRICT, enabled by some
+        // Python TLS stacks) rejects a non-self-signed leaf without an AKI; emit
+        // one referencing the CA's subject key identifier, plus the keyUsage and
+        // serverAuth EKU a TLS server leaf is expected to carry.
+        params.use_authority_key_identifier_extension = true;
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
 
         let cert = params.signed_by(&domain_key, &self.ca_cert, &self.ca_key)?;
 
@@ -176,6 +189,66 @@ mod tests {
         assert_eq!(contents.matches("BEGIN CERTIFICATE").count(), 1);
 
         reset_installed_certs();
+    }
+
+    #[test]
+    fn domain_leaf_carries_authority_key_identifier() {
+        // Strict OpenSSL verification rejects a non-self-signed leaf that lacks
+        // an AKI extension (`CERTIFICATE_VERIFY_FAILED: Missing Authority Key
+        // Identifier`). The MITM leaf must carry one or those TLS stacks fail.
+        let ca = EphemeralCa::new().unwrap();
+        let ck = ca.certified_key_for_domain("api.anthropic.com").unwrap();
+        let leaf = ck.cert[0].as_ref();
+        // authorityKeyIdentifier OID 2.5.29.35, DER-encoded as `06 03 55 1D 23`.
+        const AKI_OID: [u8; 5] = [0x06, 0x03, 0x55, 0x1D, 0x23];
+        assert!(
+            leaf.windows(5).any(|w| w == AKI_OID),
+            "leaf cert is missing the authorityKeyIdentifier extension"
+        );
+    }
+
+    #[test]
+    fn ca_carries_subject_key_identifier_for_the_aki_to_reference() {
+        // The leaf's AKI points at the CA's SKI; without the SKI the chain
+        // identifier linkage strict mode wants is broken.
+        let ca = EphemeralCa::new().unwrap();
+        let ck = ca.certified_key_for_domain("api.anthropic.com").unwrap();
+        let ca_der = ck.cert[1].as_ref();
+        // subjectKeyIdentifier OID 2.5.29.14, DER-encoded as `06 03 55 1D 0E`.
+        const SKI_OID: [u8; 5] = [0x06, 0x03, 0x55, 0x1D, 0x0E];
+        assert!(
+            ca_der.windows(5).any(|w| w == SKI_OID),
+            "CA cert is missing the subjectKeyIdentifier extension"
+        );
+    }
+
+    #[test]
+    fn ca_carries_key_usage_extension() {
+        // Strict OpenSSL fails the chain with "CA cert does not include key
+        // usage extension" unless the CA advertises keyUsage (keyCertSign).
+        let ca = EphemeralCa::new().unwrap();
+        let ck = ca.certified_key_for_domain("api.anthropic.com").unwrap();
+        let ca_der = ck.cert[1].as_ref();
+        // keyUsage OID 2.5.29.15, DER-encoded as `06 03 55 1D 0F`.
+        const KEY_USAGE_OID: [u8; 5] = [0x06, 0x03, 0x55, 0x1D, 0x0F];
+        assert!(
+            ca_der.windows(5).any(|w| w == KEY_USAGE_OID),
+            "CA cert is missing the keyUsage extension"
+        );
+    }
+
+    #[test]
+    fn domain_leaf_carries_extended_key_usage_server_auth() {
+        // TLS verifiers expect a server leaf to advertise the serverAuth EKU.
+        let ca = EphemeralCa::new().unwrap();
+        let ck = ca.certified_key_for_domain("api.anthropic.com").unwrap();
+        let leaf = ck.cert[0].as_ref();
+        // extendedKeyUsage OID 2.5.29.37, DER-encoded as `06 03 55 1D 25`.
+        const EKU_OID: [u8; 5] = [0x06, 0x03, 0x55, 0x1D, 0x25];
+        assert!(
+            leaf.windows(5).any(|w| w == EKU_OID),
+            "leaf cert is missing the extendedKeyUsage extension"
+        );
     }
 
     #[test]
