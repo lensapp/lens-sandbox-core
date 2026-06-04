@@ -17,6 +17,13 @@
 //! Gating queries by the same allowlist that already protects TCP closes
 //! that door without adding any new policy surface.
 //!
+//! Allowed `AAAA` queries are answered with NODATA (NOERROR + empty answer)
+//! rather than forwarded: the transparent interceptor binds IPv4 loopback
+//! only, so handing back a real IPv6 address would let the workload open a
+//! direct v6 connection that bypasses the proxy entirely. NODATA is the
+//! standard "no IPv6 here" signal, so the client falls back to the A record
+//! and the v4 redirect catches it. Denied names keep their NXDOMAIN path.
+//!
 //! Not handled (intentional, v1 scope):
 //! - TCP/53 fallback (rare for A/AAAA responses; the NAT chain REDIRECTs
 //!   TCP/53 into the transparent listener, which classifies DNS as Unknown
@@ -30,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::rr::RecordType;
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -140,7 +148,13 @@ async fn handle_query(
         }
         Decision::Deny { qname } => {
             emit_deny(state, &qname);
-            if let Some(resp) = nxdomain_response(&packet) {
+            if let Some(resp) = empty_response(&packet, ResponseCode::NXDomain) {
+                let _ = socket.send_to(&resp, peer).await;
+            }
+        }
+        Decision::SuppressAaaa { qname } => {
+            tracing::debug!(qname = %qname, "dns stub answering AAAA with NODATA to force IPv4");
+            if let Some(resp) = empty_response(&packet, ResponseCode::NoError) {
                 let _ = socket.send_to(&resp, peer).await;
             }
         }
@@ -155,6 +169,7 @@ async fn handle_query(
 enum Decision {
     Allow { qname: String },
     Deny { qname: String },
+    SuppressAaaa { qname: String },
     Malformed,
 }
 
@@ -178,6 +193,19 @@ fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
     let stripped = qname.strip_suffix('.').unwrap_or(&qname);
     let normalized = stripped.to_ascii_lowercase();
 
+    // AAAA answers point the workload at an IPv6 address the IPv4-only
+    // transparent interceptor can't catch, so an allowed name resolves to A
+    // (forward) and AAAA (NODATA). Denial is unaffected: a denied name gets
+    // NXDOMAIN regardless of record type.
+    let is_aaaa = query.query_type() == RecordType::AAAA;
+    let allow = |qname| {
+        if is_aaaa {
+            Decision::SuppressAaaa { qname }
+        } else {
+            Decision::Allow { qname }
+        }
+    };
+
     // Supervisor bootstrap hosts (set once at startup, never updated) need
     // to resolve before any policy has arrived — otherwise the supervisor
     // can't even connect to Lens Sandbox to fetch the first policy.
@@ -186,7 +214,7 @@ fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
         .iter()
         .any(|h| h == &normalized)
     {
-        return Decision::Allow { qname: normalized };
+        return allow(normalized);
     }
 
     let routes = state.routes.read().unwrap();
@@ -195,21 +223,22 @@ fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
     // applies at the subsequent TCP step via `find_matching_route`; the
     // DNS gate just prevents covert exfil via unlisted names.
     if hostname_allowed(&routes, &normalized) {
-        Decision::Allow { qname: normalized }
+        allow(normalized)
     } else {
         Decision::Deny { qname: normalized }
     }
 }
 
-/// Synthesise an NXDOMAIN response that echoes the request's header (id,
-/// flags) and question section. Returns `None` if the packet can't be
-/// parsed; callers should then stay silent.
-fn nxdomain_response(packet: &[u8]) -> Option<Vec<u8>> {
+/// Synthesise an answer-less response with the given code, echoing the
+/// request's header (id, flags) and question section. `NXDomain` is the deny
+/// reply; `NoError` (NODATA) is the AAAA-suppression reply. Returns `None` if
+/// the packet can't be parsed; callers should then stay silent.
+fn empty_response(packet: &[u8], code: ResponseCode) -> Option<Vec<u8>> {
     let msg = Message::from_vec(packet).ok()?;
     let mut resp = Message::new(msg.metadata.id, MessageType::Response, msg.metadata.op_code);
     resp.metadata.recursion_desired = msg.metadata.recursion_desired;
     resp.metadata.recursion_available = true;
-    resp.metadata.response_code = ResponseCode::NXDomain;
+    resp.metadata.response_code = code;
     for q in msg.queries {
         resp.add_query(q);
     }
@@ -447,16 +476,58 @@ mod tests {
     }
 
     #[test]
-    fn aaaa_and_a_treated_identically() {
-        // The allowlist is keyed by hostname, not query type. A and AAAA for
-        // the same name must both be allowed.
+    fn allowed_name_resolves_a_but_suppresses_aaaa() {
+        // The allowlist is keyed by hostname, but the record type still
+        // matters at the response: an allowed name returns its A record
+        // (forward) while its AAAA is downgraded to NODATA. Handing back a
+        // real IPv6 address would let the workload open a direct v6
+        // connection the IPv4-only transparent interceptor can't catch.
         let state = state_with_routes(vec![rule("example.com")]);
         let a = make_query("example.com", RecordType::A);
         let aaaa = make_query("example.com", RecordType::AAAA);
         assert!(matches!(classify_query(&a, &state), Decision::Allow { .. }));
+        match classify_query(&aaaa, &state) {
+            Decision::SuppressAaaa { qname } => assert_eq!(qname, "example.com"),
+            other => panic!(
+                "AAAA for an allowed name must be suppressed, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn denied_name_aaaa_still_nxdomains_not_suppressed() {
+        // Suppression is a downgrade for *allowed* names only. A denied name
+        // must keep its NXDOMAIN (Deny) path for every record type so the
+        // covert-channel defence isn't weakened — NODATA would still confirm
+        // the name's existence to the sandbox.
+        let state = state_with_routes(vec![rule("example.com")]);
+        let aaaa = make_query("evil.com", RecordType::AAAA);
+        match classify_query(&aaaa, &state) {
+            Decision::Deny { qname } => assert_eq!(qname, "evil.com"),
+            other => panic!(
+                "AAAA for a denied name must Deny, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn bootstrap_host_aaaa_is_suppressed() {
+        // Bootstrap hosts resolve before policy, but they're reached over the
+        // proxy's marked sockets just like everything else — so their AAAA is
+        // downgraded too, keeping all egress on the interceptable IPv4 path.
+        let (_srv, state) = ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            vec!["host.docker.internal".to_string()],
+        );
+        let aaaa = make_query("host.docker.internal", RecordType::AAAA);
         assert!(matches!(
             classify_query(&aaaa, &state),
-            Decision::Allow { .. }
+            Decision::SuppressAaaa { .. }
         ));
     }
 
@@ -602,7 +673,7 @@ mod tests {
     #[test]
     fn nxdomain_response_preserves_id_and_question() {
         let packet = make_query("denied.example", RecordType::A);
-        let resp = nxdomain_response(&packet).expect("response built");
+        let resp = empty_response(&packet, ResponseCode::NXDomain).expect("response built");
         let msg = Message::from_vec(&resp).expect("parseable");
         assert_eq!(msg.metadata.id, 0x1234);
         assert_eq!(msg.metadata.message_type, MessageType::Response);
@@ -611,11 +682,29 @@ mod tests {
         assert_eq!(msg.queries[0].name().to_utf8(), "denied.example.");
     }
 
+    #[test]
+    fn nodata_response_is_noerror_with_no_answers() {
+        // AAAA suppression must echo the question under NOERROR with an empty
+        // answer section — the NODATA shape clients read as "no IPv6 here, use
+        // A". NXDOMAIN here would instead tell the client the name doesn't
+        // exist and kill the IPv4 fallback.
+        let packet = make_query("api.anthropic.com", RecordType::AAAA);
+        let resp = empty_response(&packet, ResponseCode::NoError).expect("response built");
+        let msg = Message::from_vec(&resp).expect("parseable");
+        assert_eq!(msg.metadata.id, 0x1234);
+        assert_eq!(msg.metadata.message_type, MessageType::Response);
+        assert_eq!(msg.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(msg.answers.len(), 0, "NODATA carries no address records");
+        assert_eq!(msg.queries.len(), 1);
+        assert_eq!(msg.queries[0].name().to_utf8(), "api.anthropic.com.");
+    }
+
     /// Helper for panic messages.
     fn describe(d: &Decision) -> &'static str {
         match d {
             Decision::Allow { .. } => "Allow",
             Decision::Deny { .. } => "Deny",
+            Decision::SuppressAaaa { .. } => "SuppressAaaa",
             Decision::Malformed => "Malformed",
         }
     }
