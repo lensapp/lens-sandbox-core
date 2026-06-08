@@ -57,6 +57,10 @@ const KEEP_CAP_MASK: u64 = (1u64 << 0)  // CAP_CHOWN
     | (1u64 << 6)  // CAP_SETGID
     | (1u64 << 7); // CAP_SETUID
 
+/// The root group, kept as the dropped workload's sole supplementary group.
+#[cfg(target_os = "linux")]
+pub(crate) const ROOT_GID: u32 = 0;
+
 /// Reduce the child's capability set to `KEEP_CAP_MASK` and pin
 /// `NO_NEW_PRIVS` so the upcoming `execve` cannot re-acquire dropped
 /// caps via file caps or a setuid bit. Designed for `Command::pre_exec`
@@ -285,8 +289,14 @@ impl SandboxCredentials {
         let gid = self.gid;
         unsafe {
             cmd.pre_exec(move || {
+                // Drop the supervisor's supplementary groups but keep the root
+                // group (gid 0): images built for the "run as an arbitrary
+                // non-root uid" model (bitnami, OpenShift) own their writable
+                // dirs `root:0` with group-write and expect the process to be a
+                // member of the root group rather than a specific uid.
                 #[cfg(target_os = "linux")]
-                nix::unistd::setgroups(&[]).map_err(|e| std::io::Error::other(e.to_string()))?;
+                nix::unistd::setgroups(&[nix::unistd::Gid::from_raw(ROOT_GID)])
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 nix::unistd::setgid(gid).map_err(|e| std::io::Error::other(e.to_string()))?;
                 nix::unistd::setuid(uid).map_err(|e| std::io::Error::other(e.to_string()))?;
                 // setuid(non-root) already zeroed effective/permitted/inheritable

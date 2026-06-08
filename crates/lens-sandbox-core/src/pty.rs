@@ -114,8 +114,10 @@ pub fn spawn_pty(
             // agent (e.g. Claude Code with TERM=xterm-256color) can't keep
             // CAP_NET_ADMIN or skip NO_NEW_PRIVS / pdeathsig.
             if let Some((uid, gid)) = creds_info {
+                // Keep the root group (gid 0) — see privilege::apply: images built
+                // for the "arbitrary non-root uid in the root group" model expect it.
                 #[cfg(target_os = "linux")]
-                nix::unistd::setgroups(&[])
+                nix::unistd::setgroups(&[nix::unistd::Gid::from_raw(crate::privilege::ROOT_GID)])
                     .map_err(|e| std::io::Error::other(format!("setgroups: {e}")))?;
                 nix::unistd::setgid(gid)
                     .map_err(|e| std::io::Error::other(format!("setgid: {e}")))?;
