@@ -142,6 +142,10 @@ pub struct ProxyState {
     /// to a deny. Mutable for tests; production callers leave it at
     /// `gate::DECISION_TIMEOUT`.
     pub(crate) decision_timeout: std::sync::RwLock<Duration>,
+    /// How long [`connect_sandbox_upstream`] waits for the TCP connect and TLS
+    /// handshake to the forward-proxy upstream before returning an error.
+    /// Mutable for tests; production callers leave it at `UPSTREAM_CONNECT_TIMEOUT`.
+    pub(crate) upstream_connect_timeout: std::sync::RwLock<Duration>,
     /// Hostnames the supervisor itself needs to resolve before any policy
     /// arrives — chiefly the Lens Sandbox host. The DNS stub checks this list
     /// before the policy-driven `routes`, so the supervisor's bootstrap
@@ -225,6 +229,13 @@ fn get_or_init_ca(
 
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound the TCP connect + TLS handshake to the forward-proxy upstream. Without
+/// it, a black-holed upstream (e.g. a stale/unreachable address or a
+/// security group that drops the SYN) hangs until the OS TCP stack gives up
+/// (~2 min) — long past any client's patience and never reaching the per-CONNECT
+/// `HEADER_READ_TIMEOUT`, which only applies once this returns. Kept under that
+/// 30s budget so a dead upstream surfaces quickly as a 502 at the callers.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ProxyServer {
     listen_addr: SocketAddr,
@@ -262,6 +273,7 @@ impl ProxyServer {
             placeholder_index: RwLock::new(HashMap::new()),
             unarmed_credential_domains: RwLock::new(Vec::new()),
             decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
+            upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
             bootstrap_dns_allowlist: bootstrap_dns_allowlist
                 .into_iter()
                 .map(|h| h.to_ascii_lowercase())
@@ -1896,13 +1908,26 @@ pub async fn connect_sandbox_upstream(
     upstream: &SandboxUpstream,
 ) -> Result<BoxedSandboxStream, Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", upstream.host, upstream.port);
-    let tcp = sock_mark::connect_tcp_resolve(&addr).await?;
+    let connect_timeout = *state.upstream_connect_timeout.read().unwrap();
+    let tcp =
+        match tokio::time::timeout(connect_timeout, sock_mark::connect_tcp_resolve(&addr)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(format!("upstream TCP connect to {addr} timed out").into()),
+        };
     if !upstream.tls {
         return Ok(Box::new(tcp));
     }
     let connector = get_or_build_sandbox_tls_connector(state);
     let server_name = rustls::pki_types::ServerName::try_from(upstream.host.clone())?;
-    let tls_stream = connector.connect(server_name, tcp).await?;
+    let tls_stream =
+        match tokio::time::timeout(connect_timeout, connector.connect(server_name, tcp)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(
+                    format!("upstream TLS handshake to {} timed out", upstream.host).into(),
+                );
+            }
+        };
     Ok(Box::new(tls_stream))
 }
 
@@ -2157,9 +2182,51 @@ pub(crate) mod tests {
             placeholder_index: RwLock::new(HashMap::new()),
             unarmed_credential_domains: RwLock::new(Vec::new()),
             decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
+            upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
             bootstrap_dns_allowlist: Vec::new(),
         });
         (state, rx)
+    }
+
+    /// A timeout must bound the upstream TLS handshake. A peer that accepts the
+    /// TCP connection but never sends a ServerHello would otherwise hang the
+    /// connect forever; with a small budget the call returns a `timed out`
+    /// error promptly. If the timeout were removed this test would hang past
+    /// its deadline instead of asserting — i.e. it fails when the guard is lost.
+    #[tokio::test]
+    async fn upstream_tls_handshake_times_out() {
+        // Building the TLS connector needs a process-wide rustls CryptoProvider;
+        // install it (no-op if another test already installed the default).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Accept the connection but never speak TLS, stalling the client's
+        // handshake until the upstream timeout fires.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _silent_peer = tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+
+        let (state, _rx) = test_state();
+        *state.upstream_connect_timeout.write().unwrap() = Duration::from_millis(50);
+
+        let upstream = SandboxUpstream {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            auth_header: None,
+            tls: true,
+        };
+
+        // `BoxedSandboxStream` isn't `Debug`, so match rather than `expect_err`.
+        let err = match connect_sandbox_upstream(&state, &upstream).await {
+            Ok(_) => panic!("handshake against a silent peer must time out"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
     }
 
     #[test]
