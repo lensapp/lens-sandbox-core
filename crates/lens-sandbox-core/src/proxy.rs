@@ -761,14 +761,7 @@ async fn handle_connect(
         }
     };
 
-    // Check if this domain has credential injections -> use MITM.
-    // Patterns with explicit port match host:port (for security); wildcard and
-    // hostname-only patterns match on hostname only (e.g. bedrock-runtime.*.amazonaws.com).
     let hostname = extract_hostname(target_host);
-    let injections = {
-        let matched = collect_header_injections(state, target_host);
-        (!matched.is_empty()).then_some(matched)
-    };
 
     // Check if this target has a client cert config for mTLS upstream
     let client_cert = {
@@ -799,6 +792,17 @@ async fn handle_connect(
             transport
         }
         Verdict::Allow => transport,
+    };
+
+    // Collect credential injections AFTER the gate resolves: accepting an integration
+    // offer during a Verdict::Ask hold arms a credential mid-connection, and the resumed
+    // request must MITM to inject it. Collecting before the gate would use a stale (empty)
+    // snapshot, relay the placeholder upstream, and fail the request. Patterns with an
+    // explicit port match host:port; wildcard/hostname-only patterns match on hostname
+    // only (e.g. bedrock-runtime.*.amazonaws.com).
+    let injections = {
+        let matched = collect_header_injections(state, target_host);
+        (!matched.is_empty()).then_some(matched)
     };
 
     match effective_transport {
@@ -2515,6 +2519,83 @@ pub(crate) mod tests {
         assert_eq!(ev["action"], "CONNECT evil.example.com:443");
         assert!(ev.get("result").is_none());
         assert!(ev.get("status_code").is_none());
+
+        handler.abort();
+    }
+
+    #[tokio::test]
+    async fn handle_connect_ask_then_offer_armed_credential_mitms_the_held_connection() {
+        // Regression: accepting an integration offer during a Verdict::Ask hold arms a
+        // credential mid-connection. The resumed request must MITM so the freshly-armed
+        // token is injected — collecting the injection snapshot *before* the gate (the
+        // old bug) left it empty, so the held connection was plain-relayed and the
+        // placeholder leaked upstream. `ephemeral_ca` is initialised only on the MITM
+        // dispatch, never on the plain relay, so its presence proves the resumed
+        // connection was terminated rather than forwarded raw.
+        let (state, mut rx) = test_state();
+        *state.default_verdict.write().unwrap() = Verdict::Ask;
+        *state.default_transport.write().unwrap() = Transport::Direct;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_connect(server, "api.some-provider.example:443", &state_for_handler).await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("request_pending arrived")
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&pending).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Accepting the offer mid-hold arms the credential for the held host.
+        state.credential_injections.write().unwrap().insert(
+            "api.some-provider.example".to_string(),
+            vec![CredentialInjection {
+                header: "Authorization".to_string(),
+                value: "Bearer some-token".to_string(),
+                rules: Vec::new(),
+            }],
+        );
+        assert!(crate::gate::resolve_pending(
+            &state,
+            &id,
+            crate::protocol::Decision::AllowOnce,
+        ));
+
+        // Reading the `200 Connection Established` means dispatch has begun; the MITM
+        // arm then initialises the CA before terminating TLS.
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("proxy responded to CONNECT")
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+            "expected the tunnel to be established"
+        );
+
+        let mut mitmed = false;
+        for _ in 0..40 {
+            if state.ephemeral_ca.get().is_some() {
+                mitmed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            mitmed,
+            "the resumed connection must MITM so the offer-armed credential is injected; \
+             a stale pre-gate injection snapshot would have plain-relayed the placeholder"
+        );
 
         handler.abort();
     }
