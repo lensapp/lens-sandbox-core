@@ -268,7 +268,11 @@ fn extract_port(target: &str, default: u16) -> u16 {
 pub fn domain_matches(pattern: &str, hostname: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     let hostname = hostname.to_ascii_lowercase();
-    if let Some(suffix) = pattern.strip_prefix("*.") {
+    if pattern == "*" {
+        // Catch-all: any non-empty hostname or IP literal. Empty (e.g. a
+        // malformed ":443" CONNECT target) fails closed like every other arm.
+        !hostname.is_empty()
+    } else if let Some(suffix) = pattern.strip_prefix("*.") {
         // Leading wildcard: *.example.com matches foo.example.com and example.com
         hostname == suffix || hostname.ends_with(&format!(".{suffix}"))
     } else if pattern.contains("*.") {
@@ -538,6 +542,85 @@ mod tests {
                 tls_terminate: false,
             }
         );
+    }
+
+    #[test]
+    fn domain_matches_catch_all() {
+        // Bare `*` matches any hostname — the catch-all "all internet" pattern.
+        assert!(domain_matches("*", "github.com"));
+        assert!(domain_matches("*", "a.b.c.example.com"));
+        assert!(domain_matches("*", "1.2.3.4"));
+        // Case-insensitive like every other pattern.
+        assert!(domain_matches("*", "EXAMPLE.com"));
+        // Empty hostname must NOT match — fail closed on malformed input.
+        assert!(!domain_matches("*", ""));
+    }
+
+    #[test]
+    fn match_route_catch_all_allows_everything() {
+        let routes =
+            parse_routes(r#"[{"match": "*", "verdict": "allow", "transport": "upstream"}]"#)
+                .unwrap();
+        for host in ["github.com:443", "anything.example.org:443", "1.2.3.4:443"] {
+            assert_eq!(
+                match_route(
+                    &routes,
+                    host,
+                    Scheme::Https,
+                    Verdict::Deny,
+                    Transport::Upstream
+                ),
+                MatchedRoute {
+                    verdict: Verdict::Allow,
+                    transport: Transport::Upstream,
+                    tls_terminate: false,
+                },
+                "host {host} should be allowed by catch-all",
+            );
+        }
+    }
+
+    #[test]
+    fn match_route_deny_carveout_before_catch_all() {
+        // First-match-wins: a `deny` listed before `allow *` wins for its host,
+        // everything else falls through to the catch-all allow.
+        let routes = parse_routes(
+            r#"[
+                {"match": "evil.com", "verdict": "deny", "transport": "upstream"},
+                {"match": "*", "verdict": "allow", "transport": "upstream"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            match_route(
+                &routes,
+                "evil.com:443",
+                Scheme::Https,
+                Verdict::Deny,
+                Transport::Upstream
+            )
+            .verdict,
+            Verdict::Deny,
+        );
+        assert_eq!(
+            match_route(
+                &routes,
+                "good.com:443",
+                Scheme::Https,
+                Verdict::Deny,
+                Transport::Upstream
+            )
+            .verdict,
+            Verdict::Allow,
+        );
+    }
+
+    #[test]
+    fn hostname_allowed_catch_all() {
+        let routes =
+            parse_routes(r#"[{"match": "*", "verdict": "allow", "transport": "upstream"}]"#)
+                .unwrap();
+        assert!(hostname_allowed(&routes, "anything.example.com"));
     }
 
     #[test]
