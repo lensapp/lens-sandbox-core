@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -61,6 +61,57 @@ pub(crate) fn reset_installed_certs() {
     *INSTALLED_CA_CERTS.lock().unwrap() = None;
 }
 
+/// Upper bound on cached per-host MITM certs. A guest under a permissive or
+/// wildcard policy can iterate distinct SNIs; without a bound each forces a
+/// fresh keygen+sign and a permanent entry, growing RSS without limit. The
+/// cap keeps memory flat (a few hundred P-256 certs is small) while still
+/// covering the working set of any realistic workload.
+const CERT_CACHE_CAPACITY: usize = 256;
+
+/// Capacity-bounded LRU of signed domain certs. On overflow the
+/// least-recently-used entry is evicted; a subsequent miss regenerates it.
+struct DomainCertCache {
+    entries: HashMap<String, Arc<rustls::sign::CertifiedKey>>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl DomainCertCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let key = self.entries.get(hostname)?.clone();
+        self.touch(hostname);
+        Some(key)
+    }
+
+    fn insert(&mut self, hostname: String, cert: Arc<rustls::sign::CertifiedKey>) {
+        if self.entries.insert(hostname.clone(), cert).is_some() {
+            self.touch(&hostname);
+            return;
+        }
+        self.order.push_back(hostname);
+        while self.order.len() > self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+    }
+
+    fn touch(&mut self, hostname: &str) {
+        if let Some(pos) = self.order.iter().position(|h| h == hostname) {
+            let key = self.order.remove(pos).expect("position just found");
+            self.order.push_back(key);
+        }
+    }
+}
+
 /// Ephemeral CA — generates a CA key pair on construction, signs domain certs on demand.
 /// The CA private key lives only in process memory and dies with the container.
 pub struct EphemeralCa {
@@ -69,8 +120,8 @@ pub struct EphemeralCa {
     ca_key: KeyPair,
     /// PEM representation for installing into the system trust store.
     ca_cert_pem: String,
-    /// Cache of signed domain certs (domain -> (cert_chain, private_key)).
-    domain_cache: RwLock<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    /// Capacity-bounded LRU of signed domain certs (domain -> cert_chain+key).
+    domain_cache: Mutex<DomainCertCache>,
 }
 
 impl EphemeralCa {
@@ -99,7 +150,7 @@ impl EphemeralCa {
             ca_cert_der,
             ca_key: key_pair,
             ca_cert_pem,
-            domain_cache: RwLock::new(HashMap::new()),
+            domain_cache: Mutex::new(DomainCertCache::new(CERT_CACHE_CAPACITY)),
         })
     }
 
@@ -116,9 +167,9 @@ impl EphemeralCa {
     ) -> Result<Arc<rustls::sign::CertifiedKey>, Box<dyn std::error::Error>> {
         // Check cache first
         {
-            let cache = self.domain_cache.read().unwrap();
+            let mut cache = self.domain_cache.lock().unwrap();
             if let Some(key) = cache.get(hostname) {
-                return Ok(key.clone());
+                return Ok(key);
             }
         }
 
@@ -152,11 +203,16 @@ impl EphemeralCa {
 
         // Cache it
         {
-            let mut cache = self.domain_cache.write().unwrap();
+            let mut cache = self.domain_cache.lock().unwrap();
             cache.insert(hostname.to_string(), certified_key.clone());
         }
 
         Ok(certified_key)
+    }
+
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
+        self.domain_cache.lock().unwrap().entries.len()
     }
 }
 
@@ -189,6 +245,89 @@ mod tests {
         assert_eq!(contents.matches("BEGIN CERTIFICATE").count(), 1);
 
         reset_installed_certs();
+    }
+
+    #[test]
+    fn distinct_domains_under_cap_all_cache() {
+        // Up to the cap, every distinct domain is retained — a second call
+        // for the same domain returns the identical Arc (a cache hit, no
+        // regeneration).
+        let ca = EphemeralCa::new().unwrap();
+        let mut keys = Vec::new();
+        for i in 0..CERT_CACHE_CAPACITY {
+            keys.push(
+                ca.certified_key_for_domain(&format!("h{i}.example"))
+                    .unwrap(),
+            );
+        }
+        for (i, first) in keys.iter().enumerate() {
+            let again = ca
+                .certified_key_for_domain(&format!("h{i}.example"))
+                .unwrap();
+            assert!(
+                Arc::ptr_eq(first, &again),
+                "domain h{i} should still be cached (same Arc)"
+            );
+        }
+        assert_eq!(ca.cache_len(), CERT_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn cache_evicts_oldest_past_capacity_and_regenerates() {
+        // Filling past the cap evicts the least-recently-used entry (the
+        // first domain). Re-requesting it is a miss → a freshly generated
+        // Arc, not the original.
+        let ca = EphemeralCa::new().unwrap();
+        let oldest = ca.certified_key_for_domain("oldest.example").unwrap();
+        for i in 0..CERT_CACHE_CAPACITY {
+            ca.certified_key_for_domain(&format!("h{i}.example"))
+                .unwrap();
+        }
+        assert_eq!(
+            ca.cache_len(),
+            CERT_CACHE_CAPACITY,
+            "cache must not grow past its capacity"
+        );
+        let regenerated = ca.certified_key_for_domain("oldest.example").unwrap();
+        assert!(
+            !Arc::ptr_eq(&oldest, &regenerated),
+            "evicted domain must be regenerated as a new cert, not the original Arc"
+        );
+    }
+
+    #[test]
+    fn cache_hit_does_not_grow_or_regenerate() {
+        // Repeated requests for one domain are hits: the cache stays at one
+        // entry and hands back the same Arc every time.
+        let ca = EphemeralCa::new().unwrap();
+        let first = ca.certified_key_for_domain("repeat.example").unwrap();
+        for _ in 0..50 {
+            let again = ca.certified_key_for_domain("repeat.example").unwrap();
+            assert!(Arc::ptr_eq(&first, &again));
+        }
+        assert_eq!(ca.cache_len(), 1);
+    }
+
+    #[test]
+    fn recently_used_entry_survives_eviction() {
+        // LRU, not FIFO: touching the oldest entry before overflow makes a
+        // different entry the eviction victim.
+        let ca = EphemeralCa::new().unwrap();
+        let kept = ca.certified_key_for_domain("kept.example").unwrap();
+        for i in 0..(CERT_CACHE_CAPACITY - 1) {
+            ca.certified_key_for_domain(&format!("h{i}.example"))
+                .unwrap();
+        }
+        // Touch "kept" so it's the most-recently-used, then overflow by one.
+        let kept_touch = ca.certified_key_for_domain("kept.example").unwrap();
+        assert!(Arc::ptr_eq(&kept, &kept_touch));
+        ca.certified_key_for_domain("overflow.example").unwrap();
+
+        let kept_after = ca.certified_key_for_domain("kept.example").unwrap();
+        assert!(
+            Arc::ptr_eq(&kept, &kept_after),
+            "the recently-used entry must survive; h0 should have been evicted instead"
+        );
     }
 
     #[test]
