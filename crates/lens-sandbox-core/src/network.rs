@@ -127,7 +127,17 @@ fn render_install_script() -> String {
          \t}}\n\
          \n\
          \tchain output_filter {{\n\
-         \t\ttype filter hook output priority 0; policy accept;\n\
+         \t\t# Default DROP — the cage fails CLOSED. The explicit accepts below\n\
+         \t\t# whitelist the flows that may leave; anything that slips past a\n\
+         \t\t# removed/reordered rule hits this policy and is dropped rather\n\
+         \t\t# than escaping the proxy. The terminal reject still gives unmarked\n\
+         \t\t# traffic an immediate refusal; drop is the belt-and-suspenders.\n\
+         \t\ttype filter hook output priority 0; policy drop;\n\
+         \n\
+         \t\t# Marked traffic is the proxy/MITM/DNS-upstream sockets' own egress.\n\
+         \t\t# Under policy drop it needs an explicit accept or the proxy locks\n\
+         \t\t# itself out of the network.\n\
+         \t\tmeta mark {mark} accept\n\
          \n\
          \t\t# daddr loopback accept catches both direct loopback and the rewritten\n\
          \t\t# dst from output_nat's REDIRECT. oifname \"lo\" is a belt-and-suspenders\n\
@@ -253,9 +263,12 @@ mod tests {
         // Every restrictive rule (return/redirect/accept/log/reject) must
         // be gated on `meta mark != MARK_VALUE` so the proxy/MITM/DNS-upstream
         // sockets (which carry the mark) bypass the cage. A missing mark
-        // match would lock the proxy itself out of the network.
+        // match would lock the proxy itself out of the network. The sole
+        // mark-equals rule is the explicit accept that lets marked
+        // (proxy-origin) traffic out past the filter chain's drop policy.
         let s = render_install_script();
         let needle = format!("meta mark != {MARK_VALUE} ");
+        let marked_accept = format!("meta mark {MARK_VALUE} accept");
         for line in s.lines() {
             let t = line.trim();
             // Header / scaffolding lines that are allowed to lack the mark match:
@@ -268,6 +281,7 @@ mod tests {
                 || t.starts_with("chain ")
                 || t.starts_with("type ")
                 || t == "}"
+                || t == marked_accept
             {
                 continue;
             }
@@ -327,6 +341,43 @@ mod tests {
         assert!(
             s.starts_with("table inet"),
             "script must start with the table block"
+        );
+    }
+
+    #[test]
+    fn filter_chain_defaults_to_drop() {
+        // The egress filter chain must fail CLOSED: if any allow/log/reject
+        // rule is ever removed or reordered, an unmatched packet hits the
+        // chain policy. `policy accept` lets it escape the proxy cage;
+        // `policy drop` keeps the cage sealed.
+        let s = render_install_script();
+        let filter_pos = s.find("chain output_filter").expect("filter chain");
+        let drop_pos = s[filter_pos..]
+            .find("policy drop;")
+            .map(|p| p + filter_pos)
+            .expect("filter chain must declare policy drop");
+        let chain_end = s[filter_pos..]
+            .find("\n\t}")
+            .map(|p| p + filter_pos)
+            .expect("filter chain end");
+        assert!(
+            drop_pos < chain_end,
+            "policy drop must be inside the output_filter chain"
+        );
+    }
+
+    #[test]
+    fn marked_proxy_traffic_is_explicitly_accepted_in_filter_chain() {
+        // With the filter chain at `policy drop`, the proxy/MITM/DNS-upstream
+        // sockets (which carry SO_MARK == MARK_VALUE) would be dropped by the
+        // chain policy unless an explicit accept lets marked traffic out. A
+        // missing accept here would lock the proxy itself out of the network.
+        let s = render_install_script();
+        let filter_pos = s.find("chain output_filter").expect("filter chain");
+        let accept_marked = format!("meta mark {MARK_VALUE} accept");
+        assert!(
+            s[filter_pos..].contains(&accept_marked),
+            "filter chain must explicitly accept marked (proxy-origin) traffic before its drop policy"
         );
     }
 
