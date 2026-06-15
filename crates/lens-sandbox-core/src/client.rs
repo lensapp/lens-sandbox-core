@@ -997,20 +997,13 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     }
 
     // Write persistent files from policy (e.g. AWS credential files, synthetic kubeconfig).
-    // Clean up files from the previous policy that are no longer present.
+    // Remove every previously-written file before recreating so the symlink-safe
+    // O_EXCL create never collides with a file we ourselves own from the last refresh;
+    // a residual collision then means a hostile pre-plant and fails closed.
     {
-        let new_paths: Vec<String> = msg
-            .files
-            .as_ref()
-            .map(|f| f.iter().map(|t| t.path.clone()).collect())
-            .unwrap_or_default();
-
-        // Remove old files not in the new set
         let old_paths = state.previous_policy_files.read().unwrap().clone();
         for old in &old_paths {
-            if !new_paths.contains(old) {
-                let _ = tokio::fs::remove_file(old).await;
-            }
+            let _ = tokio::fs::remove_file(old).await;
         }
 
         if let Some(files) = msg.files
