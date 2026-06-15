@@ -17,12 +17,14 @@
 //! Gating queries by the same allowlist that already protects TCP closes
 //! that door without adding any new policy surface.
 //!
-//! Allowed `AAAA` queries are answered with NODATA (NOERROR + empty answer)
-//! rather than forwarded: the transparent interceptor binds IPv4 loopback
-//! only, so handing back a real IPv6 address would let the workload open a
-//! direct v6 connection that bypasses the proxy entirely. NODATA is the
-//! standard "no IPv6 here" signal, so the client falls back to the A record
-//! and the v4 redirect catches it. Denied names keep their NXDOMAIN path.
+//! Allowed `AAAA`, `HTTPS` (type 65), and `SVCB` (type 64) queries are
+//! answered with NODATA (NOERROR + empty answer) rather than forwarded: the
+//! transparent interceptor binds IPv4 loopback only, and all three record
+//! types can hand the workload an address that routes around it — AAAA a real
+//! IPv6 address, HTTPS/SVCB an `ipv4hint`/`ipv6hint`. NODATA is the standard
+//! "nothing of this type here" signal, so the client falls back to the A
+//! record and the v4 redirect catches it, keeping all egress on the
+//! interceptable IPv4 path. Denied names keep their NXDOMAIN path.
 //!
 //! Not handled (intentional, v1 scope):
 //! - TCP/53 fallback (rare for A/AAAA responses; the NAT chain REDIRECTs
@@ -152,8 +154,8 @@ async fn handle_query(
                 let _ = socket.send_to(&resp, peer).await;
             }
         }
-        Decision::SuppressAaaa { qname } => {
-            tracing::debug!(qname = %qname, "dns stub answering AAAA with NODATA to force IPv4");
+        Decision::SuppressNodata { qname } => {
+            tracing::debug!(qname = %qname, "dns stub answering AAAA/HTTPS/SVCB with NODATA to force IPv4");
             if let Some(resp) = empty_response(&packet, ResponseCode::NoError) {
                 let _ = socket.send_to(&resp, peer).await;
             }
@@ -169,7 +171,7 @@ async fn handle_query(
 enum Decision {
     Allow { qname: String },
     Deny { qname: String },
-    SuppressAaaa { qname: String },
+    SuppressNodata { qname: String },
     Malformed,
 }
 
@@ -194,13 +196,18 @@ fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
     let normalized = stripped.to_ascii_lowercase();
 
     // AAAA answers point the workload at an IPv6 address the IPv4-only
-    // transparent interceptor can't catch, so an allowed name resolves to A
-    // (forward) and AAAA (NODATA). Denial is unaffected: a denied name gets
-    // NXDOMAIN regardless of record type.
-    let is_aaaa = query.query_type() == RecordType::AAAA;
+    // transparent interceptor can't catch; HTTPS (65) and SVCB (64) records
+    // carry ipv4hint/ipv6hint/ALPN that route around the proxy the same way.
+    // So an allowed name resolves its A record (forward) and those three to
+    // NODATA, keeping all egress on the interceptable IPv4 path. Denial is
+    // unaffected: a denied name gets NXDOMAIN regardless of record type.
+    let should_suppress = matches!(
+        query.query_type(),
+        RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB
+    );
     let allow = |qname| {
-        if is_aaaa {
-            Decision::SuppressAaaa { qname }
+        if should_suppress {
+            Decision::SuppressNodata { qname }
         } else {
             Decision::Allow { qname }
         }
@@ -487,9 +494,41 @@ mod tests {
         let aaaa = make_query("example.com", RecordType::AAAA);
         assert!(matches!(classify_query(&a, &state), Decision::Allow { .. }));
         match classify_query(&aaaa, &state) {
-            Decision::SuppressAaaa { qname } => assert_eq!(qname, "example.com"),
+            Decision::SuppressNodata { qname } => assert_eq!(qname, "example.com"),
             other => panic!(
                 "AAAA for an allowed name must be suppressed, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn allowed_name_https_record_is_suppressed() {
+        // An HTTPS (type 65) record can carry ipv4hint/ipv6hint and ALPN that
+        // would let the workload connect outside the interceptable IPv4 proxy
+        // path. Suppress it to NODATA exactly like AAAA so the client falls
+        // back to the plain A record the v4 redirect catches.
+        let state = state_with_routes(vec![rule("example.com")]);
+        let https = make_query("example.com", RecordType::HTTPS);
+        match classify_query(&https, &state) {
+            Decision::SuppressNodata { qname } => assert_eq!(qname, "example.com"),
+            other => panic!(
+                "HTTPS for an allowed name must be suppressed, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn allowed_name_svcb_record_is_suppressed() {
+        // SVCB (type 64) is the generic sibling of HTTPS and carries the same
+        // address hints; suppress it to NODATA the same way.
+        let state = state_with_routes(vec![rule("example.com")]);
+        let svcb = make_query("example.com", RecordType::SVCB);
+        match classify_query(&svcb, &state) {
+            Decision::SuppressNodata { qname } => assert_eq!(qname, "example.com"),
+            other => panic!(
+                "SVCB for an allowed name must be suppressed, got: {}",
                 describe(&other)
             ),
         }
@@ -527,7 +566,7 @@ mod tests {
         let aaaa = make_query("host.docker.internal", RecordType::AAAA);
         assert!(matches!(
             classify_query(&aaaa, &state),
-            Decision::SuppressAaaa { .. }
+            Decision::SuppressNodata { .. }
         ));
     }
 
@@ -704,7 +743,7 @@ mod tests {
         match d {
             Decision::Allow { .. } => "Allow",
             Decision::Deny { .. } => "Deny",
-            Decision::SuppressAaaa { .. } => "SuppressAaaa",
+            Decision::SuppressNodata { .. } => "SuppressNodata",
             Decision::Malformed => "Malformed",
         }
     }
