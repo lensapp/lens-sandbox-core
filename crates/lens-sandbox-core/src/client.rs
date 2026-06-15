@@ -584,6 +584,25 @@ fn apply_injection(
 
 /// Parse and apply a policy message. Returns the env vars for the session handler,
 /// or a version mismatch if the sandbox protocol date is too old.
+fn parse_default_verdict(raw: Option<&str>) -> crate::routing::Verdict {
+    match raw {
+        Some("allow") => crate::routing::Verdict::Allow,
+        Some("deny") => crate::routing::Verdict::Deny,
+        Some("ask") => crate::routing::Verdict::Ask,
+        Some(other) => {
+            tracing::error!(
+                verdict = other,
+                "unknown network.defaultVerdict in policy; defaulting to deny"
+            );
+            crate::routing::Verdict::Deny
+        }
+        None => {
+            tracing::warn!("network.defaultVerdict missing; defaulting to deny");
+            crate::routing::Verdict::Deny
+        }
+    }
+}
+
 async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> PolicyResult {
     // Transport wrapper — adds server-only fields to the policy document.
     // NetworkPolicy is kept as serde_json::Value for fault-tolerant route parsing
@@ -793,22 +812,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             // Only apply defaultVerdict/defaultTransport when routes parsed
             // successfully. Otherwise the fallback above already forced Deny.
             if routes_valid {
-                let verdict = match network.default_verdict.as_deref() {
-                    Some("allow") => crate::routing::Verdict::Allow,
-                    Some("deny") => crate::routing::Verdict::Deny,
-                    Some("ask") => crate::routing::Verdict::Ask,
-                    Some(other) => {
-                        tracing::error!(
-                            verdict = other,
-                            "unknown network.defaultVerdict in policy; defaulting to deny"
-                        );
-                        crate::routing::Verdict::Deny
-                    }
-                    None => {
-                        tracing::warn!("network.defaultVerdict missing; defaulting to deny");
-                        crate::routing::Verdict::Deny
-                    }
-                };
+                let verdict = parse_default_verdict(network.default_verdict.as_deref());
                 // Transport is required per schema. Missing OR malformed means
                 // we don't know what the operator chose; on a non-deny verdict
                 // that's a fail-closed downgrade so we never silently pick a
@@ -1114,6 +1118,37 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     use tokio_tungstenite::tungstenite::http;
+
+    #[test]
+    fn runtime_default_verdict_parser_matches_the_schema_enum() {
+        use crate::policy_schema::Verdict;
+        // Exhaustive match: adding a Verdict variant breaks this at compile
+        // time, forcing parse_default_verdict's string literals to be revisited
+        // so the enforcement gate can't silently diverge from the schema the
+        // host-side validator publishes.
+        fn schema_string(v: Verdict) -> &'static str {
+            match v {
+                Verdict::Allow => "allow",
+                Verdict::Deny => "deny",
+                Verdict::Ask => "ask",
+            }
+        }
+        for v in [Verdict::Allow, Verdict::Deny, Verdict::Ask] {
+            let s = schema_string(v);
+            assert_eq!(
+                serde_json::to_value(v).unwrap(),
+                serde_json::json!(s),
+                "schema_string must equal serde's serialization for {v:?}"
+            );
+            assert_eq!(
+                parse_default_verdict(Some(s)),
+                v,
+                "the runtime parser must map the schema string back to {v:?}"
+            );
+        }
+        assert_eq!(parse_default_verdict(Some("nonsense")), Verdict::Deny);
+        assert_eq!(parse_default_verdict(None), Verdict::Deny);
+    }
 
     struct TestDispatcher;
 
