@@ -313,11 +313,67 @@ pub fn injection_matches(pattern: &str, target_host: &str) -> bool {
     }
 }
 
-/// Normalize a URL path for safe matching: collapse `//`, resolve `..`, strip trailing `/`.
-/// Does NOT decode percent-encoding (clients send literal paths over HTTP/1.1).
+const MAX_SEPARATOR_DECODE_PASSES: usize = 8;
+
+/// Decode percent-encoded path separators so a request can't smuggle a `..` or
+/// `/` past the allowlist that the origin would then decode and act on.
+/// Only the security-relevant separators are decoded — `%2e` → `.`, `%2f` → `/`,
+/// `%5c` → `\` (case-insensitive) — plus `%25` → `%` so the loop can unwrap a
+/// multiply-encoded separator; and any backslash is folded to `/`. Other percent
+/// sequences (e.g. `%20`) are left intact so a legitimately-encoded segment byte
+/// still matches by its encoded form. Decoding repeats to a bounded fixed point
+/// so forms like `%252e` collapse too; malformed sequences (`%zz`) pass through
+/// unchanged.
+fn decode_path_separators(path: &str) -> String {
+    let mut current = path.replace('\\', "/");
+    for _ in 0..MAX_SEPARATOR_DECODE_PASSES {
+        let decoded = decode_separators_once(&current);
+        if decoded == current {
+            return current;
+        }
+        current = decoded;
+    }
+    current
+}
+
+fn decode_separators_once(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            result.push(c);
+            continue;
+        }
+        let hex: String = chars.by_ref().take(2).collect();
+        match decode_separator_byte(&hex) {
+            Some(sep) => result.push(sep),
+            None => {
+                result.push('%');
+                result.push_str(&hex);
+            }
+        }
+    }
+    result
+}
+
+fn decode_separator_byte(hex: &str) -> Option<char> {
+    match hex.to_ascii_lowercase().as_str() {
+        "2e" => Some('.'),
+        "2f" | "5c" => Some('/'),
+        "25" => Some('%'),
+        _ => None,
+    }
+}
+
+/// Normalize a URL path for safe matching: decode percent-encoded separators,
+/// collapse `//`, resolve `..`, strip trailing `/`.
+/// Percent-encoded path separators (`%2e`, `%2f`, `%5c`, incl. multiply-encoded
+/// forms) ARE decoded so matching happens on the canonical path the origin sees;
+/// other percent sequences are left encoded.
 pub fn normalize_path(path: &str) -> String {
+    let decoded = decode_path_separators(path);
     let mut segments: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
+    for seg in decoded.split('/') {
         match seg {
             "" | "." => {}
             ".." => {
@@ -1468,12 +1524,55 @@ mod tests {
     }
 
     #[test]
-    fn normalize_path_does_not_decode_percent_encoding() {
-        // Known accepted limitation: percent-encoded sequences are not decoded.
-        // HTTP/1.1 clients (curl, SDKs) don't percent-encode path separators in
-        // the request-target, so %2e%2e and %2F are not practical bypass vectors.
-        assert_eq!(normalize_path("/api/%2e%2e/admin"), "/api/%2e%2e/admin");
-        assert_eq!(normalize_path("/api/v1/%2F/secret"), "/api/v1/%2F/secret");
+    fn normalize_path_decodes_percent_encoded_separators() {
+        assert_eq!(normalize_path("/api/%2e%2e/admin"), "/admin");
+        assert_eq!(normalize_path("/api/v1/%2F/secret"), "/api/v1/secret");
+        // Uppercase hex decodes identically.
+        assert_eq!(normalize_path("/api/%2E%2E/admin"), "/admin");
+        assert_eq!(normalize_path("/api/v1/%2F/secret"), "/api/v1/secret");
+    }
+
+    #[test]
+    fn normalize_path_decodes_double_encoded() {
+        assert_eq!(normalize_path("/api/%252e%252e/admin"), "/admin");
+        // Encoded backslash traversal resolves through the / fold.
+        assert_eq!(normalize_path("/api/%2e%2e%5cadmin"), "/admin");
+    }
+
+    #[test]
+    fn normalize_path_leaves_malformed_and_non_separator_encoding_intact() {
+        assert_eq!(normalize_path("/api/%zz/v1"), "/api/%zz/v1");
+        assert_eq!(normalize_path("/normal/path"), "/normal/path");
+        // %20 (space) is not a separator and must stay encoded.
+        assert_eq!(normalize_path("/api/%20/v1"), "/api/%20/v1");
+    }
+
+    #[test]
+    fn http_rules_reject_percent_encoded_traversal() {
+        let rules = vec![HttpRule {
+            method: None,
+            path: Some("/repos/**".to_string()),
+        }];
+        assert!(http_request_matches_rules(
+            &rules,
+            "GET",
+            &normalize_path("/repos/v1/list")
+        ));
+        assert!(!http_request_matches_rules(
+            &rules,
+            "GET",
+            &normalize_path("/repos/%2e%2e/admin")
+        ));
+    }
+
+    #[test]
+    fn decode_path_separators_handles_each_case() {
+        assert_eq!(decode_path_separators("/a/%2e%2e/b"), "/a/../b");
+        assert_eq!(decode_path_separators("/a/%252e%252e/b"), "/a/../b");
+        assert_eq!(decode_path_separators("/a/%2E%2F%5Cb"), "/a/.//b");
+        assert_eq!(decode_path_separators("/a/%zz/b"), "/a/%zz/b");
+        assert_eq!(decode_path_separators("/a/%20/b"), "/a/%20/b");
+        assert_eq!(decode_path_separators("/a\\b"), "/a/b");
     }
 
     #[test]
