@@ -199,6 +199,25 @@ fn run_nft_script(script: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The rendered `output_filter` chain block, from its `chain` header up to
+    /// (but not including) the chain's closing brace. Tests that assert
+    /// properties scoped to this chain slice against it so they don't
+    /// accidentally match rules in `output_nat`.
+    fn output_filter_chain(script: &str) -> &str {
+        let start = script
+            .find("chain output_filter")
+            .expect("output_filter chain");
+        let rest = &script[start..];
+        let end = rest.find("\n\t}").expect("output_filter chain end");
+        &rest[..end]
+    }
+
+    /// The single `meta mark == MARK_VALUE accept` rule (the marked-traffic
+    /// exemption). Shared so the rule text and its test guards can't drift.
+    fn marked_accept_rule() -> String {
+        format!("meta mark {MARK_VALUE} accept")
+    }
+
     #[test]
     fn dns_redirect_precedes_loopback_return() {
         // Docker's embedded 127.0.0.11:53 resolver is loopback-addressed.
@@ -268,7 +287,7 @@ mod tests {
         // (proxy-origin) traffic out past the filter chain's drop policy.
         let s = render_install_script();
         let needle = format!("meta mark != {MARK_VALUE} ");
-        let marked_accept = format!("meta mark {MARK_VALUE} accept");
+        let marked_accept = marked_accept_rule();
         for line in s.lines() {
             let t = line.trim();
             // Header / scaffolding lines that are allowed to lack the mark match:
@@ -346,38 +365,46 @@ mod tests {
 
     #[test]
     fn filter_chain_defaults_to_drop() {
-        // The egress filter chain must fail CLOSED: if any allow/log/reject
-        // rule is ever removed or reordered, an unmatched packet hits the
-        // chain policy. `policy accept` lets it escape the proxy cage;
-        // `policy drop` keeps the cage sealed.
+        // The egress filter chain must fail CLOSED. Three properties together
+        // guarantee that, and each guards a distinct fail-open regression:
+        //   1. it declares `policy drop` — an unmatched packet is dropped;
+        //   2. it does NOT declare `policy accept` anywhere — a revert that
+        //      reintroduces accept (even alongside a stray drop) escapes;
+        //   3. it keeps the terminal `reject`, the immediate refusal for
+        //      unmarked traffic that the drop policy backstops.
         let s = render_install_script();
-        let filter_pos = s.find("chain output_filter").expect("filter chain");
-        let drop_pos = s[filter_pos..]
-            .find("policy drop;")
-            .map(|p| p + filter_pos)
-            .expect("filter chain must declare policy drop");
-        let chain_end = s[filter_pos..]
-            .find("\n\t}")
-            .map(|p| p + filter_pos)
-            .expect("filter chain end");
+        let chain = output_filter_chain(&s);
         assert!(
-            drop_pos < chain_end,
-            "policy drop must be inside the output_filter chain"
+            chain.contains("policy drop;"),
+            "output_filter must declare `policy drop` (fail closed)"
+        );
+        assert!(
+            !chain.contains("policy accept"),
+            "output_filter must not declare `policy accept` — that fails open"
+        );
+        assert!(
+            chain.contains("reject with icmpx type port-unreachable"),
+            "output_filter must keep its terminal reject"
         );
     }
 
     #[test]
     fn marked_proxy_traffic_is_explicitly_accepted_in_filter_chain() {
         // With the filter chain at `policy drop`, the proxy/MITM/DNS-upstream
-        // sockets (which carry SO_MARK == MARK_VALUE) would be dropped by the
-        // chain policy unless an explicit accept lets marked traffic out. A
-        // missing accept here would lock the proxy itself out of the network.
+        // sockets (SO_MARK == MARK_VALUE) need an explicit accept — and it must
+        // appear BEFORE the terminal reject, or the reject fires first and the
+        // proxy locks itself out of the network. Assert both presence and order.
         let s = render_install_script();
-        let filter_pos = s.find("chain output_filter").expect("filter chain");
-        let accept_marked = format!("meta mark {MARK_VALUE} accept");
+        let chain = output_filter_chain(&s);
+        let accept_pos = chain
+            .find(&marked_accept_rule())
+            .expect("filter chain must explicitly accept marked (proxy-origin) traffic");
+        let reject_pos = chain
+            .find("reject with icmpx type port-unreachable")
+            .expect("filter chain must keep its terminal reject");
         assert!(
-            s[filter_pos..].contains(&accept_marked),
-            "filter chain must explicitly accept marked (proxy-origin) traffic before its drop policy"
+            accept_pos < reject_pos,
+            "marked-traffic accept ({accept_pos}) must precede the terminal reject ({reject_pos})"
         );
     }
 
