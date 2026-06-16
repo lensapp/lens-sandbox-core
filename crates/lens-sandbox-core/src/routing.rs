@@ -317,13 +317,13 @@ const MAX_SEPARATOR_DECODE_PASSES: usize = 8;
 
 /// Decode percent-encoded path separators so a request can't smuggle a `..` or
 /// `/` past the allowlist that the origin would then decode and act on.
-/// Only the security-relevant separators are decoded — `%2e` → `.`, `%2f` → `/`,
-/// `%5c` → `\` (case-insensitive) — plus `%25` → `%` so the loop can unwrap a
-/// multiply-encoded separator; and any backslash is folded to `/`. Other percent
-/// sequences (e.g. `%20`) are left intact so a legitimately-encoded segment byte
-/// still matches by its encoded form. Decoding repeats to a bounded fixed point
-/// so forms like `%252e` collapse too; malformed sequences (`%zz`) pass through
-/// unchanged.
+/// Only the security-relevant separators are decoded (case-insensitively):
+/// `%2e` → `.`, and `%2f` / `%5c` → `/` (any literal backslash is folded to `/`
+/// up front), plus `%25` → `%` so the loop can unwrap a multiply-encoded
+/// separator. Other percent sequences (e.g. `%20`) are left intact so a
+/// legitimately-encoded segment byte still matches by its encoded form.
+/// Decoding repeats to a bounded fixed point so forms like `%252e` collapse
+/// too; malformed sequences (`%zz`, a bare `%`) pass through unchanged.
 fn decode_path_separators(path: &str) -> String {
     let mut current = path.replace('\\', "/");
     for _ in 0..MAX_SEPARATOR_DECODE_PASSES {
@@ -337,21 +337,31 @@ fn decode_path_separators(path: &str) -> String {
 }
 
 fn decode_separators_once(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
     let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            result.push(c);
-            continue;
-        }
-        let hex: String = chars.by_ref().take(2).collect();
-        match decode_separator_byte(&hex) {
-            Some(sep) => result.push(sep),
-            None => {
-                result.push('%');
-                result.push_str(&hex);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Only treat `%` as the start of an encoded byte when it is followed by
+        // two hex digits. Consuming the next two chars unconditionally would let
+        // a bare or malformed `%` (e.g. `%g`, a trailing `%`, or the first `%`
+        // of `%%2f`) swallow the `%` of a following encoded separator, desyncing
+        // our canonical view from the path the origin decodes. A non-hex `%` is
+        // emitted literally and we advance by one.
+        if c == '%'
+            && i + 2 < chars.len()
+            && chars[i + 1].is_ascii_hexdigit()
+            && chars[i + 2].is_ascii_hexdigit()
+        {
+            let hex: String = [chars[i + 1], chars[i + 2]].iter().collect();
+            if let Some(sep) = decode_separator_byte(&hex) {
+                result.push(sep);
+                i += 3;
+                continue;
             }
         }
+        result.push(c);
+        i += 1;
     }
     result
 }
@@ -1573,6 +1583,23 @@ mod tests {
         assert_eq!(decode_path_separators("/a/%zz/b"), "/a/%zz/b");
         assert_eq!(decode_path_separators("/a/%20/b"), "/a/%20/b");
         assert_eq!(decode_path_separators("/a\\b"), "/a/b");
+    }
+
+    #[test]
+    fn decode_separators_does_not_consume_across_a_bare_percent() {
+        // A `%` that is not followed by two hex digits must be emitted
+        // literally and advance by ONE, so it can't swallow the `%` of a
+        // following encoded separator. Consuming two chars unconditionally
+        // would leave the inner `%2f`/`%2e` undecoded here while a lenient
+        // origin still decoded it — exactly the matcher/origin desync the
+        // allowlist relies on not happening.
+        assert_eq!(decode_path_separators("/a/%%2f/b"), "/a/%//b");
+        assert_eq!(decode_path_separators("/a/%%2e%2e/b"), "/a/%../b");
+        // Incomplete / non-hex sequences pass through unchanged.
+        assert_eq!(decode_path_separators("/a/%"), "/a/%");
+        assert_eq!(decode_path_separators("/a/%2"), "/a/%2");
+        assert_eq!(decode_path_separators("/a/%2g/b"), "/a/%2g/b");
+        assert_eq!(decode_path_separators("/a/%g2/b"), "/a/%g2/b");
     }
 
     #[test]
