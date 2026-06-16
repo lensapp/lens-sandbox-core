@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, PKCS_ECDSA_P256_SHA256};
@@ -70,46 +70,84 @@ const CERT_CACHE_CAPACITY: usize = 256;
 
 /// Capacity-bounded LRU of signed domain certs. On overflow the
 /// least-recently-used entry is evicted; a subsequent miss regenerates it.
+///
+/// Recency is tracked with a monotonic logical clock stamped onto each entry,
+/// rather than a recency list. A cache hit (the per-handshake hot path) is then
+/// O(1) — it just bumps the entry's tick — and the only O(n) scan is the
+/// least-recently-used search, which runs solely on an over-capacity insert.
 struct DomainCertCache {
-    entries: HashMap<String, Arc<rustls::sign::CertifiedKey>>,
-    order: VecDeque<String>,
+    entries: HashMap<String, CacheEntry>,
+    /// Logical clock; incremented on every access so the smallest `last_used`
+    /// is the least-recently-used entry. u64 is effectively unwrappable here
+    /// (2^64 accesses), but `wrapping_add` keeps it panic-free regardless.
+    clock: u64,
     capacity: usize,
+}
+
+struct CacheEntry {
+    cert: Arc<rustls::sign::CertifiedKey>,
+    last_used: u64,
 }
 
 impl DomainCertCache {
     fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            order: VecDeque::new(),
+            clock: 0,
             capacity,
         }
     }
 
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
     fn get(&mut self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let key = self.entries.get(hostname)?.clone();
-        self.touch(hostname);
-        Some(key)
+        let tick = self.tick();
+        let entry = self.entries.get_mut(hostname)?;
+        entry.last_used = tick;
+        Some(entry.cert.clone())
     }
 
     fn insert(&mut self, hostname: String, cert: Arc<rustls::sign::CertifiedKey>) {
-        if self.entries.insert(hostname.clone(), cert).is_some() {
-            self.touch(&hostname);
-            return;
-        }
-        self.order.push_back(hostname);
-        while self.order.len() > self.capacity {
-            if let Some(evicted) = self.order.pop_front() {
-                self.entries.remove(&evicted);
-            }
+        let last_used = self.tick();
+        let is_new = self
+            .entries
+            .insert(hostname, CacheEntry { cert, last_used })
+            .is_none();
+        // Only a genuinely new key can grow the map past capacity; overwriting
+        // an existing host just refreshes its cert and recency.
+        if is_new && self.entries.len() > self.capacity {
+            self.evict_lru();
         }
     }
 
-    fn touch(&mut self, hostname: &str) {
-        if let Some(pos) = self.order.iter().position(|h| h == hostname) {
-            let key = self.order.remove(pos).expect("position just found");
-            self.order.push_back(key);
+    /// Drop the entry with the smallest `last_used`. O(n) over the map, but
+    /// reached only when an insert overflows capacity — never on a cache hit.
+    fn evict_lru(&mut self) {
+        if let Some(victim) = self
+            .entries
+            .iter()
+            .min_by_key(|(_host, entry)| entry.last_used)
+            .map(|(host, _entry)| host.clone())
+        {
+            self.entries.remove(&victim);
         }
     }
+}
+
+/// Normalize an SNI/hostname for use as a cache key and certificate SAN: DNS
+/// names are case-insensitive (RFC 4343) and an absolute name's trailing dot is
+/// not significant, so fold both away. Without this, case/trailing-dot
+/// permutations of one allowed host (`Host`, `HOST.`, `host`) would each take a
+/// distinct cache slot, letting a guest thrash the bounded cache and evict the
+/// legitimate working set.
+fn normalize_host(hostname: &str) -> String {
+    hostname
+        .strip_suffix('.')
+        .unwrap_or(hostname)
+        .to_ascii_lowercase()
 }
 
 /// Ephemeral CA — generates a CA key pair on construction, signs domain certs on demand.
@@ -160,15 +198,19 @@ impl EphemeralCa {
     }
 
     /// Get or generate a TLS certificate for a domain, signed by this CA.
-    /// Results are cached for the process lifetime.
+    /// Results are cached in a bounded LRU (see [`CERT_CACHE_CAPACITY`]); an
+    /// entry may be evicted under cache pressure and regenerated on a later
+    /// request, so callers must not assume a stable `Arc` across calls.
     pub fn certified_key_for_domain(
         &self,
         hostname: &str,
     ) -> Result<Arc<rustls::sign::CertifiedKey>, Box<dyn std::error::Error>> {
+        let hostname = normalize_host(hostname);
+
         // Check cache first
         {
             let mut cache = self.domain_cache.lock().unwrap();
-            if let Some(key) = cache.get(hostname) {
+            if let Some(key) = cache.get(&hostname) {
                 return Ok(key);
             }
         }
@@ -176,10 +218,10 @@ impl EphemeralCa {
         // Generate domain key pair
         let domain_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
 
-        let mut params = CertificateParams::new(vec![hostname.to_string()])?;
+        let mut params = CertificateParams::new(vec![hostname.clone()])?;
         params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, hostname);
+            .push(rcgen::DnType::CommonName, hostname.clone());
         // Strict OpenSSL verification (X509_V_FLAG_X509_STRICT, enabled by some
         // Python TLS stacks) rejects a non-self-signed leaf without an AKI; emit
         // one referencing the CA's subject key identifier, plus the keyUsage and
@@ -204,7 +246,7 @@ impl EphemeralCa {
         // Cache it
         {
             let mut cache = self.domain_cache.lock().unwrap();
-            cache.insert(hostname.to_string(), certified_key.clone());
+            cache.insert(hostname, certified_key.clone());
         }
 
         Ok(certified_key)
@@ -328,6 +370,24 @@ mod tests {
             Arc::ptr_eq(&kept, &kept_after),
             "the recently-used entry must survive; h0 should have been evicted instead"
         );
+    }
+
+    #[test]
+    fn host_normalization_dedups_case_and_trailing_dot() {
+        // Case and a trailing dot are not significant in DNS names, so all
+        // these variants must resolve to one cache entry and the same Arc —
+        // otherwise a guest could thrash the bounded cache with permutations
+        // of a single allowed host and evict the legitimate working set.
+        let ca = EphemeralCa::new().unwrap();
+        let base = ca.certified_key_for_domain("api.example").unwrap();
+        for variant in ["API.EXAMPLE", "Api.Example.", "api.example."] {
+            let again = ca.certified_key_for_domain(variant).unwrap();
+            assert!(
+                Arc::ptr_eq(&base, &again),
+                "{variant} must hit the same cache entry as api.example"
+            );
+        }
+        assert_eq!(ca.cache_len(), 1);
     }
 
     #[test]
