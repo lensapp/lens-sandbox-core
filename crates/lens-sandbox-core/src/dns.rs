@@ -197,13 +197,18 @@ fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
 
     // AAAA answers point the workload at an IPv6 address the IPv4-only
     // transparent interceptor can't catch; HTTPS (65) and SVCB (64) records
-    // carry ipv4hint/ipv6hint/ALPN that route around the proxy the same way.
-    // So an allowed name resolves its A record (forward) and those three to
-    // NODATA, keeping all egress on the interceptable IPv4 path. Denial is
-    // unaffected: a denied name gets NXDOMAIN regardless of record type.
+    // carry ipv4hint/ipv6hint/ALPN that route around the proxy the same way;
+    // and an ANY (255) query would let the upstream reply carry any of those
+    // record types in one response. So an allowed name resolves its A record
+    // (forward) and all of these to NODATA, keeping egress on the interceptable
+    // IPv4 path. NOTE: this gates on the *query* type, not the response — the
+    // additional section of a forwarded non-suppressed reply could still carry
+    // hints; scrubbing those records out of the response would be the more
+    // complete fix. Denial is unaffected: a denied name gets NXDOMAIN
+    // regardless of record type.
     let should_suppress = matches!(
         query.query_type(),
-        RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB
+        RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB | RecordType::ANY
     );
     let allow = |qname| {
         if should_suppress {
@@ -529,6 +534,23 @@ mod tests {
             Decision::SuppressNodata { qname } => assert_eq!(qname, "example.com"),
             other => panic!(
                 "SVCB for an allowed name must be suppressed, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn allowed_name_any_query_is_suppressed() {
+        // An ANY (qtype 255) query for an allowed name would otherwise be
+        // forwarded verbatim, letting the upstream reply carry AAAA/HTTPS/SVCB
+        // answers — the exact address hints the suppression exists to block.
+        // Force it to NODATA so the client falls back to a typed A query.
+        let state = state_with_routes(vec![rule("example.com")]);
+        let any = make_query("example.com", RecordType::ANY);
+        match classify_query(&any, &state) {
+            Decision::SuppressNodata { qname } => assert_eq!(qname, "example.com"),
+            other => panic!(
+                "ANY for an allowed name must be suppressed, got: {}",
                 describe(&other)
             ),
         }
