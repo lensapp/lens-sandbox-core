@@ -1002,9 +1002,10 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     // a residual collision then means a hostile pre-plant and fails closed.
     {
         let old_paths = state.previous_policy_files.read().unwrap().clone();
-        for old in &old_paths {
-            let _ = tokio::fs::remove_file(old).await;
-        }
+        // Symlink-safe: re-walk each path with O_NOFOLLOW rather than letting a
+        // path-based unlink follow a parent component the agent may have swapped
+        // for a symlink between refreshes.
+        crate::temp_files::remove_temp_files(&old_paths).await;
 
         if let Some(files) = msg.files
             && !files.is_empty()
@@ -1015,7 +1016,13 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                     *state.previous_policy_files.write().unwrap() = paths;
                 }
                 Err(e) => {
+                    // write_temp_files is all-or-nothing: on failure it rolls back
+                    // any files it created this batch, and the previous set was
+                    // already removed above, so nothing policy-written remains on
+                    // disk. Clear the tracked set so it matches reality (and the
+                    // next refresh's cleanup doesn't chase already-gone paths).
                     tracing::warn!("Failed to write policy files: {e}");
+                    *state.previous_policy_files.write().unwrap() = Vec::new();
                 }
             }
         } else {

@@ -9,7 +9,14 @@ use crate::protocol::TempFile;
 
 const TEMP_BASE: &str = "/tmp";
 const DEFAULT_FILE_MODE: u32 = 0o600;
-const DIR_MODE: u32 = 0o700;
+/// Intermediate directories are created by the root supervisor but are only
+/// path-prefix waypoints to a file that gets chowned to the unprivileged
+/// sandbox user. `0o711` (execute, no read) lets that user *traverse* to its
+/// file without being able to list the directory; the delivered file itself
+/// stays `0o600` and owned by the sandbox user, so traversability grants no
+/// extra read access. `0o700` here would be root-only and would lock the
+/// sandbox user out of every multi-component policy path.
+const DIR_MODE: u32 = 0o711;
 
 /// Validate a temp file path lexically and return its base-relative component
 /// sequence. Every separator-delimited segment must be a normal name; `..`,
@@ -56,6 +63,9 @@ trait DirHandle {
     fn open_child_dir(&self, name: &OsStr) -> Result<Box<dyn DirHandle>, Errno>;
     fn make_child_dir(&self, name: &OsStr, mode: u32) -> Result<(), Errno>;
     fn create_child_file(&self, name: &OsStr, mode: u32) -> Result<Box<dyn FileHandle>, Errno>;
+    /// Unlink a child of this directory by name. Operates on the directory fd,
+    /// so a symlink at `name` unlinks the link itself rather than its target.
+    fn unlink_child(&self, name: &OsStr) -> Result<(), Errno>;
 }
 
 trait FileHandle {
@@ -80,13 +90,49 @@ fn write_temp_files_with(
     files: &[TempFile],
     creds: Option<(u32, u32)>,
 ) -> Result<Vec<String>, String> {
+    // All-or-nothing: if any file fails, roll back the ones already created so
+    // the batch never leaves half-written, sandbox-owned secret files behind.
+    // A leaked partial would otherwise be untracked by the caller (never
+    // cleaned) and, because creation is `O_EXCL`, would make every later
+    // refresh of that path fail closed forever as a phantom "hostile pre-plant".
     let mut written = Vec::with_capacity(files.len());
     for f in files {
-        let components = safe_temp_path(&f.path)?;
-        let written_path = write_one(fs, &components, &f.content, f.mode, creds)?;
-        written.push(written_path);
+        let result = safe_temp_path(&f.path).and_then(|components| {
+            write_one(fs, &components, &f.content, f.mode, creds).map(|p| (components, p))
+        });
+        match result {
+            Ok((components, path)) => written.push((components, path)),
+            Err(e) => {
+                for (components, _) in &written {
+                    remove_one(fs, components);
+                }
+                return Err(e);
+            }
+        }
     }
-    Ok(written)
+    Ok(written.into_iter().map(|(_, path)| path).collect())
+}
+
+/// Best-effort symlink-safe removal of a previously-written temp file. Re-walks
+/// the path with `O_NOFOLLOW` exactly like the writer, then unlinks the final
+/// component via the directory fd — so a parent component the agent swapped for
+/// a symlink between refreshes can't redirect the root supervisor's unlink at
+/// an attacker-chosen target. A missing or planted-symlink component is treated
+/// as "nothing safe to remove" and skipped.
+fn remove_one(fs: &dyn TempFs, components: &[OsString]) {
+    let Some((file_name, dir_components)) = components.split_last() else {
+        return;
+    };
+    let Ok(mut dir) = fs.open_base() else {
+        return;
+    };
+    for comp in dir_components {
+        match dir.open_child_dir(comp) {
+            Ok(child) => dir = child,
+            Err(_) => return,
+        }
+    }
+    let _ = dir.unlink_child(file_name);
 }
 
 fn write_one(
@@ -146,9 +192,21 @@ fn render_path(components: &[OsString]) -> String {
     path.to_string_lossy().to_string()
 }
 
-pub async fn cleanup_temp_files(paths: &[String]) {
+/// Symlink-safe removal of previously-written temp files. Each path is
+/// re-validated and re-walked with `O_NOFOLLOW`, so a parent component the
+/// agent swapped for a symlink between refreshes can't redirect the root
+/// supervisor's unlink at an attacker-chosen target — the same hazard the write
+/// path guards against. Unknown / already-gone / planted-symlink paths are
+/// silently skipped. Best-effort: failures are not surfaced.
+pub async fn remove_temp_files(paths: &[String]) {
+    remove_temp_files_with(&RealTempFs, paths);
+}
+
+fn remove_temp_files_with(fs: &dyn TempFs, paths: &[String]) {
     for path in paths {
-        let _ = tokio::fs::remove_file(path).await;
+        if let Ok(components) = safe_temp_path(path) {
+            remove_one(fs, &components);
+        }
     }
 }
 
@@ -182,16 +240,28 @@ impl DirHandle for RealDir {
         let fd = nix::fcntl::openat(&self.0, name.as_bytes(), flags, mode_from(mode))?;
         Ok(Box::new(RealFile(fd)))
     }
+
+    fn unlink_child(&self, name: &OsStr) -> Result<(), Errno> {
+        nix::unistd::unlinkat(
+            &self.0,
+            name.as_bytes(),
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+    }
 }
 
 impl FileHandle for RealFile {
     fn write_all(&mut self, mut data: &[u8]) -> Result<(), Errno> {
         while !data.is_empty() {
-            let n = nix::unistd::write(&self.0, data)?;
-            if n == 0 {
-                return Err(Errno::EIO);
+            match nix::unistd::write(&self.0, data) {
+                // A signal interrupting the write (the PID-1 supervisor reaps
+                // children, so EINTR is routine) is retried, not surfaced as a
+                // hard failure.
+                Err(Errno::EINTR) => continue,
+                Err(e) => return Err(e),
+                Ok(0) => return Err(Errno::EIO),
+                Ok(n) => data = &data[n..],
             }
-            data = &data[n..];
         }
         Ok(())
     }
@@ -296,6 +366,7 @@ mod tests {
         Write(String, Vec<u8>),
         Chmod(String, u32),
         Chown(String, u32, u32),
+        Unlink(String),
     }
 
     #[derive(Default)]
@@ -403,6 +474,12 @@ mod tests {
                 chown_err: self.chown_err,
                 write_err: self.write_err,
             }))
+        }
+
+        fn unlink_child(&self, name: &OsStr) -> Result<(), Errno> {
+            let n = name.to_string_lossy().to_string();
+            self.recorder.borrow_mut().events.push(Event::Unlink(n));
+            Ok(())
         }
     }
 
@@ -575,5 +652,65 @@ mod tests {
         let result = write_temp_files_with(&fs, &files, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("write"));
+    }
+
+    #[test]
+    fn partial_failure_rolls_back_already_written_files() {
+        // A mid-batch failure must not leave the files created before it on
+        // disk: they'd be untracked (never cleaned) and, being O_EXCL, would
+        // wedge that path's future refreshes closed forever.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.existing_files.push("second.json".to_string()); // 2nd create hits O_EXCL
+        let files = vec![
+            file("first.json", "one", None),
+            file("second.json", "two", None),
+        ];
+
+        let result = write_temp_files_with(&fs, &files, None);
+        assert!(result.is_err(), "the batch must fail when any file fails");
+
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::CreateFile(
+                "first.json".to_string(),
+                DEFAULT_FILE_MODE
+            )),
+            "first file should have been created: {events:?}"
+        );
+        assert!(
+            events.contains(&Event::Unlink("first.json".to_string())),
+            "the file written before the failure must be rolled back: {events:?}"
+        );
+    }
+
+    #[test]
+    fn remove_unlinks_via_nofollow_walk() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+
+        remove_temp_files_with(&fs, &["/tmp/creds/aws.json".to_string()]);
+
+        let events = rec.borrow().events.clone();
+        assert!(events.contains(&Event::OpenDir("creds".to_string())));
+        assert!(events.contains(&Event::Unlink("aws.json".to_string())));
+    }
+
+    #[test]
+    fn remove_skips_symlinked_parent_component() {
+        // The cleanup walk must refuse to follow a parent component the agent
+        // swapped for a symlink — otherwise the root supervisor's unlink could
+        // be redirected at an attacker-chosen target.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.symlink_dirs.push("creds".to_string());
+
+        remove_temp_files_with(&fs, &["/tmp/creds/aws.json".to_string()]);
+
+        let events = rec.borrow().events.clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Unlink(..))),
+            "must not unlink through a symlinked parent: {events:?}"
+        );
     }
 }
