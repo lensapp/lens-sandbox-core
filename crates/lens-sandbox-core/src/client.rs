@@ -582,27 +582,33 @@ fn apply_injection(
     }
 }
 
-/// Parse and apply a policy message. Returns the env vars for the session handler,
-/// or a version mismatch if the sandbox protocol date is too old.
+/// Map a policy's `network.defaultVerdict` string to a [`Verdict`].
+///
+/// Deserializing through `Verdict`'s own serde impl keeps this parser pinned to
+/// the published policy schema (the same `Verdict` type generates that schema),
+/// so the parser and the schema cannot silently drift apart. Unknown or missing
+/// input is fail-closed to `Deny`.
 fn parse_default_verdict(raw: Option<&str>) -> crate::routing::Verdict {
-    match raw {
-        Some("allow") => crate::routing::Verdict::Allow,
-        Some("deny") => crate::routing::Verdict::Deny,
-        Some("ask") => crate::routing::Verdict::Ask,
-        Some(other) => {
+    let Some(raw) = raw else {
+        tracing::warn!("network.defaultVerdict missing; defaulting to deny");
+        return crate::routing::Verdict::Deny;
+    };
+    match serde_json::from_value::<crate::routing::Verdict>(serde_json::Value::String(
+        raw.to_string(),
+    )) {
+        Ok(verdict) => verdict,
+        Err(_) => {
             tracing::error!(
-                verdict = other,
+                verdict = raw,
                 "unknown network.defaultVerdict in policy; defaulting to deny"
             );
-            crate::routing::Verdict::Deny
-        }
-        None => {
-            tracing::warn!("network.defaultVerdict missing; defaulting to deny");
             crate::routing::Verdict::Deny
         }
     }
 }
 
+/// Parse and apply a policy message. Returns the env vars for the session handler,
+/// or a version mismatch if the sandbox protocol date is too old.
 async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> PolicyResult {
     // Transport wrapper — adds server-only fields to the policy document.
     // NetworkPolicy is kept as serde_json::Value for fault-tolerant route parsing
@@ -1122,10 +1128,11 @@ mod tests {
     #[test]
     fn runtime_default_verdict_parser_matches_the_schema_enum() {
         use crate::policy_schema::Verdict;
-        // Exhaustive match: adding a Verdict variant breaks this at compile
-        // time, forcing parse_default_verdict's string literals to be revisited
-        // so the enforcement gate can't silently diverge from the schema the
-        // host-side validator publishes.
+        // parse_default_verdict deserializes through Verdict's own serde impl —
+        // the same impl that generates the published policy schema — so the
+        // parser cannot diverge from the schema by construction. This exhaustive
+        // match is a tripwire: adding a Verdict variant fails to compile here
+        // until it is listed, prompting a review of the round-trip below.
         fn schema_string(v: Verdict) -> &'static str {
             match v {
                 Verdict::Allow => "allow",
@@ -1135,18 +1142,22 @@ mod tests {
         }
         for v in [Verdict::Allow, Verdict::Deny, Verdict::Ask] {
             let s = schema_string(v);
+            // The schema string equals serde's serialization...
             assert_eq!(
                 serde_json::to_value(v).unwrap(),
                 serde_json::json!(s),
                 "schema_string must equal serde's serialization for {v:?}"
             );
+            // ...and the runtime parser maps it back to the same variant.
             assert_eq!(
                 parse_default_verdict(Some(s)),
                 v,
                 "the runtime parser must map the schema string back to {v:?}"
             );
         }
+        // Unknown, wrong-case, and missing input all stay fail-closed (deny).
         assert_eq!(parse_default_verdict(Some("nonsense")), Verdict::Deny);
+        assert_eq!(parse_default_verdict(Some("Allow")), Verdict::Deny);
         assert_eq!(parse_default_verdict(None), Verdict::Deny);
     }
 
