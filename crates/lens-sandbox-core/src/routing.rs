@@ -324,6 +324,12 @@ const MAX_SEPARATOR_DECODE_PASSES: usize = 8;
 /// legitimately-encoded segment byte still matches by its encoded form.
 /// Decoding repeats to a bounded fixed point so forms like `%252e` collapse
 /// too; malformed sequences (`%zz`, a bare `%`) pass through unchanged.
+///
+/// Scope: only ASCII separator encodings are canonicalized. Overlong/non-ASCII
+/// encodings that some legacy origins decode to a separator (e.g. overlong-UTF-8
+/// `%c0%af` / `%e0%80%af` → `/`) are deliberately NOT decoded here — the
+/// realistic origins reachable through this proxy (modern HTTPS APIs) reject
+/// overlong UTF-8, so closing them is left to the origin's own hardening.
 fn decode_path_separators(path: &str) -> String {
     let mut current = path.replace('\\', "/");
     for _ in 0..MAX_SEPARATOR_DECODE_PASSES {
