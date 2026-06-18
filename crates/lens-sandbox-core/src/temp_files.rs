@@ -90,11 +90,17 @@ fn write_temp_files_with(
     files: &[TempFile],
     creds: Option<(u32, u32)>,
 ) -> Result<Vec<String>, String> {
-    // All-or-nothing: if any file fails, roll back the ones already created so
+    // All-or-nothing: if any file fails, roll back the files already created so
     // the batch never leaves half-written, sandbox-owned secret files behind.
     // A leaked partial would otherwise be untracked by the caller (never
     // cleaned) and, because creation is `O_EXCL`, would make every later
     // refresh of that path fail closed forever as a phantom "hostile pre-plant".
+    //
+    // Rollback is file-only: `remove_one` unlinks the final (file) component but
+    // does not `rmdir` the intermediate directories the walk may have created.
+    // That residue is harmless — empty, root-owned dirs that the next refresh's
+    // EEXIST-tolerant `mkdirat` + `O_NOFOLLOW` `openat` re-traverses cleanly — so
+    // a fully clean, dir-inclusive rollback isn't worth the extra unwind.
     let mut written = Vec::with_capacity(files.len());
     for f in files {
         let result = safe_temp_path(&f.path).and_then(|components| {
