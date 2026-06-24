@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -152,6 +152,14 @@ pub struct ProxyState {
     /// `getaddrinfo()` succeeds even with an empty policy. Set once at
     /// construction; never mutated.
     pub bootstrap_dns_allowlist: Vec<String>,
+    /// Hostnames the JIT approval gate has allowed this session (lowercased,
+    /// bare host). The DNS stub consults this after the policy `routes`, so a
+    /// just-approved host resolves immediately — without waiting for the
+    /// follow-up `policy` frame (the "allow always" first-request race) and
+    /// even for an "allow once" decision that never persists a route. Only a
+    /// developer's gate click adds entries, so the workload can't grow it to
+    /// open a DNS exfil channel for names nobody approved.
+    pub(crate) gate_resolved_hosts: RwLock<HashSet<String>>,
 }
 
 impl ProxyState {
@@ -278,6 +286,7 @@ impl ProxyServer {
                 .into_iter()
                 .map(|h| h.to_ascii_lowercase())
                 .collect(),
+            gate_resolved_hosts: RwLock::new(HashSet::new()),
         });
         let server = Self {
             listen_addr,
@@ -2184,6 +2193,7 @@ pub(crate) mod tests {
             decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
             upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
             bootstrap_dns_allowlist: Vec::new(),
+            gate_resolved_hosts: RwLock::new(HashSet::new()),
         });
         (state, rx)
     }

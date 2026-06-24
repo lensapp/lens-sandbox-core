@@ -235,10 +235,27 @@ fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
     // applies at the subsequent TCP step via `find_matching_route`; the
     // DNS gate just prevents covert exfil via unlisted names.
     if hostname_allowed(&routes, &normalized) {
-        allow(normalized)
-    } else {
-        Decision::Deny { qname: normalized }
+        return allow(normalized);
     }
+    drop(routes);
+
+    // A host the JIT approval gate has already allowed this session resolves
+    // even with no standing route. This is what lets an interactive "allow
+    // once" connect at all (it persists no route) and closes the "allow
+    // always" race where the proxy resolves before the host's follow-up
+    // `policy` frame lands. Checked after `routes` so listed names are still
+    // decided by their rule; entries appear only via a developer's gate
+    // click, so this can't resolve a name nobody approved.
+    if state
+        .gate_resolved_hosts
+        .read()
+        .unwrap()
+        .contains(&normalized)
+    {
+        return allow(normalized);
+    }
+
+    Decision::Deny { qname: normalized }
 }
 
 /// Synthesise an answer-less response with the given code, echoing the
@@ -483,6 +500,38 @@ mod tests {
         let packet = make_query("example.com", RecordType::A);
         assert!(matches!(
             classify_query(&packet, &state),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn gate_resolved_host_resolves_without_a_route() {
+        // Empty policy NXDOMAINs every name (see `deny_empty_policy`). A host
+        // the JIT gate has approved this session must resolve anyway — an
+        // interactive "allow once" persists no route, so without this it
+        // could never connect (NXDOMAIN -> proxy connect fails -> 502).
+        let state = state_with_routes(vec![]);
+        state
+            .gate_resolved_hosts
+            .write()
+            .unwrap()
+            .insert("example.com".to_string());
+
+        let a = make_query("example.com", RecordType::A);
+        assert!(matches!(classify_query(&a, &state), Decision::Allow { .. }));
+
+        // AAAA stays suppressed to NODATA so egress remains on the
+        // interceptable IPv4 path, exactly as for a route-allowed name.
+        let aaaa = make_query("example.com", RecordType::AAAA);
+        assert!(matches!(
+            classify_query(&aaaa, &state),
+            Decision::SuppressNodata { .. }
+        ));
+
+        // A name the gate has not approved still fails closed.
+        let other = make_query("not-approved.example", RecordType::A);
+        assert!(matches!(
+            classify_query(&other, &state),
             Decision::Deny { .. }
         ));
     }

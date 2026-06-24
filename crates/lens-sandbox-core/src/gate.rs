@@ -197,6 +197,17 @@ pub async fn gate_or_deny(state: &ProxyState, host: &str, action: &str, reason: 
     let timeout = *state.decision_timeout.read().unwrap();
     let decision = await_decision(rx, timeout, Decision::Timeout).await;
     cleanup_after_decision(&state.pending, action, &id);
+    if decision.is_allow() {
+        // Let the DNS stub resolve this host even with no standing route:
+        // "allow once" persists none, and "allow always"'s route arrives in
+        // a later `policy` frame this request can't await. Lowercased to
+        // match the stub's normalized QNAME (see `dns::classify_query`).
+        state
+            .gate_resolved_hosts
+            .write()
+            .unwrap()
+            .insert(host.to_ascii_lowercase());
+    }
     decision
 }
 
@@ -356,6 +367,86 @@ mod tests {
         assert!(resolve_pending(&state, &id, Decision::AllowAlways));
         let decision = handle.await.unwrap();
         assert_eq!(decision, Decision::AllowAlways);
+    }
+
+    #[tokio::test]
+    async fn allow_records_host_for_dns_resolution_lowercased() {
+        // An allow decision must record the host so the DNS stub can resolve
+        // it even with no standing route — the fix for "allow once" never
+        // resolving. Recorded lowercased to match the stub's normalized
+        // QNAME (see `dns::classify_query`).
+        let (state, mut rx) = test_state();
+        let handle = tokio::spawn({
+            let state = state.clone();
+            async move {
+                gate_or_deny(
+                    &state,
+                    "Example.COM",
+                    "CONNECT Example.COM:443",
+                    "policy-ambiguous",
+                )
+                .await
+            }
+        });
+        let frame = rx.recv().await.unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&frame).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(resolve_pending(&state, &id, Decision::AllowOnce));
+        assert_eq!(handle.await.unwrap(), Decision::AllowOnce);
+        assert!(
+            state
+                .gate_resolved_hosts
+                .read()
+                .unwrap()
+                .contains("example.com"),
+            "an allow decision must record the host (lowercased) for the DNS stub"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_does_not_record_host_for_dns_resolution() {
+        // A deny must not open DNS resolution for the host.
+        let (state, mut rx) = test_state();
+        let handle = tokio::spawn({
+            let state = state.clone();
+            async move {
+                gate_or_deny(
+                    &state,
+                    "evil.com",
+                    "CONNECT evil.com:443",
+                    "policy-ambiguous",
+                )
+                .await
+            }
+        });
+        let frame = rx.recv().await.unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&frame).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(resolve_pending(&state, &id, Decision::DenyOnce));
+        assert_eq!(handle.await.unwrap(), Decision::DenyOnce);
+        assert!(
+            state.gate_resolved_hosts.read().unwrap().is_empty(),
+            "a deny must not record the host"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_does_not_record_host_for_dns_resolution() {
+        let (state, _rx) = test_state();
+        state.decision_timeout_override(Duration::from_millis(20));
+        let d = gate_or_deny(
+            &state,
+            "slow.com",
+            "CONNECT slow.com:443",
+            "policy-ambiguous",
+        )
+        .await;
+        assert_eq!(d, Decision::Timeout);
+        assert!(state.gate_resolved_hosts.read().unwrap().is_empty());
     }
 
     #[tokio::test]
