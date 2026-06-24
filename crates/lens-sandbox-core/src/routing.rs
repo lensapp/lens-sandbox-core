@@ -151,6 +151,25 @@ pub struct MatchedRoute {
 /// the QNAME reaches the upstream resolver before the click, accepted as
 /// the cost of having an interactive gate at all.
 pub fn hostname_allowed(routes: &[RouteRule], hostname: &str) -> bool {
+    matches!(hostname_match(routes, hostname), HostnameMatch::Allowed)
+}
+
+/// First-match outcome of matching a DNS QNAME against the route table,
+/// distinguished three ways so a caller can tell an explicit `Deny` apart
+/// from "no rule matched" — the DNS stub falls back to its JIT-approved set
+/// only on the latter. Matching semantics (`Domain`/`HostPort`, CIDR
+/// skipped, `Ask` counts as allowed) are as documented on [`hostname_allowed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostnameMatch {
+    /// First matching rule permits the lookup (its verdict is not `Deny`).
+    Allowed,
+    /// First matching rule is an explicit `Deny`.
+    Denied,
+    /// No rule matched the hostname.
+    Unmatched,
+}
+
+pub fn hostname_match(routes: &[RouteRule], hostname: &str) -> HostnameMatch {
     let lower = hostname.to_ascii_lowercase();
     for rule in routes {
         let matches = match &rule.matcher {
@@ -160,14 +179,16 @@ pub fn hostname_allowed(routes: &[RouteRule], hostname: &str) -> bool {
         };
         if matches {
             // First-match semantics (same as `find_matching_route`): a
-            // `Deny evil.example.com` rule listed before `Allow
-            // *.example.com` must deny the DNS lookup for `evil.example.com`,
-            // even though the wildcard would also match. Short-circuiting
-            // on the first matching rule is what prevents the leak.
-            return rule.verdict != Verdict::Deny;
+            // `Deny evil.example.com` before `Allow *.example.com` denies the
+            // lookup for `evil.example.com`, even though the wildcard matches.
+            return if rule.verdict == Verdict::Deny {
+                HostnameMatch::Denied
+            } else {
+                HostnameMatch::Allowed
+            };
         }
     }
-    false
+    HostnameMatch::Unmatched
 }
 
 /// Match a host:port target against the route rules. Returns the first matching
@@ -693,6 +714,46 @@ mod tests {
             parse_routes(r#"[{"match": "*", "verdict": "allow", "transport": "upstream"}]"#)
                 .unwrap();
         assert!(hostname_allowed(&routes, "anything.example.com"));
+    }
+
+    #[test]
+    fn hostname_match_distinguishes_unmatched_allowed_denied() {
+        let allow = parse_routes(
+            r#"[{"match": "ok.example", "verdict": "allow", "transport": "upstream"}]"#,
+        )
+        .unwrap();
+        let deny = parse_routes(
+            r#"[{"match": "evil.example", "verdict": "deny", "transport": "upstream"}]"#,
+        )
+        .unwrap();
+        assert_eq!(hostname_match(&[], "ok.example"), HostnameMatch::Unmatched);
+        assert_eq!(hostname_match(&allow, "ok.example"), HostnameMatch::Allowed);
+        assert_eq!(hostname_match(&deny, "evil.example"), HostnameMatch::Denied);
+        // A name no rule covers is Unmatched, not Denied — the gate fallback
+        // distinguishes these.
+        assert_eq!(
+            hostname_match(&deny, "other.example"),
+            HostnameMatch::Unmatched
+        );
+    }
+
+    #[test]
+    fn hostname_match_first_match_deny_beats_later_allow() {
+        let routes = parse_routes(
+            r#"[
+                {"match": "evil.example.com", "verdict": "deny", "transport": "upstream"},
+                {"match": "*.example.com", "verdict": "allow", "transport": "upstream"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hostname_match(&routes, "evil.example.com"),
+            HostnameMatch::Denied
+        );
+        assert_eq!(
+            hostname_match(&routes, "good.example.com"),
+            HostnameMatch::Allowed
+        );
     }
 
     #[test]

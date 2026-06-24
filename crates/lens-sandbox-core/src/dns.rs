@@ -45,7 +45,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::proxy::{ProxyState, emit_deny_event};
-use crate::routing::hostname_allowed;
+use crate::routing::{HostnameMatch, hostname_match};
 use crate::sock_mark;
 
 /// Receive buffer for incoming DNS *queries*. 1232 is the EDNS0-recommended
@@ -230,22 +230,22 @@ fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
     }
 
     let routes = state.routes.read().unwrap();
-    // DNS has no notion of scheme or port, so we run the lenient
-    // `hostname_allowed` check. Port- and scheme-aware enforcement still
-    // applies at the subsequent TCP step via `find_matching_route`; the
-    // DNS gate just prevents covert exfil via unlisted names.
-    if hostname_allowed(&routes, &normalized) {
-        return allow(normalized);
-    }
+    // DNS matches on hostname only (no scheme/port); port- and scheme-aware
+    // enforcement still applies at the subsequent TCP step.
+    let matched = hostname_match(&routes, &normalized);
     drop(routes);
+    match matched {
+        HostnameMatch::Allowed => return allow(normalized),
+        HostnameMatch::Denied => return Decision::Deny { qname: normalized },
+        HostnameMatch::Unmatched => {}
+    }
 
-    // A host the JIT approval gate has already allowed this session resolves
-    // even with no standing route. This is what lets an interactive "allow
-    // once" connect at all (it persists no route) and closes the "allow
-    // always" race where the proxy resolves before the host's follow-up
-    // `policy` frame lands. Checked after `routes` so listed names are still
-    // decided by their rule; entries appear only via a developer's gate
-    // click, so this can't resolve a name nobody approved.
+    // No route matched. A host the JIT approval gate allowed this session
+    // still resolves: this lets an interactive "allow once" connect (it
+    // persists no route) and closes the "allow always" race where the proxy
+    // resolves before the host's follow-up `policy` frame lands. An explicit
+    // `Deny` is handled above, so a denied name never reaches here; entries
+    // appear only via a developer's gate click.
     if state
         .gate_resolved_hosts
         .read()
@@ -532,6 +532,28 @@ mod tests {
             classify_query(&other, &state),
             Decision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn explicit_deny_beats_gate_approval() {
+        // Defense in depth: a Deny rule must NXDOMAIN even a host the gate
+        // approved earlier this session — same first-match Deny precedence
+        // the TCP gate enforces, so a late Deny can't be sidestepped at DNS.
+        let state = state_with_routes(vec![RouteRule {
+            matcher: RouteMatcher::Domain("evil.example".to_string()),
+            verdict: Verdict::Deny,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+        }]);
+        state
+            .gate_resolved_hosts
+            .write()
+            .unwrap()
+            .insert("evil.example".to_string());
+        let a = make_query("evil.example", RecordType::A);
+        assert!(matches!(classify_query(&a, &state), Decision::Deny { .. }));
     }
 
     #[test]
