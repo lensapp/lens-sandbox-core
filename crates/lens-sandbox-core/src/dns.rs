@@ -536,9 +536,8 @@ mod tests {
 
     #[test]
     fn explicit_deny_beats_gate_approval() {
-        // Defense in depth: a Deny rule must NXDOMAIN even a host the gate
-        // approved earlier this session — same first-match Deny precedence
-        // the TCP gate enforces, so a late Deny can't be sidestepped at DNS.
+        // A Deny rule must NXDOMAIN even a gate-approved host, so the resolve
+        // fallback can't sidestep a Deny added after approval.
         let state = state_with_routes(vec![RouteRule {
             matcher: RouteMatcher::Domain("evil.example".to_string()),
             verdict: Verdict::Deny,
