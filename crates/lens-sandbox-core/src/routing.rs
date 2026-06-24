@@ -160,7 +160,7 @@ pub fn hostname_allowed(routes: &[RouteRule], hostname: &str) -> bool {
 /// only on the latter. Matching semantics (`Domain`/`HostPort`, CIDR
 /// skipped, `Ask` counts as allowed) are as documented on [`hostname_allowed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HostnameMatch {
+pub(crate) enum HostnameMatch {
     /// First matching rule permits the lookup (its verdict is not `Deny`).
     Allowed,
     /// First matching rule is an explicit `Deny`.
@@ -169,7 +169,7 @@ pub enum HostnameMatch {
     Unmatched,
 }
 
-pub fn hostname_match(routes: &[RouteRule], hostname: &str) -> HostnameMatch {
+pub(crate) fn hostname_match(routes: &[RouteRule], hostname: &str) -> HostnameMatch {
     let lower = hostname.to_ascii_lowercase();
     for rule in routes {
         let matches = match &rule.matcher {
