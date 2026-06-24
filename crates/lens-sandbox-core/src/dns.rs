@@ -8,10 +8,9 @@
 //! intentionally excluded — a bare IP literal is not a legitimate QNAME and
 //! allowing it would leak CIDR policy to the upstream resolver. IP-based
 //! access is still enforced at the TCP layer). Explicit `Deny` rules take
-//! first-match precedence, same as `find_matching_route`; a name with no
-//! matching route still resolves when the JIT gate approved it this session
-//! (`ProxyState.gate_resolved_hosts`). The stub then either forwards allowed
-//! queries upstream or responds with NXDOMAIN + a deny audit event.
+//! first-match precedence, same as `find_matching_route`. The stub then
+//! either forwards allowed queries upstream or responds with NXDOMAIN +
+//! a deny audit event.
 //!
 //! Without this filter, an allow-UDP/53 rule opens a ~50 B/s covert channel
 //! through the upstream resolver (QNAME-encoded exfil, TXT-encoded ingress).
