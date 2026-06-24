@@ -506,10 +506,8 @@ mod tests {
 
     #[test]
     fn gate_resolved_host_resolves_without_a_route() {
-        // Empty policy NXDOMAINs every name (see `deny_empty_policy`). A host
-        // the JIT gate has approved this session must resolve anyway — an
-        // interactive "allow once" persists no route, so without this it
-        // could never connect (NXDOMAIN -> proxy connect fails -> 502).
+        // A gate-approved host must resolve even under empty policy, or an
+        // "allow once" (which persists no route) could never connect.
         let state = state_with_routes(vec![]);
         state
             .gate_resolved_hosts
