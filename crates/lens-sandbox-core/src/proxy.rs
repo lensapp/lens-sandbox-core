@@ -424,7 +424,23 @@ async fn handle_connection(
     )
     .await
     {
-        Ok(result) => result?,
+        Ok(Ok(request)) => request,
+        Ok(Err(e)) => {
+            // The request reached the proxy but isn't a shape we can route
+            // (e.g. a relative-form request line). Historically this closed
+            // the socket with no response, which surfaced to the client as an
+            // opaque "error getting response" with nothing in the audit log.
+            // Write a real HTTP error so the failure is diagnosable.
+            let body =
+                "Lens Sandbox proxy: unsupported request (use CONNECT or an absolute-form URL).\n";
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            client.write_all(response.as_bytes()).await.ok();
+            return Err(e);
+        }
         Err(_) => {
             client
                 .write_all(b"HTTP/1.1 408 Request Timeout\r\n\r\n")
@@ -439,7 +455,29 @@ async fn handle_connection(
             target_host,
             header_bytes,
         } => {
-            return handle_http_forward(client, &target_host, header_bytes, state, &actor).await;
+            return handle_http_forward(
+                client,
+                &target_host,
+                header_bytes,
+                state,
+                Scheme::Http,
+                &actor,
+            )
+            .await;
+        }
+        ProxyRequest::Https {
+            target_host,
+            header_bytes,
+        } => {
+            return handle_http_forward(
+                client,
+                &target_host,
+                header_bytes,
+                state,
+                Scheme::Https,
+                &actor,
+            )
+            .await;
         }
         ProxyRequest::Connect {
             target: target_host,
@@ -485,21 +523,29 @@ fn resolve_route(
     }
 }
 
-/// Handle an HTTP forward proxy request (plain HTTP, not CONNECT).
+/// Handle an absolute-form forward proxy request (not CONNECT).
 ///
-/// The client sent something like `GET http://host:port/path HTTP/1.1`.
-/// We apply the same policy routing, credential injection, HTTP rules, and
-/// audit as CONNECT+MITM — but without TLS termination since the traffic is
-/// already plaintext.
+/// For `Scheme::Http` the client sent `GET http://host:port/path HTTP/1.1` and
+/// the upstream hop is plaintext. For `Scheme::Https` the client (e.g. busybox
+/// `wget`) sent `GET https://host/path HTTP/1.1` in cleartext over the proxy
+/// hop and expects us to terminate TLS toward the upstream; we relay the
+/// response back in cleartext. Both schemes apply the same policy routing,
+/// credential injection, HTTP rules, and audit as CONNECT+MITM.
 async fn handle_http_forward(
     mut client: TcpStream,
     target_host: &str,
     header_bytes: Vec<u8>,
     state: &Arc<ProxyState>,
+    scheme: Scheme,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate target: reject CRLF injection and loopback/link-local targets
     validate_connect_target(target_host)?;
+
+    let scheme_prefix = match scheme {
+        Scheme::Http => "http://",
+        Scheme::Https => "https://",
+    };
 
     let header_str = String::from_utf8_lossy(&header_bytes);
 
@@ -510,7 +556,7 @@ async fn handle_http_forward(
     // Extract the path portion from the absolute URL (e.g. http://host/path → /path).
     // Handles URLs without an explicit path (e.g. http://host?q=1 → /?q=1).
     let raw_url = parts.get(1).copied().unwrap_or("/");
-    let path = if let Some(rest) = raw_url.strip_prefix("http://") {
+    let path = if let Some(rest) = raw_url.strip_prefix(scheme_prefix) {
         match (rest.find('/'), rest.find('?')) {
             (Some(s), _) => rest[s..].to_string(),
             (None, Some(q)) => format!("/{}", &rest[q..]),
@@ -522,12 +568,12 @@ async fn handle_http_forward(
     let raw_no_query = path.split('?').next().unwrap_or(&path);
     let normalized_path = crate::routing::normalize_path(raw_no_query);
 
-    // Find the matching route rule (same logic as CONNECT, but scheme is http
-    // since the request came in as an absolute-form http:// URL).
+    // Find the matching route rule (same logic as CONNECT), keyed on the
+    // request's scheme so scheme-scoped rules apply correctly.
     let (verdict, transport, _tls_terminate, domain_http_rules) = match resolve_route(
         state,
         target_host,
-        Scheme::Http,
+        scheme,
         actor.process(),
     ) {
         Some(decision) => decision,
@@ -625,7 +671,7 @@ async fn handle_http_forward(
             return Ok(());
         }
         Verdict::Ask => {
-            let action_str = format!("{method} http://{target_host}{path}");
+            let action_str = format!("{method} {scheme_prefix}{target_host}{path}");
             let key = gate_key(target_host);
             let decision =
                 crate::gate::gate_or_deny(state, &key, &action_str, "policy-ambiguous").await;
@@ -649,7 +695,7 @@ async fn handle_http_forward(
     match effective_transport {
         Transport::Direct => {
             // Direct connection to upstream — send modified request, relay response
-            let mut upstream = match sock_mark::connect_tcp_resolve(target_host).await {
+            let upstream = match sock_mark::connect_tcp_resolve(target_host).await {
                 Ok(t) => t,
                 Err(e) => {
                     emit_http_audit(state, target_host, method, &path, "error", 502, actor);
@@ -665,16 +711,47 @@ async fn handle_http_forward(
             tracing::debug!(
                 target = %target_host,
                 method = %method,
+                scheme = ?scheme,
                 has_injections = !injections.is_empty(),
                 "HTTP forward proxy DIRECT"
             );
 
-            // Send modified headers to upstream
-            upstream.write_all(modified_bytes.as_bytes()).await?;
-
-            // Relay the rest bidirectionally (request body + response)
-            emit_http_audit(state, target_host, method, &path, "success", 200, actor);
-            tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+            match scheme {
+                Scheme::Http => {
+                    let mut upstream = upstream;
+                    // Send modified headers to upstream
+                    upstream.write_all(modified_bytes.as_bytes()).await?;
+                    // Relay the rest bidirectionally (request body + response)
+                    emit_http_audit(state, target_host, method, &path, "success", 200, actor);
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                }
+                Scheme::Https => {
+                    let hostname = extract_hostname(target_host);
+                    let extra_certs = state.extra_ca_certs.read().unwrap().clone();
+                    let mut upstream = match crate::mitm::connect_upstream_tls_generic(
+                        upstream,
+                        &hostname,
+                        &extra_certs,
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            emit_http_audit(state, target_host, method, &path, "error", 502, actor);
+                            client
+                                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                                .await?;
+                            return Err(format!(
+                                "HTTPS forward proxy upstream TLS to {target_host}: {e}"
+                            )
+                            .into());
+                        }
+                    };
+                    upstream.write_all(modified_bytes.as_bytes()).await?;
+                    emit_http_audit(state, target_host, method, &path, "success", 200, actor);
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                }
+            }
         }
         Transport::Upstream => {
             // Route through Lens Sandbox — open a CONNECT tunnel, then send the HTTP request through it
@@ -747,16 +824,44 @@ async fn handle_http_forward(
             tracing::debug!(
                 target = %target_host,
                 method = %method,
+                scheme = ?scheme,
                 has_injections = !injections.is_empty(),
                 "HTTP forward proxy LENS (via CONNECT tunnel)"
             );
 
-            // Send modified HTTP request through the tunnel
-            upstream_stream.write_all(modified_bytes.as_bytes()).await?;
-
-            // Relay the rest bidirectionally (request body + response)
-            emit_http_audit(state, target_host, method, &path, "success", 200, actor);
-            tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await?;
+            match scheme {
+                Scheme::Http => {
+                    upstream_stream.write_all(modified_bytes.as_bytes()).await?;
+                    emit_http_audit(state, target_host, method, &path, "success", 200, actor);
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await?;
+                }
+                Scheme::Https => {
+                    let hostname = extract_hostname(target_host);
+                    let extra_certs = state.extra_ca_certs.read().unwrap().clone();
+                    let mut tls_upstream = match crate::mitm::connect_upstream_tls_generic(
+                        upstream_stream,
+                        &hostname,
+                        &extra_certs,
+                    )
+                    .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            emit_http_audit(state, target_host, method, &path, "error", 502, actor);
+                            client
+                                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                                .await?;
+                            return Err(format!(
+                                "HTTPS forward proxy upstream TLS via tunnel to {target_host}: {e}"
+                            )
+                            .into());
+                        }
+                    };
+                    tls_upstream.write_all(modified_bytes.as_bytes()).await?;
+                    emit_http_audit(state, target_host, method, &path, "success", 200, actor);
+                    tokio::io::copy_bidirectional(&mut client, &mut tls_upstream).await?;
+                }
+            }
         }
     }
 
@@ -1476,7 +1581,15 @@ async fn handle_transparent_http(
         return Ok(());
     }
 
-    handle_http_forward(stream, &target_host, header_bytes, state, &actor).await
+    handle_http_forward(
+        stream,
+        &target_host,
+        header_bytes,
+        state,
+        Scheme::Http,
+        &actor,
+    )
+    .await
 }
 
 /// Audit event for a transparent connection that was dropped before reaching
@@ -1843,12 +1956,23 @@ fn validate_connect_target(target: &str) -> Result<(), Box<dyn std::error::Error
 }
 
 /// A parsed incoming proxy request — either CONNECT tunnel or HTTP forward proxy.
+#[derive(Debug)]
 enum ProxyRequest {
     /// CONNECT host:port — tunnel mode (existing).
     Connect { target: String },
-    /// HTTP forward proxy — method + absolute URL (e.g. GET http://host/path).
+    /// HTTP forward proxy — method + absolute `http://` URL (e.g. GET http://host/path).
     /// `header_bytes` includes the full request headers (including request line).
     Http {
+        target_host: String,
+        header_bytes: Vec<u8>,
+    },
+    /// HTTPS forward proxy — method + absolute `https://` URL (e.g. GET https://host/path).
+    /// Sent by clients that don't tunnel HTTPS via CONNECT, notably busybox `wget`
+    /// (the alpine default). The request line arrives in plaintext over the proxy hop;
+    /// we terminate TLS toward the upstream and relay the response back in cleartext,
+    /// running the same routing/gate/audit/injection path as CONNECT.
+    /// `header_bytes` includes the full request headers (including request line).
+    Https {
         target_host: String,
         header_bytes: Vec<u8>,
     },
@@ -1878,22 +2002,30 @@ async fn read_proxy_request_unbuffered(
 
     // HTTP forward proxy: method + absolute URL (e.g. "GET http://host:port/path HTTP/1.1")
     let url = parts[1];
-    if let Some(target) = parse_http_forward_target(url) {
-        Ok(ProxyRequest::Http {
+    if let Some(target) = parse_forward_target(url, "http://", 80) {
+        return Ok(ProxyRequest::Http {
             target_host: target,
             header_bytes,
-        })
-    } else {
-        Err(format!("not a proxy request (relative URL or https://): {request_line}").into())
+        });
     }
+    // HTTPS forward proxy: method + absolute https:// URL (e.g. busybox `wget https://host/`).
+    // The client speaks plaintext to the proxy and expects us to terminate TLS upstream.
+    if let Some(target) = parse_forward_target(url, "https://", 443) {
+        return Ok(ProxyRequest::Https {
+            target_host: target,
+            header_bytes,
+        });
+    }
+    Err(format!("not a proxy request (relative URL): {request_line}").into())
 }
 
-/// Parse the `host[:port]` authority from an absolute-form HTTP URL.
-/// Returns `None` for non-`http://` URLs. Handles bracketed IPv6 authorities
-/// (`http://[::1]:8080/`) and URLs with a query but no path (`http://host?q=1`).
-/// Defaults to port 80 when unspecified.
-fn parse_http_forward_target(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("http://")?;
+/// Parse the `host[:port]` authority from an absolute-form URL with the given
+/// scheme prefix (e.g. `http://` or `https://`), defaulting to `default_port`
+/// when no port is present. Returns `None` when the URL doesn't start with the
+/// prefix. Handles bracketed IPv6 authorities (`https://[::1]:8443/`) and URLs
+/// with a query but no path (`https://host?q=1`).
+fn parse_forward_target(url: &str, scheme_prefix: &str, default_port: u16) -> Option<String> {
+    let rest = url.strip_prefix(scheme_prefix)?;
     let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
 
@@ -1910,7 +2042,7 @@ fn parse_http_forward_target(url: &str) -> Option<String> {
     Some(if has_explicit_port {
         authority.to_string()
     } else {
-        format!("{authority}:80")
+        format!("{authority}:{default_port}")
     })
 }
 
@@ -2919,6 +3051,7 @@ pub(crate) mod tests {
                 "api.evil.example.com",
                 header_bytes,
                 &state_for_handler,
+                Scheme::Http,
                 &actor,
             )
             .await
@@ -3086,7 +3219,8 @@ pub(crate) mod tests {
     #[test]
     fn parse_http_target_explicit_port() {
         assert_eq!(
-            parse_http_forward_target("http://svc.cluster.local:8080/api/v1/data").as_deref(),
+            parse_forward_target("http://svc.cluster.local:8080/api/v1/data", "http://", 80)
+                .as_deref(),
             Some("svc.cluster.local:8080"),
         );
     }
@@ -3094,7 +3228,7 @@ pub(crate) mod tests {
     #[test]
     fn parse_http_target_defaults_port_80() {
         assert_eq!(
-            parse_http_forward_target("http://example.com/path").as_deref(),
+            parse_forward_target("http://example.com/path", "http://", 80).as_deref(),
             Some("example.com:80"),
         );
     }
@@ -3102,7 +3236,7 @@ pub(crate) mod tests {
     #[test]
     fn parse_http_target_no_path() {
         assert_eq!(
-            parse_http_forward_target("http://example.com").as_deref(),
+            parse_forward_target("http://example.com", "http://", 80).as_deref(),
             Some("example.com:80"),
         );
     }
@@ -3110,7 +3244,7 @@ pub(crate) mod tests {
     #[test]
     fn parse_http_target_query_no_path() {
         assert_eq!(
-            parse_http_forward_target("http://example.com?q=1").as_deref(),
+            parse_forward_target("http://example.com?q=1", "http://", 80).as_deref(),
             Some("example.com:80"),
         );
     }
@@ -3118,7 +3252,7 @@ pub(crate) mod tests {
     #[test]
     fn parse_http_target_ipv6_default_port() {
         assert_eq!(
-            parse_http_forward_target("http://[2001:db8::1]/foo").as_deref(),
+            parse_forward_target("http://[2001:db8::1]/foo", "http://", 80).as_deref(),
             Some("[2001:db8::1]:80"),
         );
     }
@@ -3126,7 +3260,7 @@ pub(crate) mod tests {
     #[test]
     fn parse_http_target_ipv6_explicit_port() {
         assert_eq!(
-            parse_http_forward_target("http://[2001:db8::1]:8080/foo").as_deref(),
+            parse_forward_target("http://[2001:db8::1]:8080/foo", "http://", 80).as_deref(),
             Some("[2001:db8::1]:8080"),
         );
     }
@@ -3134,19 +3268,131 @@ pub(crate) mod tests {
     #[test]
     fn parse_http_target_ipv6_no_path() {
         assert_eq!(
-            parse_http_forward_target("http://[::1]").as_deref(),
+            parse_forward_target("http://[::1]", "http://", 80).as_deref(),
             Some("[::1]:80"),
         );
     }
 
     #[test]
     fn parse_http_target_rejects_relative_url() {
-        assert!(parse_http_forward_target("/path").is_none());
+        assert!(parse_forward_target("/path", "http://", 80).is_none());
     }
 
     #[test]
     fn parse_http_target_rejects_https_url() {
-        // HTTPS should use CONNECT, not forward proxy
-        assert!(parse_http_forward_target("https://example.com/path").is_none());
+        // Under the http:// prefix, an https:// URL is not a match.
+        assert!(parse_forward_target("https://example.com/path", "http://", 80).is_none());
+    }
+
+    // --- parse_forward_target https:// (busybox absolute-form) tests ---
+
+    #[test]
+    fn parse_https_target_defaults_port_443() {
+        assert_eq!(
+            parse_forward_target("https://example.com/path", "https://", 443).as_deref(),
+            Some("example.com:443"),
+        );
+    }
+
+    #[test]
+    fn parse_https_target_explicit_port() {
+        assert_eq!(
+            parse_forward_target("https://svc.internal:8443/api", "https://", 443).as_deref(),
+            Some("svc.internal:8443"),
+        );
+    }
+
+    #[test]
+    fn parse_https_target_no_path() {
+        assert_eq!(
+            parse_forward_target("https://example.com", "https://", 443).as_deref(),
+            Some("example.com:443"),
+        );
+    }
+
+    #[test]
+    fn parse_https_target_ipv6_default_port() {
+        assert_eq!(
+            parse_forward_target("https://[2001:db8::1]/foo", "https://", 443).as_deref(),
+            Some("[2001:db8::1]:443"),
+        );
+    }
+
+    #[test]
+    fn parse_https_target_rejects_http_url() {
+        // Under the https:// prefix, an http:// URL is not a match.
+        assert!(parse_forward_target("http://example.com/path", "https://", 443).is_none());
+    }
+
+    // --- read_proxy_request_unbuffered dispatch tests ---
+
+    #[tokio::test]
+    async fn parse_dispatches_absolute_https_to_https_variant() {
+        // busybox `wget https://host/` sends an absolute-form https:// request
+        // line in cleartext. It must parse to the Https variant (port 443),
+        // not be rejected.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        use tokio::io::AsyncWriteExt;
+        client
+            .write_all(b"GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        let request = read_proxy_request_unbuffered(&mut server).await.unwrap();
+        match request {
+            ProxyRequest::Https {
+                target_host,
+                header_bytes,
+            } => {
+                assert_eq!(target_host, "example.com:443");
+                assert!(String::from_utf8_lossy(&header_bytes).starts_with("GET https://"));
+            }
+            other => panic!("expected Https variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_dispatches_absolute_http_to_http_variant() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        use tokio::io::AsyncWriteExt;
+        client
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        let request = read_proxy_request_unbuffered(&mut server).await.unwrap();
+        match request {
+            ProxyRequest::Http { target_host, .. } => {
+                assert_eq!(target_host, "example.com:80");
+            }
+            other => panic!("expected Http variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_rejects_relative_form_request() {
+        // A relative-form request line (no absolute URL, not CONNECT) is still
+        // an error — but handle_connection now writes a 400 before closing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        use tokio::io::AsyncWriteExt;
+        client
+            .write_all(b"GET /relative HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        let result = read_proxy_request_unbuffered(&mut server).await;
+        assert!(result.is_err(), "relative-form request should be rejected");
     }
 }
