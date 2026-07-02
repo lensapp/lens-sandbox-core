@@ -73,8 +73,6 @@ pub fn parse_local_address(field: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-/// Extract `(local_address, inode)` from a `/proc/net/tcp{,6}` data row.
-/// Columns: `sl local rem st tx:rx tr:when retrnsmt uid timeout inode …`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_row(line: &str) -> Option<(SocketAddr, u64)> {
     let mut fields = line.split_whitespace();

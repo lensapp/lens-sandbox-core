@@ -46,8 +46,6 @@ pub struct MitmContext<'a> {
     /// must match against this value — not the port-stripped hostname,
     /// which would never satisfy a `host:port` credential pattern.
     pub match_host: &'a str,
-    /// Client endpoint + owning process for the connection, spliced into
-    /// every audit event so the host can populate OCSF src_endpoint / actor.
     pub actor: &'a crate::peer_process::ActorContext,
 }
 
