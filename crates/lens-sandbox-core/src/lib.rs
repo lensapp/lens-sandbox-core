@@ -26,6 +26,7 @@ pub mod gate;
 pub mod lifecycle;
 pub mod mitm;
 pub mod network;
+pub mod peer_process;
 pub mod policy_schema;
 pub mod privilege;
 pub mod protocol;
