@@ -413,9 +413,7 @@ async fn handle_connection(
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let actor = crate::peer_process::ActorContext::resolve(peer);
-    // Read the request line and headers byte-by-byte to avoid buffering past
-    // the header boundary (which would lose TLS ClientHello bytes for CONNECT).
-    // Timeout prevents slow-loris attacks.
+    // Buffering past the header boundary would swallow a CONNECT's TLS ClientHello; the timeout bounds slow-loris.
     let request = match tokio::time::timeout(
         HEADER_READ_TIMEOUT,
         read_proxy_request_unbuffered(&mut client),
@@ -1515,7 +1513,6 @@ fn emit_audit(
     );
 }
 
-/// Emit an audit event for an HTTP forward proxy request.
 fn emit_http_audit(
     state: &Arc<ProxyState>,
     target_host: &str,
