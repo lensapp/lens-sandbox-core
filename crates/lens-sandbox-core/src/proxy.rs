@@ -1496,6 +1496,17 @@ pub(crate) fn emit_deny_event(
     }
 }
 
+/// The audit facts for one egress request: the legacy combined `action` string
+/// plus the structured fields the host reads instead of re-parsing it. `host`
+/// is the bare hostname (no port) and doubles as the failure-dedup key; `path`
+/// is `None` for CONNECT tunnels, which have none.
+struct RequestFacts<'a> {
+    action: &'a str,
+    method: &'a str,
+    host: &'a str,
+    path: Option<&'a str>,
+}
+
 /// Emit an audit event for a CONNECT tunnel request.
 fn emit_audit(
     state: &Arc<ProxyState>,
@@ -1504,12 +1515,17 @@ fn emit_audit(
     status_code: u16,
     actor: &crate::peer_process::ActorContext,
 ) {
+    let host = extract_hostname(target_host);
     emit_audit_action(
         state,
-        target_host,
-        &format!("CONNECT {target_host}"),
         result,
         status_code,
+        RequestFacts {
+            action: &format!("CONNECT {target_host}"),
+            method: "CONNECT",
+            host: &host,
+            path: None,
+        },
         actor,
     );
 }
@@ -1523,12 +1539,17 @@ fn emit_http_audit(
     status_code: u16,
     actor: &crate::peer_process::ActorContext,
 ) {
+    let host = extract_hostname(target_host);
     emit_audit_action(
         state,
-        target_host,
-        &format!("{method} http://{target_host}{path}"),
         result,
         status_code,
+        RequestFacts {
+            action: &format!("{method} http://{target_host}{path}"),
+            method,
+            host: &host,
+            path: Some(path),
+        },
         actor,
     );
 }
@@ -1538,13 +1559,12 @@ fn emit_http_audit(
 /// to suppress retry storms. Success and error events are always emitted.
 fn emit_audit_action(
     state: &Arc<ProxyState>,
-    target_host: &str,
-    action: &str,
     result: &str,
     status_code: u16,
+    facts: RequestFacts<'_>,
     actor: &crate::peer_process::ActorContext,
 ) {
-    emit_audit_action_with_metadata(state, target_host, action, result, status_code, None, actor);
+    emit_audit_action_with_metadata(state, result, status_code, None, facts, actor);
 }
 
 /// Variant that attaches a `metadata` object to the audit_event. Used by
@@ -1553,32 +1573,21 @@ fn emit_audit_action(
 /// developer as an Allow/Skip dialog.
 fn emit_audit_action_with_metadata(
     state: &Arc<ProxyState>,
-    target_host: &str,
-    action: &str,
     result: &str,
     status_code: u16,
     metadata: Option<serde_json::Value>,
+    facts: RequestFacts<'_>,
     actor: &crate::peer_process::ActorContext,
 ) {
     if result == "failure" {
-        let hostname = if target_host.starts_with('[') {
-            target_host
-                .split(']')
-                .next()
-                .unwrap_or(target_host)
-                .trim_start_matches('[')
-        } else {
-            target_host.split(':').next().unwrap_or(target_host)
-        };
-
         let now = Instant::now();
         let mut dedup = state.deny_dedup.lock().unwrap();
-        if let Some(last) = dedup.get(hostname)
+        if let Some(last) = dedup.get(facts.host)
             && now.duration_since(*last).as_secs() < AUDIT_DEDUP_SECS
         {
             return;
         }
-        dedup.insert(hostname.to_string(), now);
+        dedup.insert(facts.host.to_string(), now);
         if dedup.len() > 1024 {
             dedup.clear();
         }
@@ -1589,10 +1598,15 @@ fn emit_audit_action_with_metadata(
         let mut event = serde_json::json!({
             "type": "audit_event",
             "source": "sandbox-proxy",
-            "action": action,
+            "action": facts.action,
+            "method": facts.method,
+            "host": facts.host,
             "result": result,
             "status_code": status_code,
         });
+        if let Some(path) = facts.path {
+            event["path"] = serde_json::Value::from(path);
+        }
         if let Some(meta) = metadata {
             event["metadata"] = meta;
         }
@@ -1611,13 +1625,18 @@ fn emit_policy_deny_connect(
     target_host: &str,
     actor: &crate::peer_process::ActorContext,
 ) {
+    let host = extract_hostname(target_host);
     emit_audit_action_with_metadata(
         state,
-        target_host,
-        &format!("CONNECT {target_host}"),
         "failure",
         403,
         Some(serde_json::json!({"reason": "policy-deny"})),
+        RequestFacts {
+            action: &format!("CONNECT {target_host}"),
+            method: "CONNECT",
+            host: &host,
+            path: None,
+        },
         actor,
     );
 }
@@ -1631,13 +1650,18 @@ fn emit_policy_deny_http(
     path: &str,
     actor: &crate::peer_process::ActorContext,
 ) {
+    let host = extract_hostname(target_host);
     emit_audit_action_with_metadata(
         state,
-        target_host,
-        &format!("{method} http://{target_host}{path}"),
         "failure",
         403,
         Some(serde_json::json!({"reason": "policy-deny"})),
+        RequestFacts {
+            action: &format!("{method} http://{target_host}{path}"),
+            method,
+            host: &host,
+            path: Some(path),
+        },
         actor,
     );
 }
@@ -2296,6 +2320,13 @@ pub(crate) mod tests {
         assert_eq!(event["type"], "audit_event");
         assert_eq!(event["source"], "sandbox-proxy");
         assert_eq!(event["action"], "CONNECT api.openai.com:443");
+        // Structured facts mirror `action` so the host need not re-parse it.
+        assert_eq!(event["method"], "CONNECT");
+        assert_eq!(event["host"], "api.openai.com");
+        assert!(
+            event.get("path").is_none(),
+            "a CONNECT tunnel has no HTTP path"
+        );
         assert_eq!(event["result"], "success");
         assert_eq!(event["status_code"], 200);
     }
@@ -2308,6 +2339,8 @@ pub(crate) mod tests {
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(event["action"], "CONNECT evil.example.com:443");
+        assert_eq!(event["method"], "CONNECT");
+        assert_eq!(event["host"], "evil.example.com");
         assert_eq!(event["result"], "failure");
         assert_eq!(event["status_code"], 403);
         assert_eq!(event["metadata"]["reason"], "policy-deny");
@@ -2334,6 +2367,9 @@ pub(crate) mod tests {
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(event["action"], "GET http://evil.example.com/x");
+        assert_eq!(event["method"], "GET");
+        assert_eq!(event["host"], "evil.example.com");
+        assert_eq!(event["path"], "/x");
         assert_eq!(
             event["src_endpoint"],
             serde_json::json!({"ip": "10.0.0.5", "port": 54321})
@@ -2356,6 +2392,10 @@ pub(crate) mod tests {
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(event["action"], "GET http://example.com:8080/api/data");
+        assert_eq!(event["method"], "GET");
+        // `host` is the bare hostname — the port is dropped, matching the MITM path.
+        assert_eq!(event["host"], "example.com");
+        assert_eq!(event["path"], "/api/data");
         assert_eq!(event["result"], "success");
     }
 

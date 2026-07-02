@@ -584,6 +584,9 @@ async fn mitm_inject_after_accept(
                 "type": "audit_event",
                 "source": "sandbox-proxy",
                 "action": format!("{method} {target_host}{path}"),
+                "method": method,
+                "host": target_host,
+                "path": path,
                 "result": "failure",
                 "status_code": 403,
                 "metadata": { "host": target_host, "mitm": true, "tunnel": is_tunnel, "http_rule_denied": true }
@@ -684,6 +687,9 @@ async fn mitm_inject_after_accept(
                     "type": "audit_event",
                     "source": "sandbox-proxy",
                     "action": action,
+                    "method": method,
+                    "host": target_host,
+                    "path": path,
                     "result": "failure",
                     "status_code": 403,
                     "metadata": {
@@ -742,6 +748,9 @@ async fn mitm_inject_after_accept(
                         "type": "audit_event",
                         "source": "sandbox-proxy",
                         "action": format!("{rw_method} {target_host}{path}"),
+                        "method": rw_method,
+                        "host": target_host,
+                        "path": path,
                         "result": "failure",
                         "status_code": 403,
                         "metadata": { "host": target_host, "mitm": true, "tunnel": is_tunnel, "rewritten_path_denied": true }
@@ -1973,6 +1982,11 @@ mod tests {
         assert_eq!(audits[0]["result"], "failure");
         assert_eq!(audits[0]["status_code"], 403);
         assert_eq!(audits[0]["metadata"]["http_rule_denied"], true);
+        // Structured facts are present on failures too, so the host never has
+        // to re-parse `action` for a deny outcome.
+        assert_eq!(audits[0]["method"], "POST");
+        assert_eq!(audits[0]["host"], "test.example.com");
+        assert_eq!(audits[0]["path"], "/api/v1/upload");
     }
 
     #[tokio::test]
@@ -2217,11 +2231,16 @@ mod tests {
         // The request should be denied — check audit trail for a 403
         let denied = audits
             .iter()
-            .any(|a| a["status_code"] == 403 && a["metadata"]["rewritten_path_denied"] == true);
+            .find(|a| a["status_code"] == 403 && a["metadata"]["rewritten_path_denied"] == true);
         assert!(
-            denied,
+            denied.is_some(),
             "rewritten path with traversal should be denied by re-validation: {audits:?}"
         );
+        // Structured facts accompany the denial so the host need not re-parse `action`.
+        let denied = denied.unwrap();
+        assert_eq!(denied["method"], "GET");
+        assert_eq!(denied["host"], "test.example.com");
+        assert_eq!(denied["path"], "/bot/__lens_cred:tg__/sendMessage");
     }
 
     #[test]
