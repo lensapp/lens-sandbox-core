@@ -412,8 +412,10 @@ async fn handle_connection(
     peer: SocketAddr,
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let actor = crate::peer_process::ActorContext::resolve(peer);
-    // Buffering past the header boundary would swallow a CONNECT's TLS ClientHello; the timeout bounds slow-loris.
+    let actor = crate::peer_process::ActorContext::resolve_offloaded(peer).await;
+    // Read unbuffered: for a CONNECT the bytes right after the header are the
+    // client's TLS ClientHello, which the tunnel must forward verbatim — a
+    // buffered reader would consume and drop them. The timeout is slow-loris defense.
     let request = match tokio::time::timeout(
         HEADER_READ_TIMEOUT,
         read_proxy_request_unbuffered(&mut client),
@@ -435,8 +437,7 @@ async fn handle_connection(
             target_host,
             header_bytes,
         } => {
-            return handle_http_forward(client, &target_host, header_bytes, state, Some(&actor))
-                .await;
+            return handle_http_forward(client, &target_host, header_bytes, state, &actor).await;
         }
         ProxyRequest::Connect {
             target: target_host,
@@ -457,7 +458,7 @@ async fn handle_http_forward(
     target_host: &str,
     header_bytes: Vec<u8>,
     state: &Arc<ProxyState>,
-    actor: Option<&crate::peer_process::ActorContext>,
+    actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate target: reject CRLF injection and loopback/link-local targets
     validate_connect_target(target_host)?;
@@ -797,7 +798,7 @@ async fn handle_connect(
         Verdict::Deny => {
             client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
             tracing::info!(target = %target_host, "proxy DENIED");
-            emit_policy_deny_connect(state, target_host, Some(actor));
+            emit_policy_deny_connect(state, target_host, actor);
             return Ok(());
         }
         Verdict::Ask => {
@@ -919,7 +920,7 @@ async fn handle_connect(
                 let mut target = match sock_mark::connect_tcp_resolve(target_host).await {
                     Ok(t) => t,
                     Err(e) => {
-                        emit_audit(state, target_host, "error", 502, Some(actor));
+                        emit_audit(state, target_host, "error", 502, actor);
                         return Err(format!("direct connect to {target_host}: {e}").into());
                     }
                 };
@@ -935,7 +936,7 @@ async fn handle_connect(
                     client
                         .write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
                         .await?;
-                    emit_audit(state, target_host, "error", 503, Some(actor));
+                    emit_audit(state, target_host, "error", 503, actor);
                     return Err("Lens Sandbox upstream not configured yet".into());
                 }
             };
@@ -948,7 +949,7 @@ async fn handle_connect(
                         client
                             .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                             .await?;
-                        emit_audit(state, target_host, "error", 502, Some(actor));
+                        emit_audit(state, target_host, "error", 502, actor);
                         return Err(format!(
                             "connect to Lens Sandbox upstream {upstream_addr}: {e}"
                         )
@@ -978,7 +979,7 @@ async fn handle_connect(
                     client
                         .write_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
                         .await?;
-                    emit_audit(state, target_host, "error", 504, Some(actor));
+                    emit_audit(state, target_host, "error", 504, actor);
                     return Err("upstream header read timeout".into());
                 }
             };
@@ -987,7 +988,7 @@ async fn handle_connect(
                 client
                     .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                     .await?;
-                emit_audit(state, target_host, "error", 502, Some(actor));
+                emit_audit(state, target_host, "error", 502, actor);
                 return Err(format!("Lens Sandbox upstream returned: {status}").into());
             }
 
@@ -1029,7 +1030,7 @@ async fn handle_connect(
                     };
                     crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
                 } else {
-                    emit_audit(state, target_host, "success", 200, Some(actor));
+                    emit_audit(state, target_host, "success", 200, actor);
                     tracing::debug!(target = %target_host, "proxy LENS (passthrough, no CA)");
                     tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await?;
                 }
@@ -1063,13 +1064,13 @@ async fn handle_connect(
                     };
                     crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
                 } else {
-                    emit_audit(state, target_host, "success", 200, Some(actor));
+                    emit_audit(state, target_host, "success", 200, actor);
                     tracing::debug!(target = %target_host, "proxy LENS (passthrough, no CA)");
                     tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await?;
                 }
             } else {
                 // No TLS termination, no injections — raw TCP passthrough
-                emit_audit(state, target_host, "success", 200, Some(actor));
+                emit_audit(state, target_host, "success", 200, actor);
                 tracing::debug!(target = %target_host, "proxy LENS (passthrough)");
                 tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await?;
             }
@@ -1127,10 +1128,10 @@ async fn handle_transparent_tls(
     peer: SocketAddr,
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let actor = crate::peer_process::ActorContext::resolve(peer);
-    // LazyConfigAcceptor reads the ClientHello so we can peek SNI before
-    // committing to a ServerConfig — lets us enforce the policy allowlist
-    // before the ephemeral cert is generated.
+    let actor = crate::peer_process::ActorContext::resolve_offloaded(peer).await;
+    // Peek the SNI before committing to a ServerConfig, so a policy-denied host
+    // is rejected before we mint an ephemeral cert for it. (LazyConfigAcceptor
+    // is what lets us read the ClientHello without accepting the connection yet.)
     let acceptor = rustls::server::Acceptor::default();
     let start = match tokio_rustls::LazyConfigAcceptor::new(acceptor, stream).await {
         Ok(s) => s,
@@ -1183,7 +1184,7 @@ async fn handle_transparent_tls(
 
     let effective_transport = match verdict {
         Verdict::Deny => {
-            emit_policy_deny_connect(state, &target_host, Some(&actor));
+            emit_policy_deny_connect(state, &target_host, &actor);
             drop(start);
             return Ok(());
         }
@@ -1285,7 +1286,7 @@ async fn handle_transparent_tls(
             let upstream = match upstream_opt {
                 Some(n) => n,
                 None => {
-                    emit_audit(state, &target_host, "error", 503, Some(&actor));
+                    emit_audit(state, &target_host, "error", 503, &actor);
                     return Err("Lens Sandbox upstream not configured yet".into());
                 }
             };
@@ -1294,7 +1295,7 @@ async fn handle_transparent_tls(
                 match connect_sandbox_upstream(state, &upstream).await {
                     Ok(s) => s,
                     Err(e) => {
-                        emit_audit(state, &target_host, "error", 502, Some(&actor));
+                        emit_audit(state, &target_host, "error", 502, &actor);
                         return Err(format!(
                             "connect to Lens Sandbox upstream {upstream_addr}: {e}"
                         )
@@ -1317,13 +1318,13 @@ async fn handle_transparent_tls(
             {
                 Ok(result) => result?,
                 Err(_) => {
-                    emit_audit(state, &target_host, "error", 504, Some(&actor));
+                    emit_audit(state, &target_host, "error", 504, &actor);
                     return Err("upstream header read timeout".into());
                 }
             };
 
             if !status.starts_with("200") {
-                emit_audit(state, &target_host, "error", 502, Some(&actor));
+                emit_audit(state, &target_host, "error", 502, &actor);
                 return Err(format!("Lens Sandbox upstream returned: {status}").into());
             }
 
@@ -1342,7 +1343,7 @@ async fn handle_transparent_http(
     peer: SocketAddr,
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let actor = crate::peer_process::ActorContext::resolve(peer);
+    let actor = crate::peer_process::ActorContext::resolve_offloaded(peer).await;
     let header_bytes = match tokio::time::timeout(
         HEADER_READ_TIMEOUT,
         read_until_double_crlf(&mut stream),
@@ -1430,7 +1431,7 @@ async fn handle_transparent_http(
         return Ok(());
     }
 
-    handle_http_forward(stream, &target_host, header_bytes, state, Some(&actor)).await
+    handle_http_forward(stream, &target_host, header_bytes, state, &actor).await
 }
 
 /// Audit event for a transparent connection that was dropped before reaching
@@ -1501,7 +1502,7 @@ fn emit_audit(
     target_host: &str,
     result: &str,
     status_code: u16,
-    actor: Option<&crate::peer_process::ActorContext>,
+    actor: &crate::peer_process::ActorContext,
 ) {
     emit_audit_action(
         state,
@@ -1520,7 +1521,7 @@ fn emit_http_audit(
     path: &str,
     result: &str,
     status_code: u16,
-    actor: Option<&crate::peer_process::ActorContext>,
+    actor: &crate::peer_process::ActorContext,
 ) {
     emit_audit_action(
         state,
@@ -1541,7 +1542,7 @@ fn emit_audit_action(
     action: &str,
     result: &str,
     status_code: u16,
-    actor: Option<&crate::peer_process::ActorContext>,
+    actor: &crate::peer_process::ActorContext,
 ) {
     emit_audit_action_with_metadata(state, target_host, action, result, status_code, None, actor);
 }
@@ -1557,7 +1558,7 @@ fn emit_audit_action_with_metadata(
     result: &str,
     status_code: u16,
     metadata: Option<serde_json::Value>,
-    actor: Option<&crate::peer_process::ActorContext>,
+    actor: &crate::peer_process::ActorContext,
 ) {
     if result == "failure" {
         let hostname = if target_host.starts_with('[') {
@@ -1595,7 +1596,7 @@ fn emit_audit_action_with_metadata(
         if let Some(meta) = metadata {
             event["metadata"] = meta;
         }
-        if let (Some(actor), Some(obj)) = (actor, event.as_object_mut()) {
+        if let Some(obj) = event.as_object_mut() {
             actor.augment(obj);
         }
         let _ = tx.send(event.to_string());
@@ -1608,7 +1609,7 @@ fn emit_audit_action_with_metadata(
 fn emit_policy_deny_connect(
     state: &Arc<ProxyState>,
     target_host: &str,
-    actor: Option<&crate::peer_process::ActorContext>,
+    actor: &crate::peer_process::ActorContext,
 ) {
     emit_audit_action_with_metadata(
         state,
@@ -1628,7 +1629,7 @@ fn emit_policy_deny_http(
     target_host: &str,
     method: &str,
     path: &str,
-    actor: Option<&crate::peer_process::ActorContext>,
+    actor: &crate::peer_process::ActorContext,
 ) {
     emit_audit_action_with_metadata(
         state,
@@ -2236,6 +2237,14 @@ pub(crate) mod tests {
         (state, rx)
     }
 
+    /// A throwaway actor for the `emit_*` unit tests. Off a booted Linux guest
+    /// the `/proc` walk finds nothing, so `process` stays `None` — the tests
+    /// that care about attribution assert on `src_endpoint`, which is always
+    /// stamped.
+    fn test_actor() -> crate::peer_process::ActorContext {
+        crate::peer_process::ActorContext::resolve("10.0.0.5:54321".parse().unwrap())
+    }
+
     /// A timeout must bound the upstream TLS handshake. A peer that accepts the
     /// TCP connection but never sends a ServerHello would otherwise hang the
     /// connect forever; with a small budget the call returns a `timed out`
@@ -2280,7 +2289,7 @@ pub(crate) mod tests {
     #[test]
     fn emit_audit_sends_connect_action_format() {
         let (state, mut rx) = test_state();
-        emit_audit(&state, "api.openai.com:443", "success", 200, None);
+        emit_audit(&state, "api.openai.com:443", "success", 200, &test_actor());
 
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -2294,7 +2303,7 @@ pub(crate) mod tests {
     #[test]
     fn emit_policy_deny_connect_carries_reason_metadata() {
         let (state, mut rx) = test_state();
-        emit_policy_deny_connect(&state, "evil.example.com:443", None);
+        emit_policy_deny_connect(&state, "evil.example.com:443", &test_actor());
 
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -2307,7 +2316,7 @@ pub(crate) mod tests {
     #[test]
     fn emit_policy_deny_http_carries_reason_metadata() {
         let (state, mut rx) = test_state();
-        emit_policy_deny_http(&state, "evil.example.com", "GET", "/x", None);
+        emit_policy_deny_http(&state, "evil.example.com", "GET", "/x", &test_actor());
 
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -2318,10 +2327,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn emit_policy_deny_http_stamps_the_client_endpoint_when_an_actor_is_supplied() {
+    fn emit_policy_deny_http_stamps_the_client_endpoint() {
         let (state, mut rx) = test_state();
-        let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:54321".parse().unwrap());
-        emit_policy_deny_http(&state, "evil.example.com", "GET", "/x", Some(&actor));
+        emit_policy_deny_http(&state, "evil.example.com", "GET", "/x", &test_actor());
 
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -2342,7 +2350,7 @@ pub(crate) mod tests {
             "/api/data",
             "success",
             200,
-            None,
+            &test_actor(),
         );
 
         let msg = rx.try_recv().unwrap();
@@ -2354,8 +2362,8 @@ pub(crate) mod tests {
     #[test]
     fn emit_audit_failure_dedup_suppresses_rapid_repeats() {
         let (state, mut rx) = test_state();
-        emit_audit(&state, "evil.com:443", "failure", 403, None);
-        emit_audit(&state, "evil.com:443", "failure", 403, None);
+        emit_audit(&state, "evil.com:443", "failure", 403, &test_actor());
+        emit_audit(&state, "evil.com:443", "failure", 403, &test_actor());
 
         assert!(rx.try_recv().is_ok());
         assert!(
@@ -2367,8 +2375,8 @@ pub(crate) mod tests {
     #[test]
     fn emit_audit_success_not_deduplicated() {
         let (state, mut rx) = test_state();
-        emit_audit(&state, "api.openai.com:443", "success", 200, None);
-        emit_audit(&state, "api.openai.com:443", "success", 200, None);
+        emit_audit(&state, "api.openai.com:443", "success", 200, &test_actor());
+        emit_audit(&state, "api.openai.com:443", "success", 200, &test_actor());
 
         assert!(rx.try_recv().is_ok());
         assert!(
@@ -2380,8 +2388,8 @@ pub(crate) mod tests {
     #[test]
     fn emit_audit_error_not_deduplicated() {
         let (state, mut rx) = test_state();
-        emit_audit(&state, "api.openai.com:443", "error", 502, None);
-        emit_audit(&state, "api.openai.com:443", "error", 502, None);
+        emit_audit(&state, "api.openai.com:443", "error", 502, &test_actor());
+        emit_audit(&state, "api.openai.com:443", "error", 502, &test_actor());
 
         assert!(rx.try_recv().is_ok());
         assert!(
@@ -2428,7 +2436,7 @@ pub(crate) mod tests {
         let (state, mut rx) = test_state();
         let orig_dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
         emit_transparent_deny(&state, orig_dst, "unknown-protocol");
-        emit_audit(&state, "1.2.3.4:443", "failure", 403, None);
+        emit_audit(&state, "1.2.3.4:443", "failure", 403, &test_actor());
 
         assert!(rx.try_recv().is_ok(), "transparent deny should emit");
         assert!(
@@ -2440,8 +2448,8 @@ pub(crate) mod tests {
     #[test]
     fn emit_deny_dedup_different_hosts_not_suppressed() {
         let (state, mut rx) = test_state();
-        emit_audit(&state, "evil.com:443", "failure", 403, None);
-        emit_audit(&state, "other.com:443", "failure", 403, None);
+        emit_audit(&state, "evil.com:443", "failure", 403, &test_actor());
+        emit_audit(&state, "other.com:443", "failure", 403, &test_actor());
 
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_ok());
@@ -2506,7 +2514,7 @@ pub(crate) mod tests {
             "CONNECT evil.com:443",
             crate::protocol::Decision::DenyOnce,
         );
-        emit_policy_deny_connect(&state, "evil.com:443", None);
+        emit_policy_deny_connect(&state, "evil.com:443", &test_actor());
 
         assert!(rx.try_recv().is_ok(), "gate-denied failure emits");
         assert!(
@@ -2761,12 +2769,13 @@ pub(crate) mod tests {
 
         let state_for_handler = state.clone();
         let handler = tokio::spawn(async move {
+            let actor = test_actor();
             handle_http_forward(
                 server,
                 "api.evil.example.com",
                 header_bytes,
                 &state_for_handler,
-                None,
+                &actor,
             )
             .await
         });
