@@ -2320,7 +2320,6 @@ pub(crate) mod tests {
         assert_eq!(event["type"], "audit_event");
         assert_eq!(event["source"], "sandbox-proxy");
         assert_eq!(event["action"], "CONNECT api.openai.com:443");
-        // Structured facts mirror `action` so the host need not re-parse it.
         assert_eq!(event["method"], "CONNECT");
         assert_eq!(event["host"], "api.openai.com");
         assert!(
