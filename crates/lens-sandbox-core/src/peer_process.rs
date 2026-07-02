@@ -189,4 +189,40 @@ mod tests {
     fn resolve_is_none_off_linux() {
         assert!(resolve("127.0.0.1:8080".parse().unwrap()).is_none());
     }
+
+    #[test]
+    fn augment_stamps_src_endpoint_and_actor_process_when_resolved() {
+        let actor = ActorContext {
+            peer: "10.0.0.5:54321".parse().unwrap(),
+            process: Some(PeerProcess {
+                pid: 4242,
+                name: "wget".into(),
+            }),
+        };
+        let mut event = Map::new();
+        actor.augment(&mut event);
+        assert_eq!(
+            event["src_endpoint"],
+            json!({"ip": "10.0.0.5", "port": 54321})
+        );
+        assert_eq!(
+            event["actor"],
+            json!({"process": {"name": "wget", "pid": 4242}})
+        );
+    }
+
+    #[test]
+    fn augment_omits_actor_when_the_process_is_unresolved() {
+        let actor = ActorContext {
+            peer: "10.0.0.5:54321".parse().unwrap(),
+            process: None,
+        };
+        let mut event = Map::new();
+        actor.augment(&mut event);
+        assert_eq!(
+            event["src_endpoint"],
+            json!({"ip": "10.0.0.5", "port": 54321})
+        );
+        assert!(!event.contains_key("actor"));
+    }
 }
