@@ -73,7 +73,6 @@ pub fn parse_local_address(field: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_row(line: &str) -> Option<(SocketAddr, u64)> {
     let mut fields = line.split_whitespace();
     let _sl = fields.next()?;
@@ -82,29 +81,51 @@ fn parse_row(line: &str) -> Option<(SocketAddr, u64)> {
     Some((local, inode))
 }
 
-#[cfg(target_os = "linux")]
+trait ProcReader {
+    fn read(&self, path: &str) -> std::io::Result<String>;
+    fn list_dir(&self, path: &str) -> std::io::Result<Vec<String>>;
+    fn read_link(&self, path: &str) -> std::io::Result<String>;
+}
+
+struct RealProc;
+
+impl ProcReader for RealProc {
+    fn read(&self, path: &str) -> std::io::Result<String> {
+        std::fs::read_to_string(path)
+    }
+
+    fn list_dir(&self, path: &str) -> std::io::Result<Vec<String>> {
+        Ok(std::fs::read_dir(path)?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect())
+    }
+
+    fn read_link(&self, path: &str) -> std::io::Result<String> {
+        Ok(std::fs::read_link(path)?.to_string_lossy().into_owned())
+    }
+}
+
 pub fn resolve(peer: SocketAddr) -> Option<PeerProcess> {
-    let inode = socket_inode_for(peer)?;
-    let pid = pid_owning_inode(inode)?;
+    resolve_with(&RealProc, peer)
+}
+
+fn resolve_with<P: ProcReader>(proc: &P, peer: SocketAddr) -> Option<PeerProcess> {
+    let inode = socket_inode_for(proc, peer)?;
+    let pid = pid_owning_inode(proc, inode)?;
     Some(PeerProcess {
-        name: process_name(pid).unwrap_or_default(),
+        name: process_name(proc, pid).unwrap_or_default(),
         pid,
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn resolve(_peer: SocketAddr) -> Option<PeerProcess> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn socket_inode_for(peer: SocketAddr) -> Option<u64> {
+fn socket_inode_for<P: ProcReader>(proc: &P, peer: SocketAddr) -> Option<u64> {
     let path = if peer.is_ipv6() {
         "/proc/net/tcp6"
     } else {
         "/proc/net/tcp"
     };
-    let table = std::fs::read_to_string(path).ok()?;
+    let table = proc.read(path).ok()?;
     table
         .lines()
         .skip(1)
@@ -113,34 +134,39 @@ fn socket_inode_for(peer: SocketAddr) -> Option<u64> {
         .map(|(_, inode)| inode)
 }
 
-#[cfg(target_os = "linux")]
-fn pid_owning_inode(inode: u64) -> Option<i64> {
+fn pid_owning_inode<P: ProcReader>(proc: &P, inode: u64) -> Option<i64> {
     let target = format!("socket:[{inode}]");
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i64>() else {
+    for name in proc.list_dir("/proc").ok()? {
+        let Ok(pid) = name.parse::<i64>() else {
             continue;
         };
-        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+        let fd_dir = format!("/proc/{pid}/fd");
+        let Ok(fds) = proc.list_dir(&fd_dir) else {
             continue;
         };
-        for fd in fds.flatten() {
-            if std::fs::read_link(fd.path()).is_ok_and(|link| link.to_string_lossy() == target) {
-                return Some(pid);
-            }
+        if fds.iter().any(|fd| {
+            proc.read_link(&format!("{fd_dir}/{fd}"))
+                .is_ok_and(|link| link == target)
+        }) {
+            return Some(pid);
         }
     }
     None
 }
 
-#[cfg(target_os = "linux")]
-fn process_name(pid: i64) -> Option<String> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    Some(comm.trim_end().to_string())
+fn process_name<P: ProcReader>(proc: &P, pid: i64) -> Option<String> {
+    Some(
+        proc.read(&format!("/proc/{pid}/comm"))
+            .ok()?
+            .trim_end()
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn parses_an_ipv4_local_address_little_endian_with_a_big_endian_port() {
@@ -222,5 +248,118 @@ mod tests {
             json!({"ip": "10.0.0.5", "port": 54321})
         );
         assert!(!event.contains_key("actor"));
+    }
+
+    const TCP_ROW: &str = "   3: 0100007F:1F90 0100007F:C1A2 01 00000000:00000000 00:00000000 00000000  1000        0 424242 1 ffff 100";
+
+    struct FakeProc {
+        files: HashMap<String, String>,
+        dirs: HashMap<String, Vec<String>>,
+        links: HashMap<String, String>,
+    }
+
+    impl ProcReader for FakeProc {
+        fn read(&self, path: &str) -> std::io::Result<String> {
+            self.files.get(path).cloned().ok_or_else(not_found)
+        }
+
+        fn list_dir(&self, path: &str) -> std::io::Result<Vec<String>> {
+            self.dirs.get(path).cloned().ok_or_else(not_found)
+        }
+
+        fn read_link(&self, path: &str) -> std::io::Result<String> {
+            self.links.get(path).cloned().ok_or_else(not_found)
+        }
+    }
+
+    fn not_found() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::NotFound)
+    }
+
+    fn owning_fixture() -> FakeProc {
+        FakeProc {
+            files: HashMap::from([
+                ("/proc/net/tcp".into(), format!("header\n{TCP_ROW}")),
+                ("/proc/100/comm".into(), "wget\n".into()),
+            ]),
+            dirs: HashMap::from([
+                (
+                    "/proc".into(),
+                    vec!["net".into(), "7".into(), "1".into(), "100".into()],
+                ),
+                ("/proc/1/fd".into(), vec!["0".into()]),
+                ("/proc/100/fd".into(), vec!["3".into(), "4".into()]),
+            ]),
+            links: HashMap::from([
+                ("/proc/1/fd/0".into(), "pipe:[999]".into()),
+                ("/proc/100/fd/3".into(), "socket:[111111]".into()),
+                ("/proc/100/fd/4".into(), "socket:[424242]".into()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn resolve_with_walks_proc_net_tcp_then_fd_symlinks_to_the_owning_process() {
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            resolve_with(&owning_fixture(), peer),
+            Some(PeerProcess {
+                pid: 100,
+                name: "wget".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_with_is_none_when_no_socket_row_matches_the_peer() {
+        let peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        assert!(resolve_with(&owning_fixture(), peer).is_none());
+    }
+
+    #[test]
+    fn resolve_with_is_none_when_no_process_owns_the_socket_inode() {
+        let mut fake = owning_fixture();
+        fake.links
+            .insert("/proc/100/fd/4".into(), "socket:[999999]".into());
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(resolve_with(&fake, peer).is_none());
+    }
+
+    #[test]
+    fn resolve_with_leaves_the_name_empty_when_comm_is_unreadable() {
+        let mut fake = owning_fixture();
+        fake.files.remove("/proc/100/comm");
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            resolve_with(&fake, peer),
+            Some(PeerProcess {
+                pid: 100,
+                name: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_with_matches_ipv6_sockets_via_proc_net_tcp6() {
+        const TCP6_ROW: &str = "   1: 00000000000000000000000001000000:0050 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 555555 1 ffff 100";
+        let fake = FakeProc {
+            files: HashMap::from([
+                ("/proc/net/tcp6".into(), format!("header\n{TCP6_ROW}")),
+                ("/proc/42/comm".into(), "busybox\n".into()),
+            ]),
+            dirs: HashMap::from([
+                ("/proc".into(), vec!["42".into()]),
+                ("/proc/42/fd".into(), vec!["5".into()]),
+            ]),
+            links: HashMap::from([("/proc/42/fd/5".into(), "socket:[555555]".into())]),
+        };
+        let peer: SocketAddr = "[::1]:80".parse().unwrap();
+        assert_eq!(
+            resolve_with(&fake, peer),
+            Some(PeerProcess {
+                pid: 42,
+                name: "busybox".into(),
+            })
+        );
     }
 }
