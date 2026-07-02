@@ -26,11 +26,29 @@ pub struct ActorContext {
 }
 
 impl ActorContext {
+    /// Resolve synchronously by walking `/proc`. This performs blocking
+    /// filesystem I/O; async callers should use [`ActorContext::resolve_offloaded`]
+    /// so the walk never occupies a tokio worker thread.
     pub fn resolve(peer: SocketAddr) -> Self {
         Self {
             peer,
             process: resolve(peer),
         }
+    }
+
+    /// Resolve on a blocking thread. The `/proc` walk (`read_dir` over every
+    /// pid plus a `read_link` per fd) is synchronous filesystem I/O, so we
+    /// offload it via `spawn_blocking` to keep the connection handler's tokio
+    /// worker free. Resolution still happens once at connection setup, while
+    /// the peer's socket is open and its owning process alive; a panicking
+    /// blocking task degrades to the unresolved `src_endpoint`-only context.
+    pub async fn resolve_offloaded(peer: SocketAddr) -> Self {
+        tokio::task::spawn_blocking(move || Self::resolve(peer))
+            .await
+            .unwrap_or(Self {
+                peer,
+                process: None,
+            })
     }
 
     /// Insert `src_endpoint` (always) and `actor.process` (when resolved) into
