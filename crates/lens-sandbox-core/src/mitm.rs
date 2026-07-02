@@ -1982,8 +1982,6 @@ mod tests {
         assert_eq!(audits[0]["result"], "failure");
         assert_eq!(audits[0]["status_code"], 403);
         assert_eq!(audits[0]["metadata"]["http_rule_denied"], true);
-        // Structured facts are present on failures too, so the host never has
-        // to re-parse `action` for a deny outcome.
         assert_eq!(audits[0]["method"], "POST");
         assert_eq!(audits[0]["host"], "test.example.com");
         assert_eq!(audits[0]["path"], "/api/v1/upload");
@@ -2236,7 +2234,6 @@ mod tests {
             denied.is_some(),
             "rewritten path with traversal should be denied by re-validation: {audits:?}"
         );
-        // Structured facts accompany the denial so the host need not re-parse `action`.
         let denied = denied.unwrap();
         assert_eq!(denied["method"], "GET");
         assert_eq!(denied["host"], "test.example.com");
