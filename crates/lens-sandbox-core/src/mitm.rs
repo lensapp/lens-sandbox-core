@@ -46,6 +46,9 @@ pub struct MitmContext<'a> {
     /// must match against this value — not the port-stripped hostname,
     /// which would never satisfy a `host:port` credential pattern.
     pub match_host: &'a str,
+    /// Client endpoint + owning process for the connection, spliced into
+    /// every audit event so the host can populate OCSF src_endpoint / actor.
+    pub actor: &'a crate::peer_process::ActorContext,
 }
 
 /// HTTP/1.1 request body framing, derived from the request method + headers.
@@ -503,6 +506,18 @@ fn parse_status_code(header_bytes: &[u8]) -> Option<u16> {
     std::str::from_utf8(code).ok()?.parse::<u16>().ok()
 }
 
+/// Splice the connection's src_endpoint / actor.process into an audit event and send it.
+fn send_audit(
+    tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    mut event: serde_json::Value,
+    actor: &crate::peer_process::ActorContext,
+) {
+    if let Some(obj) = event.as_object_mut() {
+        actor.augment(obj);
+    }
+    let _ = tx.send(event.to_string());
+}
+
 /// Client-side MITM phase (post-TLS-accept): read HTTP request headers,
 /// enforce HTTP rules, inject credentials, rewrite URI placeholders, emit
 /// audit event. Returns the TLS client stream and the modified header
@@ -575,7 +590,7 @@ async fn mitm_inject_after_accept(
                 "status_code": 403,
                 "metadata": { "host": target_host, "mitm": true, "tunnel": is_tunnel, "http_rule_denied": true }
             });
-            let _ = tx.send(event.to_string());
+            send_audit(tx, event, ctx.actor);
         }
         tls_client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
@@ -682,7 +697,7 @@ async fn mitm_inject_after_accept(
                         "reason": reason,
                     }
                 });
-                let _ = tx.send(event.to_string());
+                send_audit(tx, event, ctx.actor);
             }
             tls_client
                 .write_all(
@@ -733,7 +748,7 @@ async fn mitm_inject_after_accept(
                         "status_code": 403,
                         "metadata": { "host": target_host, "mitm": true, "tunnel": is_tunnel, "rewritten_path_denied": true }
                     });
-                    let _ = tx.send(event.to_string());
+                    send_audit(tx, event, ctx.actor);
                 }
                 tls_client
                     .write_all(
@@ -753,10 +768,13 @@ async fn mitm_inject_after_accept(
             "type": "audit_event",
             "source": "sandbox-proxy",
             "action": format!("{method} {target_host}{path}"),
+            "method": method,
+            "host": target_host,
+            "path": path,
             "result": "success",
             "metadata": { "host": target_host, "mitm": true, "tunnel": is_tunnel }
         });
-        let _ = tx.send(event.to_string());
+        send_audit(tx, event, ctx.actor);
     }
 
     Ok((
@@ -828,6 +846,7 @@ where
 /// forwarding the rewritten headers + `Connection: close`, switches to raw
 /// bidirectional byte copy for the remainder of the connection. For upgrade
 /// requests (WebSocket/SPDY), the connection stays open after the header phase.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_tls_bridge(
     client: TcpStream,
     dial_addr: &str,
@@ -836,6 +855,7 @@ pub async fn handle_tls_bridge(
     ca: &EphemeralCa,
     hostname_for_cert: &str,
     audit_tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Generate ephemeral cert for the hostname the agent connects to
     let certified_key = ca
@@ -903,10 +923,11 @@ pub async fn handle_tls_bridge(
             "type": "audit_event",
             "source": "sandbox-proxy",
             "action": format!("TLS_BRIDGE {hostname_for_cert} -> {dial_addr}"),
+            "host": hostname_for_cert,
             "result": "success",
             "metadata": { "host": hostname_for_cert, "tls_bridge": true }
         });
-        let _ = tx.send(event.to_string());
+        send_audit(tx, event, actor);
     }
 
     // Bidirectional byte copy for the rest of the connection.
@@ -1774,6 +1795,8 @@ mod tests {
 
         // Run MITM in the middle: accept client TLS + inject, then connect upstream
         let (client_stream, _) = client_listener.accept().await.unwrap();
+        let test_actor =
+            crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
         let test_ctx = MitmContext {
             injections: &injections,
             http_rules: &http_rules,
@@ -1783,6 +1806,7 @@ mod tests {
             placeholder_map: &placeholder_map,
             state: &state,
             match_host: hostname,
+            actor: &test_actor,
         };
         let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
         let acceptor = TlsAcceptor::from(mitm_server_config);
@@ -3025,6 +3049,8 @@ mod tests {
         let (client_stream, _) = client_listener.accept().await.unwrap();
         let upstream_headers: String = {
             let audit_tx = state.audit_tx.lock().unwrap().clone();
+            let test_actor =
+                crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
             let test_ctx = MitmContext {
                 injections: &[],
                 http_rules: &[],
@@ -3034,6 +3060,7 @@ mod tests {
                 placeholder_map: &[],
                 state: &state,
                 match_host,
+                actor: &test_actor,
             };
             let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
             let acceptor = TlsAcceptor::from(mitm_server_config);
@@ -3403,6 +3430,8 @@ mod tests {
         // ctx.placeholder_map intentionally stale (empty) — pinpointing
         // that the Allow path refreshes from state rather than relying
         // on this captured snapshot.
+        let test_actor =
+            crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
         let test_ctx = MitmContext {
             injections: &[],
             http_rules: &[],
@@ -3412,6 +3441,7 @@ mod tests {
             placeholder_map: &[],
             state: &state,
             match_host: hostname,
+            actor: &test_actor,
         };
         let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
         let acceptor = TlsAcceptor::from(mitm_server_config);
@@ -3566,6 +3596,8 @@ mod tests {
         let (client_stream, _) = client_listener.accept().await.unwrap();
         let upstream_headers: String = {
             let audit_tx = state.audit_tx.lock().unwrap().clone();
+            let test_actor =
+                crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
             let test_ctx = MitmContext {
                 injections: &[],
                 http_rules: &[],
@@ -3575,6 +3607,7 @@ mod tests {
                 placeholder_map: &[],
                 state: &state,
                 match_host: hostname,
+                actor: &test_actor,
             };
             let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
             let acceptor = TlsAcceptor::from(mitm_server_config);

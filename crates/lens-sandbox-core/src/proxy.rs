@@ -345,7 +345,7 @@ impl ProxyServer {
                 };
                 let state = explicit_state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, &state).await {
+                    if let Err(e) = handle_connection(stream, peer, &state).await {
                         tracing::debug!(kind = "explicit", peer = %peer, "proxy connection error: {e}");
                     }
                     drop(permit);
@@ -372,7 +372,7 @@ impl ProxyServer {
                 };
                 let state = transparent_state.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_transparent_connection(stream, state).await {
+                    if let Err(e) = handle_transparent_connection(stream, peer, state).await {
                         tracing::debug!(kind = "transparent", peer = %peer, "proxy connection error: {e}");
                     }
                     drop(permit);
@@ -409,8 +409,10 @@ impl ProxyServer {
 
 async fn handle_connection(
     mut client: TcpStream,
+    peer: SocketAddr,
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let actor = crate::peer_process::ActorContext::resolve(peer);
     // Read the request line and headers byte-by-byte to avoid buffering past
     // the header boundary (which would lose TLS ClientHello bytes for CONNECT).
     // Timeout prevents slow-loris attacks.
@@ -440,7 +442,7 @@ async fn handle_connection(
         ProxyRequest::Connect {
             target: target_host,
         } => {
-            return handle_connect(client, &target_host, state).await;
+            return handle_connect(client, &target_host, &actor, state).await;
         }
     }
 }
@@ -760,6 +762,7 @@ fn rewrite_http_forward_request(header_str: &str, path: &str, target_host: &str)
 async fn handle_connect(
     mut client: TcpStream,
     target_host: &str,
+    actor: &crate::peer_process::ActorContext,
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate target: reject CRLF injection and loopback/link-local targets
@@ -892,6 +895,7 @@ async fn handle_connect(
                     placeholder_map: &uri_placeholders,
                     state,
                     match_host: target_host,
+                    actor,
                 };
                 crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
             } else if let (Some(cc), Some(ca)) = (&client_cert, state.ephemeral_ca.get()) {
@@ -907,6 +911,7 @@ async fn handle_connect(
                     ca,
                     &hostname,
                     &audit_tx,
+                    actor,
                 )
                 .await?;
             } else {
@@ -1020,6 +1025,7 @@ async fn handle_connect(
                         placeholder_map: &placeholders,
                         state,
                         match_host: target_host,
+                        actor,
                     };
                     crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
                 } else {
@@ -1053,6 +1059,7 @@ async fn handle_connect(
                         placeholder_map: &placeholders,
                         state,
                         match_host: target_host,
+                        actor,
                     };
                     crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
                 } else {
@@ -1078,6 +1085,7 @@ async fn handle_connect(
 /// dropped with an audit event — matching today's fail-closed semantics.
 async fn handle_transparent_connection(
     stream: TcpStream,
+    peer: SocketAddr,
     state: Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let orig_dst = match transparent::so_original_dst(&stream) {
@@ -1103,7 +1111,7 @@ async fn handle_transparent_connection(
     // `CONNECT ` are 8.
     let first = transparent::peek_first_bytes(&stream, 8).await?;
     match transparent::classify(&first) {
-        Protocol::Tls => handle_transparent_tls(stream, orig_dst, &state).await,
+        Protocol::Tls => handle_transparent_tls(stream, orig_dst, peer, &state).await,
         Protocol::Http => handle_transparent_http(stream, orig_dst, &state).await,
         Protocol::Unknown => {
             emit_transparent_deny(&state, orig_dst, "unknown-protocol");
@@ -1116,8 +1124,10 @@ async fn handle_transparent_connection(
 async fn handle_transparent_tls(
     stream: TcpStream,
     orig_dst: SocketAddr,
+    peer: SocketAddr,
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let actor = crate::peer_process::ActorContext::resolve(peer);
     // LazyConfigAcceptor reads the ClientHello so we can peek SNI before
     // committing to a ServerConfig — lets us enforce the policy allowlist
     // before the ephemeral cert is generated.
@@ -1256,6 +1266,7 @@ async fn handle_transparent_tls(
         placeholder_map: &uri_placeholders,
         state,
         match_host: &target_host,
+        actor: &actor,
     };
 
     match effective_transport {
@@ -2509,7 +2520,9 @@ pub(crate) mod tests {
 
         let state_for_handler = state.clone();
         let handler = tokio::spawn(async move {
-            handle_connect(server, "evil.example.com:443", &state_for_handler).await
+            let actor =
+                crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+            handle_connect(server, "evil.example.com:443", &actor, &state_for_handler).await
         });
 
         let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -2571,7 +2584,9 @@ pub(crate) mod tests {
 
         let state_for_handler = state.clone();
         let handler = tokio::spawn(async move {
-            handle_connect(server, "evil.example.com:443", &state_for_handler).await
+            let actor =
+                crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+            handle_connect(server, "evil.example.com:443", &actor, &state_for_handler).await
         });
 
         let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -2620,7 +2635,15 @@ pub(crate) mod tests {
 
         let state_for_handler = state.clone();
         let handler = tokio::spawn(async move {
-            handle_connect(server, "api.some-provider.example:443", &state_for_handler).await
+            let actor =
+                crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+            handle_connect(
+                server,
+                "api.some-provider.example:443",
+                &actor,
+                &state_for_handler,
+            )
+            .await
         });
 
         let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())

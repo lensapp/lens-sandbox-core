@@ -7,12 +7,46 @@
 //! Everything is best-effort: a closed socket, a foreign netns, or a
 //! non-Linux host all yield `None`, and the caller simply omits the actor.
 
+use serde_json::{Map, Value, json};
 use std::net::SocketAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerProcess {
     pub pid: i64,
     pub name: String,
+}
+
+/// The client endpoint and (best-effort) owning process for a proxied
+/// connection, resolved once per connection and spliced into every audit
+/// event it produces.
+#[derive(Debug, Clone)]
+pub struct ActorContext {
+    peer: SocketAddr,
+    process: Option<PeerProcess>,
+}
+
+impl ActorContext {
+    pub fn resolve(peer: SocketAddr) -> Self {
+        Self {
+            peer,
+            process: resolve(peer),
+        }
+    }
+
+    /// Insert `src_endpoint` (always) and `actor.process` (when resolved) into
+    /// an audit-event object, ready for the host to copy into OCSF.
+    pub fn augment(&self, event: &mut Map<String, Value>) {
+        event.insert(
+            "src_endpoint".into(),
+            json!({"ip": self.peer.ip().to_string(), "port": self.peer.port()}),
+        );
+        if let Some(p) = &self.process {
+            event.insert(
+                "actor".into(),
+                json!({"process": {"name": p.name, "pid": p.pid}}),
+            );
+        }
+    }
 }
 
 /// Parse a `/proc/net/tcp{,6}` `local_address` field (`HEXADDR:HEXPORT`) into a
