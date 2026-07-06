@@ -3,17 +3,44 @@
 //! The transparent/explicit proxy accepts a TCP connection from a workload
 //! process; its `peer` address is that process's socket's *local* address as
 //! seen inside the guest netns. We map `peer` → socket inode (via
-//! `/proc/net/tcp{,6}`) → owning pid (via `/proc/<pid>/fd`) → command name.
+//! `/proc/net/tcp{,6}`) → owning pid (via `/proc/<pid>/fd`) → command name,
+//! executable path, and parent-process chain.
 //! Everything is best-effort: a closed socket, a foreign netns, or a
 //! non-Linux host all yield `None`, and the caller simply omits the actor.
 
 use serde_json::{Map, Value, json};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+/// How far up the parent chain we walk when resolving ancestors. Deep enough
+/// to see through a wrapper or two (e.g. `claude → node → curl`) without
+/// unbounded `/proc` reads. `init` (pid 1) is never included.
+const ANCESTOR_DEPTH_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerProcess {
     pub pid: i64,
+    /// Command name from `/proc/<pid>/comm`. Emitted in audit events.
     pub name: String,
+    /// Resolved `/proc/<pid>/exe` target, if readable. Used by the `binaries`
+    /// route filter, which matches on absolute paths rather than the
+    /// truncated, spoofable comm name.
+    pub exe: Option<PathBuf>,
+    /// Parent executables, immediate parent first, `init` excluded. Lets a
+    /// `binaries` rule name a launcher (e.g. `claude`) and still match when
+    /// the launcher spawns a child (`node`, `curl`) that opens the socket.
+    pub ancestors: Vec<PathBuf>,
+}
+
+impl PeerProcess {
+    /// The connecting exe plus its ancestor chain, immediate process first.
+    /// This is the set of paths a `binaries` route filter matches against.
+    pub fn binary_paths(&self) -> impl Iterator<Item = &Path> {
+        self.exe
+            .as_deref()
+            .into_iter()
+            .chain(self.ancestors.iter().map(PathBuf::as_path))
+    }
 }
 
 /// The client endpoint and (best-effort) owning process for a proxied
@@ -49,6 +76,12 @@ impl ActorContext {
                 peer,
                 process: None,
             })
+    }
+
+    /// The resolved owning process, if any. Used by the proxy to apply a
+    /// rule's `binaries` filter against the caller's exe and ancestors.
+    pub fn process(&self) -> Option<&PeerProcess> {
+        self.process.as_ref()
     }
 
     /// Insert `src_endpoint` (always) and `actor.process` (when resolved) into
@@ -133,6 +166,8 @@ fn resolve_with<P: ProcReader>(proc: &P, peer: SocketAddr) -> Option<PeerProcess
     let pid = pid_owning_inode(proc, inode)?;
     Some(PeerProcess {
         name: process_name(proc, pid).unwrap_or_default(),
+        exe: read_exe(proc, pid),
+        ancestors: walk_ancestors(proc, pid),
         pid,
     })
 }
@@ -179,6 +214,44 @@ fn process_name<P: ProcReader>(proc: &P, pid: i64) -> Option<String> {
             .trim_end()
             .to_string(),
     )
+}
+
+fn read_exe<P: ProcReader>(proc: &P, pid: i64) -> Option<PathBuf> {
+    let link = proc.read_link(&format!("/proc/{pid}/exe")).ok()?;
+    // The kernel appends " (deleted)" to /proc/<pid>/exe when the running
+    // binary has been unlinked or replaced on disk — a package upgrade or a
+    // mise runtime swap under a live process. Strip it so the canonical path
+    // still matches a `binaries` filter instead of silently failing closed.
+    let path = link.strip_suffix(" (deleted)").unwrap_or(&link);
+    Some(PathBuf::from(path))
+}
+
+fn read_ppid<P: ProcReader>(proc: &P, pid: i64) -> Option<i64> {
+    proc.read(&format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<i64>().ok())
+}
+
+/// Walk the parent chain from `start`, collecting each ancestor's exe path.
+/// Stops at `init` (pid ≤ 1), the depth limit, or the first unreadable link.
+fn walk_ancestors<P: ProcReader>(proc: &P, start: i64) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut current = start;
+    for _ in 0..ANCESTOR_DEPTH_LIMIT {
+        let Some(ppid) = read_ppid(proc, current) else {
+            break;
+        };
+        if ppid <= 1 {
+            break;
+        }
+        let Some(exe) = read_exe(proc, ppid) else {
+            break;
+        };
+        out.push(exe);
+        current = ppid;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -239,6 +312,8 @@ mod tests {
             process: Some(PeerProcess {
                 pid: 4242,
                 name: "wget".into(),
+                exe: Some("/usr/bin/wget".into()),
+                ancestors: vec!["/usr/bin/bash".into()],
             }),
         };
         let mut event = Map::new();
@@ -299,6 +374,10 @@ mod tests {
             files: HashMap::from([
                 ("/proc/net/tcp".into(), format!("header\n{TCP_ROW}")),
                 ("/proc/100/comm".into(), "wget\n".into()),
+                // pid 100 (wget) ← pid 7 (bash) ← init(1): the walk stops at
+                // the parent whose PPid is init, yielding a single ancestor.
+                ("/proc/100/status".into(), "Name:\twget\nPPid:\t7\n".into()),
+                ("/proc/7/status".into(), "Name:\tbash\nPPid:\t1\n".into()),
             ]),
             dirs: HashMap::from([
                 (
@@ -312,6 +391,8 @@ mod tests {
                 ("/proc/1/fd/0".into(), "pipe:[999]".into()),
                 ("/proc/100/fd/3".into(), "socket:[111111]".into()),
                 ("/proc/100/fd/4".into(), "socket:[424242]".into()),
+                ("/proc/100/exe".into(), "/usr/bin/wget".into()),
+                ("/proc/7/exe".into(), "/usr/bin/bash".into()),
             ]),
         }
     }
@@ -324,7 +405,63 @@ mod tests {
             Some(PeerProcess {
                 pid: 100,
                 name: "wget".into(),
+                exe: Some("/usr/bin/wget".into()),
+                ancestors: vec!["/usr/bin/bash".into()],
             })
+        );
+    }
+
+    #[test]
+    fn resolve_with_leaves_exe_none_and_no_ancestors_when_proc_links_are_unreadable() {
+        let mut fake = owning_fixture();
+        fake.links.remove("/proc/100/exe");
+        fake.files.remove("/proc/100/status");
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            resolve_with(&fake, peer),
+            Some(PeerProcess {
+                pid: 100,
+                name: "wget".into(),
+                exe: None,
+                ancestors: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_with_strips_the_kernel_deleted_suffix_from_exe_paths() {
+        let mut fake = owning_fixture();
+        // wget's binary was replaced on disk while the process is live, and
+        // bash's link is clean — only the affected path carries the suffix.
+        fake.links
+            .insert("/proc/100/exe".into(), "/usr/bin/wget (deleted)".into());
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            resolve_with(&fake, peer),
+            Some(PeerProcess {
+                pid: 100,
+                name: "wget".into(),
+                exe: Some("/usr/bin/wget".into()),
+                ancestors: vec!["/usr/bin/bash".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn binary_paths_yields_exe_first_then_ancestors() {
+        let p = PeerProcess {
+            pid: 100,
+            name: "node".into(),
+            exe: Some("/usr/bin/node".into()),
+            ancestors: vec!["/usr/local/bin/claude".into(), "/usr/bin/bash".into()],
+        };
+        assert_eq!(
+            p.binary_paths().collect::<Vec<_>>(),
+            vec![
+                Path::new("/usr/bin/node"),
+                Path::new("/usr/local/bin/claude"),
+                Path::new("/usr/bin/bash"),
+            ]
         );
     }
 
@@ -353,6 +490,8 @@ mod tests {
             Some(PeerProcess {
                 pid: 100,
                 name: String::new(),
+                exe: Some("/usr/bin/wget".into()),
+                ancestors: vec!["/usr/bin/bash".into()],
             })
         );
     }
@@ -364,12 +503,19 @@ mod tests {
             files: HashMap::from([
                 ("/proc/net/tcp6".into(), format!("header\n{TCP6_ROW}")),
                 ("/proc/42/comm".into(), "busybox\n".into()),
+                (
+                    "/proc/42/status".into(),
+                    "Name:\tbusybox\nPPid:\t1\n".into(),
+                ),
             ]),
             dirs: HashMap::from([
                 ("/proc".into(), vec!["42".into()]),
                 ("/proc/42/fd".into(), vec!["5".into()]),
             ]),
-            links: HashMap::from([("/proc/42/fd/5".into(), "socket:[555555]".into())]),
+            links: HashMap::from([
+                ("/proc/42/fd/5".into(), "socket:[555555]".into()),
+                ("/proc/42/exe".into(), "/bin/busybox".into()),
+            ]),
         };
         let peer: SocketAddr = "[::1]:80".parse().unwrap();
         assert_eq!(
@@ -377,6 +523,8 @@ mod tests {
             Some(PeerProcess {
                 pid: 42,
                 name: "busybox".into(),
+                exe: Some("/bin/busybox".into()),
+                ancestors: vec![],
             })
         );
     }

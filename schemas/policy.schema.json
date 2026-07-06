@@ -288,6 +288,16 @@
       "description": "A single first-match-wins route rule.",
       "type": "object",
       "properties": {
+        "binaries": {
+          "description": "Restrict this rule to connections initiated by specific binaries.\nWhen omitted, the rule matches any caller. When present, the connecting\nprocess's executable path — or any ancestor's path up to `init` — must\nequal one of the listed absolute paths (e.g. `/usr/bin/curl`). Paths are\nmatched against the kernel-resolved `/proc/<pid>/exe` target, so list the\ncanonical binary path, not a symlink or PATH shim.\n\nThe filter scopes the whole rule regardless of `verdict`: a rule whose\nhost matches but whose binary filter excludes the caller fails closed —\nthe connection is denied rather than falling through to the default\naction. On a `deny` rule this means every caller reaching the host is\ndenied (the listed binaries by verdict, the rest by fail-closed), so\n`binaries` is only meaningful on `allow` rules.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
         "description": {
           "description": "Human-readable description of this rule.",
           "type": [
