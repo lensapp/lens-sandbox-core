@@ -7,7 +7,9 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
-use crate::routing::{RouteRule, Scheme, Transport, Verdict, find_matching_route};
+use crate::routing::{
+    HttpRule, RouteOutcome, RouteRule, Scheme, Transport, Verdict, find_matching_route,
+};
 use crate::sock_mark;
 use crate::transparent::{self, Protocol};
 
@@ -447,6 +449,42 @@ async fn handle_connection(
     }
 }
 
+/// The effective policy decision for a target: `(verdict, transport,
+/// tls_terminate, http_rules)`.
+type RouteDecision = (Verdict, Transport, bool, Vec<HttpRule>);
+
+/// Resolve `host` against the route table for `caller`, collapsing the
+/// lock-guarded lookup the three proxy handlers share. Returns the effective
+/// decision — falling back to the default verdict/transport on a plain host
+/// miss — or `None` when a host-matching rule's `binaries` filter excluded the
+/// caller, which the handler must fail closed.
+fn resolve_route(
+    state: &Arc<ProxyState>,
+    host: &str,
+    scheme: Scheme,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> Option<RouteDecision> {
+    let routes = state.routes.read().unwrap();
+    let default_verdict = *state.default_verdict.read().unwrap();
+    let default_transport = *state.default_transport.read().unwrap();
+    match find_matching_route(&routes, host, scheme, caller) {
+        RouteOutcome::Matched(rule) => Some((
+            rule.verdict,
+            rule.transport,
+            rule.tls_terminate,
+            rule.http_rules.clone(),
+        )),
+        RouteOutcome::NoMatch {
+            binary_filtered: false,
+        } => Some((default_verdict, default_transport, false, Vec::new())),
+        // Host matched but the rule's `binaries` filter excluded the caller:
+        // fail closed rather than fall through to the default action.
+        RouteOutcome::NoMatch {
+            binary_filtered: true,
+        } => None,
+    }
+}
+
 /// Handle an HTTP forward proxy request (plain HTTP, not CONNECT).
 ///
 /// The client sent something like `GET http://host:port/path HTTP/1.1`.
@@ -486,18 +524,29 @@ async fn handle_http_forward(
 
     // Find the matching route rule (same logic as CONNECT, but scheme is http
     // since the request came in as an absolute-form http:// URL).
-    let (verdict, transport, _tls_terminate, domain_http_rules) = {
-        let routes = state.routes.read().unwrap();
-        let default_verdict = *state.default_verdict.read().unwrap();
-        let default_transport = *state.default_transport.read().unwrap();
-        match find_matching_route(&routes, target_host, Scheme::Http) {
-            Some(rule) => (
-                rule.verdict,
-                rule.transport,
-                rule.tls_terminate,
-                rule.http_rules.clone(),
-            ),
-            None => (default_verdict, default_transport, false, Vec::new()),
+    let (verdict, transport, _tls_terminate, domain_http_rules) = match resolve_route(
+        state,
+        target_host,
+        Scheme::Http,
+        actor.process(),
+    ) {
+        Some(decision) => decision,
+        None => {
+            tracing::info!(target = %target_host, method = %method, "HTTP forward proxy DENIED (binary not allowed)");
+            emit_policy_deny_http(
+                state,
+                target_host,
+                method,
+                &path,
+                "binary-not-allowed",
+                actor,
+            );
+            client
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await?;
+            return Ok(());
         }
     };
 
@@ -511,7 +560,7 @@ async fn handle_http_forward(
             path = %normalized_path,
             "HTTP forward proxy request denied by policy rules"
         );
-        emit_policy_deny_http(state, target_host, method, &path, actor);
+        emit_policy_deny_http(state, target_host, method, &path, "policy-deny", actor);
         client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
             .await?;
@@ -552,7 +601,7 @@ async fn handle_http_forward(
                 path = %rw_normalized,
                 "HTTP forward proxy request denied after URI placeholder rewrite"
             );
-            emit_policy_deny_http(state, target_host, method, &path, actor);
+            emit_policy_deny_http(state, target_host, method, &path, "policy-deny", actor);
             client
                 .write_all(
                     b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
@@ -572,7 +621,7 @@ async fn handle_http_forward(
                 )
                 .await?;
             tracing::info!(target = %target_host, method = %method, "HTTP forward proxy DENIED");
-            emit_policy_deny_http(state, target_host, method, &path, actor);
+            emit_policy_deny_http(state, target_host, method, &path, "policy-deny", actor);
             return Ok(());
         }
         Verdict::Ask => {
@@ -771,20 +820,16 @@ async fn handle_connect(
 
     // Find the matching route rule (first match wins, preserving order/specificity).
     // CONNECT is always HTTPS — plain HTTP uses the absolute-form forward path.
-    let (verdict, transport, tls_terminate, domain_http_rules) = {
-        let routes = state.routes.read().unwrap();
-        let default_verdict = *state.default_verdict.read().unwrap();
-        let default_transport = *state.default_transport.read().unwrap();
-        match find_matching_route(&routes, target_host, Scheme::Https) {
-            Some(rule) => (
-                rule.verdict,
-                rule.transport,
-                rule.tls_terminate,
-                rule.http_rules.clone(),
-            ),
-            None => (default_verdict, default_transport, false, Vec::new()),
-        }
-    };
+    let (verdict, transport, tls_terminate, domain_http_rules) =
+        match resolve_route(state, target_host, Scheme::Https, actor.process()) {
+            Some(decision) => decision,
+            None => {
+                client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                tracing::info!(target = %target_host, "proxy DENIED (binary not allowed)");
+                emit_policy_deny_connect(state, target_host, "binary-not-allowed", actor);
+                return Ok(());
+            }
+        };
 
     let hostname = extract_hostname(target_host);
 
@@ -798,7 +843,7 @@ async fn handle_connect(
         Verdict::Deny => {
             client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
             tracing::info!(target = %target_host, "proxy DENIED");
-            emit_policy_deny_connect(state, target_host, actor);
+            emit_policy_deny_connect(state, target_host, "policy-deny", actor);
             return Ok(());
         }
         Verdict::Ask => {
@@ -1167,24 +1212,24 @@ async fn handle_transparent_tls(
         return Ok(());
     }
 
-    let (verdict, transport, _tls_terminate, domain_http_rules) = {
-        let routes = state.routes.read().unwrap();
-        let default_verdict = *state.default_verdict.read().unwrap();
-        let default_transport = *state.default_transport.read().unwrap();
-        match find_matching_route(&routes, &target_host, Scheme::Https) {
-            Some(rule) => (
-                rule.verdict,
-                rule.transport,
-                rule.tls_terminate,
-                rule.http_rules.clone(),
-            ),
-            None => (default_verdict, default_transport, false, Vec::new()),
+    let (verdict, transport, _tls_terminate, domain_http_rules) = match resolve_route(
+        state,
+        &target_host,
+        Scheme::Https,
+        actor.process(),
+    ) {
+        Some(decision) => decision,
+        None => {
+            tracing::info!(target = %target_host, "transparent TLS DENIED (binary not allowed)");
+            emit_policy_deny_connect(state, &target_host, "binary-not-allowed", &actor);
+            drop(start);
+            return Ok(());
         }
     };
 
     let effective_transport = match verdict {
         Verdict::Deny => {
-            emit_policy_deny_connect(state, &target_host, &actor);
+            emit_policy_deny_connect(state, &target_host, "policy-deny", &actor);
             drop(start);
             return Ok(());
         }
@@ -1617,12 +1662,14 @@ fn emit_audit_action_with_metadata(
     }
 }
 
-/// Audit a CONNECT denied by policy. Carries `metadata.reason="policy-deny"`
-/// so the relay daemon can surface it to the developer as an Allow/Skip
-/// notification rather than letting it disappear into the audit log.
+/// Audit a CONNECT denied by policy. `reason` (`policy-deny` for a verdict
+/// deny, `binary-not-allowed` for a `binaries`-filter miss) rides in
+/// `metadata.reason` so the relay daemon can surface it to the developer as an
+/// Allow/Skip notification rather than letting it disappear into the audit log.
 fn emit_policy_deny_connect(
     state: &Arc<ProxyState>,
     target_host: &str,
+    reason: &str,
     actor: &crate::peer_process::ActorContext,
 ) {
     let host = extract_hostname(target_host);
@@ -1630,7 +1677,7 @@ fn emit_policy_deny_connect(
         state,
         "failure",
         403,
-        Some(serde_json::json!({"reason": "policy-deny"})),
+        Some(serde_json::json!({ "reason": reason })),
         RequestFacts {
             action: &format!("CONNECT {target_host}"),
             method: "CONNECT",
@@ -1641,13 +1688,14 @@ fn emit_policy_deny_connect(
     );
 }
 
-/// Audit an HTTP forward request denied by policy. Same metadata as
+/// Audit an HTTP forward request denied by policy. `reason` semantics match
 /// emit_policy_deny_connect.
 fn emit_policy_deny_http(
     state: &Arc<ProxyState>,
     target_host: &str,
     method: &str,
     path: &str,
+    reason: &str,
     actor: &crate::peer_process::ActorContext,
 ) {
     let host = extract_hostname(target_host);
@@ -1655,7 +1703,7 @@ fn emit_policy_deny_http(
         state,
         "failure",
         403,
-        Some(serde_json::json!({"reason": "policy-deny"})),
+        Some(serde_json::json!({ "reason": reason })),
         RequestFacts {
             action: &format!("{method} http://{target_host}{path}"),
             method,
@@ -2333,7 +2381,7 @@ pub(crate) mod tests {
     #[test]
     fn emit_policy_deny_connect_carries_reason_metadata() {
         let (state, mut rx) = test_state();
-        emit_policy_deny_connect(&state, "evil.example.com:443", &test_actor());
+        emit_policy_deny_connect(&state, "evil.example.com:443", "policy-deny", &test_actor());
 
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -2346,9 +2394,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn resolve_route_fails_closed_when_the_binaries_filter_excludes_the_caller() {
+        let (state, _rx) = test_state();
+        // One rule, matching the host but only for /usr/bin/curl.
+        *state.routes.write().unwrap() = vec![crate::routing::RouteRule {
+            matcher: crate::routing::RouteMatcher::Domain("api.openai.com".to_string()),
+            verdict: Verdict::Allow,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+        }];
+
+        let curl = crate::peer_process::PeerProcess {
+            pid: 100,
+            name: "curl".to_string(),
+            exe: Some(std::path::PathBuf::from("/usr/bin/curl")),
+            ancestors: Vec::new(),
+        };
+        let wget = crate::peer_process::PeerProcess {
+            pid: 101,
+            name: "wget".to_string(),
+            exe: Some(std::path::PathBuf::from("/usr/bin/wget")),
+            ancestors: Vec::new(),
+        };
+
+        // The allowed binary resolves to the rule's Allow verdict.
+        let (verdict, ..) =
+            resolve_route(&state, "api.openai.com:443", Scheme::Https, Some(&curl)).unwrap();
+        assert_eq!(verdict, Verdict::Allow);
+
+        // A different binary matches the host but not the filter: the handler
+        // sees None and must fail closed, not fall through to the default. Each
+        // handler turns this None into a 403 audited `binary-not-allowed`.
+        assert!(
+            resolve_route(&state, "api.openai.com:443", Scheme::Https, Some(&wget)).is_none(),
+            "an excluded caller must not fall through to the default verdict",
+        );
+    }
+
+    #[test]
     fn emit_policy_deny_http_carries_reason_metadata() {
         let (state, mut rx) = test_state();
-        emit_policy_deny_http(&state, "evil.example.com", "GET", "/x", &test_actor());
+        emit_policy_deny_http(
+            &state,
+            "evil.example.com",
+            "GET",
+            "/x",
+            "policy-deny",
+            &test_actor(),
+        );
 
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -2361,7 +2457,14 @@ pub(crate) mod tests {
     #[test]
     fn emit_policy_deny_http_stamps_the_client_endpoint() {
         let (state, mut rx) = test_state();
-        emit_policy_deny_http(&state, "evil.example.com", "GET", "/x", &test_actor());
+        emit_policy_deny_http(
+            &state,
+            "evil.example.com",
+            "GET",
+            "/x",
+            "policy-deny",
+            &test_actor(),
+        );
 
         let msg = rx.try_recv().unwrap();
         let event: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -2553,7 +2656,7 @@ pub(crate) mod tests {
             "CONNECT evil.com:443",
             crate::protocol::Decision::DenyOnce,
         );
-        emit_policy_deny_connect(&state, "evil.com:443", &test_actor());
+        emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
 
         assert!(rx.try_recv().is_ok(), "gate-denied failure emits");
         assert!(
@@ -2576,6 +2679,7 @@ pub(crate) mod tests {
                 tls_terminate: false,
                 http_rules: Vec::new(),
                 scheme: None,
+                binaries: None,
             });
     }
 

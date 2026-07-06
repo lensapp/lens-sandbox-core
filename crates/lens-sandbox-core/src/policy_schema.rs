@@ -136,6 +136,22 @@ pub struct RouteRule {
     /// When absent or empty, all HTTP requests to this destination are allowed.
     #[serde(default)]
     pub rules: Vec<HttpRule>,
+
+    /// Restrict this rule to connections initiated by specific binaries.
+    /// When omitted, the rule matches any caller. When present, the connecting
+    /// process's executable path — or any ancestor's path up to `init` — must
+    /// equal one of the listed absolute paths (e.g. `/usr/bin/curl`). Paths are
+    /// matched against the kernel-resolved `/proc/<pid>/exe` target, so list the
+    /// canonical binary path, not a symlink or PATH shim.
+    ///
+    /// The filter scopes the whole rule regardless of `verdict`: a rule whose
+    /// host matches but whose binary filter excludes the caller fails closed —
+    /// the connection is denied rather than falling through to the default
+    /// action. On a `deny` rule this means every caller reaching the host is
+    /// denied (the listed binaries by verdict, the rest by fail-closed), so
+    /// `binaries` is only meaningful on `allow` rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binaries: Option<Vec<String>>,
 }
 
 /// HTTP method/path restriction within a route rule.

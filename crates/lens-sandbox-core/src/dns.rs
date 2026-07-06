@@ -412,6 +412,7 @@ mod tests {
             tls_terminate: false,
             http_rules: Vec::new(),
             scheme: None,
+            binaries: None,
         }
     }
 
@@ -452,6 +453,7 @@ mod tests {
             tls_terminate: false,
             http_rules: Vec::new(),
             scheme: None,
+            binaries: None,
         }]);
         let packet = make_query("127.0.0.1.nip.io", RecordType::A);
         match classify_query(&packet, &state) {
@@ -545,6 +547,7 @@ mod tests {
             tls_terminate: false,
             http_rules: Vec::new(),
             scheme: None,
+            binaries: None,
         }]);
         state
             .gate_resolved_hosts
@@ -674,6 +677,7 @@ mod tests {
                 tls_terminate: false,
                 http_rules: Vec::new(),
                 scheme: None,
+                binaries: None,
             },
             RouteRule {
                 matcher: RouteMatcher::Domain("*.example.com".to_string()),
@@ -682,6 +686,7 @@ mod tests {
                 tls_terminate: false,
                 http_rules: Vec::new(),
                 scheme: None,
+                binaries: None,
             },
         ]);
         let packet = make_query("evil.example.com", RecordType::A);
@@ -725,6 +730,7 @@ mod tests {
             tls_terminate: false,
             http_rules: Vec::new(),
             scheme: None,
+            binaries: None,
         }]);
         let packet = make_query("evil.example", RecordType::A);
         assert!(matches!(
@@ -747,6 +753,7 @@ mod tests {
             tls_terminate: false,
             http_rules: Vec::new(),
             scheme: None,
+            binaries: None,
         }]);
         let packet = make_query("ask.example", RecordType::A);
         assert!(matches!(
@@ -769,6 +776,7 @@ mod tests {
             tls_terminate: false,
             http_rules: Vec::new(),
             scheme: None,
+            binaries: None,
         }]);
         let packet = make_query("10.1.2.3", RecordType::A);
         assert!(matches!(

@@ -2,6 +2,8 @@
 //! sandbox proxy. Parses the policy JSON into `RouteRule`s and resolves a
 //! CONNECT target (plus optional HTTP method/path) to an action.
 
+use std::path::PathBuf;
+
 use ipnet::IpNet;
 
 pub use crate::policy_schema::{HttpRule, Scheme, Transport, Verdict};
@@ -21,6 +23,12 @@ pub struct RouteRule {
     /// Restrict this rule to a specific scheme; `None` means the rule matches
     /// both `http` and `https` requests.
     pub scheme: Option<Scheme>,
+    /// Restrict this rule to callers whose exe (or an ancestor) is one of these
+    /// absolute paths, matched against the kernel-resolved `/proc/<pid>/exe`
+    /// target (a canonical path, not a symlink or shim). `None` matches any
+    /// caller; see [`find_matching_route`] for the fail-closed semantics of a
+    /// host match that the filter excludes.
+    pub binaries: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +114,10 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             })
             .collect();
 
+        let binaries = raw
+            .binaries
+            .map(|paths| paths.into_iter().map(PathBuf::from).collect());
+
         Ok(RouteRule {
             matcher,
             verdict,
@@ -113,6 +125,7 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             tls_terminate: raw.tls_terminate,
             http_rules,
             scheme: raw.scheme,
+            binaries,
         })
     }
 }
@@ -191,15 +204,34 @@ pub(crate) fn hostname_match(routes: &[RouteRule], hostname: &str) -> HostnameMa
     HostnameMatch::Unmatched
 }
 
-/// Match a host:port target against the route rules. Returns the first matching
-/// rule reference, or `None` if nothing matches. Rules with a `scheme` filter
-/// only match requests with the same scheme as the provided `request_scheme`;
-/// rules without a scheme filter match both `http` and `https` requests.
+/// Outcome of resolving a connection's destination against the route table.
+/// Distinguishes a plain host miss from a host match that a rule's `binaries`
+/// filter excluded, so the proxy can fail that case closed instead of leaking
+/// it through the default action.
+#[derive(Debug)]
+pub enum RouteOutcome<'a> {
+    /// A rule matched host, scheme, and (if present) its binary filter.
+    Matched(&'a RouteRule),
+    /// No rule matched. `binary_filtered` is true when at least one rule matched
+    /// host and scheme but its `binaries` filter excluded the caller.
+    NoMatch { binary_filtered: bool },
+}
+
+/// Match a host:port target against the route rules. Rules with a `scheme`
+/// filter only match requests with the same scheme as `request_scheme`; rules
+/// without one match both `http` and `https`.
+///
+/// When a rule carries a `binaries` filter, `caller` (the connecting exe plus
+/// its ancestor chain) must include one of the listed paths. Without caller
+/// info — non-Linux, an already-closed socket, or a `/proc` read failure — a
+/// binary-filtered rule never matches, and the miss is reported as
+/// `binary_filtered` so the proxy fails closed.
 pub fn find_matching_route<'a>(
     routes: &'a [RouteRule],
     host: &str,
     request_scheme: Scheme,
-) -> Option<&'a RouteRule> {
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> RouteOutcome<'a> {
     let hostname = if host.starts_with('[') {
         host.split(']')
             .next()
@@ -209,6 +241,7 @@ pub fn find_matching_route<'a>(
         host.split(':').next().unwrap_or(host)
     };
 
+    let mut binary_filtered = false;
     for rule in routes {
         if let Some(required) = rule.scheme
             && required != request_scheme
@@ -226,15 +259,47 @@ pub fn find_matching_route<'a>(
                 domain_matches(pattern_host, &target_hostname) && *pattern_port == target_port
             }
         };
-        if matched {
-            return Some(rule);
+        if !matched {
+            continue;
         }
+        if binary_filter_matches(rule, caller) {
+            return RouteOutcome::Matched(rule);
+        }
+        // Host+scheme matched but the binary filter excluded the caller. Keep
+        // scanning for another rule, but remember the exclusion so the proxy
+        // fails closed instead of leaking through the default action.
+        binary_filtered = true;
     }
-    None
+    RouteOutcome::NoMatch { binary_filtered }
 }
 
-/// Match a host:port target against the route rules. Returns the matched route
-/// config for the first matching rule, or defaults if nothing matches.
+/// Check a rule's `binaries` filter against the caller. Returns `true` when the
+/// rule has no filter (any caller allowed) or when the caller's exe or an
+/// ancestor is one of the listed paths. Returns `false` — fail closed — when
+/// the filter is present but caller info is missing.
+fn binary_filter_matches(
+    rule: &RouteRule,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> bool {
+    let Some(allowed) = rule.binaries.as_deref() else {
+        return true;
+    };
+    let Some(caller) = caller else {
+        return false;
+    };
+    caller
+        .binary_paths()
+        .any(|candidate| allowed.iter().any(|p| p.as_path() == candidate))
+}
+
+/// Match a host:port target against the route rules. Binary-filtered rules
+/// never match here — there is no caller to check — so they fall through to the
+/// supplied defaults, exactly as a plain host miss does. Returns the matched
+/// route config for the first matching rule, or the defaults otherwise. This is
+/// a caller-agnostic convenience: the live proxy calls [`find_matching_route`]
+/// with the resolved caller so the binary filter applies. Prefer that path when
+/// caller identity is available; reach for this only when it is not, or does not
+/// matter.
 pub fn match_route(
     routes: &[RouteRule],
     host: &str,
@@ -242,18 +307,17 @@ pub fn match_route(
     default_verdict: Verdict,
     default_transport: Transport,
 ) -> MatchedRoute {
-    if let Some(rule) = find_matching_route(routes, host, request_scheme) {
-        MatchedRoute {
+    match find_matching_route(routes, host, request_scheme, None) {
+        RouteOutcome::Matched(rule) => MatchedRoute {
             verdict: rule.verdict,
             transport: rule.transport,
             tls_terminate: rule.tls_terminate,
-        }
-    } else {
-        MatchedRoute {
+        },
+        RouteOutcome::NoMatch { .. } => MatchedRoute {
             verdict: default_verdict,
             transport: default_transport,
             tls_terminate: false,
-        }
+        },
     }
 }
 
@@ -1689,7 +1753,11 @@ mod tests {
         let parsed = parse_proxy_routes(&val).unwrap();
         let routes: Vec<RouteRule> = parsed.into_iter().map(|p| p.rule).collect();
 
-        let matched = find_matching_route(&routes, "api.github.com:443", Scheme::Https).unwrap();
+        let matched = match find_matching_route(&routes, "api.github.com:443", Scheme::Https, None)
+        {
+            RouteOutcome::Matched(rule) => rule,
+            other => panic!("expected Matched, got {other:?}"),
+        };
         // Should get the exact match's rules (GET /api/v1/*), not the wildcard's
         assert_eq!(matched.http_rules.len(), 1);
         assert_eq!(matched.http_rules[0].method.as_deref(), Some("GET"));
@@ -1707,5 +1775,146 @@ mod tests {
             "GET",
             "/api/v1/repos"
         ));
+    }
+
+    // --- binaries filter ---
+
+    fn routes_from(json: &str) -> Vec<RouteRule> {
+        let val: serde_json::Value = serde_json::from_str(json).unwrap();
+        parse_proxy_routes(&val)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.rule)
+            .collect()
+    }
+
+    fn caller(exe: &str, ancestors: &[&str]) -> crate::peer_process::PeerProcess {
+        crate::peer_process::PeerProcess {
+            pid: 1234,
+            name: exe.rsplit('/').next().unwrap_or(exe).to_string(),
+            exe: Some(exe.into()),
+            ancestors: ancestors.iter().map(Into::into).collect(),
+        }
+    }
+
+    #[test]
+    fn binaries_absent_matches_any_caller() {
+        let routes = routes_from(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct"}]"#,
+        );
+        let c = caller("/usr/bin/curl", &[]);
+        assert!(matches!(
+            find_matching_route(&routes, "api.github.com:443", Scheme::Https, Some(&c)),
+            RouteOutcome::Matched(_)
+        ));
+    }
+
+    #[test]
+    fn binaries_filter_matches_exe() {
+        let routes = routes_from(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/curl"]}]"#,
+        );
+        let c = caller("/usr/bin/curl", &["/usr/bin/bash"]);
+        assert!(matches!(
+            find_matching_route(&routes, "api.github.com:443", Scheme::Https, Some(&c)),
+            RouteOutcome::Matched(_)
+        ));
+    }
+
+    #[test]
+    fn binaries_filter_matches_ancestor() {
+        // claude spawns node which opens the socket; the rule names claude.
+        let routes = routes_from(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/local/bin/claude"]}]"#,
+        );
+        let c = caller("/usr/bin/node", &["/usr/local/bin/claude", "/usr/bin/bash"]);
+        assert!(matches!(
+            find_matching_route(&routes, "api.github.com:443", Scheme::Https, Some(&c)),
+            RouteOutcome::Matched(_)
+        ));
+    }
+
+    #[test]
+    fn binaries_filter_excludes_unrelated_caller() {
+        let routes = routes_from(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/curl"]}]"#,
+        );
+        let c = caller("/usr/bin/wget", &["/usr/bin/bash"]);
+        assert!(matches!(
+            find_matching_route(&routes, "api.github.com:443", Scheme::Https, Some(&c)),
+            RouteOutcome::NoMatch {
+                binary_filtered: true
+            }
+        ));
+    }
+
+    #[test]
+    fn binaries_filter_fails_closed_without_caller() {
+        // No resolved caller (non-Linux, closed socket, /proc failure): a
+        // binary-filtered rule must not match.
+        let routes = routes_from(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/curl"]}]"#,
+        );
+        assert!(matches!(
+            find_matching_route(&routes, "api.github.com:443", Scheme::Https, None),
+            RouteOutcome::NoMatch {
+                binary_filtered: true
+            }
+        ));
+    }
+
+    #[test]
+    fn binaries_filter_falls_through_to_a_later_rule() {
+        // First rule restricts to curl; a wget caller skips it and matches the
+        // later wildcard deny — first-match semantics still hold.
+        let routes = routes_from(
+            r#"[
+                {"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/curl"]},
+                {"match": "*.github.com", "verdict": "deny", "transport": "direct"}
+            ]"#,
+        );
+        let c = caller("/usr/bin/wget", &[]);
+        match find_matching_route(&routes, "api.github.com:443", Scheme::Https, Some(&c)) {
+            RouteOutcome::Matched(rule) => assert_eq!(rule.verdict, Verdict::Deny),
+            other => panic!("expected Matched(deny), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_miss_reports_binary_filtered_false() {
+        let routes = routes_from(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/curl"]}]"#,
+        );
+        let c = caller("/usr/bin/curl", &[]);
+        assert!(matches!(
+            find_matching_route(&routes, "elsewhere.com:443", Scheme::Https, Some(&c)),
+            RouteOutcome::NoMatch {
+                binary_filtered: false
+            }
+        ));
+    }
+
+    #[test]
+    fn binaries_field_parses_into_pathbufs() {
+        let routes = routes_from(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/curl", "/usr/local/bin/claude"]}]"#,
+        );
+        assert_eq!(
+            routes[0].binaries.as_deref(),
+            Some(
+                [
+                    PathBuf::from("/usr/bin/curl"),
+                    PathBuf::from("/usr/local/bin/claude"),
+                ]
+                .as_slice()
+            )
+        );
     }
 }
