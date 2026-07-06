@@ -3,14 +3,17 @@
 //!
 //! nftables REDIRECTs `meta mark != MARK_VALUE` UDP/53 traffic to this listener
 //! (`127.0.0.1:5355` by default). For each query we parse the first question,
-//! match its QNAME against `ProxyState.routes` via `routing::hostname_match`
-//! (Domain and HostPort matchers; wildcards supported; CIDR matchers are
-//! intentionally excluded — a bare IP literal is not a legitimate QNAME and
-//! allowing it would leak CIDR policy to the upstream resolver. IP-based
-//! access is still enforced at the TCP layer). Explicit `Deny` rules take
-//! first-match precedence, same as `find_matching_route`. The stub then
-//! either forwards allowed queries upstream or responds with NXDOMAIN +
-//! a deny audit event.
+//! match its QNAME against `ProxyState.routes` via
+//! `routing::hostname_match_for_caller` (Domain and HostPort matchers;
+//! wildcards supported; CIDR matchers are intentionally excluded — a bare IP
+//! literal is not a legitimate QNAME and allowing it would leak CIDR policy to
+//! the upstream resolver. IP-based access is still enforced at the TCP layer).
+//! Explicit `Deny` rules take first-match precedence, same as
+//! `find_matching_route`. When a route carries a `binaries` filter we resolve
+//! the querying process (best-effort, via `/proc`) so a name reachable only by
+//! other binaries fails closed here, exactly as it would at the TCP layer. The
+//! stub then either forwards allowed queries upstream or responds with
+//! NXDOMAIN + a deny audit event.
 //!
 //! Without this filter, an allow-UDP/53 rule opens a ~50 B/s covert channel
 //! through the upstream resolver (QNAME-encoded exfil, TXT-encoded ingress).
@@ -44,8 +47,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
+use crate::peer_process::{PeerProcess, resolve_udp_offloaded};
 use crate::proxy::{ProxyState, emit_deny_event};
-use crate::routing::{HostnameMatch, hostname_match};
+use crate::routing::{HostnameMatch, hostname_match_for_caller};
 use crate::sock_mark;
 
 /// Receive buffer for incoming DNS *queries*. 1232 is the EDNS0-recommended
@@ -139,7 +143,8 @@ async fn handle_query(
     state: &Arc<ProxyState>,
     upstream: SocketAddr,
 ) {
-    let decision = classify_query(&packet, state);
+    let caller = maybe_resolve_caller(peer, state).await;
+    let decision = classify_query(&packet, state, caller.as_ref());
 
     match decision {
         Decision::Allow { qname } => {
@@ -148,8 +153,8 @@ async fn handle_query(
                 tracing::warn!(qname = %qname, "dns stub upstream error: {e}");
             }
         }
-        Decision::Deny { qname } => {
-            emit_deny(state, &qname);
+        Decision::Deny { qname, reason } => {
+            emit_deny(state, &qname, reason);
             if let Some(resp) = empty_response(&packet, ResponseCode::NXDomain) {
                 let _ = socket.send_to(&resp, peer).await;
             }
@@ -170,14 +175,41 @@ async fn handle_query(
 
 enum Decision {
     Allow { qname: String },
-    Deny { qname: String },
+    Deny { qname: String, reason: &'static str },
     SuppressNodata { qname: String },
     Malformed,
 }
 
+/// Audit reason for a name blocked because no route allows it (or an explicit
+/// `Deny` matched).
+const DENY_REASON: &str = "dns-denied";
+/// Audit reason for a name whose only matching route is scoped to binaries
+/// other than the caller's — the DNS analogue of a `binary_filtered` TCP miss.
+const BINARY_DENY_REASON: &str = "dns-binary-not-allowed";
+
+/// Resolve the querying process, but only when the policy scopes some rule to
+/// specific binaries — otherwise the caller can't change any DNS verdict and
+/// the `/proc` walk is pure cost. The common (no-`binaries`) policy pays
+/// nothing; a policy with binary rules pays one offloaded walk per query, even
+/// for names those rules don't cover, which is an acceptable over-resolution.
+async fn maybe_resolve_caller(peer: SocketAddr, state: &ProxyState) -> Option<PeerProcess> {
+    let has_binary_rule = state
+        .routes
+        .read()
+        .unwrap()
+        .iter()
+        .any(|r| r.binaries.is_some());
+    if !has_binary_rule {
+        return None;
+    }
+    resolve_udp_offloaded(peer).await
+}
+
 /// Parse the request and match its first question against the allowlist.
-/// Split out for direct unit testing — no I/O, no async.
-fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
+/// `caller` is the resolved querying process (see [`maybe_resolve_caller`]),
+/// used to apply a route's `binaries` filter. Split out for direct unit
+/// testing — no I/O, no async.
+fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess>) -> Decision {
     let Ok(msg) = Message::from_vec(packet) else {
         return Decision::Malformed;
     };
@@ -231,12 +263,29 @@ fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
 
     let routes = state.routes.read().unwrap();
     // DNS matches on hostname only (no scheme/port); port- and scheme-aware
-    // enforcement still applies at the subsequent TCP step.
-    let matched = hostname_match(&routes, &normalized);
+    // enforcement still applies at the subsequent TCP step. `caller` applies
+    // any `binaries` filter, so a name reachable only by other binaries fails
+    // closed here just as it would at the TCP layer.
+    let matched = hostname_match_for_caller(&routes, &normalized, caller);
     drop(routes);
     match matched {
         HostnameMatch::Allowed => return allow(normalized),
-        HostnameMatch::Denied => return Decision::Deny { qname: normalized },
+        HostnameMatch::Denied => {
+            return Decision::Deny {
+                qname: normalized,
+                reason: DENY_REASON,
+            };
+        }
+        // A binary-scoped rule matched the name but excluded the caller. Fail
+        // closed with its own reason, and — unlike an unmatched name — do not
+        // consult the JIT-approved set: that set is host-keyed, so honouring it
+        // would let any binary re-open a host once any binary got it approved.
+        HostnameMatch::BinaryDenied => {
+            return Decision::Deny {
+                qname: normalized,
+                reason: BINARY_DENY_REASON,
+            };
+        }
         HostnameMatch::Unmatched => {}
     }
 
@@ -255,7 +304,10 @@ fn classify_query(packet: &[u8], state: &ProxyState) -> Decision {
         return allow(normalized);
     }
 
-    Decision::Deny { qname: normalized }
+    Decision::Deny {
+        qname: normalized,
+        reason: DENY_REASON,
+    }
 }
 
 /// Synthesise an answer-less response with the given code, echoing the
@@ -354,16 +406,17 @@ fn parse_resolv_conf(content: &str) -> Option<SocketAddr> {
     None
 }
 
-fn emit_deny(state: &Arc<ProxyState>, qname: &str) {
-    tracing::info!(qname, "dns stub denied query (not in allowlist)");
-    // `"d:"` key prefix + `"dns-denied"` reason keep DNS denies separate
-    // from the transparent-TCP (`"t:"`) and hostname-keyed CONNECT paths
-    // in the shared dedup map.
+fn emit_deny(state: &Arc<ProxyState>, qname: &str, reason: &str) {
+    tracing::info!(qname, reason, "dns stub denied query");
+    // `"d:"` key prefix keeps DNS denies separate from the transparent-TCP
+    // (`"t:"`) and hostname-keyed CONNECT paths in the shared dedup map. The
+    // reason distinguishes an allowlist miss (`dns-denied`) from a
+    // binary-scoping exclusion (`dns-binary-not-allowed`).
     emit_deny_event(
         state,
         format!("d:{qname}"),
         format!("DNS {qname}"),
-        serde_json::json!({ "dns": true, "reason": "dns-denied", "qname": qname }),
+        serde_json::json!({ "dns": true, "reason": reason, "qname": qname }),
     );
 }
 
@@ -375,6 +428,7 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::domain::Name;
     use hickory_proto::rr::{DNSClass, RecordType};
+    use std::path::PathBuf;
     use std::str::FromStr;
 
     fn make_query(qname: &str, rtype: RecordType) -> Vec<u8> {
@@ -416,6 +470,24 @@ mod tests {
         }
     }
 
+    /// An allow rule for `pattern` scoped to the given absolute exe paths.
+    fn binary_rule(pattern: &str, bins: &[&str]) -> RouteRule {
+        RouteRule {
+            binaries: Some(bins.iter().map(|b| PathBuf::from(*b)).collect()),
+            ..rule(pattern)
+        }
+    }
+
+    /// A resolved caller whose connecting exe is `exe` (no ancestors).
+    fn caller(exe: &str) -> PeerProcess {
+        PeerProcess {
+            pid: 100,
+            name: "proc".into(),
+            exe: Some(PathBuf::from(exe)),
+            ancestors: Vec::new(),
+        }
+    }
+
     #[test]
     fn bootstrap_allowlist_resolves_before_policy_arrives() {
         // Empty routes, but bootstrap allowlist has the Lens Sandbox host — the
@@ -428,14 +500,14 @@ mod tests {
             vec!["host.docker.internal".to_string()],
         );
         let packet = make_query("host.docker.internal", RecordType::A);
-        match classify_query(&packet, &state) {
+        match classify_query(&packet, &state, None) {
             Decision::Allow { qname } => assert_eq!(qname, "host.docker.internal"),
             other => panic!("bootstrap host should resolve, got: {}", describe(&other)),
         }
 
         // Non-bootstrap host with empty routes still denied.
         let packet = make_query("evil.example.com", RecordType::A);
-        match classify_query(&packet, &state) {
+        match classify_query(&packet, &state, None) {
             Decision::Deny { .. } => {}
             other => panic!("non-bootstrap should deny, got: {}", describe(&other)),
         }
@@ -456,7 +528,7 @@ mod tests {
             binaries: None,
         }]);
         let packet = make_query("127.0.0.1.nip.io", RecordType::A);
-        match classify_query(&packet, &state) {
+        match classify_query(&packet, &state, None) {
             Decision::Allow { .. } => {}
             other => panic!(
                 "expected Allow for HostPort pattern, got: {}",
@@ -469,7 +541,7 @@ mod tests {
     fn allow_exact_match() {
         let state = state_with_routes(vec![rule("example.com")]);
         let packet = make_query("example.com", RecordType::A);
-        match classify_query(&packet, &state) {
+        match classify_query(&packet, &state, None) {
             Decision::Allow { qname } => assert_eq!(qname, "example.com"),
             other => panic!("expected Allow, got: {}", describe(&other)),
         }
@@ -479,7 +551,7 @@ mod tests {
     fn allow_wildcard_match() {
         let state = state_with_routes(vec![rule("*.amazonaws.com")]);
         let packet = make_query("sts.us-east-1.amazonaws.com", RecordType::A);
-        match classify_query(&packet, &state) {
+        match classify_query(&packet, &state, None) {
             Decision::Allow { .. } => {}
             other => panic!("wildcard should match, got: {}", describe(&other)),
         }
@@ -489,9 +561,105 @@ mod tests {
     fn deny_unlisted_host() {
         let state = state_with_routes(vec![rule("example.com")]);
         let packet = make_query("evil.com", RecordType::A);
-        match classify_query(&packet, &state) {
-            Decision::Deny { qname } => assert_eq!(qname, "evil.com"),
+        match classify_query(&packet, &state, None) {
+            Decision::Deny { qname, .. } => assert_eq!(qname, "evil.com"),
             other => panic!("expected Deny, got: {}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn binary_scoped_name_resolves_for_the_listed_caller() {
+        let state = state_with_routes(vec![binary_rule("api.example.com", &["/usr/bin/curl"])]);
+        let packet = make_query("api.example.com", RecordType::A);
+        let curl = caller("/usr/bin/curl");
+        match classify_query(&packet, &state, Some(&curl)) {
+            Decision::Allow { qname } => assert_eq!(qname, "api.example.com"),
+            other => panic!("listed caller should resolve, got: {}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn binary_scoped_name_is_denied_for_an_excluded_caller() {
+        let state = state_with_routes(vec![binary_rule("api.example.com", &["/usr/bin/curl"])]);
+        let packet = make_query("api.example.com", RecordType::A);
+        let wget = caller("/usr/bin/wget");
+        match classify_query(&packet, &state, Some(&wget)) {
+            Decision::Deny { qname, reason } => {
+                assert_eq!(qname, "api.example.com");
+                assert_eq!(reason, BINARY_DENY_REASON);
+            }
+            other => panic!(
+                "excluded caller should be denied, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn binary_scoped_name_is_denied_when_the_caller_is_unresolved() {
+        // No caller info (non-Linux, closed socket, `/proc` failure) fails a
+        // binary-scoped name closed, exactly as it does at the TCP layer.
+        let state = state_with_routes(vec![binary_rule("api.example.com", &["/usr/bin/curl"])]);
+        let packet = make_query("api.example.com", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Deny { reason, .. } => assert_eq!(reason, BINARY_DENY_REASON),
+            other => panic!(
+                "unresolved caller should be denied, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn a_gate_approved_host_cannot_reopen_a_binary_scoped_name() {
+        // The JIT-approved set is host-keyed, not caller-keyed. An excluded
+        // caller must not ride a prior approval of the same host back in.
+        let state = state_with_routes(vec![binary_rule("api.example.com", &["/usr/bin/curl"])]);
+        state
+            .gate_resolved_hosts
+            .write()
+            .unwrap()
+            .insert("api.example.com".into());
+        let packet = make_query("api.example.com", RecordType::A);
+        let wget = caller("/usr/bin/wget");
+        match classify_query(&packet, &state, Some(&wget)) {
+            Decision::Deny { reason, .. } => assert_eq!(reason, BINARY_DENY_REASON),
+            other => panic!(
+                "gate must not reopen a scoped name, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn an_aaaa_query_for_an_excluded_caller_is_denied_not_suppressed() {
+        // An excluded caller has no access at all, so AAAA gets NXDOMAIN
+        // (Deny), not the NODATA suppression an allowed caller would see.
+        let state = state_with_routes(vec![binary_rule("api.example.com", &["/usr/bin/curl"])]);
+        let packet = make_query("api.example.com", RecordType::AAAA);
+        let wget = caller("/usr/bin/wget");
+        match classify_query(&packet, &state, Some(&wget)) {
+            Decision::Deny { reason, .. } => assert_eq!(reason, BINARY_DENY_REASON),
+            other => panic!("excluded AAAA should deny, got: {}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn an_unrestricted_name_ignores_the_caller() {
+        // A rule with no `binaries` filter resolves for any caller, and the
+        // presence of a binary rule for a *different* host doesn't affect it.
+        let state = state_with_routes(vec![
+            binary_rule("api.example.com", &["/usr/bin/curl"]),
+            rule("cdn.example.com"),
+        ]);
+        let packet = make_query("cdn.example.com", RecordType::A);
+        let wget = caller("/usr/bin/wget");
+        match classify_query(&packet, &state, Some(&wget)) {
+            Decision::Allow { .. } => {}
+            other => panic!(
+                "unrestricted name should resolve, got: {}",
+                describe(&other)
+            ),
         }
     }
 
@@ -501,7 +669,7 @@ mod tests {
         let state = state_with_routes(vec![]);
         let packet = make_query("example.com", RecordType::A);
         assert!(matches!(
-            classify_query(&packet, &state),
+            classify_query(&packet, &state, None),
             Decision::Deny { .. }
         ));
     }
@@ -518,20 +686,23 @@ mod tests {
             .insert("example.com".to_string());
 
         let a = make_query("example.com", RecordType::A);
-        assert!(matches!(classify_query(&a, &state), Decision::Allow { .. }));
+        assert!(matches!(
+            classify_query(&a, &state, None),
+            Decision::Allow { .. }
+        ));
 
         // AAAA stays suppressed to NODATA so egress remains on the
         // interceptable IPv4 path, exactly as for a route-allowed name.
         let aaaa = make_query("example.com", RecordType::AAAA);
         assert!(matches!(
-            classify_query(&aaaa, &state),
+            classify_query(&aaaa, &state, None),
             Decision::SuppressNodata { .. }
         ));
 
         // A name the gate has not approved still fails closed.
         let other = make_query("not-approved.example", RecordType::A);
         assert!(matches!(
-            classify_query(&other, &state),
+            classify_query(&other, &state, None),
             Decision::Deny { .. }
         ));
     }
@@ -555,7 +726,10 @@ mod tests {
             .unwrap()
             .insert("evil.example".to_string());
         let a = make_query("evil.example", RecordType::A);
-        assert!(matches!(classify_query(&a, &state), Decision::Deny { .. }));
+        assert!(matches!(
+            classify_query(&a, &state, None),
+            Decision::Deny { .. }
+        ));
     }
 
     #[test]
@@ -568,8 +742,11 @@ mod tests {
         let state = state_with_routes(vec![rule("example.com")]);
         let a = make_query("example.com", RecordType::A);
         let aaaa = make_query("example.com", RecordType::AAAA);
-        assert!(matches!(classify_query(&a, &state), Decision::Allow { .. }));
-        match classify_query(&aaaa, &state) {
+        assert!(matches!(
+            classify_query(&a, &state, None),
+            Decision::Allow { .. }
+        ));
+        match classify_query(&aaaa, &state, None) {
             Decision::SuppressNodata { qname } => assert_eq!(qname, "example.com"),
             other => panic!(
                 "AAAA for an allowed name must be suppressed, got: {}",
@@ -586,7 +763,7 @@ mod tests {
         // back to the plain A record the v4 redirect catches.
         let state = state_with_routes(vec![rule("example.com")]);
         let https = make_query("example.com", RecordType::HTTPS);
-        match classify_query(&https, &state) {
+        match classify_query(&https, &state, None) {
             Decision::SuppressNodata { qname } => assert_eq!(qname, "example.com"),
             other => panic!(
                 "HTTPS for an allowed name must be suppressed, got: {}",
@@ -601,7 +778,7 @@ mod tests {
         // address hints; suppress it to NODATA the same way.
         let state = state_with_routes(vec![rule("example.com")]);
         let svcb = make_query("example.com", RecordType::SVCB);
-        match classify_query(&svcb, &state) {
+        match classify_query(&svcb, &state, None) {
             Decision::SuppressNodata { qname } => assert_eq!(qname, "example.com"),
             other => panic!(
                 "SVCB for an allowed name must be suppressed, got: {}",
@@ -618,7 +795,7 @@ mod tests {
         // Force it to NODATA so the client falls back to a typed A query.
         let state = state_with_routes(vec![rule("example.com")]);
         let any = make_query("example.com", RecordType::ANY);
-        match classify_query(&any, &state) {
+        match classify_query(&any, &state, None) {
             Decision::SuppressNodata { qname } => assert_eq!(qname, "example.com"),
             other => panic!(
                 "ANY for an allowed name must be suppressed, got: {}",
@@ -635,8 +812,8 @@ mod tests {
         // the name's existence to the sandbox.
         let state = state_with_routes(vec![rule("example.com")]);
         let aaaa = make_query("evil.com", RecordType::AAAA);
-        match classify_query(&aaaa, &state) {
-            Decision::Deny { qname } => assert_eq!(qname, "evil.com"),
+        match classify_query(&aaaa, &state, None) {
+            Decision::Deny { qname, .. } => assert_eq!(qname, "evil.com"),
             other => panic!(
                 "AAAA for a denied name must Deny, got: {}",
                 describe(&other)
@@ -658,7 +835,7 @@ mod tests {
         );
         let aaaa = make_query("host.docker.internal", RecordType::AAAA);
         assert!(matches!(
-            classify_query(&aaaa, &state),
+            classify_query(&aaaa, &state, None),
             Decision::SuppressNodata { .. }
         ));
     }
@@ -691,13 +868,13 @@ mod tests {
         ]);
         let packet = make_query("evil.example.com", RecordType::A);
         assert!(matches!(
-            classify_query(&packet, &state),
+            classify_query(&packet, &state, None),
             Decision::Deny { .. }
         ));
         // Sanity: non-denied subdomain still allowed by the wildcard.
         let packet = make_query("good.example.com", RecordType::A);
         assert!(matches!(
-            classify_query(&packet, &state),
+            classify_query(&packet, &state, None),
             Decision::Allow { .. }
         ));
     }
@@ -710,8 +887,8 @@ mod tests {
         // into a single audit event.
         let state = state_with_routes(vec![rule("example.com")]);
         let packet = make_query("EVIL.example", RecordType::A);
-        match classify_query(&packet, &state) {
-            Decision::Deny { qname } => assert_eq!(qname, "evil.example"),
+        match classify_query(&packet, &state, None) {
+            Decision::Deny { qname, .. } => assert_eq!(qname, "evil.example"),
             other => panic!("expected Deny, got {}", describe(&other)),
         }
     }
@@ -734,7 +911,7 @@ mod tests {
         }]);
         let packet = make_query("evil.example", RecordType::A);
         assert!(matches!(
-            classify_query(&packet, &state),
+            classify_query(&packet, &state, None),
             Decision::Deny { .. }
         ));
     }
@@ -757,7 +934,7 @@ mod tests {
         }]);
         let packet = make_query("ask.example", RecordType::A);
         assert!(matches!(
-            classify_query(&packet, &state),
+            classify_query(&packet, &state, None),
             Decision::Allow { .. }
         ));
     }
@@ -780,7 +957,7 @@ mod tests {
         }]);
         let packet = make_query("10.1.2.3", RecordType::A);
         assert!(matches!(
-            classify_query(&packet, &state),
+            classify_query(&packet, &state, None),
             Decision::Deny { .. }
         ));
     }
@@ -790,7 +967,7 @@ mod tests {
         let state = state_with_routes(vec![rule("example.com")]);
         let garbage = vec![0u8; 3];
         assert!(matches!(
-            classify_query(&garbage, &state),
+            classify_query(&garbage, &state, None),
             Decision::Malformed
         ));
     }
@@ -802,7 +979,7 @@ mod tests {
         let msg = Message::new(1, MessageType::Query, OpCode::Query);
         let packet = msg.to_vec().unwrap();
         assert!(matches!(
-            classify_query(&packet, &state),
+            classify_query(&packet, &state, None),
             Decision::Malformed
         ));
     }

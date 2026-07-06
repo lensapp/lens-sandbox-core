@@ -168,29 +168,47 @@ pub fn hostname_allowed(routes: &[RouteRule], hostname: &str) -> bool {
 }
 
 /// First-match outcome of matching a DNS QNAME against the route table,
-/// distinguished three ways so a caller can tell an explicit `Deny` apart
-/// from "no rule matched" — the DNS stub falls back to its JIT-approved set
-/// only on the latter. Matching semantics (`Domain`/`HostPort`, CIDR
-/// skipped, `Ask` counts as allowed) are as documented on [`hostname_allowed`].
+/// distinguished so a caller can tell an explicit `Deny`, and a
+/// binary-scoped exclusion, apart from "no rule matched" — the DNS stub
+/// falls back to its JIT-approved set only on the latter. Matching semantics
+/// (`Domain`/`HostPort`, CIDR skipped, `Ask` counts as allowed) are as
+/// documented on [`hostname_allowed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostnameMatch {
-    /// First matching rule permits the lookup (its verdict is not `Deny`).
+    /// First admitting rule permits the lookup (its verdict is not `Deny`).
     Allowed,
-    /// First matching rule is an explicit `Deny`.
+    /// First admitting rule is an explicit `Deny`.
     Denied,
     /// No rule matched the hostname.
     Unmatched,
+    /// A binary-scoped rule matched the hostname but excluded the caller, and
+    /// no later rule admitted it. Fails closed (NXDOMAIN) rather than falling
+    /// back to the JIT-approved set — the DNS analogue of `find_matching_route`
+    /// reporting `binary_filtered`.
+    BinaryDenied,
 }
 
 pub(crate) fn hostname_match(routes: &[RouteRule], hostname: &str) -> HostnameMatch {
+    hostname_match_for_caller(routes, hostname, None)
+}
+
+/// [`hostname_match`] with the caller's identity, applying each rule's
+/// `binaries` filter through the shared [`caller_admits_rule`] helper so the
+/// DNS gate and `find_matching_route` never diverge on binary-scoping (the
+/// no-reopen guard included). Passing `None` fails a binary-scoped host closed,
+/// exactly as an unresolved caller does at the TCP layer.
+pub(crate) fn hostname_match_for_caller(
+    routes: &[RouteRule],
+    hostname: &str,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> HostnameMatch {
     let lower = hostname.to_ascii_lowercase();
+    let mut binary_filtered = false;
     for rule in routes {
-        let matches = match &rule.matcher {
-            RouteMatcher::Domain(pattern) => domain_matches(pattern, &lower),
-            RouteMatcher::HostPort(pattern_host, _) => domain_matches(pattern_host, &lower),
-            RouteMatcher::Cidr(_) => false,
-        };
-        if matches {
+        if !qname_matches_rule(rule, &lower) {
+            continue;
+        }
+        if caller_admits_rule(rule, caller, binary_filtered) {
             // First-match semantics (same as `find_matching_route`): a
             // `Deny evil.example.com` before `Allow *.example.com` denies the
             // lookup for `evil.example.com`, even though the wildcard matches.
@@ -200,8 +218,27 @@ pub(crate) fn hostname_match(routes: &[RouteRule], hostname: &str) -> HostnameMa
                 HostnameMatch::Allowed
             };
         }
+        // A binary-scoped rule matched the hostname but excluded the caller (or
+        // a later unrestricted rule was suppressed). Remember it so the tail
+        // fails closed instead of falling back to the JIT-approved set.
+        binary_filtered = true;
     }
-    HostnameMatch::Unmatched
+    if binary_filtered {
+        HostnameMatch::BinaryDenied
+    } else {
+        HostnameMatch::Unmatched
+    }
+}
+
+/// Whether `rule`'s matcher covers a bare DNS QNAME. `Domain` and `HostPort`
+/// (host part, port ignored) match; `Cidr` never does — a QNAME is a name, not
+/// an IP literal (see [`hostname_allowed`]).
+fn qname_matches_rule(rule: &RouteRule, lower: &str) -> bool {
+    match &rule.matcher {
+        RouteMatcher::Domain(pattern) => domain_matches(pattern, lower),
+        RouteMatcher::HostPort(pattern_host, _) => domain_matches(pattern_host, lower),
+        RouteMatcher::Cidr(_) => false,
+    }
 }
 
 /// Outcome of resolving a connection's destination against the route table.
@@ -268,25 +305,42 @@ pub fn find_matching_route<'a>(
         if !matched {
             continue;
         }
-        if binary_filter_matches(rule, caller) {
-            // Guard against re-opening: once an earlier binary-scoped rule
-            // matched this host but excluded the caller, an unrestricted
-            // `allow`/`ask` rule must not let that caller back in. An explicit
-            // `deny` still applies — it only reinforces the block — and a later
-            // binary-scoped rule that lists the caller (its `binaries` is
-            // `Some`) still matches here.
-            if binary_filtered && rule.binaries.is_none() && rule.verdict != Verdict::Deny {
-                continue;
-            }
+        if caller_admits_rule(rule, caller, binary_filtered) {
             return RouteOutcome::Matched(rule);
         }
-        // Host+scheme matched but the binary filter excluded the caller. Keep
-        // scanning for a later rule that admits it, but remember the exclusion
-        // so the proxy fails closed instead of leaking through the default
-        // action or a broad unrestricted rule.
+        // Host+scheme matched but the binary filter excluded the caller (or a
+        // later unrestricted rule was suppressed). Keep scanning for a later
+        // rule that admits it, but remember the exclusion so the proxy fails
+        // closed instead of leaking through the default action or a broad
+        // unrestricted rule.
         binary_filtered = true;
     }
     RouteOutcome::NoMatch { binary_filtered }
+}
+
+/// Whether a rule that already matched the target admits `caller`, applying the
+/// `binaries` filter and the no-reopen guard. Shared by `find_matching_route`
+/// (TCP) and `hostname_match_for_caller` (DNS) so the two never diverge on
+/// binary-scoping. When it returns `false`, the caller records the exclusion
+/// (`binary_filtered`) and scans on.
+///
+/// `binary_filtered` is the caller's running "an earlier binary-scoped rule
+/// already claimed this target but excluded me" flag; it drives the guard that
+/// stops a later *unrestricted* `allow`/`ask` from re-opening the target.
+fn caller_admits_rule(
+    rule: &RouteRule,
+    caller: Option<&crate::peer_process::PeerProcess>,
+    binary_filtered: bool,
+) -> bool {
+    if !binary_filter_matches(rule, caller) {
+        return false;
+    }
+    // No-reopen: once an earlier binary-scoped rule claimed this target but
+    // excluded the caller, a later *unrestricted* `allow`/`ask` must not let it
+    // back in. An explicit `deny` is never suppressed — it reinforces the
+    // block — and a later binary-scoped rule that lists the caller (its
+    // `binaries` is `Some`) still matches.
+    !(binary_filtered && rule.binaries.is_none() && rule.verdict != Verdict::Deny)
 }
 
 /// Check a rule's `binaries` filter against the caller. Returns `true` when the
@@ -2043,6 +2097,77 @@ mod tests {
                 ]
                 .as_slice()
             )
+        );
+    }
+
+    #[test]
+    fn hostname_match_for_caller_admits_the_listed_caller() {
+        let routes = routes_from(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/curl"]}]"#,
+        );
+        let curl = caller("/usr/bin/curl", &[]);
+        assert_eq!(
+            hostname_match_for_caller(&routes, "api.github.com", Some(&curl)),
+            HostnameMatch::Allowed
+        );
+    }
+
+    #[test]
+    fn hostname_match_for_caller_reports_binary_denied_for_an_excluded_caller() {
+        let routes = routes_from(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/curl"]}]"#,
+        );
+        let wget = caller("/usr/bin/wget", &[]);
+        assert_eq!(
+            hostname_match_for_caller(&routes, "api.github.com", Some(&wget)),
+            HostnameMatch::BinaryDenied
+        );
+        // No caller info fails closed the same way.
+        assert_eq!(
+            hostname_match_for_caller(&routes, "api.github.com", None),
+            HostnameMatch::BinaryDenied
+        );
+    }
+
+    #[test]
+    fn hostname_match_for_caller_does_not_reopen_a_binary_scoped_host() {
+        // Mirrors the TCP no-reopen guard at the DNS layer: a later unrestricted
+        // allow must not resolve the name for an excluded caller.
+        let routes = routes_from(
+            r#"[
+                {"match": "registry.npmjs.org", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/local/bin/npm"]},
+                {"match": "*.npmjs.org", "verdict": "allow", "transport": "direct"}
+            ]"#,
+        );
+        let curl = caller("/usr/bin/curl", &[]);
+        assert_eq!(
+            hostname_match_for_caller(&routes, "registry.npmjs.org", Some(&curl)),
+            HostnameMatch::BinaryDenied
+        );
+        let npm = caller("/usr/local/bin/npm", &[]);
+        assert_eq!(
+            hostname_match_for_caller(&routes, "registry.npmjs.org", Some(&npm)),
+            HostnameMatch::Allowed
+        );
+    }
+
+    #[test]
+    fn hostname_match_for_caller_still_honours_a_later_deny() {
+        // An explicit deny is never suppressed by the no-reopen guard.
+        let routes = routes_from(
+            r#"[
+                {"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/git"]},
+                {"match": "*.github.com", "verdict": "deny", "transport": "direct"}
+            ]"#,
+        );
+        let curl = caller("/usr/bin/curl", &[]);
+        assert_eq!(
+            hostname_match_for_caller(&routes, "api.github.com", Some(&curl)),
+            HostnameMatch::Denied
         );
     }
 }

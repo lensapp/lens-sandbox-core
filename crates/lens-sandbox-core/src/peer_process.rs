@@ -157,12 +157,35 @@ impl ProcReader for RealProc {
     }
 }
 
-pub fn resolve(peer: SocketAddr) -> Option<PeerProcess> {
-    resolve_with(&RealProc, peer)
+/// Which `/proc/net` table holds the peer's socket. The transparent and
+/// CONNECT proxies own TCP sockets; the DNS stub receives UDP datagrams.
+#[derive(Clone, Copy)]
+enum Proto {
+    Tcp,
+    Udp,
 }
 
-fn resolve_with<P: ProcReader>(proc: &P, peer: SocketAddr) -> Option<PeerProcess> {
-    let inode = socket_inode_for(proc, peer)?;
+/// Resolve the process behind a TCP peer (transparent/CONNECT proxy path).
+pub fn resolve(peer: SocketAddr) -> Option<PeerProcess> {
+    resolve_with(&RealProc, peer, Proto::Tcp)
+}
+
+/// Resolve the process behind a UDP peer (the DNS stub path).
+fn resolve_udp(peer: SocketAddr) -> Option<PeerProcess> {
+    resolve_with(&RealProc, peer, Proto::Udp)
+}
+
+/// [`resolve_udp`] on a blocking thread, for async callers (the DNS stub). The
+/// `/proc` walk is synchronous filesystem I/O, so offloading keeps the stub's
+/// tokio worker free. A panicking task degrades to `None` — fail closed.
+pub(crate) async fn resolve_udp_offloaded(peer: SocketAddr) -> Option<PeerProcess> {
+    tokio::task::spawn_blocking(move || resolve_udp(peer))
+        .await
+        .unwrap_or(None)
+}
+
+fn resolve_with<P: ProcReader>(proc: &P, peer: SocketAddr, proto: Proto) -> Option<PeerProcess> {
+    let inode = socket_inode_for(proc, peer, proto)?;
     let pid = pid_owning_inode(proc, inode)?;
     Some(PeerProcess {
         name: process_name(proc, pid).unwrap_or_default(),
@@ -172,19 +195,34 @@ fn resolve_with<P: ProcReader>(proc: &P, peer: SocketAddr) -> Option<PeerProcess
     })
 }
 
-fn socket_inode_for<P: ProcReader>(proc: &P, peer: SocketAddr) -> Option<u64> {
-    let path = if peer.is_ipv6() {
-        "/proc/net/tcp6"
-    } else {
-        "/proc/net/tcp"
+fn socket_inode_for<P: ProcReader>(proc: &P, peer: SocketAddr, proto: Proto) -> Option<u64> {
+    let path = match (proto, peer.is_ipv6()) {
+        (Proto::Tcp, false) => "/proc/net/tcp",
+        (Proto::Tcp, true) => "/proc/net/tcp6",
+        (Proto::Udp, false) => "/proc/net/udp",
+        (Proto::Udp, true) => "/proc/net/udp6",
     };
     let table = proc.read(path).ok()?;
-    table
-        .lines()
-        .skip(1)
-        .filter_map(parse_row)
-        .find(|(local, _)| *local == peer)
-        .map(|(_, inode)| inode)
+    let rows: Vec<(SocketAddr, u64)> = table.lines().skip(1).filter_map(parse_row).collect();
+    if let Some((_, inode)) = rows.iter().find(|(local, _)| *local == peer) {
+        return Some(*inode);
+    }
+    // An unconnected UDP client (musl's resolver `sendto`s without `connect`)
+    // auto-binds to the wildcard address, so /proc/net/udp records `0.0.0.0`/`::`
+    // as the local IP while the datagram carries a concrete source. Fall back to
+    // matching on port alone for such rows. The port identifies the socket
+    // uniquely unless two wildcard-bound sockets share it via `SO_REUSEPORT`
+    // (which DNS clients don't use) — a best-effort limit, and we still fail
+    // closed if nothing matches. TCP never needs this — an established
+    // connection always has a concrete local address, and matching a
+    // wildcard-bound *listener* here would be a false positive.
+    if matches!(proto, Proto::Udp) {
+        return rows
+            .iter()
+            .find(|(local, _)| local.ip().is_unspecified() && local.port() == peer.port())
+            .map(|(_, inode)| *inode);
+    }
+    None
 }
 
 fn pid_owning_inode<P: ProcReader>(proc: &P, inode: u64) -> Option<i64> {
@@ -401,7 +439,7 @@ mod tests {
     fn resolve_with_walks_proc_net_tcp_then_fd_symlinks_to_the_owning_process() {
         let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(
-            resolve_with(&owning_fixture(), peer),
+            resolve_with(&owning_fixture(), peer, Proto::Tcp),
             Some(PeerProcess {
                 pid: 100,
                 name: "wget".into(),
@@ -418,7 +456,7 @@ mod tests {
         fake.files.remove("/proc/100/status");
         let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(
-            resolve_with(&fake, peer),
+            resolve_with(&fake, peer, Proto::Tcp),
             Some(PeerProcess {
                 pid: 100,
                 name: "wget".into(),
@@ -437,7 +475,7 @@ mod tests {
             .insert("/proc/100/exe".into(), "/usr/bin/wget (deleted)".into());
         let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(
-            resolve_with(&fake, peer),
+            resolve_with(&fake, peer, Proto::Tcp),
             Some(PeerProcess {
                 pid: 100,
                 name: "wget".into(),
@@ -468,7 +506,7 @@ mod tests {
     #[test]
     fn resolve_with_is_none_when_no_socket_row_matches_the_peer() {
         let peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        assert!(resolve_with(&owning_fixture(), peer).is_none());
+        assert!(resolve_with(&owning_fixture(), peer, Proto::Tcp).is_none());
     }
 
     #[test]
@@ -477,7 +515,7 @@ mod tests {
         fake.links
             .insert("/proc/100/fd/4".into(), "socket:[999999]".into());
         let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        assert!(resolve_with(&fake, peer).is_none());
+        assert!(resolve_with(&fake, peer, Proto::Tcp).is_none());
     }
 
     #[test]
@@ -486,7 +524,7 @@ mod tests {
         fake.files.remove("/proc/100/comm");
         let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(
-            resolve_with(&fake, peer),
+            resolve_with(&fake, peer, Proto::Tcp),
             Some(PeerProcess {
                 pid: 100,
                 name: String::new(),
@@ -519,7 +557,7 @@ mod tests {
         };
         let peer: SocketAddr = "[::1]:80".parse().unwrap();
         assert_eq!(
-            resolve_with(&fake, peer),
+            resolve_with(&fake, peer, Proto::Tcp),
             Some(PeerProcess {
                 pid: 42,
                 name: "busybox".into(),
@@ -527,5 +565,61 @@ mod tests {
                 ancestors: vec![],
             })
         );
+    }
+
+    #[test]
+    fn resolve_with_reads_proc_net_udp_for_udp_peers() {
+        // The DNS stub receives datagrams, so the caller's socket lives in
+        // /proc/net/udp, not /proc/net/tcp. Same row shape, different table.
+        let mut fake = owning_fixture();
+        let udp = fake.files.remove("/proc/net/tcp").unwrap();
+        fake.files.insert("/proc/net/udp".into(), udp);
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            resolve_with(&fake, peer, Proto::Udp),
+            Some(PeerProcess {
+                pid: 100,
+                name: "wget".into(),
+                exe: Some("/usr/bin/wget".into()),
+                ancestors: vec!["/usr/bin/bash".into()],
+            })
+        );
+        // The proto selects the table: a TCP lookup no longer finds the row.
+        assert!(resolve_with(&fake, peer, Proto::Tcp).is_none());
+    }
+
+    #[test]
+    fn resolve_with_matches_a_wildcard_bound_udp_socket_by_port() {
+        // musl's resolver sends without connect(), so its socket auto-binds to
+        // 0.0.0.0 — /proc/net/udp records the wildcard local IP (00000000)
+        // while the stub sees a concrete source. Port-only fallback resolves it.
+        const WILDCARD_ROW: &str = "   3: 00000000:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 424242 1 ffff 100";
+        let mut fake = owning_fixture();
+        fake.files.remove("/proc/net/tcp");
+        fake.files
+            .insert("/proc/net/udp".into(), format!("header\n{WILDCARD_ROW}"));
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            resolve_with(&fake, peer, Proto::Udp),
+            Some(PeerProcess {
+                pid: 100,
+                name: "wget".into(),
+                exe: Some("/usr/bin/wget".into()),
+                ancestors: vec!["/usr/bin/bash".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_with_does_not_apply_the_wildcard_fallback_to_tcp() {
+        // The port-only fallback is UDP-only: a wildcard-bound TCP row (a
+        // listener) must not be matched against a peer whose own connected
+        // socket has already closed — that would be a false positive.
+        const WILDCARD_ROW: &str = "   3: 00000000:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 424242 1 ffff 100";
+        let mut fake = owning_fixture();
+        fake.files
+            .insert("/proc/net/tcp".into(), format!("header\n{WILDCARD_ROW}"));
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(resolve_with(&fake, peer, Proto::Tcp).is_none());
     }
 }
