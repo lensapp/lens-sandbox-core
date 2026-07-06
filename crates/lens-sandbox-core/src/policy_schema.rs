@@ -150,6 +150,13 @@ pub struct RouteRule {
     /// action. On a `deny` rule this means every caller reaching the host is
     /// denied (the listed binaries by verdict, the rest by fail-closed), so
     /// `binaries` is only meaningful on `allow` rules.
+    ///
+    /// Once a binary-scoped rule claims a host, a later *unrestricted* `allow`
+    /// or `ask` for the same host does not re-open it for the excluded caller
+    /// (the excluded caller is denied, not prompted). To grant several
+    /// binaries, list them together or add more binary-scoped rules; order an
+    /// unrestricted rule before the scoped one only if you intend it to win for
+    /// everyone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binaries: Option<Vec<String>>,
 }

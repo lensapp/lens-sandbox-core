@@ -226,6 +226,12 @@ pub enum RouteOutcome<'a> {
 /// info — non-Linux, an already-closed socket, or a `/proc` read failure — a
 /// binary-filtered rule never matches, and the miss is reported as
 /// `binary_filtered` so the proxy fails closed.
+///
+/// Once a binary-scoped rule matches the host but excludes the caller, a later
+/// *unrestricted* `allow`/`ask` rule for the same host is skipped so it cannot
+/// re-open the restriction; a later `deny`, or a later binary-scoped rule that
+/// lists the caller, still applies. First-match order otherwise stands — put an
+/// unrestricted rule *before* a binary-scoped one if you want it to win.
 pub fn find_matching_route<'a>(
     routes: &'a [RouteRule],
     host: &str,
@@ -263,11 +269,21 @@ pub fn find_matching_route<'a>(
             continue;
         }
         if binary_filter_matches(rule, caller) {
+            // Guard against re-opening: once an earlier binary-scoped rule
+            // matched this host but excluded the caller, an unrestricted
+            // `allow`/`ask` rule must not let that caller back in. An explicit
+            // `deny` still applies — it only reinforces the block — and a later
+            // binary-scoped rule that lists the caller (its `binaries` is
+            // `Some`) still matches here.
+            if binary_filtered && rule.binaries.is_none() && rule.verdict != Verdict::Deny {
+                continue;
+            }
             return RouteOutcome::Matched(rule);
         }
         // Host+scheme matched but the binary filter excluded the caller. Keep
-        // scanning for another rule, but remember the exclusion so the proxy
-        // fails closed instead of leaking through the default action.
+        // scanning for a later rule that admits it, but remember the exclusion
+        // so the proxy fails closed instead of leaking through the default
+        // action or a broad unrestricted rule.
         binary_filtered = true;
     }
     RouteOutcome::NoMatch { binary_filtered }
@@ -294,12 +310,14 @@ fn binary_filter_matches(
 
 /// Match a host:port target against the route rules. Binary-filtered rules
 /// never match here — there is no caller to check — so they fall through to the
-/// supplied defaults, exactly as a plain host miss does. Returns the matched
-/// route config for the first matching rule, or the defaults otherwise. This is
-/// a caller-agnostic convenience: the live proxy calls [`find_matching_route`]
-/// with the resolved caller so the binary filter applies. Prefer that path when
-/// caller identity is available; reach for this only when it is not, or does not
-/// matter.
+/// supplied defaults, exactly as a plain host miss does. A binary-scoped rule
+/// also suppresses any later unrestricted rule for the same host, so this
+/// caller-agnostic path returns the defaults rather than that later rule.
+/// Returns the matched route config for the first matching rule, or the
+/// defaults otherwise. This is a caller-agnostic convenience: the live proxy
+/// calls [`find_matching_route`] with the resolved caller so the binary filter
+/// applies. Prefer that path when caller identity is available; reach for this
+/// only when it is not, or does not matter.
 pub fn match_route(
     routes: &[RouteRule],
     host: &str,
@@ -1882,6 +1900,116 @@ mod tests {
         match find_matching_route(&routes, "api.github.com:443", Scheme::Https, Some(&c)) {
             RouteOutcome::Matched(rule) => assert_eq!(rule.verdict, Verdict::Deny),
             other => panic!("expected Matched(deny), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_later_unrestricted_allow_does_not_reopen_a_binary_scoped_host() {
+        // The narrow rule scopes registry.npmjs.org to npm; the broad wildcard
+        // allow must NOT let an excluded caller back in.
+        let routes = routes_from(
+            r#"[
+                {"match": "registry.npmjs.org", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/local/bin/npm"]},
+                {"match": "*.npmjs.org", "verdict": "allow", "transport": "direct"}
+            ]"#,
+        );
+        let curl = caller("/usr/bin/curl", &[]);
+        assert!(matches!(
+            find_matching_route(
+                &routes,
+                "registry.npmjs.org:443",
+                Scheme::Https,
+                Some(&curl)
+            ),
+            RouteOutcome::NoMatch {
+                binary_filtered: true
+            }
+        ));
+        // The listed binary still matches its own rule.
+        let npm = caller("/usr/local/bin/npm", &[]);
+        match find_matching_route(&routes, "registry.npmjs.org:443", Scheme::Https, Some(&npm)) {
+            RouteOutcome::Matched(rule) => assert_eq!(rule.verdict, Verdict::Allow),
+            other => panic!("expected Matched(allow), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_later_unrestricted_ask_does_not_reopen_a_binary_scoped_host() {
+        // A binary-scoped allow restricts the host; a later unrestricted `ask`
+        // does not give the excluded caller a prompt — it fails closed.
+        let routes = routes_from(
+            r#"[
+                {"match": "registry.npmjs.org", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/local/bin/npm"]},
+                {"match": "*.npmjs.org", "verdict": "ask", "transport": "direct"}
+            ]"#,
+        );
+        let curl = caller("/usr/bin/curl", &[]);
+        assert!(matches!(
+            find_matching_route(
+                &routes,
+                "registry.npmjs.org:443",
+                Scheme::Https,
+                Some(&curl)
+            ),
+            RouteOutcome::NoMatch {
+                binary_filtered: true
+            }
+        ));
+    }
+
+    #[test]
+    fn a_later_binary_scoped_rule_that_lists_the_caller_still_matches() {
+        // Two binary-scoped rules for the same host: an excluded-from-the-first
+        // caller can still match the second, but an unlisted caller is denied.
+        let routes = routes_from(
+            r#"[
+                {"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/git"]},
+                {"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/gh"]}
+            ]"#,
+        );
+        let gh = caller("/usr/bin/gh", &[]);
+        match find_matching_route(&routes, "api.github.com:443", Scheme::Https, Some(&gh)) {
+            RouteOutcome::Matched(rule) => {
+                assert_eq!(
+                    rule.binaries.as_deref().unwrap(),
+                    [PathBuf::from("/usr/bin/gh")]
+                );
+            }
+            other => panic!("expected Matched(gh rule), got {other:?}"),
+        }
+        let curl = caller("/usr/bin/curl", &[]);
+        assert!(matches!(
+            find_matching_route(&routes, "api.github.com:443", Scheme::Https, Some(&curl)),
+            RouteOutcome::NoMatch {
+                binary_filtered: true
+            }
+        ));
+    }
+
+    #[test]
+    fn an_unrestricted_allow_before_a_binary_scoped_rule_still_wins() {
+        // First-match order stands: an unrestricted rule placed first admits
+        // any caller, even when a binary-scoped rule for the host follows.
+        let routes = routes_from(
+            r#"[
+                {"match": "*.npmjs.org", "verdict": "allow", "transport": "direct"},
+                {"match": "registry.npmjs.org", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/local/bin/npm"]}
+            ]"#,
+        );
+        let curl = caller("/usr/bin/curl", &[]);
+        match find_matching_route(
+            &routes,
+            "registry.npmjs.org:443",
+            Scheme::Https,
+            Some(&curl),
+        ) {
+            RouteOutcome::Matched(rule) => assert!(rule.binaries.is_none()),
+            other => panic!("expected Matched(unrestricted), got {other:?}"),
         }
     }
 
