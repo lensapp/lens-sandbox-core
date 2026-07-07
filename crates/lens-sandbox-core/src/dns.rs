@@ -143,8 +143,7 @@ async fn handle_query(
     state: &Arc<ProxyState>,
     upstream: SocketAddr,
 ) {
-    let caller = maybe_resolve_caller(peer, state).await;
-    let decision = classify_query(&packet, state, caller.as_ref());
+    let decision = resolve_decision(&packet, peer, state).await;
 
     match decision {
         Decision::Allow { qname } => {
@@ -187,28 +186,38 @@ const DENY_REASON: &str = "dns-denied";
 /// other than the caller's — the DNS analogue of a `binary_filtered` TCP miss.
 const BINARY_DENY_REASON: &str = "dns-binary-not-allowed";
 
-/// Resolve the querying process, but only when the policy scopes some rule to
-/// specific binaries — otherwise the caller can't change any DNS verdict and
-/// the `/proc` walk is pure cost. The common (no-`binaries`) policy pays
-/// nothing; a policy with binary rules pays one offloaded walk per query, even
-/// for names those rules don't cover, which is an acceptable over-resolution.
-async fn maybe_resolve_caller(peer: SocketAddr, state: &ProxyState) -> Option<PeerProcess> {
+/// Classify a query, resolving the querying process only when the policy has a
+/// binary-scoped rule — the one thing a caller can change. A no-`binaries`
+/// policy never walks `/proc`; otherwise we resolve once (offloaded) and
+/// classify with the real caller, so DNS and the TCP layer stay in lockstep.
+/// An unresolvable caller fails a binary-scoped name closed.
+///
+/// We deliberately do NOT narrow this to "resolve only when the caller-less
+/// classification is `BinaryDenied`": once a binary rule excludes a missing
+/// caller, a *later* unrestricted `deny` produces a plain `Denied` that is
+/// indistinguishable from a caller-independent deny, so a listed binary that
+/// the TCP layer would allow (allow-for-binary, then deny-the-broader-domain)
+/// would be wrongly NXDOMAIN'd. The walk under a binary policy is bounded by
+/// the inflight semaphore.
+async fn resolve_decision(packet: &[u8], peer: SocketAddr, state: &ProxyState) -> Decision {
     let has_binary_rule = state
         .routes
         .read()
         .unwrap()
         .iter()
         .any(|r| r.binaries.is_some());
-    if !has_binary_rule {
-        return None;
-    }
-    resolve_udp_offloaded(peer).await
+    let caller = if has_binary_rule {
+        resolve_udp_offloaded(peer).await
+    } else {
+        None
+    };
+    classify_query(packet, state, caller.as_ref())
 }
 
 /// Parse the request and match its first question against the allowlist.
-/// `caller` is the resolved querying process (see [`maybe_resolve_caller`]),
-/// used to apply a route's `binaries` filter. Split out for direct unit
-/// testing — no I/O, no async.
+/// `caller` is the resolved querying process (see [`resolve_decision`]), used
+/// to apply a route's `binaries` filter. Split out for direct unit testing —
+/// no I/O, no async.
 fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess>) -> Decision {
     let Ok(msg) = Message::from_vec(packet) else {
         return Decision::Malformed;

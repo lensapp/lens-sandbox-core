@@ -114,9 +114,7 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             })
             .collect();
 
-        let binaries = raw
-            .binaries
-            .map(|paths| paths.into_iter().map(PathBuf::from).collect());
+        let binaries = raw.binaries.map(parse_binaries).transpose()?;
 
         Ok(RouteRule {
             matcher,
@@ -128,6 +126,34 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             binaries,
         })
     }
+}
+
+/// Validate a rule's `binaries` filter. Entries are matched against the
+/// kernel-resolved `/proc/<pid>/exe` (always an absolute, canonical path), so
+/// both failure modes below can *never* match and are almost certainly
+/// misconfigurations — reject them at parse time rather than fail closed
+/// silently at request time:
+///
+/// - An empty list matches no caller, turning an `allow` into an unconditional
+///   deny for the host. Omit `binaries` to allow any caller.
+/// - A relative path can never equal an absolute `/proc/<pid>/exe` target.
+fn parse_binaries(paths: Vec<String>) -> Result<Vec<PathBuf>, String> {
+    if paths.is_empty() {
+        return Err(
+            "binaries filter is empty: it matches no caller and would deny the host for \
+             everyone; omit `binaries` to allow any caller"
+                .to_string(),
+        );
+    }
+    for path in &paths {
+        if !std::path::Path::new(path).is_absolute() {
+            return Err(format!(
+                "binaries entry {path:?} is not an absolute path; entries are matched against \
+                 the kernel-resolved /proc/<pid>/exe, so a relative path can never match"
+            ));
+        }
+    }
+    Ok(paths.into_iter().map(PathBuf::from).collect())
 }
 
 /// Match result from `match_route`.
@@ -2083,6 +2109,35 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_binaries_filter_is_rejected() {
+        // `[]` matches no caller, silently turning an allow into a deny for the
+        // host — reject it at parse time instead.
+        let val: serde_json::Value = serde_json::from_str(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": []}]"#,
+        )
+        .unwrap();
+        let err = parse_proxy_routes(&val)
+            .err()
+            .expect("empty binaries rejected");
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_relative_binaries_entry_is_rejected() {
+        // A relative path can never equal an absolute /proc/<pid>/exe target.
+        let val: serde_json::Value = serde_json::from_str(
+            r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["curl"]}]"#,
+        )
+        .unwrap();
+        let err = parse_proxy_routes(&val)
+            .err()
+            .expect("relative binaries rejected");
+        assert!(err.contains("absolute"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn binaries_field_parses_into_pathbufs() {
         let routes = routes_from(
             r#"[{"match": "api.github.com", "verdict": "allow", "transport": "direct",
@@ -2151,6 +2206,33 @@ mod tests {
         assert_eq!(
             hostname_match_for_caller(&routes, "registry.npmjs.org", Some(&npm)),
             HostnameMatch::Allowed
+        );
+    }
+
+    #[test]
+    fn hostname_match_for_caller_admits_the_listed_binary_over_a_later_deny() {
+        // The listed binary must resolve even when a later unrestricted deny
+        // covers the broader domain — matching the TCP layer. This is the case
+        // a naive "re-resolve only on BinaryDenied" DNS gate would break: the
+        // caller-less classification hits the later deny (a plain `Denied`), so
+        // the real caller has to be used up front.
+        let routes = routes_from(
+            r#"[
+                {"match": "api.github.com", "verdict": "allow", "transport": "direct",
+                 "binaries": ["/usr/bin/git"]},
+                {"match": "*.github.com", "verdict": "deny", "transport": "direct"}
+            ]"#,
+        );
+        let git = caller("/usr/bin/git", &[]);
+        assert_eq!(
+            hostname_match_for_caller(&routes, "api.github.com", Some(&git)),
+            HostnameMatch::Allowed
+        );
+        // The excluded binary still falls through to the later deny.
+        let curl = caller("/usr/bin/curl", &[]);
+        assert_eq!(
+            hostname_match_for_caller(&routes, "api.github.com", Some(&curl)),
+            HostnameMatch::Denied
         );
     }
 

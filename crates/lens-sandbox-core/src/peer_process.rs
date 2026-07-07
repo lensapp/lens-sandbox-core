@@ -210,17 +210,20 @@ fn socket_inode_for<P: ProcReader>(proc: &P, peer: SocketAddr, proto: Proto) -> 
     // An unconnected UDP client (musl's resolver `sendto`s without `connect`)
     // auto-binds to the wildcard address, so /proc/net/udp records `0.0.0.0`/`::`
     // as the local IP while the datagram carries a concrete source. Fall back to
-    // matching on port alone for such rows. The port identifies the socket
-    // uniquely unless two wildcard-bound sockets share it via `SO_REUSEPORT`
-    // (which DNS clients don't use) — a best-effort limit, and we still fail
-    // closed if nothing matches. TCP never needs this — an established
-    // connection always has a concrete local address, and matching a
+    // matching on port alone for such rows — but only when exactly one matches.
+    // If two wildcard sockets share the port (e.g. `SO_REUSEPORT`), we can't
+    // tell which process owns the datagram, so we fail closed rather than risk
+    // attributing it to a binary the allowlist trusts. TCP never needs this — an
+    // established connection always has a concrete local address, and matching a
     // wildcard-bound *listener* here would be a false positive.
     if matches!(proto, Proto::Udp) {
-        return rows
+        let mut wildcard = rows
             .iter()
-            .find(|(local, _)| local.ip().is_unspecified() && local.port() == peer.port())
-            .map(|(_, inode)| *inode);
+            .filter(|(local, _)| local.ip().is_unspecified() && local.port() == peer.port());
+        return match (wildcard.next(), wildcard.next()) {
+            (Some((_, inode)), None) => Some(*inode),
+            _ => None,
+        };
     }
     None
 }
@@ -608,6 +611,23 @@ mod tests {
                 ancestors: vec!["/usr/bin/bash".into()],
             })
         );
+    }
+
+    #[test]
+    fn resolve_with_fails_closed_when_two_wildcard_udp_rows_share_a_port() {
+        // Two wildcard-bound sockets on the same port (e.g. SO_REUSEPORT): we
+        // can't tell which owns the datagram, so we must not guess — resolve to
+        // None rather than risk attributing it to a trusted binary.
+        const WILDCARD_A: &str = "   3: 00000000:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 424242 1 ffff 100";
+        const WILDCARD_B: &str = "   4: 00000000:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 555555 1 ffff 100";
+        let mut fake = owning_fixture();
+        fake.files.remove("/proc/net/tcp");
+        fake.files.insert(
+            "/proc/net/udp".into(),
+            format!("header\n{WILDCARD_A}\n{WILDCARD_B}"),
+        );
+        let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(resolve_with(&fake, peer, Proto::Udp).is_none());
     }
 
     #[test]
