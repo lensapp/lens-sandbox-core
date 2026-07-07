@@ -92,10 +92,16 @@ impl ActorContext {
             json!({"ip": self.peer.ip().to_string(), "port": self.peer.port()}),
         );
         if let Some(p) = &self.process {
-            event.insert(
-                "actor".into(),
-                json!({"process": {"name": p.name, "pid": p.pid}}),
-            );
+            let mut process = json!({"name": p.name, "pid": p.pid});
+            if let Some(exe) = &p.exe {
+                // OCSF `process.file.path`: the kernel-resolved image path the
+                // `binaries` policy filter actually matches on. The `name`
+                // above is the comm — truncated to 15 bytes and settable by the
+                // process itself — so an audit trail that only carried it could
+                // not show which binary a per-binary allow/deny keyed on.
+                process["file"] = json!({"path": exe.to_string_lossy()});
+            }
+            event.insert("actor".into(), json!({ "process": process }));
         }
     }
 }
@@ -363,6 +369,27 @@ mod tests {
             event["src_endpoint"],
             json!({"ip": "10.0.0.5", "port": 54321})
         );
+        assert_eq!(
+            event["actor"],
+            json!({"process": {"name": "wget", "pid": 4242, "file": {"path": "/usr/bin/wget"}}})
+        );
+    }
+
+    #[test]
+    fn augment_omits_the_process_file_when_the_exe_is_unresolved() {
+        // Process resolved but /proc/<pid>/exe unreadable: emit name+pid, but
+        // no `file.path` — never a partial/empty path that reads as an identity.
+        let actor = ActorContext {
+            peer: "10.0.0.5:54321".parse().unwrap(),
+            process: Some(PeerProcess {
+                pid: 4242,
+                name: "wget".into(),
+                exe: None,
+                ancestors: vec![],
+            }),
+        };
+        let mut event = Map::new();
+        actor.augment(&mut event);
         assert_eq!(
             event["actor"],
             json!({"process": {"name": "wget", "pid": 4242}})
