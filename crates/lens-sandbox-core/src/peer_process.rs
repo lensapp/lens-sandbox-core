@@ -93,13 +93,16 @@ impl ActorContext {
         );
         if let Some(p) = &self.process {
             let mut process = json!({"name": p.name, "pid": p.pid});
-            if let Some(exe) = &p.exe {
-                // OCSF `process.file.path`: the kernel-resolved image path the
-                // `binaries` policy filter actually matches on. The `name`
-                // above is the comm — truncated to 15 bytes and settable by the
-                // process itself — so an audit trail that only carried it could
-                // not show which binary a per-binary allow/deny keyed on.
-                process["file"] = json!({"path": exe.to_string_lossy()});
+            // OCSF `process.file.path`: the kernel-resolved image path the
+            // `binaries` policy filter actually matches on. The `name` above is
+            // the comm — truncated to 15 bytes and settable by the process
+            // itself — so an audit trail that only carried it could not show
+            // which binary a per-binary allow/deny keyed on. Omitted for a
+            // non-UTF-8 path (which JSON can't carry losslessly): the filter
+            // keys on the raw bytes, so a lossy string would not byte-match the
+            // real identity, and a misleading path is worse than none.
+            if let Some(path) = p.exe.as_deref().and_then(Path::to_str) {
+                process["file"] = json!({ "path": path });
             }
             event.insert("actor".into(), json!({ "process": process }));
         }
@@ -385,6 +388,32 @@ mod tests {
                 pid: 4242,
                 name: "wget".into(),
                 exe: None,
+                ancestors: vec![],
+            }),
+        };
+        let mut event = Map::new();
+        actor.augment(&mut event);
+        assert_eq!(
+            event["actor"],
+            json!({"process": {"name": "wget", "pid": 4242}})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn augment_omits_the_process_file_for_a_non_utf8_exe_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        // A path with non-UTF-8 bytes can't be carried in a JSON string, and a
+        // lossy replacement would not byte-match what the filter keyed on — so
+        // `file` is omitted rather than emit a misleading path.
+        let exe = PathBuf::from(OsStr::from_bytes(b"/usr/bin/\xff"));
+        let actor = ActorContext {
+            peer: "10.0.0.5:54321".parse().unwrap(),
+            process: Some(PeerProcess {
+                pid: 4242,
+                name: "wget".into(),
+                exe: Some(exe),
                 ancestors: vec![],
             }),
         };
