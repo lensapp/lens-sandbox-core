@@ -11,10 +11,14 @@
 //!
 //! Both helpers cooperate with `tokio::process::Child`: the reaper never
 //! touches the supervisor's own managed child (registered via
-//! [`OrphanReaper::protect_pid`]), so tokio still retrieves the agent's
-//! real exit status via `Child::wait()`.
+//! [`OrphanReaper::protect_pid`]) nor any short-lived direct child a
+//! subsystem is waiting on itself (registered via a [`PidGuard`] handed
+//! out by [`OrphanReaper::guard`]), so tokio still retrieves those
+//! children's real exit status via `Child::wait()`.
 
+use std::collections::HashSet;
 use std::process::ExitStatus;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::process::Child;
@@ -117,12 +121,54 @@ fn forward_sigterm(child: &Child) {
 /// sees `ECHILD` and loses the real exit code. So the reaper scans the
 /// supervisor's current direct children via `/proc/<pid>/task/<pid>/children`
 /// and only calls `waitpid(pid, WNOHANG)` on PIDs that are *not* the
-/// protected agent PID. Grandchildren that reparented to us are not in
-/// the protected set, so they get reaped; the agent itself is left to
-/// tokio.
+/// protected agent PID and *not* registered in the [`PidGuard`] set.
+/// Grandchildren that reparented to us are in neither, so they get
+/// reaped; the agent and any in-flight exec children are left to their
+/// own `Child::wait()`.
 #[cfg(target_os = "linux")]
 pub struct OrphanReaper {
     protected: tokio::sync::watch::Sender<Option<i32>>,
+    guard: PidGuard,
+}
+
+/// Cloneable handle for subsystems that spawn short-lived direct children
+/// they `Child::wait()` on themselves (e.g. the exec manager). A PID
+/// registered via [`protect`](PidGuard::protect) is skipped by the reaper
+/// until [`release`](PidGuard::release)d, so the caller's own wait wins
+/// the race for the exit status instead of losing it to the reaper's
+/// `waitpid` (which would surface as `ECHILD` and drop the exit code).
+///
+/// Unlike the single agent PID, exec children come and go concurrently,
+/// so this is a set rather than the `watch<Option<i32>>` slot.
+///
+/// Defined on all platforms so cross-platform callers (e.g. the shell
+/// sandbox dispatcher) can construct one uniformly; only the reaper that
+/// consults it is Linux-only, so on other hosts the set is simply never
+/// read.
+#[derive(Clone, Default)]
+pub struct PidGuard {
+    guarded: Arc<Mutex<HashSet<i32>>>,
+}
+
+impl PidGuard {
+    /// Protect a live direct child PID from the reaper. Must be called
+    /// before the current task yields after the spawn, so the reaper
+    /// cannot observe the child's exit (via SIGCHLD, which only fires
+    /// once the child has run) before the PID is registered.
+    pub fn protect(&self, pid: u32) {
+        self.guarded.lock().unwrap().insert(pid as i32);
+    }
+
+    /// Release a PID once the caller's own `Child::wait()` has reaped it.
+    /// Idempotent — releasing an unknown PID is a no-op.
+    pub fn release(&self, pid: u32) {
+        self.guarded.lock().unwrap().remove(&(pid as i32));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn contains(&self, pid: i32) -> bool {
+        self.guarded.lock().unwrap().contains(&pid)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -132,8 +178,12 @@ impl OrphanReaper {
     /// Dropping the handle stops the reaper.
     pub fn spawn() -> Self {
         let (tx, rx) = tokio::sync::watch::channel::<Option<i32>>(None);
-        tokio::spawn(run_reaper(rx));
-        Self { protected: tx }
+        let guard = PidGuard::default();
+        tokio::spawn(run_reaper(rx, guard.clone()));
+        Self {
+            protected: tx,
+            guard,
+        }
     }
 
     /// Register the supervisor's directly-managed child PID. The reaper
@@ -143,10 +193,17 @@ impl OrphanReaper {
     pub fn protect_pid(&self, pid: u32) {
         let _ = self.protected.send(Some(pid as i32));
     }
+
+    /// A cloneable [`PidGuard`] sharing this reaper's exec-child set.
+    /// Hand it to any subsystem that spawns direct children it waits on
+    /// itself, so the reaper leaves those PIDs alone until released.
+    pub fn guard(&self) -> PidGuard {
+        self.guard.clone()
+    }
 }
 
 #[cfg(target_os = "linux")]
-async fn run_reaper(protected: tokio::sync::watch::Receiver<Option<i32>>) {
+async fn run_reaper(protected: tokio::sync::watch::Receiver<Option<i32>>, guard: PidGuard) {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut sigchld = match signal(SignalKind::child()) {
@@ -172,22 +229,22 @@ async fn run_reaper(protected: tokio::sync::watch::Receiver<Option<i32>>) {
             // agent — by then no other direct-child waiters exist.
             continue;
         };
-        reap_orphans(Some(protected_pid));
+        reap_orphans(protected_pid, &guard);
     }
 }
 
-/// Reap every direct child of this process whose PID is not
-/// `protected_pid`, taking a single snapshot of `/proc/<self>/task/<self>/children`
-/// and calling `waitpid(pid, WNOHANG)` per entry. SIGCHLD coalesces, but
-/// we don't loop here — a still-running child returns `StillAlive` and
-/// the next SIGCHLD covers any new exits.
+/// Reap every direct child of this process whose PID is neither
+/// `protected_pid` nor registered in `guard`, taking a single snapshot of
+/// `/proc/<self>/task/<self>/children` and calling `waitpid(pid, WNOHANG)`
+/// per entry. SIGCHLD coalesces, but we don't loop here — a still-running
+/// child returns `StillAlive` and the next SIGCHLD covers any new exits.
 #[cfg(target_os = "linux")]
-fn reap_orphans(protected_pid: Option<i32>) {
+fn reap_orphans(protected_pid: i32, guard: &PidGuard) {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     use nix::unistd::Pid;
 
     for pid in current_children() {
-        if Some(pid) == protected_pid {
+        if pid == protected_pid || guard.contains(pid) {
             continue;
         }
         match waitpid(Some(Pid::from_raw(pid)), Some(WaitPidFlag::WNOHANG)) {
@@ -242,11 +299,44 @@ impl OrphanReaper {
         Self
     }
     pub fn protect_pid(&self, _pid: u32) {}
+    pub fn guard(&self) -> PidGuard {
+        PidGuard::default()
+    }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// The exec guard is the mechanism that keeps the reaper off an exec
+    /// child until its owner has `wait()`ed it: `reap_orphans` skips any
+    /// PID `guard.contains(...)` reports. Pin the set semantics and — just
+    /// as importantly — that a clone shares the same underlying set, since
+    /// `OrphanReaper::guard()` hands `ExecManager` a clone and relies on
+    /// the reaper task seeing every PID the manager protects.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_guard_shares_set_across_clones() {
+        let guard = PidGuard::default();
+        assert!(!guard.contains(1234));
+
+        guard.protect(1234);
+        assert!(guard.contains(1234));
+        guard.protect(1234); // idempotent — no double-insert surprises
+        assert!(guard.contains(1234));
+
+        // A clone (what the reaper task holds) sees the manager's inserts.
+        let reaper_view = guard.clone();
+        guard.protect(42);
+        assert!(reaper_view.contains(42));
+
+        // Release drops it from every clone; releasing twice is a no-op.
+        guard.release(1234);
+        assert!(!reaper_view.contains(1234));
+        guard.release(1234);
+        assert!(!guard.contains(1234));
+        assert!(reaper_view.contains(42), "unrelated PID must stay guarded");
+    }
 
     /// /proc-backed child enumeration matches `tokio::process::Child::id()`
     /// for processes we directly spawned. Cheap end-to-end check that the

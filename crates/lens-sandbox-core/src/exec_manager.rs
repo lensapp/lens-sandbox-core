@@ -36,6 +36,7 @@ use crate::child_spawner::{self, ChildSpec};
 use crate::exec_protocol::{
     ActorIdentity, DetachReason, IncomingMessage, OutgoingMessage, TerminalSize,
 };
+use crate::lifecycle::PidGuard;
 use crate::privilege::SandboxCredentials;
 use crate::pty::OwnedRawFd;
 
@@ -69,6 +70,13 @@ struct Inner {
     sessions: Mutex<HashMap<String, SessionHandle>>,
     creds: Option<SandboxCredentials>,
     is_root: bool,
+    /// Shields exec child PIDs from the PID-1 orphan reaper for the window
+    /// between spawn and this manager's own `Child::wait()`. Exec children
+    /// are direct children of the supervisor, so without this the reaper
+    /// would `waitpid` them first and `run_controller`'s wait would see
+    /// `ECHILD` — losing the exit code. Default (unwired) on hosts without
+    /// a reaper, e.g. the short-lived shell sandbox, where it's a no-op.
+    pid_guard: PidGuard,
 }
 
 /// Stdin frame sent from the manager to the writer task. Bytes are written
@@ -108,12 +116,13 @@ struct SessionHandle {
 }
 
 impl ExecManager {
-    pub fn new(creds: Option<SandboxCredentials>, is_root: bool) -> Self {
+    pub fn new(creds: Option<SandboxCredentials>, is_root: bool, pid_guard: PidGuard) -> Self {
         Self {
             inner: std::sync::Arc::new(Inner {
                 sessions: Mutex::new(HashMap::new()),
                 creds,
                 is_root,
+                pid_guard,
             }),
         }
     }
@@ -216,6 +225,18 @@ impl ExecManager {
         };
 
         let pid = child.id().unwrap_or(0);
+        // Shield this PID from the reaper for the window between spawn and
+        // `run_controller`'s `child.wait()`. The reaper runs on another
+        // worker, so this task's lack of an await point doesn't fence it —
+        // what makes register-first safe is latency: the child cannot exit
+        // and drive SIGCHLD → reaper wakeup → /proc scan → waitpid in the
+        // handful of instructions between `spawn()` returning and here.
+        // `id()` is `None` only after the child is reaped (impossible this
+        // early), so the guard against 0 is belt-and-braces — it also keeps
+        // a bogus 0 (which release would never clear) out of the set.
+        if pid != 0 {
+            self.inner.pid_guard.protect(pid);
+        }
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
         let stdin = child.stdin.take().expect("stdin was piped");
@@ -330,6 +351,9 @@ impl ExecManager {
             writer,
             pid,
         } = pty;
+        // Shield the PID from the reaper — see the latency note in
+        // `attach_piped`. The PTY spawn always yields a real pid.
+        self.inner.pid_guard.protect(pid);
         // Wrap the master fd in an Arc so both the registry and any
         // in-flight resize call own a share; reader/writer keep their
         // own dup'd fds and aren't affected by this Arc.
@@ -828,7 +852,15 @@ async fn run_controller(
     fwd_tx: mpsc::UnboundedSender<ForwarderEvent>,
     registry: std::sync::Arc<Inner>,
 ) {
+    // Captured before `wait()` reaps the child (after which `id()` is
+    // `None`) so we can release the reaper guard once tokio owns the exit.
+    let pid = child.id();
     let status = child.wait().await;
+    // tokio has now reaped the child, so the reaper can no longer race it;
+    // drop it from the guard set to keep that set bounded across execs.
+    if let Some(pid) = pid {
+        registry.pid_guard.release(pid);
+    }
 
     // Drain output BEFORE emitting exit — the protocol contract says
     // exec_exit is the last frame for the exec_id, and clients trust it
@@ -888,7 +920,8 @@ mod tests {
     use tokio::time::timeout;
 
     fn manager() -> ExecManager {
-        ExecManager::new(None, false)
+        // No reaper in the unit tests — an unwired guard is a no-op.
+        ExecManager::new(None, false, PidGuard::default())
     }
 
     fn channel() -> (
