@@ -1976,10 +1976,11 @@ pub fn parse_upstream_url(url: &str) -> Option<SandboxUpstream> {
     // TLS-wrapped before the CONNECT envelope is written.
     let (without_scheme, tls) = if let Some(rest) = url.strip_prefix("https://") {
         (rest, true)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        (rest, false)
     } else {
-        return None;
+        // Anything but http:// (and the https:// handled above) is not an
+        // upstream we can speak — bail. `?` keeps clippy's question_mark
+        // lint happy on newer toolchains.
+        (url.strip_prefix("http://")?, false)
     };
 
     let (auth, host_port) = if let Some(at_pos) = without_scheme.rfind('@') {
