@@ -1190,6 +1190,22 @@ pub(crate) async fn connect_upstream_tls_public(
     connect_upstream_tls(upstream, target_host, None, None, extra_ca_certs).await
 }
 
+/// Generic variant of [`connect_upstream_tls_public`] over any stream type.
+/// Used by the absolute-form `https://` forward path, where the underlying
+/// upstream may be a raw `TcpStream` (Direct transport) or a boxed sandbox
+/// tunnel stream (Upstream transport). `server_name` must be the bare
+/// hostname (no port) for SNI/certificate verification.
+pub(crate) async fn connect_upstream_tls_generic<S>(
+    upstream: S,
+    server_name: &str,
+    extra_ca_certs: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<tokio_rustls::client::TlsStream<S>, Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    connect_upstream_tls(upstream, server_name, None, None, extra_ca_certs).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
