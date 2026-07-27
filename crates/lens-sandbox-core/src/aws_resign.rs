@@ -150,6 +150,7 @@ pub async fn handle_aws_resign(
         &format!("{target_host}:{target_port}"),
         target_port,
         ctx.actor.process(),
+        crate::proxy::Gated::NotAsked,
     )
     .await?;
     let tls_upstream =
