@@ -83,7 +83,10 @@ pub struct NetworkPolicy {
 /// Hostname `tcp` rules apply however the traffic reaches the proxy. An IP/CIDR
 /// rule can only match an address, so when the workload connects by name it
 /// binds after resolution — in time to deny the connection, but not to grant a
-/// raw splice. Write a hostname rule when you want a raw splice by name.
+/// raw splice, and only where the sandbox resolves the name itself. A route the
+/// `http` table sends over `upstream` transport is tunnelled to Lens Sandbox
+/// unresolved, so no IP/CIDR rule sees it. Write a hostname rule whenever you
+/// want a `tcp` rule to bind by name.
 ///
 /// So a `tcp` allow turns off HTTP rules, credential injection, and inspection
 /// for the port it names — that is what asking for a raw splice means. Because

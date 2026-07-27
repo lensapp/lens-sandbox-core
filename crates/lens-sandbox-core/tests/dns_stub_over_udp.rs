@@ -95,15 +95,13 @@ fn state_with_tcp_hostname(host: &str) -> Arc<ProxyState> {
         None,
         Vec::new(),
     );
-    state.policy.write().unwrap().tcp_egress = vec![RouteRule {
-        matcher: RouteMatcher::Domain(host.to_string()),
-        verdict: Verdict::Allow,
-        transport: Transport::Direct,
-        tls_terminate: false,
-        http_rules: Vec::new(),
-        scheme: None,
-        binaries: None,
-    }];
+    // Through the real parser: `egress.tcp` rules always carry a port, so a
+    // hand-built portless matcher would be a shape the policy path can never
+    // produce.
+    state.policy.write().unwrap().tcp_egress = lens_sandbox_core::routing::parse_tcp_egress(
+        &serde_json::json!([{ "match": format!("{host}:5432"), "verdict": "allow" }]),
+    )
+    .expect("valid tcp egress rule");
     state
 }
 

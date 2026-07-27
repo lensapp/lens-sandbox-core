@@ -1332,10 +1332,9 @@ async fn handle_transparent_connection(
         return Ok(());
     }
 
-    // Resolve the caller once, up front: the `egress.tcp` binary filter needs
-    // it, and threading it into the l7 handlers means they no longer re-resolve
-    // (previously each did its own `/proc` read, doubling the cost whenever any
-    // tcp rule was configured).
+    // Resolve the caller once, up front, and thread it into the l7 handlers:
+    // the `egress.tcp` binary filter needs it, and one `/proc` read per
+    // connection is the budget.
     let actor = crate::peer_process::ActorContext::resolve_offloaded(peer).await;
 
     // Raw TCP egress: an `egress.tcp` rule matching the raw destination splices
@@ -1382,8 +1381,8 @@ pub(crate) struct TcpDecision {
 
 /// The `egress.tcp` table's decision for one destination, or `None` when no
 /// rule claims it — the connection then falls through to the `egress.http`
-/// routes. Every door asks this same question, in one ordered pass, so a static
-/// IP rule and a pinned hostname rule compete by their real policy position.
+/// routes. Every door asks this same question, in the one ordered pass
+/// [`parse_tcp_egress`] built the list for.
 ///
 /// A `Cidr`/`CidrPort` rule binds by address, so on the doors that name their
 /// destination it has nothing to match until [`connect_egress_under_policy`]
@@ -1472,13 +1471,12 @@ fn tcp_egress_verdict_for_hostport(
 /// checked here against a `10.0.0.0/8:22` rule it could not be tested against
 /// before.
 ///
-/// Only an allow (or no match) admits. No gate can run inside a dial, so an
-/// `ask` refuses rather than admitting: the workload picks the door, and this
-/// one must never answer more permissively than the transparent door, which
-/// would put that same IP to a human.
+/// `already_gated` carries whether a developer has already answered for this
+/// connection — see [`tcp_egress_admits`] for what that changes.
 ///
-/// Does not cover the MITM/AWS-resign dials, which have no caller to evaluate
-/// binary-scoped rules against; those stay governed by the L7 table.
+/// Every outbound dial goes through here — the raw doors, the MITM upstream,
+/// and the AWS-resign upstream — so no path reaches the network with the tcp
+/// table unread.
 pub(crate) async fn connect_egress_under_policy(
     state: &Arc<ProxyState>,
     target_host: &str,
