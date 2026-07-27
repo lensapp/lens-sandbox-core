@@ -714,6 +714,51 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         tcp: serde_json::Value,
     }
 
+    /// The two egress tables a policy publishes, or `Ok(None)` when it names
+    /// no policy at all. Every shape that must fail closed comes back as
+    /// `Err`, so the caller force-denies from one place and this function is
+    /// the single answer to "which policies are we willing to install".
+    ///
+    /// An `egress` block is authoritative: it supersedes `allowedRoutes`
+    /// entirely, so an absent `egress.http` is the legitimate tcp-only case
+    /// and yields no http rules rather than quietly reviving the deprecated
+    /// list. `allowedRoutes` is read only when there is no `egress` block at
+    /// all. Anything else is an operator typo, and silently dropping every
+    /// rule is the most permissive reading of one available.
+    type EgressTables = (
+        Vec<crate::routing::ParsedRoute>,
+        Vec<crate::routing::RouteRule>,
+    );
+    fn parse_egress_tables(network: &NetworkPolicyRaw) -> Result<Option<EgressTables>, String> {
+        let egress: EgressRaw = match &network.egress {
+            serde_json::Value::Object(_) => serde_json::from_value(network.egress.clone())
+                .map_err(|e| format!("egress: {e}"))?,
+            serde_json::Value::Null => {
+                if !network.allowed_routes.is_array() {
+                    return Ok(None);
+                }
+                let routes = parse_proxy_routes(&network.allowed_routes)
+                    .map_err(|e| format!("allowedRoutes: {e}"))?;
+                return Ok(Some((routes, Vec::new())));
+            }
+            _ => return Err("network.egress must be an object".to_string()),
+        };
+
+        let http = match &egress.http {
+            v if v.is_array() => parse_proxy_routes(v).map_err(|e| format!("egress.http: {e}"))?,
+            v if v.is_null() => Vec::new(),
+            _ => return Err("egress.http must be an array".to_string()),
+        };
+        let tcp = match &egress.tcp {
+            v if v.is_array() => {
+                crate::routing::parse_tcp_egress(v).map_err(|e| format!("egress.tcp: {e}"))?
+            }
+            v if v.is_null() => Vec::new(),
+            _ => return Err("egress.tcp must be an array".to_string()),
+        };
+        Ok(Some((http, tcp)))
+    }
+
     // Parsed first, alone — the version gate must fire before the full typed
     // parse so a future shape that serde can't decode surfaces
     // `VersionMismatch`, not a silent drop.
@@ -821,145 +866,84 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 state.client_certs.write().unwrap().clear();
             };
 
-            // Resolve the http source. egress.http wins; else the deprecated
-            // top-level allowedRoutes. When the operator opted into the egress
-            // block at all, an absent http is simply "no http rules" (a tcp-only
-            // policy is valid) — not malformed. Only a legacy policy with
-            // neither egress nor a valid allowedRoutes is treated as malformed
-            // and fails closed.
-            // Absent/null = no egress block, an object = parse it, anything else
-            // (string/number/array) is an operator typo that must fail closed.
-            let egress: Result<Option<EgressRaw>, String> = match &network.egress {
-                serde_json::Value::Null => Ok(None),
-                serde_json::Value::Object(_) => serde_json::from_value(network.egress.clone())
-                    .map(Some)
-                    .map_err(|e| format!("invalid egress: {e}")),
-                _ => Err("network.egress must be an object".to_string()),
-            };
+            match parse_egress_tables(&network) {
+                Ok(Some((parsed_routes, tcp_egress_rules))) => {
+                    let mut route_rules = Vec::with_capacity(parsed_routes.len());
+                    let mut cert_map: HashMap<String, crate::proxy::ClientCertConfig> =
+                        HashMap::new();
 
-            let empty = serde_json::Value::Array(Vec::new());
-            // `Ok(Some)` = an http source to parse, `Ok(None)` = no policy at all
-            // (force deny), `Err` = a malformed egress/http shape (force deny).
-            //
-            // An `egress` block is authoritative: it supersedes `allowedRoutes`
-            // entirely, so a null `egress.http` is the legitimate tcp-only case
-            // and yields no http rules rather than quietly reviving the
-            // deprecated list. `allowedRoutes` is read only when there is no
-            // `egress` block at all. Any other non-array is an operator typo and
-            // must fail closed, not silently drop every rule.
-            let http_value: Result<Option<&serde_json::Value>, String> = match &egress {
-                Err(e) => Err(e.clone()),
-                Ok(Some(e)) if e.http.is_array() => Ok(Some(&e.http)),
-                Ok(Some(e)) if e.http.is_null() => Ok(Some(&empty)),
-                Ok(Some(_)) => Err("egress.http must be an array".to_string()),
-                Ok(None) if network.allowed_routes.is_array() => Ok(Some(&network.allowed_routes)),
-                Ok(None) => Ok(None),
-            };
-            // egress.tcp is the raw-L4 list: absent means none, present-but-
-            // invalid fails closed alongside the http list.
-            let tcp_result: Result<Vec<crate::routing::RouteRule>, String> = match &egress {
-                Err(e) => Err(e.clone()),
-                Ok(Some(e)) if e.tcp.is_null() => Ok(Vec::new()),
-                Ok(Some(e)) if e.tcp.is_array() => crate::routing::parse_tcp_egress(&e.tcp),
-                Ok(Some(_)) => Err("egress.tcp must be an array".to_string()),
-                Ok(None) => Ok(Vec::new()),
-            };
+                    for mut parsed in parsed_routes {
+                        if let Some(fwd) = parsed.forward.take() {
+                            let key = match &parsed.rule.matcher {
+                                crate::routing::RouteMatcher::HostPort(h, p) => {
+                                    format!("{h}:{p}")
+                                }
+                                other => {
+                                    tracing::error!(
+                                        matcher = ?other,
+                                        "forward config on non-HostPort route; denying route"
+                                    );
+                                    parsed.rule.verdict = crate::routing::Verdict::Deny;
+                                    route_rules.push(parsed.rule);
+                                    continue;
+                                }
+                            };
 
-            match http_value {
-                Ok(Some(http_value)) => match (parse_proxy_routes(http_value), tcp_result) {
-                    (Ok(parsed_routes), Ok(tcp_egress_rules)) => {
-                        let mut route_rules = Vec::with_capacity(parsed_routes.len());
-                        let mut cert_map: HashMap<String, crate::proxy::ClientCertConfig> =
-                            HashMap::new();
-
-                        for mut parsed in parsed_routes {
-                            if let Some(fwd) = parsed.forward.take() {
-                                let key = match &parsed.rule.matcher {
-                                    crate::routing::RouteMatcher::HostPort(h, p) => {
-                                        format!("{h}:{p}")
-                                    }
-                                    other => {
-                                        tracing::error!(
-                                            matcher = ?other,
-                                            "forward config on non-HostPort route; denying route"
-                                        );
-                                        parsed.rule.verdict = crate::routing::Verdict::Deny;
-                                        route_rules.push(parsed.rule);
-                                        continue;
-                                    }
-                                };
-
-                                match parse_forward_certs(&fwd) {
-                                    Ok(cc) => {
-                                        tracing::info!(
-                                            domain_port = %key,
-                                            dial_addr = %fwd.dial_addr,
-                                            tls_server_name = %fwd.tls_server_name,
-                                            "forward cert config parsed from route"
-                                        );
-                                        cert_map.insert(key, cc);
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            domain_port = %key,
-                                            "forward cert parse failed: {e}; denying route"
-                                        );
-                                        parsed.rule.verdict = crate::routing::Verdict::Deny;
-                                    }
+                            match parse_forward_certs(&fwd) {
+                                Ok(cc) => {
+                                    tracing::info!(
+                                        domain_port = %key,
+                                        dial_addr = %fwd.dial_addr,
+                                        tls_server_name = %fwd.tls_server_name,
+                                        "forward cert config parsed from route"
+                                    );
+                                    cert_map.insert(key, cc);
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        domain_port = %key,
+                                        "forward cert parse failed: {e}; denying route"
+                                    );
+                                    parsed.rule.verdict = crate::routing::Verdict::Deny;
                                 }
                             }
-                            route_rules.push(parsed.rule);
                         }
+                        route_rules.push(parsed.rule);
+                    }
 
-                        // Resolve the default verdict/transport here so the whole
-                        // policy — routes, defaults, and tcp rules — publishes in
-                        // one atomic swap below. Computing it after the swap (as a
-                        // separate write) is what let a DNS/connect decision pair
-                        // this policy's routes with the previous policy's defaults.
-                        let (default_verdict, default_transport) =
-                            resolve_default_verdict_transport(
-                                network.default_verdict.as_deref(),
-                                network.default_transport.as_deref(),
-                            );
-                        tracing::info!(
-                            route_count = route_rules.len(),
-                            tcp_egress_count = tcp_egress_rules.len(),
-                            client_cert_count = cert_map.len(),
-                            client_cert_keys = ?cert_map.keys().collect::<Vec<_>>(),
-                            verdict = ?default_verdict,
-                            transport = ?default_transport,
-                            "proxy routes, tcp egress, defaults, and forward certs updated from policy"
-                        );
-                        *state.client_certs.write().unwrap() = cert_map;
-                        // Publish routes, defaults, and the ordered tcp egress
-                        // rules, clear the previous policy's pins, and bump the
-                        // generation in one atomic swap, so no connection or DNS
-                        // lookup can combine these with a superseded policy's
-                        // fields.
-                        crate::proxy::apply_network_policy(
-                            state,
-                            crate::proxy::NetworkPolicy {
-                                routes: route_rules,
-                                default_verdict,
-                                default_transport,
-                                tcp_egress: tcp_egress_rules,
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    (Err(e), _) => {
-                        tracing::error!(
-                            "invalid network egress.http/allowedRoutes in policy: {e}; clearing routes and forcing deny"
-                        );
-                        force_deny();
-                    }
-                    (_, Err(e)) => {
-                        tracing::error!(
-                            "invalid network.egress.tcp in policy: {e}; clearing routes and forcing deny"
-                        );
-                        force_deny();
-                    }
-                },
+                    // Resolve the default verdict/transport here so the whole
+                    // policy — routes, defaults, and tcp rules — publishes in
+                    // one atomic swap below.
+                    let (default_verdict, default_transport) = resolve_default_verdict_transport(
+                        network.default_verdict.as_deref(),
+                        network.default_transport.as_deref(),
+                    );
+                    tracing::info!(
+                        route_count = route_rules.len(),
+                        tcp_egress_count = tcp_egress_rules.len(),
+                        client_cert_count = cert_map.len(),
+                        client_cert_keys = ?cert_map.keys().collect::<Vec<_>>(),
+                        verdict = ?default_verdict,
+                        transport = ?default_transport,
+                        "proxy routes, tcp egress, defaults, and forward certs updated from policy"
+                    );
+                    *state.client_certs.write().unwrap() = cert_map;
+                    // Publish routes, defaults, and the ordered tcp egress
+                    // rules, clear the previous policy's pins, and bump the
+                    // generation in one atomic swap, so no connection or DNS
+                    // lookup can combine these with a superseded policy's
+                    // fields.
+                    crate::proxy::apply_network_policy(
+                        state,
+                        crate::proxy::NetworkPolicy {
+                            routes: route_rules,
+                            default_verdict,
+                            default_transport,
+                            tcp_egress: tcp_egress_rules,
+                            ..Default::default()
+                        },
+                    );
+                }
                 Ok(None) => {
                     tracing::info!(
                         "network policy has neither egress nor a valid allowedRoutes; clearing routes and forcing deny"
@@ -968,7 +952,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 }
                 Err(e) => {
                     tracing::error!(
-                        "invalid network.egress.http in policy: {e}; clearing routes and forcing deny"
+                        "invalid network policy: {e}; clearing routes and forcing deny"
                     );
                     force_deny();
                 }
