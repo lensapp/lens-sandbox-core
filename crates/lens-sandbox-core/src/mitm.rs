@@ -105,7 +105,17 @@ pub async fn handle_mitm_pre_accepted(
 
     match upstream_mode {
         UpstreamMode::DirectTls { host, port } => {
-            let target_stream = sock_mark::connect_tcp_egress(&format!("{host}:{port}")).await?;
+            // Through the policy-aware dial, not a bare one: an `egress.tcp`
+            // CIDR rule binds by address, so this is the first point at which it
+            // can be applied to a target the client named. Skipping it would let
+            // a CIDR deny hold on the transparent door and not here.
+            let target_stream = crate::proxy::connect_egress_under_policy(
+                ctx.state,
+                &format!("{host}:{port}"),
+                port,
+                ctx.actor.process(),
+            )
+            .await?;
             let mut tls_upstream =
                 connect_upstream_tls(target_stream, &host, None, None, ctx.extra_ca_certs).await?;
             tls_upstream.write_all(modified.as_bytes()).await?;
@@ -3669,5 +3679,79 @@ mod tests {
         assert!(!upstream_headers.contains(github_ph));
         assert!(!upstream_headers.contains(openai_ph));
         assert!(client_response.contains("200 OK"), "{client_response}");
+    }
+
+    #[tokio::test]
+    async fn a_tcp_cidr_deny_blocks_the_mitm_dial() {
+        // An `egress.tcp` CIDR rule binds by address, so a client that named its
+        // destination can only be tested against one here, at the dial. Dialling
+        // bare would let the same deny hold on the transparent door — which sees
+        // an address — and not on this one, and the workload picks the door.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = EphemeralCa::new().unwrap();
+        let (state, _rx) = crate::proxy::tests::test_state();
+        state.policy.write().unwrap().tcp_egress = crate::routing::parse_tcp_egress(
+            &serde_json::json!([{"match": "203.0.113.0/24:443", "verdict": "deny"}]),
+        )
+        .unwrap();
+
+        let hostname = "db.internal";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let root_store = ca_root_store(&ca);
+
+        let client = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(config));
+            let name = ServerName::try_from(hostname.to_string()).unwrap();
+            let mut tls = connector.connect(name, stream).await.unwrap();
+            tls.write_all(b"GET / HTTP/1.1\r\nHost: db.internal\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            let _ = tls.read_to_end(&mut buf).await;
+        });
+
+        let (client_stream, _) = listener.accept().await.unwrap();
+        let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+        let audit_tx = state.audit_tx.lock().unwrap().clone();
+        let ctx = MitmContext {
+            injections: &[],
+            http_rules: &[],
+            ca: &ca,
+            audit_tx: &audit_tx,
+            extra_ca_certs: &[],
+            placeholder_map: &[],
+            state: &state,
+            match_host: hostname,
+            actor: &actor,
+        };
+        let server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
+        let tls_client = TlsAcceptor::from(server_config)
+            .accept(client_stream)
+            .await
+            .unwrap();
+
+        // The name resolves into the denied range; the dial must refuse rather
+        // than reach the origin.
+        let err = handle_mitm_pre_accepted(
+            tls_client,
+            hostname,
+            UpstreamMode::DirectTls {
+                host: "203.0.113.9".to_string(),
+                port: 443,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("a tcp deny covering the resolved address must refuse the dial");
+        assert!(
+            err.to_string().contains("denied by policy"),
+            "expected a policy refusal, got: {err}"
+        );
+        client.abort();
     }
 }

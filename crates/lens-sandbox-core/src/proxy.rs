@@ -1087,11 +1087,9 @@ async fn handle_connect(
                 let ca = get_or_init_ca(state)?;
                 tracing::debug!(target = %target_host, "proxy DIRECT+AWS_RESIGN");
                 let port = extract_port(target_host, 443);
-                let audit_tx = state.audit_tx.lock().unwrap().clone();
-                let extra_certs = state.extra_ca_certs.read().unwrap().clone();
                 state
                     .aws_resign
-                    .handle(client, &hostname, port, ca, &extra_certs, &audit_tx)
+                    .handle(client, &hostname, port, ca, state, actor)
                     .await?;
             } else if needs_mitm {
                 let ca = get_or_init_ca(state)?;
@@ -1475,7 +1473,7 @@ fn tcp_egress_verdict_for_hostport(
 ///
 /// Does not cover the MITM/AWS-resign dials, which have no caller to evaluate
 /// binary-scoped rules against; those stay governed by the L7 table.
-async fn connect_egress_under_policy(
+pub(crate) async fn connect_egress_under_policy(
     state: &Arc<ProxyState>,
     target_host: &str,
     default_port: u16,
