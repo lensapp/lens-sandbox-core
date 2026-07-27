@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use crate::routing::{
-    HttpRule, RouteOutcome, RouteRule, Scheme, Transport, Verdict, find_matching_route,
+    FqdnPin, HttpRule, RouteOutcome, RouteRule, Scheme, Transport, Verdict, binaries_admit_caller,
+    find_matching_route,
 };
 use crate::sock_mark;
 use crate::transparent::{self, Protocol};
@@ -38,6 +39,23 @@ pub struct SandboxUpstream {
 
 /// How long to suppress duplicate audit events for the same host.
 const AUDIT_DEDUP_SECS: u64 = 10;
+
+/// Floor and ceiling applied to a DNS record's TTL when pinning its IPs. The
+/// floor keeps a 0-TTL answer usable long enough for the follow-up connect; the
+/// ceiling bounds how long a stale pin outlives a policy change or a DNS
+/// rebind. Values are seconds.
+const PIN_TTL_FLOOR_SECS: u64 = 30;
+const PIN_TTL_CAP_SECS: u64 = 3600;
+/// Hard cap on distinct pinned IPs; a prune-expired-then-clear backstop against
+/// unbounded growth from a name that resolves to churning addresses.
+const MAX_PINNED_IPS: usize = 4096;
+
+/// An IP pinned from a DNS answer for a `tcp_fqdn` name, plus its expiry.
+#[derive(Debug, Clone)]
+pub struct PinnedIp {
+    pub pin: FqdnPin,
+    pub expiry: Instant,
+}
 
 /// A single header injection for a credential bound to a domain.
 #[derive(Debug, Clone)]
@@ -83,7 +101,22 @@ impl Clone for ClientCertConfig {
 /// Shared state for the proxy — upstream + routes can be updated at runtime.
 pub struct ProxyState {
     pub upstream: Mutex<Option<SandboxUpstream>>,
+    /// Application-layer routes (`egress.l7` / the deprecated `allowedRoutes`),
+    /// consulted after protocol classification.
     pub routes: RwLock<Vec<RouteRule>>,
+    /// Raw-TCP egress rules with a literal IP/CIDR match (`egress.tcp`),
+    /// consulted before classification. Each splices its match through as an
+    /// opaque byte tunnel.
+    pub tcp_egress: RwLock<Vec<RouteRule>>,
+    /// Raw-TCP egress rules with a hostname match (`egress.tcp` FQDN entries).
+    /// The raw path never sees a name, so these drive DNS-answer pinning: the
+    /// stub consults them to gate the lookup and record the answer IPs into
+    /// [`pinned_ips`](Self::pinned_ips).
+    pub tcp_fqdn: RwLock<Vec<RouteRule>>,
+    /// IPs pinned from DNS answers of `tcp_fqdn` names, each carrying the
+    /// originating rule's decision and a TTL-bounded expiry. Consulted by
+    /// [`resolve_tcp_egress`] after the static rules.
+    pub pinned_ips: RwLock<HashMap<IpAddr, Vec<PinnedIp>>>,
     pub default_verdict: RwLock<Verdict>,
     pub default_transport: RwLock<Transport>,
     pub audit_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
@@ -265,6 +298,9 @@ impl ProxyServer {
         let state = Arc::new(ProxyState {
             upstream: Mutex::new(None),
             routes: RwLock::new(Vec::new()),
+            tcp_egress: RwLock::new(Vec::new()),
+            tcp_fqdn: RwLock::new(Vec::new()),
+            pinned_ips: RwLock::new(HashMap::new()),
             default_verdict: RwLock::new(Verdict::Allow),
             default_transport: RwLock::new(Transport::Upstream),
             audit_tx: std::sync::Mutex::new(None),
@@ -1153,12 +1189,26 @@ async fn handle_transparent_connection(
         return Ok(());
     }
 
+    // Resolve the caller once, up front: the `egress.tcp` binary filter needs
+    // it, and threading it into the l7 handlers means they no longer re-resolve
+    // (previously each did its own `/proc` read, doubling the cost whenever any
+    // tcp rule was configured).
+    let actor = crate::peer_process::ActorContext::resolve_offloaded(peer).await;
+
+    // Raw TCP egress: an `egress.tcp` rule matching the raw destination splices
+    // bytes through untouched — no protocol peek, no TLS interception. Decided
+    // before classification so TLS-speaking databases are not MITM'd.
+    let raw_target = format!("{}:{}", orig_dst.ip(), orig_dst.port());
+    if let Some(verdict) = resolve_tcp_egress(&state, &raw_target, actor.process()) {
+        return handle_raw_passthrough(stream, &raw_target, verdict, &state, &actor).await;
+    }
+
     // 8 bytes covers every classifier prefix: TLS needs 3, `OPTIONS ` and
     // `CONNECT ` are 8.
     let first = transparent::peek_first_bytes(&stream, 8).await?;
     match transparent::classify(&first) {
-        Protocol::Tls => handle_transparent_tls(stream, orig_dst, peer, &state).await,
-        Protocol::Http => handle_transparent_http(stream, orig_dst, peer, &state).await,
+        Protocol::Tls => handle_transparent_tls(stream, orig_dst, actor, &state).await,
+        Protocol::Http => handle_transparent_http(stream, orig_dst, actor, &state).await,
         Protocol::Unknown => {
             emit_transparent_deny(&state, orig_dst, "unknown-protocol");
             // Dropping the stream closes the socket.
@@ -1167,13 +1217,216 @@ async fn handle_transparent_connection(
     }
 }
 
+/// Resolve `raw_target` (an `ip:port`) against the `egress.tcp` rules. Checks
+/// the static IP/CIDR rules first, then any live pin recorded from a `tcp_fqdn`
+/// DNS answer. Returns the matched verdict, or `None` when nothing matches (the
+/// connection then falls through to classification and the `egress.l7` routes)
+/// or when a `binaries` filter excluded the caller — never re-opened here. Raw
+/// TCP always egresses directly, so no transport is returned.
+///
+/// An opaque tunnel carries no HTTP scheme, so the probe scheme is arbitrary;
+/// `egress.tcp` rules never set one.
+fn resolve_tcp_egress(
+    state: &Arc<ProxyState>,
+    raw_target: &str,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> Option<Verdict> {
+    {
+        let tcp = state.tcp_egress.read().unwrap();
+        if let RouteOutcome::Matched(rule) =
+            find_matching_route(&tcp, raw_target, Scheme::Https, caller)
+        {
+            return Some(rule.verdict);
+        }
+    }
+    resolve_pinned(state, raw_target, caller)
+}
+
+/// Match `raw_target` against the IPs pinned from `tcp_fqdn` DNS answers. A pin
+/// admits the connection when it is unexpired, its port is unset or equals the
+/// target port, and its `binaries` filter admits the caller. Expired pins for
+/// the looked-up IP are pruned lazily on the way through.
+fn resolve_pinned(
+    state: &Arc<ProxyState>,
+    raw_target: &str,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> Option<Verdict> {
+    let ip: IpAddr = extract_hostname(raw_target).parse().ok()?;
+    let port = extract_port(raw_target, 0);
+    let now = Instant::now();
+
+    let mut pinned = state.pinned_ips.write().unwrap();
+    let entry = pinned.get_mut(&ip)?;
+    entry.retain(|p| p.expiry > now);
+    let decision = entry
+        .iter()
+        .find(|p| {
+            p.pin.port.is_none_or(|want| want == port)
+                && binaries_admit_caller(p.pin.binaries.as_deref(), caller)
+        })
+        .map(|p| p.pin.verdict);
+    if entry.is_empty() {
+        pinned.remove(&ip);
+    }
+    decision
+}
+
+/// Record `ips` (from a DNS answer) against `pin` (the `tcp_fqdn` rule the
+/// queried name matched), expiring after `ttl_secs` clamped to
+/// [`PIN_TTL_FLOOR_SECS`, `PIN_TTL_CAP_SECS`]. Called by the DNS stub after it
+/// forwards an allowed answer. A no-op when there are no IPs.
+///
+/// Re-resolving the same name refreshes an existing equivalent pin's expiry
+/// rather than appending a duplicate, so a hot name's per-IP list stays bounded
+/// by the number of *distinct* rules that resolve to it, not the resolve rate.
+pub(crate) fn pin_dns_answers(
+    state: &Arc<ProxyState>,
+    ips: &[IpAddr],
+    pin: &FqdnPin,
+    ttl_secs: u32,
+) {
+    if ips.is_empty() {
+        return;
+    }
+    let ttl = (ttl_secs as u64).clamp(PIN_TTL_FLOOR_SECS, PIN_TTL_CAP_SECS);
+    let expiry = Instant::now() + Duration::from_secs(ttl);
+
+    let mut pinned = state.pinned_ips.write().unwrap();
+    // Backstop against unbounded growth: once at the cap, drop everything
+    // expired, and if that didn't get us back under, refuse to grow further.
+    // The follow-up connect then finds no pin and is denied — fail closed.
+    if pinned.len() >= MAX_PINNED_IPS {
+        let now = Instant::now();
+        pinned.retain(|_, v| {
+            v.retain(|p| p.expiry > now);
+            !v.is_empty()
+        });
+        if pinned.len() >= MAX_PINNED_IPS {
+            return;
+        }
+    }
+    for &ip in ips {
+        let entry = pinned.entry(ip).or_default();
+        match entry.iter_mut().find(|p| p.pin == *pin) {
+            Some(existing) => existing.expiry = expiry,
+            None => entry.push(PinnedIp {
+                pin: pin.clone(),
+                expiry,
+            }),
+        }
+    }
+}
+
+/// Open an opaque CONNECT tunnel to `target` through the Lens Sandbox upstream
+/// and return the stream once the upstream answers `200`. On any failure a
+/// matching audit event is emitted and the error returned. Shared by the raw
+/// passthrough and transparent-TLS upstream paths, which then splice or MITM
+/// the returned stream.
+///
+/// The explicit-CONNECT path deliberately does NOT use this: it must write HTTP
+/// status lines back to its own client on failure, which this helper can't do.
+async fn open_upstream_tunnel(
+    state: &Arc<ProxyState>,
+    target: &str,
+    actor: &crate::peer_process::ActorContext,
+) -> Result<BoxedSandboxStream, Box<dyn std::error::Error + Send + Sync>> {
+    let upstream = match state.upstream.lock().await.clone() {
+        Some(n) => n,
+        None => {
+            emit_audit(state, target, "error", 503, actor);
+            return Err("Lens Sandbox upstream not configured yet".into());
+        }
+    };
+    let upstream_addr = format!("{}:{}", upstream.host, upstream.port);
+    let mut upstream_stream: BoxedSandboxStream = match connect_sandbox_upstream(state, &upstream)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            emit_audit(state, target, "error", 502, actor);
+            return Err(format!("connect to Lens Sandbox upstream {upstream_addr}: {e}").into());
+        }
+    };
+    let mut connect_req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
+    if let Some(auth) = &upstream.auth_header {
+        connect_req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+    }
+    connect_req.push_str("\r\n");
+    upstream_stream.write_all(connect_req.as_bytes()).await?;
+
+    let status = match tokio::time::timeout(
+        HEADER_READ_TIMEOUT,
+        read_response_status_unbuffered(&mut upstream_stream),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            emit_audit(state, target, "error", 504, actor);
+            return Err("upstream header read timeout".into());
+        }
+    };
+    if !status.starts_with("200") {
+        emit_audit(state, target, "error", 502, actor);
+        return Err(format!("Lens Sandbox upstream returned: {status}").into());
+    }
+    Ok(upstream_stream)
+}
+
+/// Splice a policy-approved raw TCP connection to its original destination
+/// without interpreting the payload. Raw TCP always egresses directly: a
+/// SO_MARK'd socket dials the destination, bypassing the nftables cage, and the
+/// bytes are spliced through untouched. Honors `deny`/`ask` exactly as the
+/// transparent TLS path does. `raw_target` is the pre-redirect `ip:port`.
+async fn handle_raw_passthrough(
+    mut stream: TcpStream,
+    raw_target: &str,
+    verdict: Verdict,
+    state: &Arc<ProxyState>,
+    actor: &crate::peer_process::ActorContext,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match verdict {
+        Verdict::Deny => {
+            emit_policy_deny_connect(state, raw_target, "policy-deny", actor);
+            return Ok(());
+        }
+        Verdict::Ask => {
+            let action_str = format!("CONNECT {raw_target}");
+            let key = gate_key(raw_target);
+            let decision =
+                crate::gate::gate_or_deny(state, &key, &action_str, "policy-ambiguous").await;
+            if !decision.is_allow() {
+                emit_gate_denied(state, &action_str, decision);
+                tracing::info!(target = %raw_target, reason = decision.audit_reason(), "transparent passthrough DENIED (gated)");
+                return Ok(());
+            }
+            emit_gate_resolved(state, &action_str, decision);
+            tracing::info!(target = %raw_target, reason = decision.audit_reason(), "transparent passthrough ALLOWED (gated)");
+        }
+        Verdict::Allow => {}
+    }
+
+    // Raw TCP always egresses directly: SO_MARK bypasses the nftables cage and
+    // the bytes are spliced through untouched.
+    let mut upstream = match sock_mark::connect_tcp_resolve(raw_target).await {
+        Ok(s) => s,
+        Err(e) => {
+            emit_audit(state, raw_target, "error", 502, actor);
+            return Err(format!("passthrough connect to {raw_target}: {e}").into());
+        }
+    };
+    tracing::debug!(target = %raw_target, "transparent passthrough DIRECT");
+    emit_audit(state, raw_target, "allow", 200, actor);
+    tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
+    Ok(())
+}
+
 async fn handle_transparent_tls(
     stream: TcpStream,
     orig_dst: SocketAddr,
-    peer: SocketAddr,
+    actor: crate::peer_process::ActorContext,
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let actor = crate::peer_process::ActorContext::resolve_offloaded(peer).await;
     // Peek the SNI before committing to a ServerConfig, so a policy-denied host
     // is rejected before we mint an ephemeral cert for it. (LazyConfigAcceptor
     // is what lets us read the ClientHello without accepting the connection yet.)
@@ -1326,53 +1579,9 @@ async fn handle_transparent_tls(
         }
         Transport::Upstream => {
             // Open a CONNECT tunnel through Lens Sandbox before handing the
-            // pre-accepted TLS stream to the MITM pipeline.
-            let upstream_opt = state.upstream.lock().await.clone();
-            let upstream = match upstream_opt {
-                Some(n) => n,
-                None => {
-                    emit_audit(state, &target_host, "error", 503, &actor);
-                    return Err("Lens Sandbox upstream not configured yet".into());
-                }
-            };
-            let upstream_addr = format!("{}:{}", upstream.host, upstream.port);
-            let mut upstream_stream: BoxedSandboxStream =
-                match connect_sandbox_upstream(state, &upstream).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        emit_audit(state, &target_host, "error", 502, &actor);
-                        return Err(format!(
-                            "connect to Lens Sandbox upstream {upstream_addr}: {e}"
-                        )
-                        .into());
-                    }
-                };
-            let mut connect_req =
-                format!("CONNECT {target_host} HTTP/1.1\r\nHost: {target_host}\r\n");
-            if let Some(auth) = &upstream.auth_header {
-                connect_req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
-            }
-            connect_req.push_str("\r\n");
-            upstream_stream.write_all(connect_req.as_bytes()).await?;
-
-            let status = match tokio::time::timeout(
-                HEADER_READ_TIMEOUT,
-                read_response_status_unbuffered(&mut upstream_stream),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    emit_audit(state, &target_host, "error", 504, &actor);
-                    return Err("upstream header read timeout".into());
-                }
-            };
-
-            if !status.starts_with("200") {
-                emit_audit(state, &target_host, "error", 502, &actor);
-                return Err(format!("Lens Sandbox upstream returned: {status}").into());
-            }
-
+            // pre-accepted TLS stream to the MITM pipeline. No success audit
+            // here — the MITM pipeline audits per request.
+            let upstream_stream = open_upstream_tunnel(state, &target_host, &actor).await?;
             tracing::debug!(target = %target_host, "transparent TLS LENS+MITM");
             let mode = crate::mitm::UpstreamMode::TunnelTls(upstream_stream);
             crate::mitm::handle_mitm_pre_accepted(tls_client, &hostname, mode, &ctx).await?;
@@ -1385,10 +1594,9 @@ async fn handle_transparent_tls(
 async fn handle_transparent_http(
     mut stream: TcpStream,
     orig_dst: SocketAddr,
-    peer: SocketAddr,
+    actor: crate::peer_process::ActorContext,
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let actor = crate::peer_process::ActorContext::resolve_offloaded(peer).await;
     let header_bytes = match tokio::time::timeout(
         HEADER_READ_TIMEOUT,
         read_until_double_crlf(&mut stream),
@@ -2285,6 +2493,9 @@ pub(crate) mod tests {
         let state = Arc::new(ProxyState {
             upstream: Mutex::new(None),
             routes: RwLock::new(Vec::new()),
+            tcp_egress: RwLock::new(Vec::new()),
+            tcp_fqdn: RwLock::new(Vec::new()),
+            pinned_ips: RwLock::new(HashMap::new()),
             default_verdict: RwLock::new(Verdict::Allow),
             default_transport: RwLock::new(Transport::Upstream),
             audit_tx: std::sync::Mutex::new(Some(tx)),
@@ -2433,6 +2644,152 @@ pub(crate) mod tests {
             resolve_route(&state, "api.openai.com:443", Scheme::Https, Some(&wget)).is_none(),
             "an excluded caller must not fall through to the default verdict",
         );
+    }
+
+    #[test]
+    fn pinned_dns_answer_resolves_the_raw_target() {
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let pin = FqdnPin {
+            port: Some(5432),
+            verdict: Verdict::Allow,
+            binaries: None,
+        };
+        pin_dns_answers(&state, &[ip], &pin, 300);
+
+        // A connect to the pinned ip:port resolves to the pin's verdict.
+        let verdict =
+            resolve_tcp_egress(&state, "203.0.113.7:5432", None).expect("pin should match");
+        assert_eq!(verdict, Verdict::Allow);
+
+        // A different port on the same ip is not covered by the port-scoped pin.
+        assert!(resolve_tcp_egress(&state, "203.0.113.7:6379", None).is_none());
+        // An ip that was never pinned does not match.
+        assert!(resolve_tcp_egress(&state, "198.51.100.1:5432", None).is_none());
+    }
+
+    #[test]
+    fn expired_pins_are_pruned_and_do_not_resolve() {
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        // Insert a pin that is already expired.
+        {
+            let mut pinned = state.pinned_ips.write().unwrap();
+            pinned.insert(
+                ip,
+                vec![PinnedIp {
+                    pin: FqdnPin {
+                        port: None,
+                        verdict: Verdict::Allow,
+                        binaries: None,
+                    },
+                    expiry: Instant::now() - Duration::from_secs(1),
+                }],
+            );
+        }
+
+        assert!(resolve_tcp_egress(&state, "203.0.113.9:5432", None).is_none());
+        // The lazy prune drops the now-empty entry entirely.
+        assert!(state.pinned_ips.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pin_dns_answers_is_a_noop_without_ips() {
+        let (state, _rx) = test_state();
+        let pin = FqdnPin {
+            port: None,
+            verdict: Verdict::Allow,
+            binaries: None,
+        };
+
+        pin_dns_answers(&state, &[], &pin, 300);
+        assert!(state.pinned_ips.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pin_dns_answers_refreshes_expiry_instead_of_duplicating() {
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.30".parse().unwrap();
+        let pin = FqdnPin {
+            port: Some(5432),
+            verdict: Verdict::Allow,
+            binaries: None,
+        };
+
+        // Re-resolving the same name to the same IP must not grow the per-IP list.
+        pin_dns_answers(&state, &[ip], &pin, 300);
+        pin_dns_answers(&state, &[ip], &pin, 300);
+        pin_dns_answers(&state, &[ip], &pin, 300);
+
+        let pinned = state.pinned_ips.read().unwrap();
+        assert_eq!(pinned.get(&ip).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn pin_dns_answers_bounds_growth_at_the_cap() {
+        let (state, _rx) = test_state();
+        let pin = FqdnPin {
+            port: None,
+            verdict: Verdict::Allow,
+            binaries: None,
+        };
+        // Fill the store to the cap with distinct, unexpired IPs.
+        {
+            let mut pinned = state.pinned_ips.write().unwrap();
+            let expiry = Instant::now() + Duration::from_secs(300);
+            for i in 0..MAX_PINNED_IPS {
+                let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+                pinned.insert(
+                    ip,
+                    vec![PinnedIp {
+                        pin: pin.clone(),
+                        expiry,
+                    }],
+                );
+            }
+        }
+
+        // A fresh IP over the cap (nothing expired to reclaim) must be refused,
+        // not appended — the map stays bounded.
+        let overflow: IpAddr = "203.0.113.250".parse().unwrap();
+        pin_dns_answers(&state, &[overflow], &pin, 300);
+
+        let pinned = state.pinned_ips.read().unwrap();
+        assert_eq!(pinned.len(), MAX_PINNED_IPS);
+        assert!(!pinned.contains_key(&overflow));
+    }
+
+    #[test]
+    fn pinned_binaries_filter_is_rechecked_at_connect() {
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.20".parse().unwrap();
+        let pin = FqdnPin {
+            port: Some(5432),
+            verdict: Verdict::Allow,
+            binaries: Some(vec![std::path::PathBuf::from("/usr/bin/psql")]),
+        };
+        pin_dns_answers(&state, &[ip], &pin, 300);
+
+        let psql = crate::peer_process::PeerProcess {
+            pid: 200,
+            name: "psql".to_string(),
+            exe: Some(std::path::PathBuf::from("/usr/bin/psql")),
+            ancestors: Vec::new(),
+        };
+        let curl = crate::peer_process::PeerProcess {
+            pid: 201,
+            name: "curl".to_string(),
+            exe: Some(std::path::PathBuf::from("/usr/bin/curl")),
+            ancestors: Vec::new(),
+        };
+
+        // The listed binary is admitted by the pin.
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.20:5432", Some(&psql)),
+            Some(Verdict::Allow)
+        );
+        // A different binary is not — the pin's filter fails closed.
+        assert!(resolve_tcp_egress(&state, "203.0.113.20:5432", Some(&curl)).is_none());
     }
 
     #[test]

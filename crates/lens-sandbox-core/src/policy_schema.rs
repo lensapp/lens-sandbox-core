@@ -46,19 +46,84 @@ pub struct PolicyDocument {
     pub files: Option<Vec<TempFile>>,
 }
 
-/// Network policy controlling which domains the sandbox can reach.
+/// Network policy controlling what the sandbox can reach.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicy {
-    /// Ordered list of route rules (first match wins).
-    pub allowed_routes: Vec<RouteRule>,
+    /// **Deprecated** — use [`egress.l7`](Egress::l7). Accepted as a
+    /// back-compat alias: when both are present, `egress.l7` wins. Ordered
+    /// list of application-layer route rules (first match wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_routes: Option<Vec<RouteRule>>,
 
-    /// Verdict for destinations not matching any route rule.
+    /// Egress rules grouped by the layer they filter at. Optional so older
+    /// policies that only set the deprecated top-level `allowedRoutes` still
+    /// parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<Egress>,
+
+    /// Verdict for destinations not matching any rule.
     pub default_verdict: Verdict,
 
     /// Transport applied when the default verdict is `allow`. Ignored when the
     /// default verdict is `deny`.
     pub default_transport: Transport,
+}
+
+/// Egress rules split by the layer at which the destination is filtered.
+///
+/// - [`l7`](Self::l7) filters by hostname and can see and rewrite the payload
+///   (HTTP rules, TLS termination, credential injection).
+/// - [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the
+///   payload — an opaque byte splice for non-HTTP services.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Egress {
+    /// Application-layer (hostname + HTTP/TLS) route rules, first match wins.
+    /// Same rule type as the deprecated top-level `allowedRoutes`.
+    #[serde(default)]
+    pub l7: Vec<RouteRule>,
+
+    /// Raw TCP rules, first match wins. Each matches a destination by IP/CIDR
+    /// or hostname (optionally scoped to a port) and splices the connection
+    /// through opaquely — no protocol classification, no TLS interception, no
+    /// HTTP rules. Intended for databases, brokers, and caches, including those
+    /// that speak TLS (the connection is not intercepted, so pinning works).
+    ///
+    /// A hostname rule permits its own DNS lookup and pins the resolved IPs, so
+    /// it needs no paired [`l7`](Self::l7) rule (see [`TcpEgressRule`]).
+    #[serde(default)]
+    pub tcp: Vec<TcpEgressRule>,
+}
+
+/// A single first-match-wins raw-TCP egress rule.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpEgressRule {
+    /// Destination as an IP, CIDR, `ip:port`, `cidr:port`, hostname, or
+    /// `hostname:port` (e.g. `10.20.0.0/24:5432`, `[2001:db8::/32]:5432`,
+    /// `db.internal:5432`). A bare IP/CIDR/hostname matches any port.
+    ///
+    /// IP/CIDR patterns match the resolved destination directly at connect
+    /// time. Hostname patterns can only match via DNS forward-pinning: the DNS
+    /// stub permits the lookup for a matching hostname rule, then pins the
+    /// resolved A-record IPs so the raw TCP layer admits the follow-up
+    /// connection. A hostname rule is self-sufficient — it gates its own DNS
+    /// lookup, so no paired [`l7`](Egress::l7) rule is required.
+    #[serde(rename = "match")]
+    pub match_pattern: String,
+
+    /// Policy verdict: allow, deny, or ask.
+    pub verdict: Verdict,
+
+    /// Restrict this rule to connections initiated by specific binaries. Same
+    /// semantics as [`RouteRule::binaries`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binaries: Option<Vec<String>>,
+
+    /// Human-readable description of this rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Verdict for a matched route or as default: should the connection be allowed,

@@ -35,6 +35,10 @@ pub struct RouteRule {
 pub enum RouteMatcher {
     Domain(String),
     Cidr(IpNet),
+    /// A CIDR (or single-IP `/32`,`/128`) scoped to a specific port, e.g.
+    /// `10.0.0.0/24:5432`. Unlike [`RouteMatcher::Cidr`], which matches any
+    /// port, this matches only the given port.
+    CidrPort(IpNet, u16),
     HostPort(String, u16),
 }
 
@@ -67,38 +71,9 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
         let verdict = raw.verdict;
         let transport = raw.transport;
 
-        let matcher = if let Ok(cidr) = raw.match_pattern.parse::<IpNet>() {
-            // CIDR check first — avoids false match on IPv6 like "2001:db8::/32"
-            RouteMatcher::Cidr(cidr)
-        } else if raw.match_pattern.starts_with('[') {
-            // Bracketed IPv6 with port: [::1]:6443
-            let Some((bracket_part, port_str)) = raw.match_pattern.rsplit_once("]:") else {
-                return Err(format!("invalid bracketed address: {}", raw.match_pattern));
-            };
-            let host = bracket_part.trim_start_matches('[');
-            let port: u16 = port_str
-                .parse()
-                .map_err(|_| format!("invalid port in {}", raw.match_pattern))?;
-            RouteMatcher::HostPort(host.to_ascii_lowercase(), port)
-        } else if raw.match_pattern.matches(':').count() > 1 {
-            // Raw unbracketed IPv6 (multiple colons without brackets) — reject
-            return Err(format!(
-                "ambiguous IPv6 address without brackets: {}; use [addr]:port notation",
-                raw.match_pattern
-            ));
-        } else if let Some((host, port_str)) = raw.match_pattern.rsplit_once(':') {
-            // Single colon — could be host:port
-            if let Ok(port) = port_str.parse::<u16>() {
-                RouteMatcher::HostPort(host.to_ascii_lowercase(), port)
-            } else {
-                // Port doesn't parse — treat as domain
-                RouteMatcher::Domain(raw.match_pattern)
-            }
-        } else {
-            RouteMatcher::Domain(raw.match_pattern)
-        };
+        let matcher = parse_matcher(&raw.match_pattern)?;
 
-        let http_rules = raw
+        let http_rules: Vec<HttpRule> = raw
             .rules
             .into_iter()
             .filter_map(|r| {
@@ -126,6 +101,183 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             binaries,
         })
     }
+}
+
+/// Parse a `match` pattern into a [`RouteMatcher`]. Shared by application-layer
+/// (`allowedRoutes` / `egress.l7`) and raw-TCP (`egress.tcp`) parsing so the
+/// two never diverge on how a pattern is interpreted. Accepts a bare IP/CIDR,
+/// `ip:port`/`host:port`, `cidr:port` (`10.0.0.0/24:5432`), bracketed IPv6
+/// (`[::1]:6443`, `[2001:db8::/32]:5432`), or a domain / wildcard.
+pub fn parse_matcher(pattern: &str) -> Result<RouteMatcher, String> {
+    if let Ok(cidr) = pattern.parse::<IpNet>() {
+        // CIDR check first — avoids false match on IPv6 like "2001:db8::/32"
+        Ok(RouteMatcher::Cidr(cidr))
+    } else if pattern.starts_with('[') {
+        // Bracketed IPv6 with port: [::1]:6443, or bracketed IPv6 CIDR with
+        // port: [2001:db8::/32]:5432.
+        let Some((bracket_part, port_str)) = pattern.rsplit_once("]:") else {
+            return Err(format!("invalid bracketed address: {pattern}"));
+        };
+        let host = bracket_part.trim_start_matches('[');
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| format!("invalid port in {pattern}"))?;
+        // A `/` inside the brackets means a prefix length — treat it as a
+        // CIDR scoped to the port. A bare literal stays HostPort so existing
+        // `[::1]:6443` rules are unchanged.
+        if host.contains('/') {
+            let net = host
+                .parse::<IpNet>()
+                .map_err(|_| format!("invalid CIDR in {pattern}"))?;
+            Ok(RouteMatcher::CidrPort(net, port))
+        } else {
+            Ok(RouteMatcher::HostPort(host.to_ascii_lowercase(), port))
+        }
+    } else if pattern.contains('/') && pattern.matches(':').count() == 1 {
+        // Unbracketed IPv4 CIDR with port: 10.0.0.0/24:5432. IPv6 CIDRs must
+        // use bracket notation (handled above) — the single-colon guard keeps
+        // a raw IPv6 CIDR:port from being mis-split here.
+        let (net_str, port_str) = pattern
+            .rsplit_once(':')
+            .ok_or_else(|| format!("invalid CIDR:port: {pattern}"))?;
+        let net = net_str
+            .parse::<IpNet>()
+            .map_err(|_| format!("invalid CIDR in {pattern}"))?;
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| format!("invalid port in {pattern}"))?;
+        Ok(RouteMatcher::CidrPort(net, port))
+    } else if pattern.matches(':').count() > 1 {
+        // Raw unbracketed IPv6 (multiple colons without brackets) — reject
+        Err(format!(
+            "ambiguous IPv6 address without brackets: {pattern}; use [addr]:port notation"
+        ))
+    } else if let Some((host, port_str)) = pattern.rsplit_once(':') {
+        // Single colon — could be host:port
+        if let Ok(port) = port_str.parse::<u16>() {
+            Ok(RouteMatcher::HostPort(host.to_ascii_lowercase(), port))
+        } else {
+            // Port doesn't parse — treat as domain
+            Ok(RouteMatcher::Domain(pattern.to_string()))
+        }
+    } else {
+        Ok(RouteMatcher::Domain(pattern.to_string()))
+    }
+}
+
+/// Raw-TCP egress rules, split by how the destination is matched.
+///
+/// - [`ip_rules`](Self::ip_rules) match a literal IP/CIDR (optionally
+///   `:port`) at connect time via [`find_matching_route`].
+/// - [`fqdn_rules`](Self::fqdn_rules) match by hostname: the raw path never
+///   sees a name, so these instead drive DNS-answer *pinning* — when the stub
+///   resolves a matching name it records the answer IPs so the subsequent TCP
+///   connection to one of them is admitted (see [`matching_fqdn_pins`]).
+#[derive(Debug, Default)]
+pub struct TcpEgress {
+    pub ip_rules: Vec<RouteRule>,
+    pub fqdn_rules: Vec<RouteRule>,
+}
+
+/// The connect-time decision to pin against a DNS-resolved IP: the fqdn rule's
+/// verdict, the port it is scoped to (`None` = any), and its `binaries` filter
+/// (re-checked against the TCP caller). Raw TCP always egresses directly, so
+/// there is no transport to carry. `PartialEq` lets the pin store refresh an
+/// equivalent entry's expiry instead of appending a duplicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FqdnPin {
+    pub port: Option<u16>,
+    pub verdict: Verdict,
+    pub binaries: Option<Vec<PathBuf>>,
+}
+
+/// Parse the `egress.tcp` list, splitting IP/CIDR rules (matched at connect
+/// time) from hostname rules (which drive DNS-answer pinning). Both are held
+/// separately from `allowedRoutes`/`egress.l7` and consulted before protocol
+/// classification, so no per-rule flag is needed to mark them raw.
+pub fn parse_tcp_egress(json: &serde_json::Value) -> Result<TcpEgress, String> {
+    let arr = json.as_array().ok_or("egress.tcp must be an array")?;
+    let mut out = TcpEgress::default();
+    for v in arr {
+        let raw: crate::policy_schema::TcpEgressRule =
+            serde_json::from_value(v.clone()).map_err(|e| format!("invalid tcp rule: {e}"))?;
+        let matcher = parse_matcher(&raw.match_pattern)?;
+        let binaries = raw.binaries.map(parse_binaries).transpose()?;
+        let rule = RouteRule {
+            matcher,
+            verdict: raw.verdict,
+            // Raw TCP always egresses directly; the shared `RouteRule` still
+            // carries a transport, so pin it to `Direct` for the raw path.
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries,
+        };
+        // IP/CIDR match the resolved dst directly; hostnames can only match via
+        // DNS-answer pinning. `HostPort` straddles both: an IP-literal host is a
+        // direct match, a hostname host is an fqdn rule.
+        match &rule.matcher {
+            RouteMatcher::Cidr(_) | RouteMatcher::CidrPort(_, _) => out.ip_rules.push(rule),
+            RouteMatcher::HostPort(host, _) if host.parse::<std::net::IpAddr>().is_ok() => {
+                out.ip_rules.push(rule)
+            }
+            RouteMatcher::HostPort(_, _) | RouteMatcher::Domain(_) => out.fqdn_rules.push(rule),
+        }
+    }
+    Ok(out)
+}
+
+/// The pin spec for the first `fqdn_rules` entry whose host matches `qname` and
+/// whose `binaries` filter admits `caller`, when its verdict is not `Deny`.
+/// First-match, mirroring every other route decision; `None` when nothing
+/// matches or the first match is a `Deny`. Used by the DNS stub to pin the
+/// resolved A-record IPs.
+pub fn matching_fqdn_pin(
+    fqdn_rules: &[RouteRule],
+    qname: &str,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> Option<FqdnPin> {
+    let lower = qname.to_ascii_lowercase();
+    let mut binary_filtered = false;
+    for rule in fqdn_rules {
+        if !qname_matches_rule(rule, &lower) {
+            continue;
+        }
+        if caller_admits_rule(rule, caller, binary_filtered) {
+            if rule.verdict == Verdict::Deny {
+                return None;
+            }
+            let port = match &rule.matcher {
+                RouteMatcher::HostPort(_, p) => Some(*p),
+                _ => None,
+            };
+            return Some(FqdnPin {
+                port,
+                verdict: rule.verdict,
+                binaries: rule.binaries.clone(),
+            });
+        }
+        binary_filtered = true;
+    }
+    None
+}
+
+/// Whether a pin's `binaries` filter admits `caller` — the same check the route
+/// matchers apply, exposed so the TCP layer can re-validate a pinned entry.
+pub fn binaries_admit_caller(
+    binaries: Option<&[PathBuf]>,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> bool {
+    let Some(allowed) = binaries else {
+        return true;
+    };
+    let Some(caller) = caller else {
+        return false;
+    };
+    caller
+        .binary_paths()
+        .any(|candidate| allowed.iter().any(|p| p.as_path() == candidate))
 }
 
 /// Validate a rule's `binaries` filter. Entries are matched against the
@@ -263,7 +415,7 @@ fn qname_matches_rule(rule: &RouteRule, lower: &str) -> bool {
     match &rule.matcher {
         RouteMatcher::Domain(pattern) => domain_matches(pattern, lower),
         RouteMatcher::HostPort(pattern_host, _) => domain_matches(pattern_host, lower),
-        RouteMatcher::Cidr(_) => false,
+        RouteMatcher::Cidr(_) | RouteMatcher::CidrPort(_, _) => false,
     }
 }
 
@@ -322,6 +474,12 @@ pub fn find_matching_route<'a>(
             RouteMatcher::Cidr(cidr) => hostname
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| cidr.contains(&ip)),
+            RouteMatcher::CidrPort(cidr, pattern_port) => {
+                hostname
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| cidr.contains(&ip))
+                    && extract_port(host, 443) == *pattern_port
+            }
             RouteMatcher::HostPort(pattern_host, pattern_port) => {
                 let target_hostname = extract_hostname(host).to_ascii_lowercase();
                 let target_port = extract_port(host, 443);
@@ -369,23 +527,14 @@ fn caller_admits_rule(
     !(binary_filtered && rule.binaries.is_none() && rule.verdict != Verdict::Deny)
 }
 
-/// Check a rule's `binaries` filter against the caller. Returns `true` when the
-/// rule has no filter (any caller allowed) or when the caller's exe or an
-/// ancestor is one of the listed paths. Returns `false` — fail closed — when
-/// the filter is present but caller info is missing.
+/// Check a rule's `binaries` filter against the caller. Thin wrapper over
+/// [`binaries_admit_caller`] so the route matchers and the TCP pin layer share
+/// one implementation.
 fn binary_filter_matches(
     rule: &RouteRule,
     caller: Option<&crate::peer_process::PeerProcess>,
 ) -> bool {
-    let Some(allowed) = rule.binaries.as_deref() else {
-        return true;
-    };
-    let Some(caller) = caller else {
-        return false;
-    };
-    caller
-        .binary_paths()
-        .any(|candidate| allowed.iter().any(|p| p.as_path() == candidate))
+    binaries_admit_caller(rule.binaries.as_deref(), caller)
 }
 
 /// Match a host:port target against the route rules. Binary-filtered rules
@@ -746,6 +895,221 @@ mod tests {
                 transport: Transport::Upstream,
                 tls_terminate: false,
             }
+        );
+    }
+
+    #[test]
+    fn parse_cidr_port_ipv4() {
+        let routes = parse_routes(
+            r#"[{"match": "10.0.0.0/24:5432", "verdict": "allow", "transport": "direct"}]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &routes[0].matcher,
+            RouteMatcher::CidrPort(net, 5432) if net.to_string() == "10.0.0.0/24"
+        ));
+    }
+
+    #[test]
+    fn parse_cidr_port_ipv6_bracketed() {
+        let routes = parse_routes(
+            r#"[{"match": "[2001:db8::/32]:5432", "verdict": "allow", "transport": "direct"}]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &routes[0].matcher,
+            RouteMatcher::CidrPort(net, 5432) if net.to_string() == "2001:db8::/32"
+        ));
+    }
+
+    #[test]
+    fn parse_bare_ipv6_bracketed_stays_host_port() {
+        // A bracketed literal without a prefix length must remain HostPort so
+        // existing `[::1]:6443` rules keep matching by exact host.
+        let routes =
+            parse_routes(r#"[{"match": "[::1]:6443", "verdict": "allow", "transport": "direct"}]"#)
+                .unwrap();
+        assert!(matches!(
+            &routes[0].matcher,
+            RouteMatcher::HostPort(h, 6443) if h == "::1"
+        ));
+    }
+
+    #[test]
+    fn match_cidr_port_enforces_both_range_and_port() {
+        let routes = parse_routes(
+            r#"[{"match": "10.0.0.0/24:5432", "verdict": "allow", "transport": "direct"}]"#,
+        )
+        .unwrap();
+        // In-range IP on the right port matches.
+        assert_eq!(
+            match_route(
+                &routes,
+                "10.0.0.5:5432",
+                Scheme::Https,
+                Verdict::Deny,
+                Transport::Upstream
+            )
+            .verdict,
+            Verdict::Allow,
+        );
+        // In-range IP on a different port does NOT match.
+        assert_eq!(
+            match_route(
+                &routes,
+                "10.0.0.5:5433",
+                Scheme::Https,
+                Verdict::Deny,
+                Transport::Upstream
+            )
+            .verdict,
+            Verdict::Deny,
+        );
+        // Out-of-range IP on the right port does NOT match.
+        assert_eq!(
+            match_route(
+                &routes,
+                "10.0.1.5:5432",
+                Scheme::Https,
+                Verdict::Deny,
+                Transport::Upstream
+            )
+            .verdict,
+            Verdict::Deny,
+        );
+    }
+
+    #[test]
+    fn match_ip_port_via_host_port() {
+        // A single `ip:port` needs no new matcher — it already round-trips
+        // through HostPort exact-matching.
+        let routes = parse_routes(
+            r#"[{"match": "10.0.0.5:5432", "verdict": "allow", "transport": "direct"}]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &routes[0].matcher,
+            RouteMatcher::HostPort(h, 5432) if h == "10.0.0.5"
+        ));
+        assert_eq!(
+            match_route(
+                &routes,
+                "10.0.0.5:5432",
+                Scheme::Https,
+                Verdict::Deny,
+                Transport::Upstream
+            )
+            .verdict,
+            Verdict::Allow,
+        );
+        assert_eq!(
+            match_route(
+                &routes,
+                "10.0.0.5:5433",
+                Scheme::Https,
+                Verdict::Deny,
+                Transport::Upstream
+            )
+            .verdict,
+            Verdict::Deny,
+        );
+    }
+
+    fn parse_tcp(json: &str) -> Result<TcpEgress, String> {
+        let val: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        parse_tcp_egress(&val)
+    }
+
+    #[test]
+    fn parse_tcp_egress_cidr_port() {
+        let egress = parse_tcp(r#"[{"match": "10.0.0.0/24:5432", "verdict": "allow"}]"#).unwrap();
+        assert_eq!(egress.ip_rules.len(), 1);
+        assert!(egress.fqdn_rules.is_empty());
+        assert!(matches!(
+            &egress.ip_rules[0].matcher,
+            RouteMatcher::CidrPort(net, 5432) if net.to_string() == "10.0.0.0/24"
+        ));
+        assert_eq!(egress.ip_rules[0].verdict, Verdict::Allow);
+        // Raw TCP always egresses directly.
+        assert_eq!(egress.ip_rules[0].transport, Transport::Direct);
+    }
+
+    #[test]
+    fn parse_tcp_egress_ip_port_and_bare_cidr_are_ip_rules() {
+        let egress = parse_tcp(
+            r#"[
+                {"match": "10.0.0.5:5432", "verdict": "allow"},
+                {"match": "10.0.0.0/8", "verdict": "allow"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(egress.ip_rules.len(), 2);
+        assert!(egress.fqdn_rules.is_empty());
+        assert!(matches!(
+            &egress.ip_rules[0].matcher,
+            RouteMatcher::HostPort(h, 5432) if h == "10.0.0.5"
+        ));
+        assert!(matches!(&egress.ip_rules[1].matcher, RouteMatcher::Cidr(_)));
+    }
+
+    #[test]
+    fn parse_tcp_egress_hostname_becomes_fqdn_rule() {
+        // A hostname can't match the resolved IP directly, so it routes to the
+        // fqdn list, which drives DNS-answer pinning instead of a static match.
+        let egress = parse_tcp(
+            r#"[
+                {"match": "db.internal:5432", "verdict": "allow"},
+                {"match": "*.rds.amazonaws.com", "verdict": "allow"}
+            ]"#,
+        )
+        .unwrap();
+        assert!(egress.ip_rules.is_empty());
+        assert_eq!(egress.fqdn_rules.len(), 2);
+        assert!(matches!(
+            &egress.fqdn_rules[0].matcher,
+            RouteMatcher::HostPort(h, 5432) if h == "db.internal"
+        ));
+        assert!(matches!(
+            &egress.fqdn_rules[1].matcher,
+            RouteMatcher::Domain(_)
+        ));
+    }
+
+    #[test]
+    fn parse_tcp_egress_honors_binaries_filter() {
+        let egress = parse_tcp(
+            r#"[{"match": "10.0.0.0/24:5432", "verdict": "allow", "binaries": ["/usr/bin/psql"]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            egress.ip_rules[0].binaries.as_deref(),
+            Some(&[PathBuf::from("/usr/bin/psql")][..])
+        );
+    }
+
+    #[test]
+    fn matching_fqdn_pin_returns_first_admitting_rule() {
+        let egress = parse_tcp(r#"[{"match": "db.internal:5432", "verdict": "allow"}]"#).unwrap();
+        let pin = matching_fqdn_pin(&egress.fqdn_rules, "db.internal", None).unwrap();
+        assert_eq!(pin.port, Some(5432));
+        assert_eq!(pin.verdict, Verdict::Allow);
+    }
+
+    #[test]
+    fn matching_fqdn_pin_wildcard_any_port() {
+        let egress =
+            parse_tcp(r#"[{"match": "*.rds.amazonaws.com", "verdict": "allow"}]"#).unwrap();
+        let pin = matching_fqdn_pin(&egress.fqdn_rules, "prod.rds.amazonaws.com", None).unwrap();
+        assert_eq!(pin.port, None, "bare domain rule pins any port");
+        assert!(matching_fqdn_pin(&egress.fqdn_rules, "other.example.com", None).is_none());
+    }
+
+    #[test]
+    fn matching_fqdn_pin_deny_yields_no_pin() {
+        let egress = parse_tcp(r#"[{"match": "db.internal:5432", "verdict": "deny"}]"#).unwrap();
+        assert!(
+            matching_fqdn_pin(&egress.fqdn_rules, "db.internal", None).is_none(),
+            "a deny fqdn rule must not pin"
         );
     }
 
