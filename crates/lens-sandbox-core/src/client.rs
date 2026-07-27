@@ -684,7 +684,8 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct NetworkPolicyRaw {
-        /// Deprecated alias for `egress.http`. `egress.http` wins when both are set.
+        /// Deprecated. Read only when there is no `egress` block at all — an
+        /// `egress` block supersedes this list entirely.
         #[serde(default)]
         allowed_routes: serde_json::Value,
         /// Kept loose (not `Option<EgressRaw>`): a malformed *shape* (a
@@ -821,12 +822,8 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             // policy is valid) — not malformed. Only a legacy policy with
             // neither egress nor a valid allowedRoutes is treated as malformed
             // and fails closed.
-            // Validate the egress *shape* loosely: absent/null = no egress
-            // block, an object = parse it, anything else (string/number/array)
-            // is an operator typo that must fail closed. Doing this here rather
-            // than via a typed `Option<EgressRaw>` field is deliberate — a typed
-            // field would abort the whole `PolicyMessage` parse and silently
-            // retain the previous policy instead of forcing deny.
+            // Absent/null = no egress block, an object = parse it, anything else
+            // (string/number/array) is an operator typo that must fail closed.
             let egress: Result<Option<EgressRaw>, String> = match &network.egress {
                 serde_json::Value::Null => Ok(None),
                 serde_json::Value::Object(_) => serde_json::from_value(network.egress.clone())
@@ -837,16 +834,17 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
 
             let empty = serde_json::Value::Array(Vec::new());
             // `Ok(Some)` = an http source to parse, `Ok(None)` = no policy at all
-            // (force deny), `Err` = a malformed egress/http shape (force deny). A
-            // null/absent `egress.http` is the legitimate tcp-only case → empty
-            // list; any other non-array is an operator typo and must fail
-            // closed, not silently drop every rule. Mirrors `tcp_result` below.
+            // (force deny), `Err` = a malformed egress/http shape (force deny).
+            //
+            // An `egress` block is authoritative: it supersedes `allowedRoutes`
+            // entirely, so a null `egress.http` is the legitimate tcp-only case
+            // and yields no http rules rather than quietly reviving the
+            // deprecated list. `allowedRoutes` is read only when there is no
+            // `egress` block at all. Any other non-array is an operator typo and
+            // must fail closed, not silently drop every rule.
             let http_value: Result<Option<&serde_json::Value>, String> = match &egress {
                 Err(e) => Err(e.clone()),
                 Ok(Some(e)) if e.http.is_array() => Ok(Some(&e.http)),
-                Ok(Some(e)) if e.http.is_null() && network.allowed_routes.is_array() => {
-                    Ok(Some(&network.allowed_routes))
-                }
                 Ok(Some(e)) if e.http.is_null() => Ok(Some(&empty)),
                 Ok(Some(_)) => Err("egress.http must be an array".to_string()),
                 Ok(None) if network.allowed_routes.is_array() => Ok(Some(&network.allowed_routes)),
@@ -2628,6 +2626,44 @@ mod tests {
             2,
             "egress.http should win over the deprecated allowedRoutes alias"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tcp_only_egress_block_does_not_revive_allowed_routes() {
+        // An `egress` block is the operator saying "this is the policy now". A
+        // tcp-only one grants no http routes — reading the deprecated list back
+        // in would silently restore access the new policy never mentions.
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        let policy_json = serde_json::json!({
+            "network": {
+                "allowedRoutes": [
+                    {"match": "old.example.com", "verdict": "allow", "transport": "upstream"}
+                ],
+                "egress": {
+                    "tcp": [{"match": "db.internal:5432", "verdict": "allow"}]
+                },
+                "defaultVerdict": "deny",
+                "defaultTransport": "upstream"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        let policy = state.policy.read().unwrap();
+        assert!(
+            policy.routes.is_empty(),
+            "an egress block supersedes allowedRoutes; got {:?}",
+            policy.routes
+        );
+        assert_eq!(policy.tcp_egress.len(), 1, "the tcp rule must still apply");
     }
 
     #[tokio::test]
