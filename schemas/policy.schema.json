@@ -197,7 +197,7 @@
       ]
     },
     "Egress": {
-      "description": "Egress rules split by the protocol at which the destination is filtered.\n\n- [`http`](Self::http) filters by hostname and can see and rewrite the\n  payload (HTTP rules, TLS termination, credential injection).\n- [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the\n  payload — an opaque byte splice for non-HTTP services.",
+      "description": "Egress rules split by the protocol at which the destination is filtered.\n\n- [`http`](Self::http) filters by hostname and can see and rewrite the\n  payload (HTTP rules, TLS termination, credential injection).\n- [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the\n  payload — an opaque byte splice for non-HTTP services.\n\n`tcp` is a pre-filter: whatever it claims, it governs, and its verdict is\nfinal. Only a destination no `tcp` rule matches falls through to `http`.\n\nHostname `tcp` rules apply however the traffic reaches the proxy. An IP/CIDR\nrule can only match an address, so when the workload connects by name it\nbinds after resolution — in time to deny the connection, but not to grant a\nraw splice. Write a hostname rule when you want a raw splice by name.\n\nSo a `tcp` allow turns off HTTP rules, credential injection, and inspection\nfor the port it names — that is what asking for a raw splice means. Because\nevery `tcp` rule carries a port, the two lists can describe the same host\nwithout colliding: `db.internal:5432` in `tcp` leaves `db.internal:443` to\n`http`. An overlap on the same port is allowed, and logged at load.",
       "type": "object",
       "properties": {
         "http": {

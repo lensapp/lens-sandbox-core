@@ -25,7 +25,9 @@ use std::time::Duration;
 use rand::RngCore;
 use tokio::sync::watch;
 
-use crate::protocol::{CredentialDecisionKind, CredentialPending, Decision, RequestPending};
+use crate::protocol::{
+    CredentialDecisionKind, CredentialPending, Decision, RequestPending, Treatment,
+};
 use crate::proxy::ProxyState;
 
 /// How long the proxy waits for a `request_decision` before defaulting to
@@ -168,13 +170,21 @@ fn resolve<V: Copy>(table: &std::sync::Mutex<PendingTable<V>>, id: &str, decisio
 /// Suspend the request until the developer answers the dialog or the
 /// timeout fires. Emits the `request_pending` frame on first sight of an
 /// `action`; subsequent concurrent retries of the *same* request join
-/// the existing entry. Different requests to the same host (e.g.
+/// the existing entry and inherit its `treatment`, which is well-defined
+/// because treatment is a function of the destination under one policy
+/// generation. Different requests to the same host (e.g.
 /// `GET /safe` and `DELETE /danger`) each get their own dialog so an
 /// `AllowOnce` click releases only what was shown in the prompt.
 ///
 /// Returns the resolved `Decision` so callers can record the appropriate
 /// audit event with `Decision::audit_reason()`.
-pub async fn gate_or_deny(state: &ProxyState, host: &str, action: &str, reason: &str) -> Decision {
+pub async fn gate_or_deny(
+    state: &ProxyState,
+    host: &str,
+    action: &str,
+    reason: &str,
+    treatment: Treatment,
+) -> Decision {
     let (rx, id, emitted) = match subscribe_or_open(&state.pending, action, "gate", |id| {
         emit_pending_frame(
             state,
@@ -185,6 +195,7 @@ pub async fn gate_or_deny(state: &ProxyState, host: &str, action: &str, reason: 
                 host.to_string(),
                 action.to_string(),
                 reason.to_string(),
+                treatment,
             ),
         )
     }) {
@@ -342,6 +353,18 @@ mod tests {
         crate::proxy::tests::test_state()
     }
 
+    /// Gate mechanics under test here are treatment-independent.
+    async fn gate(state: &ProxyState, host: &str, action: &str) -> Decision {
+        gate_or_deny(
+            state,
+            host,
+            action,
+            "policy-ambiguous",
+            Treatment::Inspected,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn gate_emits_request_pending_and_resolves_on_allow() {
         let (state, mut rx) = test_state();
@@ -353,6 +376,7 @@ mod tests {
                     "evil.example.com",
                     "CONNECT evil.example.com:443",
                     "policy-ambiguous",
+                    Treatment::Inspected,
                 )
                 .await
             }
@@ -384,6 +408,7 @@ mod tests {
                     "Example.COM",
                     "CONNECT Example.COM:443",
                     "policy-ambiguous",
+                    Treatment::Inspected,
                 )
                 .await
             }
@@ -417,6 +442,7 @@ mod tests {
                     "evil.com",
                     "CONNECT evil.com:443",
                     "policy-ambiguous",
+                    Treatment::Inspected,
                 )
                 .await
             }
@@ -443,6 +469,7 @@ mod tests {
             "slow.com",
             "CONNECT slow.com:443",
             "policy-ambiguous",
+            Treatment::Inspected,
         )
         .await;
         assert_eq!(d, Decision::Timeout);
@@ -454,13 +481,13 @@ mod tests {
         let (state, mut rx) = test_state();
         let h1 = tokio::spawn({
             let state = state.clone();
-            async move { gate_or_deny(&state, "h", "CONNECT h:443", "policy-ambiguous").await }
+            async move { gate(&state, "h", "CONNECT h:443").await }
         });
         // Ensure h1 has registered the pending entry before h2 races.
         tokio::time::sleep(Duration::from_millis(10)).await;
         let h2 = tokio::spawn({
             let state = state.clone();
-            async move { gate_or_deny(&state, "h", "CONNECT h:443", "policy-ambiguous").await }
+            async move { gate(&state, "h", "CONNECT h:443").await }
         });
 
         let frame = rx.recv().await.unwrap();
@@ -479,7 +506,7 @@ mod tests {
     async fn timeout_yields_timeout_decision() {
         let (state, _rx) = test_state();
         state.decision_timeout_override(Duration::from_millis(20));
-        let d = gate_or_deny(&state, "slow", "CONNECT slow:443", "policy-ambiguous").await;
+        let d = gate(&state, "slow", "CONNECT slow:443").await;
         assert_eq!(d, Decision::Timeout);
     }
 
@@ -492,7 +519,7 @@ mod tests {
         state.decision_timeout_override(Duration::from_secs(60));
 
         let start = std::time::Instant::now();
-        let decision = gate_or_deny(&state, "h", "CONNECT h:443", "policy-ambiguous").await;
+        let decision = gate(&state, "h", "CONNECT h:443").await;
         let elapsed = start.elapsed();
 
         assert_eq!(decision, Decision::Timeout);
@@ -527,6 +554,7 @@ mod tests {
             "overflow-host",
             "CONNECT overflow:443",
             "policy-ambiguous",
+            Treatment::Inspected,
         )
         .await;
         let elapsed = start.elapsed();
@@ -550,7 +578,7 @@ mod tests {
         drop(rx);
 
         let start = std::time::Instant::now();
-        let decision = gate_or_deny(&state, "h", "CONNECT h:443", "policy-ambiguous").await;
+        let decision = gate(&state, "h", "CONNECT h:443").await;
         let elapsed = start.elapsed();
 
         assert_eq!(decision, Decision::Timeout);
@@ -577,12 +605,12 @@ mod tests {
         let danger = "DELETE http://api.evil.com/danger";
         let h1 = tokio::spawn({
             let state = state.clone();
-            async move { gate_or_deny(&state, "api.evil.com", safe, "policy-ambiguous").await }
+            async move { gate(&state, "api.evil.com", safe).await }
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
         let h2 = tokio::spawn({
             let state = state.clone();
-            async move { gate_or_deny(&state, "api.evil.com", danger, "policy-ambiguous").await }
+            async move { gate(&state, "api.evil.com", danger).await }
         });
 
         let f1: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
@@ -637,12 +665,12 @@ mod tests {
         let (state, mut rx) = test_state();
         let h1 = tokio::spawn({
             let state = state.clone();
-            async move { gate_or_deny(&state, "h", "x", "policy-ambiguous").await }
+            async move { gate(&state, "h", "x").await }
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
         let h2 = tokio::spawn({
             let state = state.clone();
-            async move { gate_or_deny(&state, "h", "x", "policy-ambiguous").await }
+            async move { gate(&state, "h", "x").await }
         });
 
         let frame1 = rx.recv().await.unwrap();
@@ -659,7 +687,7 @@ mod tests {
         // after this insertion.
         let h3 = tokio::spawn({
             let state = state.clone();
-            async move { gate_or_deny(&state, "h", "x", "policy-ambiguous").await }
+            async move { gate(&state, "h", "x").await }
         });
         let frame2 = rx.recv().await.unwrap();
         let id2 = serde_json::from_str::<serde_json::Value>(&frame2).unwrap()["id"]
@@ -856,7 +884,7 @@ mod tests {
         // first round
         let h = tokio::spawn({
             let state = state.clone();
-            async move { gate_or_deny(&state, "h", "x", "policy-ambiguous").await }
+            async move { gate(&state, "h", "x").await }
         });
         let frame1 = rx.recv().await.unwrap();
         let id1 = serde_json::from_str::<serde_json::Value>(&frame1).unwrap()["id"]
@@ -869,7 +897,7 @@ mod tests {
         // second round — must emit fresh request_pending with a new id
         let h2 = tokio::spawn({
             let state = state.clone();
-            async move { gate_or_deny(&state, "h", "x", "policy-ambiguous").await }
+            async move { gate(&state, "h", "x").await }
         });
         let frame2 = rx.recv().await.unwrap();
         let id2 = serde_json::from_str::<serde_json::Value>(&frame2).unwrap()["id"]

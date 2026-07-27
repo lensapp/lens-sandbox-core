@@ -76,6 +76,20 @@ pub struct NetworkPolicy {
 ///   payload (HTTP rules, TLS termination, credential injection).
 /// - [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the
 ///   payload — an opaque byte splice for non-HTTP services.
+///
+/// `tcp` is a pre-filter: whatever it claims, it governs, and its verdict is
+/// final. Only a destination no `tcp` rule matches falls through to `http`.
+///
+/// Hostname `tcp` rules apply however the traffic reaches the proxy. An IP/CIDR
+/// rule can only match an address, so when the workload connects by name it
+/// binds after resolution — in time to deny the connection, but not to grant a
+/// raw splice. Write a hostname rule when you want a raw splice by name.
+///
+/// So a `tcp` allow turns off HTTP rules, credential injection, and inspection
+/// for the port it names — that is what asking for a raw splice means. Because
+/// every `tcp` rule carries a port, the two lists can describe the same host
+/// without colliding: `db.internal:5432` in `tcp` leaves `db.internal:443` to
+/// `http`. An overlap on the same port is allowed, and logged at load.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Egress {
