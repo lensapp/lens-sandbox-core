@@ -32,7 +32,6 @@ use crate::aws_sigv4::{
     resign_request,
 };
 use crate::ca::EphemeralCa;
-use crate::sock_mark;
 
 /// Non-S3 body buffer cap. JSON API payloads (DynamoDB, Lambda, SQS, …) are
 /// typically KB; 1 MiB is plenty of headroom without risking memory exhaustion.
@@ -47,6 +46,11 @@ pub struct AwsResignContext<'a> {
     pub ca: &'a EphemeralCa,
     pub extra_ca_certs: &'a [rustls::pki_types::CertificateDer<'static>],
     pub audit_tx: &'a Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Needed to apply `egress.tcp` to the resolved upstream address: a CIDR
+    /// rule binds by address, so this dial is the first place it can be tested
+    /// against a target the client named.
+    pub state: &'a std::sync::Arc<crate::proxy::ProxyState>,
+    pub actor: &'a crate::peer_process::ActorContext,
 }
 
 /// Owns the mutable state the AWS SigV4 re-sign MITM needs: the placeholder
@@ -99,15 +103,22 @@ impl AwsResignInterceptor {
         target_host: &str,
         target_port: u16,
         ca: &EphemeralCa,
-        extra_ca_certs: &[rustls::pki_types::CertificateDer<'static>],
-        audit_tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        state: &std::sync::Arc<crate::proxy::ProxyState>,
+        actor: &crate::peer_process::ActorContext,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let configs = self.configs_snapshot();
+        // Snapshotted here rather than passed in: both are plain reads off
+        // `state`, which this now takes anyway, and one fewer parameter each is
+        // one fewer thing a call site can get wrong.
+        let audit_tx = state.audit_tx.lock().unwrap().clone();
+        let extra_ca_certs = state.extra_ca_certs.read().unwrap().clone();
         let ctx = AwsResignContext {
             configs: &configs,
             ca,
-            extra_ca_certs,
-            audit_tx,
+            extra_ca_certs: &extra_ca_certs,
+            audit_tx: &audit_tx,
+            state,
+            actor,
         };
         handle_aws_resign(client, target_host, target_port, &ctx).await
     }
@@ -134,7 +145,13 @@ pub async fn handle_aws_resign(
     };
 
     // Connect upstream only after we've committed to forwarding.
-    let upstream = sock_mark::connect_tcp_egress(&format!("{target_host}:{target_port}")).await?;
+    let upstream = crate::proxy::connect_egress_under_policy(
+        ctx.state,
+        &format!("{target_host}:{target_port}"),
+        target_port,
+        ctx.actor.process(),
+    )
+    .await?;
     let tls_upstream =
         crate::mitm::connect_upstream_tls_public(upstream, target_host, ctx.extra_ca_certs).await?;
 
@@ -603,6 +620,19 @@ fn emit_resign_audit(
 
 #[cfg(test)]
 mod tests {
+
+    /// Proxy state + caller for `AwsResignContext`. The resign dial now runs
+    /// through the policy-aware connect, which needs both; these tests assert on
+    /// what happens before it, and an empty policy claims nothing.
+    fn policy_ctx() -> (
+        std::sync::Arc<crate::proxy::ProxyState>,
+        crate::peer_process::ActorContext,
+    ) {
+        let (state, rx) = crate::proxy::tests::test_state();
+        std::mem::forget(rx);
+        let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:54321".parse().unwrap());
+        (state, actor)
+    }
     use super::*;
 
     #[test]
@@ -919,11 +949,14 @@ mod tests {
         let (client_stream, _) = client_listener.accept().await.unwrap();
         let mut configs = HashMap::new();
         configs.insert(fake_config().access_key_id.clone(), real_config());
+        let (policy_state, policy_actor) = policy_ctx();
         let ctx = AwsResignContext {
             configs: &configs,
             ca: &ca,
             extra_ca_certs: &[],
             audit_tx: &None,
+            state: &policy_state,
+            actor: &policy_actor,
         };
 
         // Run the resign. The handler connects to `TEST_HOSTNAME:target_port`
@@ -1155,11 +1188,14 @@ mod tests {
         let (client_stream, _) = listener.accept().await.unwrap();
         let mut configs = HashMap::new();
         configs.insert(fake_config().access_key_id.clone(), real_config());
+        let (policy_state, policy_actor) = policy_ctx();
         let ctx = AwsResignContext {
             configs: &configs,
             ca: &ca,
             extra_ca_certs: &[],
             audit_tx: &None,
+            state: &policy_state,
+            actor: &policy_actor,
         };
 
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
@@ -1219,11 +1255,14 @@ mod tests {
         let (client_stream, _) = listener.accept().await.unwrap();
         let mut configs = HashMap::new();
         configs.insert(fake_config().access_key_id.clone(), real_config());
+        let (policy_state, policy_actor) = policy_ctx();
         let ctx = AwsResignContext {
             configs: &configs,
             ca: &ca,
             extra_ca_certs: &[],
             audit_tx: &None,
+            state: &policy_state,
+            actor: &policy_actor,
         };
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
         let response = client_handle.await.unwrap();
@@ -1280,11 +1319,14 @@ mod tests {
         let (client_stream, _) = listener.accept().await.unwrap();
         let mut configs = HashMap::new();
         configs.insert(fake_config().access_key_id.clone(), real_config());
+        let (policy_state, policy_actor) = policy_ctx();
         let ctx = AwsResignContext {
             configs: &configs,
             ca: &ca,
             extra_ca_certs: &[],
             audit_tx: &None,
+            state: &policy_state,
+            actor: &policy_actor,
         };
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
         let response = client_handle.await.unwrap();
@@ -1348,11 +1390,14 @@ mod tests {
         let (client_stream, _) = listener.accept().await.unwrap();
         let mut configs = HashMap::new();
         configs.insert(fake_config().access_key_id.clone(), real_config());
+        let (policy_state, policy_actor) = policy_ctx();
         let ctx = AwsResignContext {
             configs: &configs,
             ca: &ca,
             extra_ca_certs: &[],
             audit_tx: &None,
+            state: &policy_state,
+            actor: &policy_actor,
         };
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
         let response = client_handle.await.unwrap();
@@ -1413,11 +1458,14 @@ mod tests {
 
         let (client_stream, _) = listener.accept().await.unwrap();
         let configs: HashMap<String, AwsSigv4Config> = HashMap::new();
+        let (policy_state, policy_actor) = policy_ctx();
         let ctx = AwsResignContext {
             configs: &configs,
             ca: &ca,
             extra_ca_certs: &[],
             audit_tx: &None,
+            state: &policy_state,
+            actor: &policy_actor,
         };
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
         let response = client_handle.await.unwrap();
