@@ -59,7 +59,7 @@ const MAX_PINNED_ENTRIES: usize = 4096;
 /// Stores the originating `qname`, not the winning rule: a DNS caller may skip
 /// an earlier caller-scoped deny and pin from a later allow, so admitting a
 /// raw-TCP connection must re-evaluate the ordered `tcp_egress` rules for this
-/// name against the *connecting* caller — see [`resolve_tcp_egress`]. Storing
+/// name against the *connecting* caller — see [`tcp_egress_verdict`]. Storing
 /// only the selected allow rule would let a different caller, one an earlier
 /// deny would reject, reuse the pin.
 #[derive(Debug, Clone)]
@@ -91,13 +91,13 @@ pub struct NetworkPolicy {
     /// directly; `Domain`/`HostPort` matchers match only a dst IP that a live
     /// DNS pin bound to a name the rule covers (the raw path never sees a name,
     /// so hostname rules drive DNS-answer pinning). Both kinds are evaluated in
-    /// one ordered pass by [`resolve_tcp_egress`] / `find_matching_tcp_egress`,
+    /// one ordered pass by [`tcp_egress_verdict`] / `find_matching_tcp_egress`,
     /// and the DNS stub gates lookups against the hostname entries of this same
     /// list via `hostname_match_for_caller`.
     pub tcp_egress: Vec<RouteRule>,
     /// IPs pinned from DNS answers of hostname `tcp_egress` names, each carrying
     /// the originating `qname` and a TTL-bounded expiry. Consulted by
-    /// [`resolve_tcp_egress`] to match hostname rules against a raw connection.
+    /// [`tcp_egress_verdict`] to match hostname rules against a raw connection.
     pub pins: HashMap<IpAddr, Vec<PinnedIp>>,
     /// Bumped every time the policy is (re)applied. The DNS stub captures it
     /// when it authorizes a lookup and hands it back at pin-insertion time; an
@@ -628,14 +628,22 @@ async fn handle_http_forward(
     let raw_no_query = path.split('?').next().unwrap_or(&path);
     let normalized_path = crate::routing::normalize_path(raw_no_query);
 
-    // See `tcp_egress_denies`. Absolute-form `http://` is port 80, not 443.
-    if tcp_egress_denies(state, target_host, 80, actor.process()) {
-        tracing::info!(target = %target_host, method = %method, "HTTP forward proxy DENIED (egress.tcp)");
-        emit_policy_deny_http(state, target_host, method, &path, "tcp-policy-deny", actor);
-        client
-            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            .await?;
-        return Ok(());
+    // Origin-form rewrite: proxy framing, needed on the raw path below too.
+    let relative_request = rewrite_http_forward_request(&header_str, &path, target_host);
+
+    // `egress.tcp` claims are final on every door — see `tcp_egress_verdict`.
+    // Absolute-form `http://` is port 80, not 443.
+    if let Some(decision) = tcp_egress_verdict_for_hostport(state, target_host, 80, actor.process())
+    {
+        return http_forward_raw_passthrough(
+            client,
+            target_host,
+            &relative_request,
+            &decision,
+            state,
+            actor,
+        )
+        .await;
     }
 
     // Find the matching route rule (same logic as CONNECT, but scheme is http
@@ -696,9 +704,7 @@ async fn handle_http_forward(
     };
     let uri_placeholders = collect_uri_placeholders(state, target_host);
 
-    // Rewrite the request headers: convert absolute URL to relative path,
-    // inject credentials, and apply URI placeholder replacements.
-    let relative_request = rewrite_http_forward_request(&header_str, &path, target_host);
+    // Inject credentials and apply URI placeholder replacements.
     let header_injected = crate::mitm::inject_headers(&relative_request, &injections);
     let modified = crate::mitm::rewrite_uri_placeholders(&header_injected, &uri_placeholders);
 
@@ -743,8 +749,14 @@ async fn handle_http_forward(
         Verdict::Ask => {
             let action_str = format!("{method} http://{target_host}{path}");
             let key = gate_key(target_host);
-            let decision =
-                crate::gate::gate_or_deny(state, &key, &action_str, "policy-ambiguous").await;
+            let decision = crate::gate::gate_or_deny(
+                state,
+                &key,
+                &action_str,
+                "policy-ambiguous",
+                crate::protocol::Treatment::Inspected,
+            )
+            .await;
             if !decision.is_allow() {
                 emit_gate_denied(state, &action_str, decision);
                 client
@@ -765,7 +777,14 @@ async fn handle_http_forward(
     match effective_transport {
         Transport::Direct => {
             // Direct connection to upstream — send modified request, relay response
-            let mut upstream = match sock_mark::connect_tcp_egress(target_host).await {
+            let mut upstream = match connect_egress_under_policy(
+                state,
+                target_host,
+                80,
+                actor.process(),
+            )
+            .await
+            {
                 Ok(t) => t,
                 Err(e) => {
                     emit_http_audit(state, target_host, method, &path, "error", 502, actor);
@@ -934,12 +953,11 @@ async fn handle_connect(
     // Validate target: reject CRLF injection and loopback/link-local targets
     validate_connect_target(target_host)?;
 
-    // `egress.tcp` denies bind on every door — see `tcp_egress_denies`.
-    if tcp_egress_denies(state, target_host, 443, actor.process()) {
-        client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        tracing::info!(target = %target_host, "proxy DENIED (egress.tcp)");
-        emit_policy_deny_connect(state, target_host, "tcp-policy-deny", actor);
-        return Ok(());
+    // `egress.tcp` claims are final on every door — see `tcp_egress_verdict`.
+    if let Some(decision) =
+        tcp_egress_verdict_for_hostport(state, target_host, 443, actor.process())
+    {
+        return connect_raw_passthrough(client, target_host, &decision, state, actor).await;
     }
 
     // Find the matching route rule (first match wins, preserving order/specificity).
@@ -973,8 +991,14 @@ async fn handle_connect(
         Verdict::Ask => {
             let action_str = format!("CONNECT {target_host}");
             let key = gate_key(target_host);
-            let decision =
-                crate::gate::gate_or_deny(state, &key, &action_str, "policy-ambiguous").await;
+            let decision = crate::gate::gate_or_deny(
+                state,
+                &key,
+                &action_str,
+                "policy-ambiguous",
+                crate::protocol::Treatment::Inspected,
+            )
+            .await;
             if !decision.is_allow() {
                 emit_gate_denied(state, &action_str, decision);
                 client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
@@ -1086,13 +1110,16 @@ async fn handle_connect(
                 .await?;
             } else {
                 // Neither → plain TCP relay
-                let mut target = match sock_mark::connect_tcp_egress(target_host).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        emit_audit(state, target_host, "error", 502, actor);
-                        return Err(format!("direct connect to {target_host}: {e}").into());
-                    }
-                };
+                let mut target =
+                    match connect_egress_under_policy(state, target_host, 443, actor.process())
+                        .await
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            emit_audit(state, target_host, "error", 502, actor);
+                            return Err(format!("direct connect to {target_host}: {e}").into());
+                        }
+                    };
                 tracing::debug!(target = %target_host, "proxy DIRECT");
                 tokio::io::copy_bidirectional(&mut client, &mut target).await?;
             }
@@ -1286,9 +1313,14 @@ async fn handle_transparent_connection(
     // Raw TCP egress: an `egress.tcp` rule matching the raw destination splices
     // bytes through untouched — no protocol peek, no TLS interception. Decided
     // before classification so TLS-speaking databases are not MITM'd.
-    let raw_target = format!("{}:{}", orig_dst.ip(), orig_dst.port());
-    if let Some(verdict) = resolve_tcp_egress(&state, &raw_target, actor.process()) {
-        return handle_raw_passthrough(stream, &raw_target, verdict, &state, &actor).await;
+    let raw_target = orig_dst.to_string();
+    if let Some(decision) = tcp_egress_verdict(
+        &state,
+        &orig_dst.ip().to_string(),
+        orig_dst.port(),
+        actor.process(),
+    ) {
+        return handle_raw_passthrough(stream, &raw_target, &decision, &state, &actor).await;
     }
 
     // 8 bytes covers every classifier prefix: TLS needs 3, `OPTIONS ` and
@@ -1305,52 +1337,75 @@ async fn handle_transparent_connection(
     }
 }
 
-/// Resolve `raw_target` (an `ip:port`) against the `egress.tcp` rules in ONE
-/// ordered pass. `Cidr`/`CidrPort` rules match the dst IP directly; hostname
-/// (`Domain`/`HostPort`) rules match a dst IP that a live DNS pin bound to a
-/// name the rule covers. Walking the single policy-ordered list is what lets a
-/// static IP rule and a pinned hostname rule compete by their real position —
-/// an earlier rule wins whichever kind it is (the bug was checking every IP
-/// rule before any hostname rule). Returns the matched verdict, or `None` when
-/// nothing matches (the connection then falls through to classification and the
-/// `egress.http` routes) or when a `binaries` filter excluded the caller — never
-/// re-opened here. A matched deny (IP or hostname) is terminal for the raw path.
-/// Raw TCP always egresses directly, so no transport is returned.
-fn resolve_tcp_egress(
-    state: &Arc<ProxyState>,
-    raw_target: &str,
-    caller: Option<&crate::peer_process::PeerProcess>,
-) -> Option<Verdict> {
-    let ip: IpAddr = extract_hostname(raw_target).parse().ok()?;
-    let port = extract_port(raw_target, 0);
+/// An `egress.tcp` verdict and the destination as the policy author wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TcpDecision {
+    pub(crate) verdict: Verdict,
+    /// `name:port` when the rule bound through a name, `None` when it matched
+    /// by address. Feeds the ask dialog and, via `gate_key`, the QNAME-keyed
+    /// approval set — never the audit trail, which names the real address.
+    /// Owned: the name may come from a pin borrowed under the policy lock, and
+    /// re-deriving it later could observe a different pin after a reload.
+    pub(crate) matched_target: Option<String>,
+}
 
+/// The `egress.tcp` table's decision for one destination, or `None` when no
+/// rule claims it — the connection then falls through to the `egress.http`
+/// routes. Every door asks this same question, in one ordered pass, so a static
+/// IP rule and a pinned hostname rule compete by their real policy position.
+///
+/// A `Cidr`/`CidrPort` rule binds by address, so on the doors that name their
+/// destination it has nothing to match until [`connect_egress_under_policy`]
+/// re-asks after resolution — where it can only refuse, never authorize a
+/// splice. A CIDR *allow* therefore reaches only the transparent door.
+///
+/// `hostname` is a name or an IP literal; `port` is the destination port, the
+/// scheme default already applied. A rule that claimed the target but excluded
+/// the caller fails closed as a deny, same as [`find_matching_route`]. Raw TCP
+/// always egresses directly, so no transport is returned.
+fn tcp_egress_verdict(
+    state: &Arc<ProxyState>,
+    hostname: &str,
+    port: u16,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> Option<TcpDecision> {
     // Read the rules and the pins under ONE policy snapshot. A reload swaps both
     // (and clears the pins) atomically under the write lock, so a connection
     // sees either the old rules with the old pins or the new rules with the pins
     // cleared — never the new rules combined with a superseded policy's pins.
     let policy = state.policy.read().unwrap();
 
-    let pinned_qnames = live_pinned_qnames(&policy, ip);
-    let target = TcpTarget::resolved(ip, &pinned_qnames);
-    match find_matching_tcp_egress(&policy.tcp_egress, target, port, caller) {
-        RouteOutcome::Matched(rule) => Some(rule.verdict),
-        // A rule claimed this target but excluded the caller: fail closed, same
-        // as `find_matching_route`.
+    let pinned_qnames = live_pinned_qnames(&policy, hostname);
+    let target = TcpTarget::at(hostname, &pinned_qnames);
+    let found = find_matching_tcp_egress(&policy.tcp_egress, target, port, caller);
+    let matched_target = found.matched_name.map(|n| format!("{n}:{port}"));
+    match found.outcome {
+        RouteOutcome::Matched(rule) => Some(TcpDecision {
+            verdict: rule.verdict,
+            matched_target,
+        }),
         RouteOutcome::NoMatch {
             binary_filtered: true,
-        } => Some(Verdict::Deny),
+        } => Some(TcpDecision {
+            verdict: Verdict::Deny,
+            matched_target,
+        }),
         RouteOutcome::NoMatch { .. } => None,
     }
 }
 
-/// The live (unexpired) qnames pinned to `ip`. Storing only the name is what
-/// lets the ordered rules — including any earlier caller-scoped deny — be
-/// re-evaluated against the *connecting* caller rather than the DNS caller.
+/// The live (unexpired) qnames pinned to `host`, empty unless it is an IP
+/// literal. Storing only the name is what lets the ordered rules — including any
+/// earlier caller-scoped deny — be re-evaluated against the *connecting* caller
+/// rather than the DNS caller.
 ///
 /// The key is canonicalized because pins are recorded under the A record's IPv4
 /// address: a client-supplied mapped literal addresses the same host and must
 /// reach the same pins.
-fn live_pinned_qnames(policy: &NetworkPolicy, ip: IpAddr) -> Vec<&str> {
+fn live_pinned_qnames<'p>(policy: &'p NetworkPolicy, host: &str) -> Vec<&'p str> {
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return Vec::new();
+    };
     let now = Instant::now();
     policy
         .pins
@@ -1365,45 +1420,47 @@ fn live_pinned_qnames(policy: &NetworkPolicy, ip: IpAddr) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// Deny-terminal `egress.tcp` check for the explicit-proxy doors (`CONNECT` and
-/// absolute-form HTTP), which never reach the transparent listener and so never
-/// run [`resolve_tcp_egress`]. `CONNECT` opens a tunnel to an arbitrary
-/// `host:port` — exactly what `egress.tcp` governs — and the proxy port is
-/// exempt from the nftables REDIRECT and advertised to the workload via
-/// `HTTPS_PROXY`, so a check on the transparent door alone secures the door the
-/// workload is least likely to use.
-///
-/// `default_port` supplies the scheme default when the target carries no
-/// explicit port (443 for `CONNECT`, 80 for absolute-form `http://`).
-///
-/// A matched *deny*, or a rule that claimed the target but excluded the caller,
-/// is terminal: denies from the two tables union, so either can veto a
-/// destination and neither can overrule the other's veto. A tcp *allow*
-/// deliberately does NOT authorize a raw splice here — honoring it would hand
-/// the workload a way to opt out of L7 inspection for any host a tcp allow
-/// covers.
-fn tcp_egress_denies(
+/// [`tcp_egress_verdict`] for a target still written as `host:port`, applying
+/// `default_port` when the target carries no explicit one (443 for `CONNECT`,
+/// 80 for absolute-form `http://`).
+fn tcp_egress_verdict_for_hostport(
     state: &Arc<ProxyState>,
     target_host: &str,
     default_port: u16,
     caller: Option<&crate::peer_process::PeerProcess>,
-) -> bool {
+) -> Option<TcpDecision> {
     let hostname = extract_hostname(target_host);
     let port = extract_port(target_host, default_port);
-    let policy = state.policy.read().unwrap();
-    // A named target that is an IP literal also carries the pins for that IP, so
-    // resolving a name and reconnecting to its bare address cannot shake a
-    // hostname rule that the transparent door would have caught.
-    let pinned_qnames = hostname
-        .parse::<IpAddr>()
-        .map(|ip| live_pinned_qnames(&policy, ip))
-        .unwrap_or_default();
-    let target = TcpTarget::named(&hostname, &pinned_qnames);
-    match find_matching_tcp_egress(&policy.tcp_egress, target, port, caller) {
-        RouteOutcome::Matched(rule) => rule.verdict == Verdict::Deny,
-        // Same fail-closed rule as `resolve_tcp_egress`.
-        RouteOutcome::NoMatch { binary_filtered } => binary_filtered,
-    }
+    tcp_egress_verdict(state, &hostname, port, caller)
+}
+
+/// Dial a sandbox-egress target, re-running the `egress.tcp` table on the
+/// resolved address. A CIDR rule can match a named target only once the name has
+/// resolved, so a `CONNECT internal.example:22` that the L7 table admits is
+/// checked here against a `10.0.0.0/8:22` rule it could not be tested against
+/// before.
+///
+/// Only an allow (or no match) admits. No gate can run inside a dial, so an
+/// `ask` refuses rather than admitting: the workload picks the door, and this
+/// one must never answer more permissively than the transparent door, which
+/// would put that same IP to a human.
+///
+/// Does not cover the MITM/AWS-resign dials, which have no caller to evaluate
+/// binary-scoped rules against; those stay governed by the L7 table.
+async fn connect_egress_under_policy(
+    state: &Arc<ProxyState>,
+    target_host: &str,
+    default_port: u16,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> std::io::Result<TcpStream> {
+    let port = extract_port(target_host, default_port);
+    sock_mark::connect_tcp_egress_where(target_host, |ip| {
+        matches!(
+            tcp_egress_verdict(state, &ip.to_string(), port, caller).map(|d| d.verdict),
+            None | Some(Verdict::Allow)
+        )
+    })
+    .await
 }
 
 /// (Re)apply the entire network egress policy in one atomic swap: publish the
@@ -1433,6 +1490,14 @@ pub(crate) fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
     if policy.egress_eq(&next) {
         return;
     }
+    for (tcp, http) in crate::routing::shadowed_http_rules(&next.tcp_egress, &next.routes) {
+        tracing::warn!(
+            ?tcp,
+            ?http,
+            "egress.tcp claims this port, so the egress.http rule for the same host is not applied: \
+             traffic is spliced raw, with no HTTP rules, credential injection, or inspection"
+        );
+    }
     *policy = NetworkPolicy {
         generation: policy.generation + 1,
         pins: HashMap::new(),
@@ -1447,7 +1512,7 @@ pub(crate) fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
 ///
 /// Only the name is stored — not the `tcp_egress` rule it matched — so the
 /// connect path re-evaluates the ordered rules against the *connecting* caller
-/// (see [`resolve_tcp_egress`]) rather than trusting the DNS caller's verdict.
+/// (see [`tcp_egress_verdict`]) rather than trusting the DNS caller's verdict.
 ///
 /// `generation` is the policy generation in force when the lookup was
 /// authorized; if a policy has since been applied (bumping the generation and
@@ -1569,7 +1634,7 @@ async fn open_upstream_tunnel(
 async fn handle_raw_passthrough(
     mut stream: TcpStream,
     raw_target: &str,
-    verdict: Verdict,
+    decision: &TcpDecision,
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1584,25 +1649,8 @@ async fn handle_raw_passthrough(
         return Ok(());
     }
 
-    match verdict {
-        Verdict::Deny => {
-            emit_policy_deny_connect(state, raw_target, "policy-deny", actor);
-            return Ok(());
-        }
-        Verdict::Ask => {
-            let action_str = format!("CONNECT {raw_target}");
-            let key = gate_key(raw_target);
-            let decision =
-                crate::gate::gate_or_deny(state, &key, &action_str, "policy-ambiguous").await;
-            if !decision.is_allow() {
-                emit_gate_denied(state, &action_str, decision);
-                tracing::info!(target = %raw_target, reason = decision.audit_reason(), "transparent passthrough DENIED (gated)");
-                return Ok(());
-            }
-            emit_gate_resolved(state, &action_str, decision);
-            tracing::info!(target = %raw_target, reason = decision.audit_reason(), "transparent passthrough ALLOWED (gated)");
-        }
-        Verdict::Allow => {}
+    if !raw_verdict_admits(state, raw_target, decision, actor).await {
+        return Ok(());
     }
 
     // Raw TCP always egresses directly: SO_MARK bypasses the nftables cage and
@@ -1617,6 +1665,134 @@ async fn handle_raw_passthrough(
     tracing::debug!(target = %raw_target, "transparent passthrough DIRECT");
     emit_audit(state, raw_target, "success", 200, actor);
     tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
+    Ok(())
+}
+
+/// Whether an `egress.tcp` verdict admits the splice, running the developer
+/// gate for `Ask` and emitting the deny audit. How a refusal reaches the client
+/// — a 403 on the explicit-proxy doors, a silent close on the transparent one —
+/// is the caller's business.
+async fn raw_verdict_admits(
+    state: &Arc<ProxyState>,
+    target: &str,
+    decision: &TcpDecision,
+    actor: &crate::peer_process::ActorContext,
+) -> bool {
+    match decision.verdict {
+        Verdict::Allow => true,
+        Verdict::Deny => {
+            emit_policy_deny_connect(state, target, "policy-deny", actor);
+            false
+        }
+        Verdict::Ask => {
+            let shown = decision.matched_target.as_deref().unwrap_or(target);
+            let action_str = format!("CONNECT {shown}");
+            let answer = crate::gate::gate_or_deny(
+                state,
+                &gate_key(shown),
+                &action_str,
+                "policy-ambiguous",
+                crate::protocol::Treatment::Raw,
+            )
+            .await;
+            if answer.is_allow() {
+                emit_gate_resolved(state, &action_str, answer);
+                tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough ALLOWED (gated)");
+            } else {
+                emit_gate_denied(state, &action_str, answer);
+                tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough DENIED (gated)");
+            }
+            answer.is_allow()
+        }
+    }
+}
+
+/// Serve a `CONNECT` whose destination the `egress.tcp` table claimed: refuse
+/// it, or open the tunnel and splice the bytes through untouched. No protocol
+/// peek, no TLS interception, no credential injection — claiming a port in the
+/// tcp table is what opts it out of all of that.
+///
+/// The dial re-runs the table on the resolved address, so a CIDR deny the client
+/// could not be tested against while it was still a name still binds.
+async fn connect_raw_passthrough(
+    mut client: TcpStream,
+    target_host: &str,
+    decision: &TcpDecision,
+    state: &Arc<ProxyState>,
+    actor: &crate::peer_process::ActorContext,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !raw_verdict_admits(state, target_host, decision, actor).await {
+        tracing::info!(target = %target_host, "proxy DENIED (egress.tcp)");
+        client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    let mut upstream =
+        match connect_egress_under_policy(state, target_host, 443, actor.process()).await {
+            Ok(s) => s,
+            Err(e) => {
+                emit_audit(state, target_host, "error", 502, actor);
+                client
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    .await?;
+                return Err(format!("raw passthrough connect to {target_host}: {e}").into());
+            }
+        };
+
+    client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+    tracing::debug!(target = %target_host, "proxy RAW passthrough");
+    emit_audit(state, target_host, "success", 200, actor);
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
+}
+
+/// Serve an absolute-form `http://` request whose destination the `egress.tcp`
+/// table claimed: refuse it, or send the origin-form rewrite of the request head
+/// upstream and splice the rest through untouched. The rewrite is proxy framing,
+/// not inspection — it also strips `Proxy-*`, so the client's proxy credentials
+/// never reach the origin. No HTTP rules, no credential injection, no URI
+/// placeholder rewriting.
+///
+/// The refusal is audited as a connect rather than an HTTP transaction: the tcp
+/// table judged the destination, not the request line.
+async fn http_forward_raw_passthrough(
+    mut client: TcpStream,
+    target_host: &str,
+    request_head: &str,
+    decision: &TcpDecision,
+    state: &Arc<ProxyState>,
+    actor: &crate::peer_process::ActorContext,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !raw_verdict_admits(state, target_host, decision, actor).await {
+        tracing::info!(target = %target_host, "HTTP forward proxy DENIED (egress.tcp)");
+        client
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
+    let mut upstream =
+        match connect_egress_under_policy(state, target_host, 80, actor.process()).await {
+            Ok(s) => s,
+            Err(e) => {
+                emit_audit(state, target_host, "error", 502, actor);
+                client
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await?;
+                return Err(format!("raw passthrough connect to {target_host}: {e}").into());
+            }
+        };
+
+    upstream
+        .write_all(format!("{request_head}\r\n\r\n").as_bytes())
+        .await?;
+    tracing::debug!(target = %target_host, "HTTP forward proxy RAW passthrough");
+    emit_audit(state, target_host, "success", 200, actor);
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
 }
 
@@ -1688,8 +1864,14 @@ async fn handle_transparent_tls(
         Verdict::Ask => {
             let action_str = format!("CONNECT {target_host}");
             let key = gate_key(&target_host);
-            let decision =
-                crate::gate::gate_or_deny(state, &key, &action_str, "policy-ambiguous").await;
+            let decision = crate::gate::gate_or_deny(
+                state,
+                &key,
+                &action_str,
+                "policy-ambiguous",
+                crate::protocol::Treatment::Inspected,
+            )
+            .await;
             if !decision.is_allow() {
                 emit_gate_denied(state, &action_str, decision);
                 tracing::info!(target = %target_host, reason = decision.audit_reason(), "transparent TLS DENIED (gated)");
@@ -2876,14 +3058,13 @@ pub(crate) mod tests {
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
         // A connect to the pinned ip:port re-evaluates the rule and admits it.
-        let verdict =
-            resolve_tcp_egress(&state, "203.0.113.7:5432", None).expect("pin should match");
+        let verdict = tcp_verdict(&state, "203.0.113.7:5432", None).expect("pin should match");
         assert_eq!(verdict, Verdict::Allow);
 
         // A different port on the same ip is not covered by the port-scoped rule.
-        assert!(resolve_tcp_egress(&state, "203.0.113.7:6379", None).is_none());
+        assert!(tcp_verdict(&state, "203.0.113.7:6379", None).is_none());
         // An ip that was never pinned does not match.
-        assert!(resolve_tcp_egress(&state, "198.51.100.1:5432", None).is_none());
+        assert!(tcp_verdict(&state, "198.51.100.1:5432", None).is_none());
     }
 
     #[test]
@@ -2907,7 +3088,7 @@ pub(crate) mod tests {
         // An expired pin is skipped at connect time, so the connection is
         // denied. The read path no longer prunes — storage is reclaimed at
         // insert time and on reload — so the entry may still be present.
-        assert!(resolve_tcp_egress(&state, "203.0.113.9:5432", None).is_none());
+        assert!(tcp_verdict(&state, "203.0.113.9:5432", None).is_none());
     }
 
     #[test]
@@ -3104,10 +3285,7 @@ pub(crate) mod tests {
         ];
         let generation = state.policy.read().unwrap().generation;
         pin_dns_answers(&state, &[x], "db.example.com", 300, generation);
-        assert_eq!(
-            resolve_tcp_egress(&state, target, None),
-            Some(Verdict::Deny)
-        );
+        assert_eq!(tcp_verdict(&state, target, None), Some(Verdict::Deny));
 
         // Reload to policy B (no static rules, default deny). Publishing the
         // empty rules and clearing the pin happen together, so the allow-pin
@@ -3119,8 +3297,17 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(resolve_tcp_egress(&state, target, None), None);
+        assert_eq!(tcp_verdict(&state, target, None), None);
         assert!(state.policy.read().unwrap().pins.is_empty());
+    }
+
+    #[test]
+    fn a_wildcard_hostname_rule_does_not_reach_an_unpinned_ip_literal() {
+        // An IP literal is not a name, on any door: hostname rules reach it only
+        // through a DNS pin. See `TcpTarget::at`.
+        let (state, _rx) = test_state();
+        install_tcp_rules(&state, r#"[{"match": "*:443", "verdict": "deny"}]"#);
+        assert_eq!(tcp_verdict(&state, "203.0.113.7:443", None), None);
     }
 
     #[test]
@@ -3152,12 +3339,12 @@ pub(crate) mod tests {
 
         // The listed binary is admitted by the pin.
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.20:5432", Some(&psql)),
+            tcp_verdict(&state, "203.0.113.20:5432", Some(&psql)),
             Some(Verdict::Allow)
         );
         // A different binary is not — the pin's filter fails closed.
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.20:5432", Some(&curl)),
+            tcp_verdict(&state, "203.0.113.20:5432", Some(&curl)),
             Some(Verdict::Deny)
         );
     }
@@ -3171,7 +3358,7 @@ pub(crate) mod tests {
                  "binaries": ["/usr/bin/curl"]}]"#,
         );
         assert_eq!(
-            resolve_tcp_egress(&state, "10.0.0.5:5432", None),
+            tcp_verdict(&state, "10.0.0.5:5432", None),
             Some(Verdict::Deny),
             "an unresolvable caller must not slip past a binary-scoped deny"
         );
@@ -3217,12 +3404,12 @@ pub(crate) mod tests {
         // pin must NOT re-open the connection — the binary-excluded match fails
         // closed rather than falling through to the pin.
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.50:5432", Some(&curl)),
+            tcp_verdict(&state, "203.0.113.50:5432", Some(&curl)),
             Some(Verdict::Deny)
         );
         // psql is admitted by the static rule directly.
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.50:5432", Some(&psql)),
+            tcp_verdict(&state, "203.0.113.50:5432", Some(&psql)),
             Some(Verdict::Allow)
         );
     }
@@ -3263,7 +3450,7 @@ pub(crate) mod tests {
 
         // Direct client connecting is admitted by the allow rule.
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.60:5432", Some(&direct)),
+            tcp_verdict(&state, "203.0.113.60:5432", Some(&direct)),
             Some(Verdict::Allow)
         );
 
@@ -3277,7 +3464,7 @@ pub(crate) mod tests {
             ancestors: vec![std::path::PathBuf::from("/usr/bin/bad-parent")],
         };
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.60:5432", Some(&under_bad_parent)),
+            tcp_verdict(&state, "203.0.113.60:5432", Some(&under_bad_parent)),
             Some(Verdict::Deny),
             "the earlier caller-scoped deny must apply to the reused pin"
         );
@@ -3298,17 +3485,17 @@ pub(crate) mod tests {
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.70:5432", None),
+            tcp_verdict(&state, "203.0.113.70:5432", None),
             Some(Verdict::Allow),
             "the first port-scoped allow must admit its port"
         );
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.70:6379", None),
+            tcp_verdict(&state, "203.0.113.70:6379", None),
             Some(Verdict::Allow),
             "a later port-scoped allow must admit its port too"
         );
         // A port neither rule covers stays unmatched.
-        assert!(resolve_tcp_egress(&state, "203.0.113.70:9999", None).is_none());
+        assert!(tcp_verdict(&state, "203.0.113.70:9999", None).is_none());
     }
 
     #[test]
@@ -3325,12 +3512,12 @@ pub(crate) mod tests {
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.71:5432", None),
+            tcp_verdict(&state, "203.0.113.71:5432", None),
             Some(Verdict::Deny),
             "the port-scoped deny must bind its port"
         );
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.71:6379", None),
+            tcp_verdict(&state, "203.0.113.71:6379", None),
             Some(Verdict::Allow),
             "the later allow must bind its own port"
         );
@@ -3359,7 +3546,7 @@ pub(crate) mod tests {
                 pin_dns_answers(&state, &[ip], name, 300, 0);
             }
             assert_eq!(
-                resolve_tcp_egress(&state, "203.0.113.80:5432", None),
+                tcp_verdict(&state, "203.0.113.80:5432", None),
                 Some(Verdict::Deny),
                 "the earlier deny rule wins regardless of pin insertion order"
             );
@@ -3392,7 +3579,7 @@ pub(crate) mod tests {
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.90:5432", None),
+            tcp_verdict(&state, "203.0.113.90:5432", None),
             Some(Verdict::Ask),
             "the earlier hostname rule must win over the later CIDR allow"
         );
@@ -3423,7 +3610,7 @@ pub(crate) mod tests {
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.95:5432", None),
+            tcp_verdict(&state, "203.0.113.95:5432", None),
             Some(Verdict::Allow),
             "the earlier CIDR allow must win over the later hostname deny"
         );
@@ -3679,6 +3866,16 @@ pub(crate) mod tests {
             });
     }
 
+    /// The tcp table's verdict for `target`; tests that also care about the
+    /// name the rule bound through call `tcp_egress_verdict_for_hostport`.
+    fn tcp_verdict(
+        state: &Arc<ProxyState>,
+        target: &str,
+        caller: Option<&crate::peer_process::PeerProcess>,
+    ) -> Option<Verdict> {
+        tcp_egress_verdict_for_hostport(state, target, 0, caller).map(|d| d.verdict)
+    }
+
     fn install_tcp_rules(state: &Arc<ProxyState>, json: &str) {
         let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
         state.policy.write().unwrap().tcp_egress =
@@ -3816,6 +4013,126 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_pinned_hostname_ask_names_the_host_in_the_dialog() {
+        // The transparent door has only SO_ORIGINAL_DST, but the rule bound
+        // through a DNS pin, so the name is known. Ask about the name the
+        // policy author wrote, not the address it happened to resolve to —
+        // and record that name, since the set it lands in is keyed by QNAME.
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "db.internal:5432", "verdict": "ask"}]"#,
+        );
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        pin_dns_answers(&state, &[ip], "db.internal", 300, 0);
+
+        // Straight from the table, exactly as the transparent door gets it.
+        let decision = tcp_egress_verdict_for_hostport(&state, "203.0.113.9:5432", 0, None)
+            .expect("the pinned hostname rule must claim this address");
+
+        let (_client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            handle_raw_passthrough(
+                server,
+                "203.0.113.9:5432",
+                &decision,
+                &state_for_handler,
+                &actor,
+            )
+            .await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a dialog must be raised")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&pending).unwrap();
+        assert_eq!(parsed["host"], "db.internal");
+        assert_eq!(parsed["action"], "CONNECT db.internal:5432");
+        // A raw splice is opaque: nothing about it will be inspected, logged
+        // per-request, or credential-injected. The dialog must say so.
+        assert_eq!(parsed["treatment"], "raw");
+
+        // An approval is recorded under that same name. The DNS stub compares
+        // this set against QNAMEs, so an address here would never match.
+        let id = parsed["id"].as_str().unwrap().to_string();
+        assert!(crate::gate::resolve_pending(
+            &state,
+            &id,
+            crate::protocol::Decision::AllowOnce,
+        ));
+        let resolved = tokio::time::timeout(Duration::from_secs(2), async {
+            while !state
+                .gate_resolved_hosts
+                .read()
+                .unwrap()
+                .contains("db.internal")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(resolved.is_ok(), "the approved name must be recorded");
+    }
+
+    #[test]
+    fn a_cidr_rule_names_no_host_even_when_the_address_is_pinned() {
+        // The dialog must fall back to the address. Surfacing the pin here
+        // "for consistency" would ask about — and then record as approved — a
+        // name the policy author never wrote a rule about.
+        let (state, _rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "203.0.113.0/24:5432", "verdict": "ask"}]"#,
+        );
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        pin_dns_answers(&state, &[ip], "db.internal", 300, 0);
+
+        let decision = tcp_egress_verdict_for_hostport(&state, "203.0.113.9:5432", 0, None)
+            .expect("the cidr rule must claim this address");
+        assert_eq!(decision.verdict, Verdict::Ask);
+        assert_eq!(decision.matched_target, None);
+    }
+
+    #[tokio::test]
+    async fn a_tcp_allow_splices_raw_on_the_http_forward_door() {
+        // Same pre-filter rule as the CONNECT door. The destination is
+        // unresolvable, so 502 (the splice tried to dial) distinguishes the raw
+        // path from the l7 default deny, which would answer 403 without dialing.
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "nonexistent.invalid:80", "verdict": "allow"}]"#,
+        );
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            let headers =
+                b"GET http://nonexistent.invalid/ HTTP/1.1\r\nHost: nonexistent.invalid\r\n\r\n"
+                    .to_vec();
+            handle_http_forward(
+                server,
+                "nonexistent.invalid:80",
+                headers,
+                &state_for_handler,
+                &actor,
+            )
+            .await
+        });
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 502"),
+            "a tcp allow must take the raw path, not the l7 table; got {response:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn connect_to_a_pinned_ip_still_hits_the_hostname_tcp_deny() {
         // A port-scoped deny alongside an allow on another port: the name still
         // resolves (the :443 allow survives the DNS gate) and pins its IP. The
@@ -3834,7 +4151,7 @@ pub(crate) mod tests {
 
         // The transparent door already refuses it.
         assert_eq!(
-            resolve_tcp_egress(&state, "203.0.113.80:5432", None),
+            tcp_verdict(&state, "203.0.113.80:5432", None),
             Some(Verdict::Deny)
         );
 
@@ -3888,34 +4205,109 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_tcp_allow_does_not_bypass_the_l7_table_on_the_proxy_door() {
-        // Deny-terminal only, by design: honoring a tcp *allow* here would hand
-        // the workload a way to opt out of L7 inspection for any host a tcp
-        // allow covers. The L7 table stays in charge of everything but denies.
+    async fn a_tcp_allow_splices_raw_on_the_proxy_door() {
+        // The tcp table is the pre-filter: what it claims, it governs. A default
+        // deny in the l7 table is not consulted for a destination a tcp allow
+        // already claimed, exactly as on the transparent door.
+        //
+        // The destination is unresolvable, so the splice reports 502 rather than
+        // opening. That is the assertion: the l7 default deny would have answered
+        // 403 without ever dialing.
         let (state, _rx) = test_state();
         state.policy.write().unwrap().default_verdict = Verdict::Deny;
         install_tcp_rules(
             &state,
-            r#"[{"match": "10.0.0.0/8:22", "verdict": "allow"}]"#,
+            r#"[{"match": "nonexistent.invalid:22", "verdict": "allow"}]"#,
         );
 
         let (mut client, server) = socket_pair().await;
         let state_for_handler = state.clone();
         tokio::spawn(async move {
             let actor = test_actor();
-            handle_connect(server, "10.0.0.5:22", &actor, &state_for_handler).await
+            handle_connect(server, "nonexistent.invalid:22", &actor, &state_for_handler).await
         });
 
         let response = read_response(&mut client).await;
         assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "a tcp allow must not authorize a raw splice past the L7 table; got {response:?}"
+            response.starts_with("HTTP/1.1 502"),
+            "a tcp allow must take the raw path, not the l7 table; got {response:?}"
         );
     }
 
     #[tokio::test]
+    async fn a_tcp_ask_gates_before_splicing_on_the_proxy_door() {
+        // `ask` reaches the developer on this door too; a refusal is a 403, not
+        // a fall-through to the l7 table.
+        let (state, mut rx) = test_state();
+        install_catch_all_allow(&state);
+        install_tcp_rules(&state, r#"[{"match": "10.0.0.0/8:22", "verdict": "ask"}]"#);
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            let actor = test_actor();
+            handle_connect(server, "10.0.0.5:22", &actor, &state_for_handler).await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("request_pending arrived")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&pending).unwrap();
+        assert_eq!(parsed["type"], "request_pending");
+        let id = parsed["id"].as_str().unwrap().to_string();
+        assert!(crate::gate::resolve_pending(
+            &state,
+            &id,
+            crate::protocol::Decision::DenyOnce,
+        ));
+
+        let response = read_response(&mut client).await;
+        let _ = handler.await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a refused gate must deny the splice; got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_egress_under_policy_refuses_a_post_resolution_ask() {
+        // No gate can run inside the dial, and admitting would let this door
+        // skip a decision the transparent door asks a human for — the workload
+        // chooses the door, so the permissive answer must not be reachable.
+        let (state, _rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "10.0.0.0/8:5432", "verdict": "ask"}]"#,
+        );
+        let dial = connect_egress_under_policy(&state, "10.0.0.5:5432", 5432, None);
+        let err = tokio::time::timeout(Duration::from_secs(2), dial)
+            .await
+            .expect("policy must refuse before dialing")
+            .expect_err("an ask that cannot be gated must not admit");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn connect_egress_under_policy_applies_an_ipv6_cidr_deny() {
+        // The post-resolution re-check has to survive the round trip through an
+        // `ip:port` string, which for IPv6 only parses back when bracketed.
+        let (state, _rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "[2001:db8::/32]:443", "verdict": "deny"}]"#,
+        );
+        let dial = connect_egress_under_policy(&state, "[2001:db8::1]:443", 443, None);
+        let err = tokio::time::timeout(Duration::from_secs(2), dial)
+            .await
+            .expect("policy must refuse before dialing")
+            .expect_err("the v6 CIDR deny must apply");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
     async fn connect_fails_closed_when_a_binary_scoped_rule_excludes_the_caller() {
-        // The same fail-closed rule `resolve_tcp_egress` applies must hold on
+        // The same fail-closed rule `tcp_egress_verdict` applies must hold on
         // the door the workload is actually pointed at by HTTPS_PROXY.
         let (state, _rx) = test_state();
         install_catch_all_allow(&state);
@@ -3942,9 +4334,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn connect_still_reaches_the_l7_table_when_no_tcp_rule_denies() {
-        // Deny-terminal only: a tcp rule that does not deny must leave the L7
-        // decision untouched, so an `ask` route still suspends for a decision.
+    async fn connect_reaches_the_l7_table_when_no_tcp_rule_claims_the_destination() {
+        // The tcp rule covers a different host, so it claims nothing here and
+        // the l7 table governs in full — an `ask` route still suspends.
         let (state, mut rx) = test_state();
         install_ask_route(&state, "evil.example.com");
         install_tcp_deny(&state, "10.0.0.0/8:22");
@@ -3995,6 +4387,7 @@ pub(crate) mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&pending).unwrap();
         assert_eq!(parsed["type"], "request_pending");
         assert_eq!(parsed["host"], "evil.example.com");
+        assert_eq!(parsed["treatment"], "inspected");
         let id = parsed["id"].as_str().unwrap().to_string();
 
         assert!(crate::gate::resolve_pending(

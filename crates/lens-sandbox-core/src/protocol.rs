@@ -79,18 +79,43 @@ pub struct RequestPending {
     pub host: String,
     pub action: String,
     pub reason: String,
+    pub treatment: Treatment,
 }
 
 impl RequestPending {
-    pub fn new(id: String, host: String, action: String, reason: String) -> Self {
+    pub fn new(
+        id: String,
+        host: String,
+        action: String,
+        reason: String,
+        treatment: Treatment,
+    ) -> Self {
         Self {
             msg_type: "request_pending",
             id,
             host,
             action,
             reason,
+            treatment,
         }
     }
+}
+
+/// What approving a pending request actually permits.
+///
+/// `action` cannot express this: a raw `egress.tcp` splice and an inspected
+/// `egress.http` tunnel both render as `CONNECT host:port`, differing only by a
+/// port number the reader would have to map back to the policy. The two are not
+/// equally consequential — approving `Raw` accepts that the connection is opaque
+/// to the proxy, so no HTTP rules, credential injection, or per-request audit
+/// apply to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Treatment {
+    /// Bytes are spliced through untouched — an `egress.tcp` rule claimed it.
+    Raw,
+    /// The proxy terminates and inspects — an `egress.http` route governs it.
+    Inspected,
 }
 
 /// Inbound frame carrying the developer's answer to a pending request.
@@ -245,11 +270,13 @@ mod tests {
             "evil.example.com".into(),
             "CONNECT evil.example.com:443".into(),
             "policy-ambiguous".into(),
+            Treatment::Raw,
         );
         let json = serde_json::to_value(&p).unwrap();
         assert_eq!(json["type"], "request_pending");
         assert_eq!(json["id"], "id-1");
         assert_eq!(json["host"], "evil.example.com");
+        assert_eq!(json["treatment"], "raw");
     }
 
     #[test]

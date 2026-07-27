@@ -3472,8 +3472,14 @@ mod tests {
         let h = tokio::spawn({
             let state = state.clone();
             async move {
-                crate::gate::gate_or_deny(&state, "evil", "CONNECT evil:443", "policy-ambiguous")
-                    .await
+                crate::gate::gate_or_deny(
+                    &state,
+                    "evil",
+                    "CONNECT evil:443",
+                    "policy-ambiguous",
+                    crate::protocol::Treatment::Inspected,
+                )
+                .await
             }
         });
         let frame = rx.recv().await.expect("request_pending emitted");

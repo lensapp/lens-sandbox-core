@@ -94,6 +94,17 @@ pub async fn connect_tcp_resolve(addr: &str) -> io::Result<TcpStream> {
 /// is checked *after* resolution, closing the gap that a string-level target
 /// check (which only sees the hostname) leaves open.
 pub async fn connect_tcp_egress(addr: &str) -> io::Result<TcpStream> {
+    connect_tcp_egress_where(addr, |_| true).await
+}
+
+/// [`connect_tcp_egress`] plus a caller-supplied check on the resolved address.
+/// `admits` runs after the SSRF floor and before the dial, on the exact address
+/// about to be connected, so a later DNS answer can't change the decision.
+/// The predicate is a parameter so this module stays policy-free.
+pub async fn connect_tcp_egress_where(
+    addr: &str,
+    admits: impl FnOnce(IpAddr) -> bool,
+) -> io::Result<TcpStream> {
     let resolved = resolve_first(addr).await?;
     if is_disallowed_egress_ip(resolved.ip()) {
         return Err(io::Error::new(
@@ -102,6 +113,12 @@ pub async fn connect_tcp_egress(addr: &str) -> io::Result<TcpStream> {
                 "egress to {} (loopback/link-local/unspecified) denied",
                 resolved.ip()
             ),
+        ));
+    }
+    if !admits(resolved.ip()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("egress to {} denied by policy", resolved.ip()),
         ));
     }
     connect_marked(resolved).await
@@ -152,6 +169,21 @@ mod tests {
     #[tokio::test]
     async fn egress_rejects_loopback_literal() {
         let err = connect_tcp_egress("127.0.0.1:9").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn the_policy_predicate_sees_the_resolved_address_and_can_refuse_it() {
+        // A private address the SSRF floor deliberately permits, so only the
+        // predicate can stop it.
+        let mut seen = None;
+        let err = connect_tcp_egress_where("10.0.0.5:22", |ip| {
+            seen = Some(ip);
+            false
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(seen, Some("10.0.0.5".parse().unwrap()));
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 

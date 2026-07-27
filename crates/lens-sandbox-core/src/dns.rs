@@ -8,8 +8,10 @@
 //! wildcards supported; CIDR matchers are intentionally excluded — a bare IP
 //! literal is not a legitimate QNAME and allowing it would leak CIDR policy to
 //! the upstream resolver. IP-based access is still enforced at the TCP layer).
-//! Explicit `Deny` rules take first-match precedence, same as
-//! `find_matching_route`. When a route carries a `binaries` filter we resolve
+//! Explicit `Deny` rules take first-match precedence within a table, same as
+//! `find_matching_route`; across the two tables a name resolves iff either
+//! holds a live allow (`HostnameMatch::union`), since a query names no port and
+//! the tables govern different ones. When a route carries a `binaries` filter we resolve
 //! the querying process (best-effort, via `/proc`) so a name reachable only by
 //! other binaries fails closed here, exactly as it would at the TCP layer. The
 //! stub then either forwards allowed queries upstream or responds with
@@ -291,27 +293,21 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         query.query_type(),
         RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB | RecordType::ANY
     );
-    // Read the L7 routes, the tcp rules, and the generation under ONE policy
-    // snapshot. The DNS verdict pairs an L7-route match with a tcp-rule-derived
-    // pin stamped with the generation, so all three must come from the same
-    // policy — reading them separately would let a reload pair one policy's L7
-    // allow with another policy's tcp pin (and stamp it with a generation the
-    // pin doesn't belong to). A reload swaps the whole snapshot and bumps the
-    // generation atomically, so an equal generation at pin-insertion time still
-    // proves the pin matches the policy in force. One `tcp_egress` evaluation
-    // decides both whether the name resolves and whether to pin: the IP-only
-    // matchers (`Cidr`/`CidrPort`) are transparent to the hostname gate, so the
-    // stub records the answer IPs against the QNAME for the connect layer to
-    // re-evaluate (port-aware) against the connector. Computing it from the same
-    // match the verdict uses is what keeps the two from ever disagreeing.
+    // Read both tables and the generation under ONE policy snapshot: the
+    // verdict, the pin it implies, and the generation stamped on that pin must
+    // come from the same policy, or a reload could pair one policy's allow with
+    // another's pin. The generation check at pin-insertion time then still
+    // proves the pin matches the policy in force. The same `tcp_egress`
+    // evaluation decides whether the name resolves and whether to pin, so those
+    // two can never disagree.
     let policy = state.policy.read().unwrap();
     let generation = policy.generation;
-    let fqdn_match =
+    let tcp_match =
         hostname_match_for_caller(&policy.tcp_egress, &normalized, caller, PortScope::PerPort);
     // Pin on any hostname tcp match, deny included: the raw path can only bind
     // hostname rules through pins, and a pin carries no verdict — connect
     // re-evaluates.
-    let should_pin = fqdn_match != HostnameMatch::Unmatched;
+    let should_pin = tcp_match != HostnameMatch::Unmatched;
 
     let allow = |qname| {
         if should_suppress {
@@ -339,11 +335,12 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
     // DNS matches on hostname only (no scheme/port); port- and scheme-aware
     // enforcement still applies at the subsequent TCP step. `caller` applies
     // any `binaries` filter, so a name reachable only by other binaries fails
-    // closed here just as it would at the TCP layer.
-    let matched =
+    // closed here just as it would at the TCP layer. The two tables union —
+    // see `HostnameMatch::union`.
+    let http_match =
         hostname_match_for_caller(&policy.routes, &normalized, caller, PortScope::FirstMatch);
     drop(policy);
-    match matched {
+    match tcp_match.union(http_match) {
         HostnameMatch::Allowed => return allow(normalized),
         HostnameMatch::Denied => {
             return Decision::Deny {
@@ -355,26 +352,6 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         // closed with its own reason, and — unlike an unmatched name — do not
         // consult the JIT-approved set: that set is host-keyed, so honouring it
         // would let any binary re-open a host once any binary got it approved.
-        HostnameMatch::BinaryDenied => {
-            return Decision::Deny {
-                qname: normalized,
-                reason: BINARY_DENY_REASON,
-            };
-        }
-        HostnameMatch::Unmatched => {}
-    }
-
-    // No l7 route matched — a raw-TCP fqdn rule may still permit the lookup so
-    // its answer IPs can be pinned for the TCP layer. Same first-match / deny /
-    // binary-scoping semantics as the l7 gate above.
-    match fqdn_match {
-        HostnameMatch::Allowed => return allow(normalized),
-        HostnameMatch::Denied => {
-            return Decision::Deny {
-                qname: normalized,
-                reason: DENY_REASON,
-            };
-        }
         HostnameMatch::BinaryDenied => {
             return Decision::Deny {
                 qname: normalized,
@@ -612,6 +589,22 @@ mod tests {
         }
     }
 
+    /// A port-scoped `egress.tcp` rule — the only shape `parse_tcp_egress` accepts.
+    fn tcp_rule(host: &str, port: u16, verdict: Verdict) -> RouteRule {
+        RouteRule {
+            matcher: RouteMatcher::HostPort(host.to_string(), port),
+            verdict,
+            ..rule(host)
+        }
+    }
+
+    fn deny_rule(pattern: &str) -> RouteRule {
+        RouteRule {
+            verdict: Verdict::Deny,
+            ..rule(pattern)
+        }
+    }
+
     /// An allow rule for `pattern` scoped to the given absolute exe paths.
     fn binary_rule(pattern: &str, bins: &[&str]) -> RouteRule {
         RouteRule {
@@ -768,20 +761,23 @@ mod tests {
         let state = state_with_routes(Vec::new());
         let packet = make_query("h.internal", RecordType::A);
 
-        // Policy A: L7 denies H, but a hostname tcp_egress rule allows it. The
-        // L7 deny wins, so the lookup is denied and no pin is produced.
+        // Policy A: L7 denies H, but a tcp_egress rule claims :5432. The name
+        // resolves on the tcp allow and carries that snapshot's pin.
         crate::proxy::apply_network_policy(
             &state,
             crate::proxy::NetworkPolicy {
                 routes: vec![route("h.internal", Verdict::Deny)],
                 default_verdict: Verdict::Deny,
-                tcp_egress: vec![route("h.internal", Verdict::Allow)],
+                tcp_egress: vec![tcp_rule("h.internal", 5432, Verdict::Allow)],
                 ..Default::default()
             },
         );
         match classify_query(&packet, &state, None) {
-            Decision::Deny { .. } => {}
-            other => panic!("policy A must deny H at DNS, got: {}", describe(&other)),
+            Decision::Allow { should_pin, .. } => assert!(
+                should_pin,
+                "the tcp allow that resolved the name must also pin it"
+            ),
+            other => panic!("policy A must allow H at DNS, got: {}", describe(&other)),
         }
 
         // Policy B: L7 allows H, no hostname tcp_egress rule. The lookup is
@@ -801,6 +797,49 @@ mod tests {
                 "a routes-allow must not carry an fqdn pin from another snapshot"
             ),
             other => panic!("policy B must allow H at DNS, got: {}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn a_tcp_allow_resolves_a_name_the_http_table_denies() {
+        // The tables govern different ports of the same host, so an http deny
+        // cannot speak for a port the tcp table claims. NXDOMAIN here would
+        // leave the tcp allow permanently dead: the raw path binds hostname
+        // rules only through pins, and an unresolved name pins nothing.
+        let state = state_with_routes(vec![deny_rule("db.internal")]);
+        state.policy.write().unwrap().tcp_egress =
+            vec![tcp_rule("db.internal", 5432, Verdict::Allow)];
+
+        let packet = make_query("db.internal", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Allow { should_pin, .. } => {
+                assert!(should_pin, "the tcp allow needs its pin")
+            }
+            other => panic!(
+                "the tcp allow must resolve the name, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn an_http_allow_resolves_a_name_a_port_scoped_tcp_deny_covers() {
+        // The mirror image, and the reason the gate unions the tables rather
+        // than simply consulting tcp first: a tcp deny on :5432 says nothing
+        // about :443, which the http table allows.
+        let state = state_with_routes(vec![rule("api.internal")]);
+        state.policy.write().unwrap().tcp_egress =
+            vec![tcp_rule("api.internal", 5432, Verdict::Deny)];
+
+        let packet = make_query("api.internal", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Allow { should_pin, .. } => {
+                assert!(should_pin, "the tcp deny needs its pin to bind at connect")
+            }
+            other => panic!(
+                "the http allow must resolve the name, got: {}",
+                describe(&other)
+            ),
         }
     }
 
