@@ -684,7 +684,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct NetworkPolicyRaw {
-        /// Deprecated alias for `egress.l7`. `egress.l7` wins when both are set.
+        /// Deprecated alias for `egress.http`. `egress.http` wins when both are set.
         #[serde(default)]
         allowed_routes: serde_json::Value,
         /// Kept loose (not `Option<EgressRaw>`): a malformed *shape* (a
@@ -703,7 +703,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     #[serde(rename_all = "camelCase")]
     struct EgressRaw {
         #[serde(default)]
-        l7: serde_json::Value,
+        http: serde_json::Value,
         #[serde(default)]
         tcp: serde_json::Value,
     }
@@ -815,9 +815,9 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 state.client_certs.write().unwrap().clear();
             };
 
-            // Resolve the l7 source. egress.l7 wins; else the deprecated
+            // Resolve the http source. egress.http wins; else the deprecated
             // top-level allowedRoutes. When the operator opted into the egress
-            // block at all, an absent l7 is simply "no l7 rules" (a tcp-only
+            // block at all, an absent http is simply "no http rules" (a tcp-only
             // policy is valid) — not malformed. Only a legacy policy with
             // neither egress nor a valid allowedRoutes is treated as malformed
             // and fails closed.
@@ -836,24 +836,24 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             };
 
             let empty = serde_json::Value::Array(Vec::new());
-            // `Ok(Some)` = an l7 source to parse, `Ok(None)` = no policy at all
-            // (force deny), `Err` = a malformed egress/l7 shape (force deny). A
-            // null/absent `egress.l7` is the legitimate tcp-only case → empty
+            // `Ok(Some)` = an http source to parse, `Ok(None)` = no policy at all
+            // (force deny), `Err` = a malformed egress/http shape (force deny). A
+            // null/absent `egress.http` is the legitimate tcp-only case → empty
             // list; any other non-array is an operator typo and must fail
             // closed, not silently drop every rule. Mirrors `tcp_result` below.
-            let l7_value: Result<Option<&serde_json::Value>, String> = match &egress {
+            let http_value: Result<Option<&serde_json::Value>, String> = match &egress {
                 Err(e) => Err(e.clone()),
-                Ok(Some(e)) if e.l7.is_array() => Ok(Some(&e.l7)),
-                Ok(Some(e)) if e.l7.is_null() && network.allowed_routes.is_array() => {
+                Ok(Some(e)) if e.http.is_array() => Ok(Some(&e.http)),
+                Ok(Some(e)) if e.http.is_null() && network.allowed_routes.is_array() => {
                     Ok(Some(&network.allowed_routes))
                 }
-                Ok(Some(e)) if e.l7.is_null() => Ok(Some(&empty)),
-                Ok(Some(_)) => Err("egress.l7 must be an array".to_string()),
+                Ok(Some(e)) if e.http.is_null() => Ok(Some(&empty)),
+                Ok(Some(_)) => Err("egress.http must be an array".to_string()),
                 Ok(None) if network.allowed_routes.is_array() => Ok(Some(&network.allowed_routes)),
                 Ok(None) => Ok(None),
             };
             // egress.tcp is the raw-L4 list: absent means none, present-but-
-            // invalid fails closed alongside the l7 list.
+            // invalid fails closed alongside the http list.
             let tcp_result: Result<Vec<crate::routing::RouteRule>, String> = match &egress {
                 Err(e) => Err(e.clone()),
                 Ok(Some(e)) if e.tcp.is_null() => Ok(Vec::new()),
@@ -862,8 +862,8 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 Ok(None) => Ok(Vec::new()),
             };
 
-            match l7_value {
-                Ok(Some(l7_value)) => match (parse_proxy_routes(l7_value), tcp_result) {
+            match http_value {
+                Ok(Some(http_value)) => match (parse_proxy_routes(http_value), tcp_result) {
                     (Ok(parsed_routes), Ok(tcp_egress_rules)) => {
                         let mut route_rules = Vec::with_capacity(parsed_routes.len());
                         let mut cert_map: HashMap<String, crate::proxy::ClientCertConfig> =
@@ -946,7 +946,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                     }
                     (Err(e), _) => {
                         tracing::error!(
-                            "invalid network egress.l7/allowedRoutes in policy: {e}; clearing routes and forcing deny"
+                            "invalid network egress.http/allowedRoutes in policy: {e}; clearing routes and forcing deny"
                         );
                         force_deny();
                     }
@@ -965,7 +965,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 }
                 Err(e) => {
                     tracing::error!(
-                        "invalid network.egress.l7 in policy: {e}; clearing routes and forcing deny"
+                        "invalid network.egress.http in policy: {e}; clearing routes and forcing deny"
                     );
                     force_deny();
                 }
@@ -2503,7 +2503,7 @@ mod tests {
         let policy_json = serde_json::json!({
             "network": {
                 "egress": {
-                    "l7": [
+                    "http": [
                         {"match": "api.github.com", "verdict": "allow", "transport": "upstream"}
                     ],
                     "tcp": [
@@ -2517,7 +2517,7 @@ mod tests {
 
         apply_local_policy(&policy_json.to_string(), &proxy_state).await;
 
-        // l7 rule landed in routes; tcp rule landed in the tcp policy.
+        // http rule landed in routes; tcp rule landed in the tcp policy.
         assert_eq!(state.policy.read().unwrap().routes.len(), 1);
         let policy = state.policy.read().unwrap();
         let tcp = &policy.tcp_egress;
@@ -2530,7 +2530,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_only_policy_keeps_tcp_rules_and_applies_defaults() {
-        // A pure IP-based DB policy (egress.tcp, no l7) must stay live — this is
+        // A pure IP-based DB policy (egress.tcp, no http) must stay live — this is
         // the first-class "connect by IP, no DNS" case the schema advertises.
         let (_proxy_server, state) = crate::proxy::ProxyServer::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -2555,7 +2555,7 @@ mod tests {
 
         apply_local_policy(&policy_json.to_string(), &proxy_state).await;
 
-        // tcp rule kept, no l7 rules, and the operator's default verdict applied
+        // tcp rule kept, no http rules, and the operator's default verdict applied
         // (NOT force-denied by a spurious "malformed policy" path).
         assert_eq!(state.policy.read().unwrap().tcp_egress.len(), 1);
         assert!(state.policy.read().unwrap().routes.is_empty());
@@ -2566,7 +2566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allowed_routes_still_works_as_l7_alias() {
+    async fn allowed_routes_still_works_as_http_alias() {
         let (_proxy_server, state) = crate::proxy::ProxyServer::new(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2594,7 +2594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn egress_l7_wins_over_allowed_routes() {
+    async fn egress_http_wins_over_allowed_routes() {
         let (_proxy_server, state) = crate::proxy::ProxyServer::new(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2604,14 +2604,14 @@ mod tests {
         );
         let proxy_state = Some(state.clone());
 
-        // Both present: egress.l7 (two rules) must win over allowedRoutes (one rule).
+        // Both present: egress.http (two rules) must win over allowedRoutes (one rule).
         let policy_json = serde_json::json!({
             "network": {
                 "allowedRoutes": [
                     {"match": "old.example.com", "verdict": "allow", "transport": "upstream"}
                 ],
                 "egress": {
-                    "l7": [
+                    "http": [
                         {"match": "a.example.com", "verdict": "allow", "transport": "upstream"},
                         {"match": "b.example.com", "verdict": "allow", "transport": "upstream"}
                     ]
@@ -2626,7 +2626,7 @@ mod tests {
         assert_eq!(
             state.policy.read().unwrap().routes.len(),
             2,
-            "egress.l7 should win over the deprecated allowedRoutes alias"
+            "egress.http should win over the deprecated allowedRoutes alias"
         );
     }
 
@@ -2646,7 +2646,7 @@ mod tests {
         let policy_json = serde_json::json!({
             "network": {
                 "egress": {
-                    "l7": [
+                    "http": [
                         {"match": "api.github.com", "verdict": "allow", "transport": "upstream"}
                     ],
                     "tcp": "not-an-array"
@@ -2668,7 +2668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_egress_l7_fails_closed_even_with_default_allow() {
+    async fn malformed_egress_http_fails_closed_even_with_default_allow() {
         let (_proxy_server, state) = crate::proxy::ProxyServer::new(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2678,13 +2678,13 @@ mod tests {
         );
         let proxy_state = Some(state.clone());
 
-        // egress.l7 is an object, not an array — an operator typo. With
-        // defaultVerdict:allow, silently treating it as "no l7 rules" would open
+        // egress.http is an object, not an array — an operator typo. With
+        // defaultVerdict:allow, silently treating it as "no http rules" would open
         // everything. It must fail closed instead.
         let policy_json = serde_json::json!({
             "network": {
                 "egress": {
-                    "l7": {"match": "api.github.com", "verdict": "allow"}
+                    "http": {"match": "api.github.com", "verdict": "allow"}
                 },
                 "defaultVerdict": "allow",
                 "defaultTransport": "upstream"
@@ -2697,7 +2697,7 @@ mod tests {
         assert_eq!(
             state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny,
-            "a malformed egress.l7 must force deny, not fall through to default-allow"
+            "a malformed egress.http must force deny, not fall through to default-allow"
         );
     }
 
@@ -2716,7 +2716,7 @@ mod tests {
         let good = serde_json::json!({
             "network": {
                 "egress": {
-                    "l7": [
+                    "http": [
                         {"match": "api.github.com", "verdict": "allow", "transport": "upstream"}
                     ]
                 },

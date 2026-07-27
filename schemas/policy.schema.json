@@ -197,10 +197,10 @@
       ]
     },
     "Egress": {
-      "description": "Egress rules split by the layer at which the destination is filtered.\n\n- [`l7`](Self::l7) filters by hostname and can see and rewrite the payload\n  (HTTP rules, TLS termination, credential injection).\n- [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the\n  payload — an opaque byte splice for non-HTTP services.",
+      "description": "Egress rules split by the protocol at which the destination is filtered.\n\n- [`http`](Self::http) filters by hostname and can see and rewrite the\n  payload (HTTP rules, TLS termination, credential injection).\n- [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the\n  payload — an opaque byte splice for non-HTTP services.",
       "type": "object",
       "properties": {
-        "l7": {
+        "http": {
           "description": "Application-layer (hostname + HTTP/TLS) route rules, first match wins.\nSame rule type as the deprecated top-level `allowedRoutes`.",
           "type": "array",
           "default": [],
@@ -209,7 +209,7 @@
           }
         },
         "tcp": {
-          "description": "Raw TCP rules, first match wins. Each matches a destination by IP/CIDR\nor hostname (optionally scoped to a port) and splices the connection\nthrough opaquely — no protocol classification, no TLS interception, no\nHTTP rules. Intended for databases, brokers, and caches, including those\nthat speak TLS (the connection is not intercepted, so pinning works).\n\nA hostname rule permits its own DNS lookup and pins the resolved IPs, so\nit needs no paired [`l7`](Self::l7) rule (see [`TcpEgressRule`]).",
+          "description": "Raw TCP rules, first match wins. Each matches a destination by IP/CIDR\nor hostname scoped to a required port, and splices the connection\nthrough opaquely — no protocol classification, no TLS interception, no\nHTTP rules. Intended for databases, brokers, and caches, including those\nthat speak TLS (the connection is not intercepted, so pinning works).\n\nA hostname rule permits its own DNS lookup and pins the resolved IPs, so\nit needs no paired [`http`](Self::http) rule (see [`TcpEgressRule`]).",
           "type": "array",
           "default": [],
           "items": {
@@ -285,7 +285,7 @@
       "type": "object",
       "properties": {
         "allowedRoutes": {
-          "description": "**Deprecated** — use [`egress.l7`](Egress::l7). Accepted as a\nback-compat alias: when both are present, `egress.l7` wins. Ordered\nlist of application-layer route rules (first match wins).",
+          "description": "**Deprecated** — use [`egress.http`](Egress::http). Accepted as a\nback-compat alias: when both are present, `egress.http` wins. Ordered\nlist of application-layer route rules (first match wins).",
           "type": [
             "array",
             "null"
@@ -424,7 +424,7 @@
           ]
         },
         "match": {
-          "description": "Destination as an IP, CIDR, `ip:port`, `cidr:port`, hostname, or\n`hostname:port` (e.g. `10.20.0.0/24:5432`, `[2001:db8::/32]:5432`,\n`db.internal:5432`). A bare IP/CIDR/hostname matches any port.\n\nIP/CIDR patterns match the resolved destination directly at connect\ntime. Hostname patterns can only match via DNS forward-pinning: the DNS\nstub permits the lookup for a matching hostname rule, then pins the\nresolved A-record IPs so the raw TCP layer admits the follow-up\nconnection. A hostname rule is self-sufficient — it gates its own DNS\nlookup, so no paired [`l7`](Egress::l7) rule is required.",
+          "description": "Destination as `ip:port`, `cidr:port`, or `hostname:port` (e.g.\n`10.20.5.10:6379`, `10.20.0.0/24:5432`, `[2001:db8::/32]:5432`,\n`db.internal:5432`). A port is **required** — a raw connection is spliced\nopaquely with no inspection, so a portless \"any port\" grant would be too\nbroad; a pattern without a port is rejected and fails the policy closed.\n\nIP/CIDR patterns match the resolved destination directly at connect\ntime. Hostname patterns can only match via DNS forward-pinning: the DNS\nstub permits the lookup for a matching hostname rule, then pins the\nresolved A-record IPs so the raw TCP layer admits the follow-up\nconnection. A hostname rule is self-sufficient — it gates its own DNS\nlookup, so no paired [`http`](Egress::http) rule is required.",
           "type": "string"
         },
         "verdict": {
