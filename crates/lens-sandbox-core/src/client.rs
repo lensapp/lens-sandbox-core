@@ -700,8 +700,13 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         default_transport: Option<String>,
     }
 
+    // `deny_unknown_fields` because an absent `http` is a legitimate tcp-only
+    // policy: a misspelled key would otherwise read as one, publishing zero
+    // routes and handing the whole table to `defaultVerdict`. A relay that
+    // grows a new egress kind bumps `minProtocolDate`, so the version gate
+    // above — not this parse — is what an old sandbox trips on.
     #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct EgressRaw {
         #[serde(default)]
         http: serde_json::Value,
@@ -2664,6 +2669,43 @@ mod tests {
             policy.routes
         );
         assert_eq!(policy.tcp_egress.len(), 1, "the tcp rule must still apply");
+    }
+
+    #[tokio::test]
+    async fn a_misspelled_egress_key_fails_closed_instead_of_reading_as_tcp_only() {
+        // `htttp` leaves both known fields absent, which is exactly the shape a
+        // legitimate tcp-only policy has. Accepting it publishes no routes and
+        // lets `defaultVerdict: allow` govern the whole table — an operator typo
+        // turning into allow-all.
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        let policy_json = serde_json::json!({
+            "network": {
+                "egress": {
+                    "htttp": [{"match": "api.github.com", "verdict": "allow"}]
+                },
+                "defaultVerdict": "allow",
+                "defaultTransport": "direct"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        let policy = state.policy.read().unwrap();
+        assert_eq!(
+            policy.default_verdict,
+            crate::routing::Verdict::Deny,
+            "a typo must fail closed, not hand the table to defaultVerdict"
+        );
+        assert!(policy.routes.is_empty());
+        assert!(policy.tcp_egress.is_empty());
     }
 
     #[tokio::test]
