@@ -628,23 +628,20 @@ async fn handle_http_forward(
     let raw_no_query = path.split('?').next().unwrap_or(&path);
     let normalized_path = crate::routing::normalize_path(raw_no_query);
 
-    // Origin-form rewrite: proxy framing, needed on the raw path below too.
-    let relative_request = rewrite_http_forward_request(&header_str, &path, target_host);
-
     // `egress.tcp` claims are final on every door — see `tcp_egress_verdict`.
     // Absolute-form `http://` is port 80, not 443.
     if let Some(decision) = tcp_egress_verdict_for_hostport(state, target_host, 80, actor.process())
     {
-        return http_forward_raw_passthrough(
-            client,
-            target_host,
-            &relative_request,
-            &decision,
-            state,
-            actor,
-        )
-        .await;
+        let head =
+            rewrite_http_forward_request(&header_str, &path, target_host, Reuse::OneRequestOnly);
+        return http_forward_raw_passthrough(client, target_host, &head, &decision, state, actor)
+            .await;
     }
+
+    // Origin-form rewrite: proxy framing for the inspected path, which stays in
+    // the loop for every request and so leaves connection reuse to the client.
+    let relative_request =
+        rewrite_http_forward_request(&header_str, &path, target_host, Reuse::AsClientSent);
 
     // Find the matching route rule (same logic as CONNECT, but scheme is http
     // since the request came in as an absolute-form http:// URL).
@@ -901,7 +898,26 @@ async fn handle_http_forward(
 /// Rewrite an HTTP forward proxy request from absolute URL to relative path.
 /// Input:  "GET http://host:port/path HTTP/1.1\r\nHost: ...\r\n..."
 /// Output: "GET /path HTTP/1.1\r\nHost: host:port\r\n..."
-fn rewrite_http_forward_request(header_str: &str, path: &str, target_host: &str) -> String {
+/// Whether the rewritten head keeps the client's connection semantics or forces
+/// the origin to close after one response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reuse {
+    /// Leave `Connection`/`Keep-Alive` as the client sent them. Safe wherever
+    /// the proxy stays in the loop and judges every request on the connection.
+    AsClientSent,
+    /// Force `Connection: close`. Required wherever the proxy splices after the
+    /// head: everything past it is opaque, so a second request would reach the
+    /// origin with its `Proxy-*` headers intact, still in absolute form, and
+    /// judged by nothing.
+    OneRequestOnly,
+}
+
+fn rewrite_http_forward_request(
+    header_str: &str,
+    path: &str,
+    target_host: &str,
+    reuse: Reuse,
+) -> String {
     let lines: Vec<&str> = header_str.split("\r\n").collect();
     let mut result = Vec::new();
 
@@ -933,11 +949,19 @@ fn rewrite_http_forward_request(header_str: &str, path: &str, target_host: &str)
         if name.starts_with("proxy-") {
             continue;
         }
+        // Dropped so the forced `Connection: close` below is the only one.
+        if reuse == Reuse::OneRequestOnly && (name == "connection" || name == "keep-alive") {
+            continue;
+        }
         result.push(line.to_string());
     }
 
     if !has_host {
         result.insert(1, format!("Host: {target_host}"));
+    }
+
+    if reuse == Reuse::OneRequestOnly {
+        result.push("Connection: close".to_string());
     }
 
     result.join("\r\n")
@@ -1793,9 +1817,12 @@ async fn connect_raw_passthrough(
 /// Serve an absolute-form `http://` request whose destination the `egress.tcp`
 /// table claimed: refuse it, or send the origin-form rewrite of the request head
 /// upstream and splice the rest through untouched. The rewrite is proxy framing,
-/// not inspection — it also strips `Proxy-*`, so the client's proxy credentials
-/// never reach the origin. No HTTP rules, no credential injection, no URI
-/// placeholder rewriting.
+/// not inspection — no HTTP rules, no credential injection, no URI placeholder
+/// rewriting.
+///
+/// `request_head` must be built with [`Reuse::OneRequestOnly`]: the rewrite
+/// (which strips `Proxy-*`) reaches only the first request, and everything
+/// after it is spliced verbatim.
 ///
 /// The refusal is audited as a connect rather than an HTTP transaction: the tcp
 /// table judged the destination, not the request line.
@@ -4313,6 +4340,32 @@ pub(crate) mod tests {
         assert_eq!(decision.matched_target, None);
     }
 
+    #[test]
+    fn the_raw_forward_head_forces_one_request_per_connection() {
+        let header = "GET http://api.example.com/x HTTP/1.1\r\n\
+                      Host: api.example.com\r\n\
+                      Proxy-Authorization: Basic c2VjcmV0\r\n\
+                      Connection: keep-alive\r\n";
+
+        let raw =
+            rewrite_http_forward_request(header, "/x", "api.example.com:80", Reuse::OneRequestOnly);
+        assert!(raw.contains("Connection: close"), "got {raw:?}");
+        assert!(!raw.to_lowercase().contains("keep-alive"), "got {raw:?}");
+        assert!(
+            !raw.to_lowercase().contains("proxy-authorization"),
+            "the strip must not be undone by a reused connection; got {raw:?}"
+        );
+
+        // The inspected path judges every request on the connection, so reuse
+        // stays the client's call there.
+        let inspected =
+            rewrite_http_forward_request(header, "/x", "api.example.com:80", Reuse::AsClientSent);
+        assert!(
+            inspected.contains("Connection: keep-alive"),
+            "got {inspected:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_tcp_allow_splices_raw_on_the_http_forward_door() {
         // Same pre-filter rule as the CONNECT door. The destination is
@@ -4894,7 +4947,12 @@ pub(crate) mod tests {
     #[test]
     fn rewrite_replaces_absolute_url_with_relative_path() {
         let header = "GET http://example.com:8080/api/data HTTP/1.1\r\nHost: example.com:8080\r\n";
-        let result = rewrite_http_forward_request(header, "/api/data", "example.com:8080");
+        let result = rewrite_http_forward_request(
+            header,
+            "/api/data",
+            "example.com:8080",
+            Reuse::AsClientSent,
+        );
         assert!(result.starts_with("GET /api/data HTTP/1.1\r\n"));
         assert!(result.contains("Host: example.com:8080"));
     }
@@ -4903,7 +4961,8 @@ pub(crate) mod tests {
     fn rewrite_overwrites_host_header() {
         // Host header should always match target_host, even if the original differs
         let header = "POST http://svc.local/path HTTP/1.1\r\nHost: wrong-host\r\nContent-Type: application/json\r\n";
-        let result = rewrite_http_forward_request(header, "/path", "svc.local:80");
+        let result =
+            rewrite_http_forward_request(header, "/path", "svc.local:80", Reuse::AsClientSent);
         assert!(result.contains("Content-Type: application/json"));
         assert!(result.contains("Host: svc.local:80"));
         assert!(!result.contains("Host: wrong-host"));
@@ -4912,7 +4971,8 @@ pub(crate) mod tests {
     #[test]
     fn rewrite_strips_proxy_headers() {
         let header = "GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n";
-        let result = rewrite_http_forward_request(header, "/path", "example.com:80");
+        let result =
+            rewrite_http_forward_request(header, "/path", "example.com:80", Reuse::AsClientSent);
         assert!(!result.contains("Proxy-Authorization"));
         assert!(!result.contains("Proxy-Connection"));
         assert!(result.contains("Accept: */*"));
@@ -4921,14 +4981,16 @@ pub(crate) mod tests {
     #[test]
     fn rewrite_root_path() {
         let header = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n";
-        let result = rewrite_http_forward_request(header, "/", "example.com:80");
+        let result =
+            rewrite_http_forward_request(header, "/", "example.com:80", Reuse::AsClientSent);
         assert!(result.starts_with("GET / HTTP/1.1\r\n"));
     }
 
     #[test]
     fn rewrite_inserts_host_header_when_missing() {
         let header = "GET http://example.com:9090/path HTTP/1.1\r\nAccept: */*\r\n";
-        let result = rewrite_http_forward_request(header, "/path", "example.com:9090");
+        let result =
+            rewrite_http_forward_request(header, "/path", "example.com:9090", Reuse::AsClientSent);
         assert!(result.contains("Host: example.com:9090"));
         let lines: Vec<&str> = result.split("\r\n").collect();
         assert_eq!(lines[1], "Host: example.com:9090");
