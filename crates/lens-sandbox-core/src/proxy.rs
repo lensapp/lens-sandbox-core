@@ -4759,9 +4759,9 @@ pub(crate) mod tests {
             r#"[{"match": "203.0.113.0/24:5432", "verdict": "ask"}]"#,
         );
 
-        let (mut client, server) = socket_pair().await;
+        let (_client, server) = socket_pair().await;
         let state_for_handler = state.clone();
-        tokio::spawn(async move {
+        let handler = tokio::spawn(async move {
             let actor = test_actor();
             handle_connect(server, "203.0.113.9:5432", &actor, &state_for_handler).await
         });
@@ -4780,10 +4780,17 @@ pub(crate) mod tests {
             crate::protocol::Decision::AllowAlways,
         ));
 
-        let response = read_response(&mut client).await;
+        // Reaching the dial is the whole assertion, and what TEST-NET-3 does
+        // with a SYN is the platform's business — refused on one, swallowed on
+        // the next. So a handler still parked in `connect` has already made the
+        // point; only the guard's own refusal fails, and it names itself.
+        let outcome = match tokio::time::timeout(Duration::from_secs(2), handler).await {
+            Ok(joined) => format!("{:?}", joined.expect("handler must not panic")),
+            Err(_) => String::new(),
+        };
         assert!(
-            !response.starts_with("HTTP/1.1 403") && !response.starts_with("HTTP/1.1 502"),
-            "the approved ask must reach the dial, not be refused by it; got {response:?}"
+            !outcome.contains("denied by policy"),
+            "the approved ask must reach the dial, not be refused by it; got {outcome}"
         );
     }
 
