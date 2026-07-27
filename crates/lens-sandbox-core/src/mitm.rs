@@ -105,7 +105,7 @@ pub async fn handle_mitm_pre_accepted(
 
     match upstream_mode {
         UpstreamMode::DirectTls { host, port } => {
-            let target_stream = sock_mark::connect_tcp_resolve(&format!("{host}:{port}")).await?;
+            let target_stream = sock_mark::connect_tcp_egress(&format!("{host}:{port}")).await?;
             let mut tls_upstream =
                 connect_upstream_tls(target_stream, &host, None, None, ctx.extra_ca_certs).await?;
             tls_upstream.write_all(modified.as_bytes()).await?;

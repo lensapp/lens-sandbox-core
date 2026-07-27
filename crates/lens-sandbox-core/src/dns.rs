@@ -433,8 +433,8 @@ async fn forward_upstream(
 }
 
 /// Parse an upstream response and pin its A-record IPs against `pin`, using the
-/// smallest answer TTL. A malformed response is ignored (the bytes are still
-/// relayed to the client by the caller).
+/// smallest TTL across every answer-section record. A malformed response is
+/// ignored (the bytes are still relayed to the client by the caller).
 fn pin_answer_ips(response: &[u8], state: &Arc<ProxyState>, pin: &FqdnPin) {
     let Ok(msg) = Message::from_vec(response) else {
         return;
@@ -442,16 +442,27 @@ fn pin_answer_ips(response: &[u8], state: &Arc<ProxyState>, pin: &FqdnPin) {
     let mut ips = Vec::new();
     let mut min_ttl = u32::MAX;
     for record in &msg.answers {
+        // Honor the shortest TTL over every answer record, not just the A
+        // records: a 30s CNAME in front of a 3600s A record means the
+        // name→address mapping is only valid for 30s, so the pin must expire
+        // with the CNAME, not the A. Min can only shorten — the fail-safe way.
+        min_ttl = min_ttl.min(record.ttl);
         if let RData::A(a) = &record.data {
-            ips.push(IpAddr::V4(a.0));
-            min_ttl = min_ttl.min(record.ttl);
+            let ip = IpAddr::V4(a.0);
+            // Defence in depth: never pin a loopback/link-local/unspecified
+            // answer, so a poisoned DNS response can't even enter the store (the
+            // egress connect guard rejects these too, but keep the store clean).
+            if crate::sock_mark::is_disallowed_egress_ip(ip) {
+                continue;
+            }
+            ips.push(ip);
         }
     }
     if ips.is_empty() {
         return;
     }
-    // `min_ttl` is set on every A record, so it is never `MAX` once `ips` is
-    // non-empty; `pin_dns_answers` clamps a 0 up to the floor regardless.
+    // `min_ttl` is set from at least the A record(s) above, so it is never `MAX`
+    // once `ips` is non-empty; `pin_dns_answers` clamps a 0 up to the floor.
     let ttl = min_ttl;
     pin_dns_answers(state, &ips, pin, ttl);
 }
@@ -575,6 +586,45 @@ mod tests {
             exe: Some(PathBuf::from(exe)),
             ancestors: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pin_ttl_honors_a_short_cname_ttl() {
+        use hickory_proto::rr::Record;
+        use hickory_proto::rr::rdata::{A, CNAME};
+        use std::net::Ipv4Addr;
+
+        // Response: a 60s CNAME in front of a 3600s A record. The pin must
+        // expire with the CNAME (60s), not the A (3600s) — the name→address
+        // mapping is only valid as long as the shortest link in the chain.
+        let a_ip = Ipv4Addr::new(203, 0, 113, 5);
+        let mut resp = Message::new(0x1, MessageType::Response, OpCode::Query);
+        let name = Name::from_str("db.example.com.").unwrap();
+        let target = Name::from_str("real.example.com.").unwrap();
+        resp.add_answer(Record::from_rdata(
+            name,
+            60,
+            RData::CNAME(CNAME(target.clone())),
+        ));
+        resp.add_answer(Record::from_rdata(target, 3600, RData::A(A(a_ip))));
+        let bytes = resp.to_vec().unwrap();
+
+        let state = state_with_routes(Vec::new());
+        let pin = FqdnPin {
+            port: Some(5432),
+            verdict: Verdict::Allow,
+            binaries: None,
+        };
+        pin_answer_ips(&bytes, &state, &pin);
+
+        let pinned = state.pinned_ips.read().unwrap();
+        let entry = pinned.get(&IpAddr::V4(a_ip)).expect("A record pinned");
+        // 60s CNAME TTL (> the 30s floor) bounds the pin. Without honoring the
+        // CNAME the A's 3600s would apply, pushing expiry ~an hour out.
+        assert!(
+            entry[0].expiry <= std::time::Instant::now() + Duration::from_secs(120),
+            "the 60s CNAME TTL must bound the pin, not the 3600s A TTL"
+        );
     }
 
     #[test]

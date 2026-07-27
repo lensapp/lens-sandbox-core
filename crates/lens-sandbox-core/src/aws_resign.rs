@@ -134,7 +134,7 @@ pub async fn handle_aws_resign(
     };
 
     // Connect upstream only after we've committed to forwarding.
-    let upstream = sock_mark::connect_tcp_resolve(&format!("{target_host}:{target_port}")).await?;
+    let upstream = sock_mark::connect_tcp_egress(&format!("{target_host}:{target_port}")).await?;
     let tls_upstream =
         crate::mitm::connect_upstream_tls_public(upstream, target_host, ctx.extra_ca_certs).await?;
 
