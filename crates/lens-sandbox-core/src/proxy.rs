@@ -1392,10 +1392,8 @@ fn tcp_egress_verdict(
     port: u16,
     caller: Option<&crate::peer_process::PeerProcess>,
 ) -> Option<TcpDecision> {
-    // Read the rules and the pins under ONE policy snapshot. A reload swaps both
-    // (and clears the pins) atomically under the write lock, so a connection
-    // sees either the old rules with the old pins or the new rules with the pins
-    // cleared — never the new rules combined with a superseded policy's pins.
+    // Rules and pins come from one snapshot (see `NetworkPolicy`), so a
+    // connection never pairs new rules with a superseded policy's pins.
     let policy = state.policy.read().unwrap();
 
     let pinned_qnames = live_pinned_qnames(&policy, hostname);
@@ -1507,15 +1505,13 @@ fn tcp_egress_admits(
 /// L7 `routes` and their `default_verdict`/`default_transport`, the ordered
 /// `tcp_egress` rules, clear the pins from the previous policy, and bump the
 /// generation — all under one `policy` write lock. This is the ONLY entry point
-/// for changing the egress policy, and its single atomic publication is what
-/// closes the reload races: every reader (L7 connect, raw-TCP connect,
-/// DNS-classify) takes a consistent snapshot, so no decision can combine one
-/// policy's routes/defaults with another's tcp rules or pins, and the
-/// generation bump can't be observed before the rules it accompanies. Pass
-/// empty vectors / the deny defaults to reset. The bump paired with the pin
-/// clear also makes [`pin_dns_answers`]'s check race-free: an in-flight answer
-/// from the old generation either inserted before this ran (and is cleared
-/// here) or runs after (and is rejected by the check), never surviving.
+/// for changing the egress policy; it is what makes the snapshot `NetworkPolicy`
+/// promises actually atomic. Pass empty vectors / the deny defaults to reset.
+///
+/// Bumping the generation in the same swap that clears the pins is what makes
+/// [`pin_dns_answers`]'s check race-free: an in-flight answer from the old
+/// generation either inserted before this ran (and is cleared here) or runs
+/// after (and is rejected by the check), never surviving.
 ///
 /// Takes the next policy as a whole `NetworkPolicy` value so callers name every
 /// field — the rules, defaults, and tcp lists can't be transposed at a call
@@ -3598,10 +3594,9 @@ pub(crate) mod tests {
 
     #[test]
     fn earlier_hostname_rule_beats_a_later_ip_rule() {
-        // The reviewer's regression: a hostname `ask` listed BEFORE a CIDR
-        // `allow` that covers the resolved IP. Splitting the list into IP-first
-        // and FQDN-second let the later CIDR allow bypass the earlier ask; a
-        // single ordered pass must honour the earlier ask.
+        // One ordered pass, so an earlier rule wins whatever its matcher kind:
+        // a hostname `ask` listed before a CIDR `allow` covering the resolved IP
+        // still decides.
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.90".parse().unwrap();
         state.policy.write().unwrap().tcp_egress = vec![
