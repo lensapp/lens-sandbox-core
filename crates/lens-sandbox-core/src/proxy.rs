@@ -2963,29 +2963,27 @@ pub(crate) mod tests {
         (state, rx)
     }
 
-    /// Build a hostname `tcp_egress` rule so the pin tests can exercise the
-    /// connect-time re-evaluation via `find_matching_tcp_egress`. A `Some(port)`
-    /// scopes the rule via a `HostPort` matcher; `None` uses a bare `Domain`
-    /// matcher (any port).
-    fn fqdn_rule(
-        host: &str,
-        port: Option<u16>,
-        verdict: Verdict,
-        binaries: Option<Vec<std::path::PathBuf>>,
-    ) -> RouteRule {
-        let matcher = match port {
-            Some(p) => crate::routing::RouteMatcher::HostPort(host.to_string(), p),
-            None => crate::routing::RouteMatcher::Domain(host.to_string()),
-        };
-        RouteRule {
-            matcher,
-            verdict,
-            transport: Transport::Direct,
-            tls_terminate: false,
-            http_rules: Vec::new(),
-            scheme: None,
-            binaries,
+    /// One `egress.tcp` rule, built through the real parser so a test can only
+    /// construct shapes a policy could actually carry. Hand-assembling a
+    /// `RouteRule` here would let a test exercise a matcher the port requirement
+    /// rules out, and keep the matching code for it alive on that basis alone.
+    fn tcp_rule(pattern: &str, verdict: Verdict, binaries: Option<Vec<&str>>) -> RouteRule {
+        let mut obj = serde_json::json!({
+            "match": pattern,
+            "verdict": serde_json::to_value(verdict).unwrap(),
+        });
+        if let Some(paths) = binaries {
+            obj["binaries"] = serde_json::json!(paths);
         }
+        crate::routing::parse_tcp_egress(&serde_json::json!([obj]))
+            .expect("test rule must be a shape production accepts")
+            .pop()
+            .expect("one rule in, one rule out")
+    }
+
+    /// [`tcp_rule`] for the common hostname case.
+    fn fqdn_rule(host: &str, port: u16, verdict: Verdict) -> RouteRule {
+        tcp_rule(&format!("{host}:{port}"), verdict, None)
     }
 
     /// A throwaway actor for the `emit_*` unit tests. Off a booted Linux guest
@@ -3118,12 +3116,8 @@ pub(crate) mod tests {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         // A port-scoped fqdn allow rule for the resolved name, plus its pin.
-        state.policy.write().unwrap().tcp_egress = vec![fqdn_rule(
-            "db.example.com",
-            Some(5432),
-            Verdict::Allow,
-            None,
-        )];
+        state.policy.write().unwrap().tcp_egress =
+            vec![fqdn_rule("db.example.com", 5432, Verdict::Allow)];
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
         // A connect to the pinned ip:port re-evaluates the rule and admits it.
@@ -3144,7 +3138,7 @@ pub(crate) mod tests {
         // rule, so only the expiry — checked before re-evaluation — keeps it out.
         {
             let mut policy = state.policy.write().unwrap();
-            policy.tcp_egress = vec![fqdn_rule("db.example.com", None, Verdict::Allow, None)];
+            policy.tcp_egress = vec![fqdn_rule("db.example.com", 5432, Verdict::Allow)];
             policy.pins.insert(
                 ip,
                 vec![PinnedIp {
@@ -3233,7 +3227,7 @@ pub(crate) mod tests {
     fn reapplying_an_unchanged_policy_keeps_the_pins() {
         let (state, _rx) = test_state();
         let egress = || NetworkPolicy {
-            tcp_egress: vec![fqdn_rule("db.internal", Some(5432), Verdict::Allow, None)],
+            tcp_egress: vec![fqdn_rule("db.internal", 5432, Verdict::Allow)],
             ..Default::default()
         };
         apply_network_policy(&state, egress());
@@ -3264,7 +3258,7 @@ pub(crate) mod tests {
         apply_network_policy(
             &state,
             NetworkPolicy {
-                tcp_egress: vec![fqdn_rule("db.internal", Some(5432), Verdict::Allow, None)],
+                tcp_egress: vec![fqdn_rule("db.internal", 5432, Verdict::Allow)],
                 ..Default::default()
             },
         );
@@ -3276,12 +3270,7 @@ pub(crate) mod tests {
         apply_network_policy(
             &state,
             NetworkPolicy {
-                tcp_egress: vec![fqdn_rule(
-                    "other.internal",
-                    Some(5432),
-                    Verdict::Allow,
-                    None,
-                )],
+                tcp_egress: vec![fqdn_rule("other.internal", 5432, Verdict::Allow)],
                 ..Default::default()
             },
         );
@@ -3341,16 +3330,8 @@ pub(crate) mod tests {
         // the name that resolves into it. First-match by policy order means the
         // earlier deny wins, so X is denied under the complete policy.
         state.policy.write().unwrap().tcp_egress = vec![
-            RouteRule {
-                matcher: crate::routing::RouteMatcher::Cidr("203.0.113.0/24".parse().unwrap()),
-                verdict: Verdict::Deny,
-                transport: Transport::Direct,
-                tls_terminate: false,
-                http_rules: Vec::new(),
-                scheme: None,
-                binaries: None,
-            },
-            fqdn_rule("db.example.com", None, Verdict::Allow, None),
+            tcp_rule("203.0.113.0/24:5432", Verdict::Deny, None),
+            fqdn_rule("db.example.com", 5432, Verdict::Allow),
         ];
         let generation = state.policy.read().unwrap().generation;
         pin_dns_answers(&state, &[x], "db.example.com", 300, generation);
@@ -3385,11 +3366,10 @@ pub(crate) mod tests {
         let ip: IpAddr = "203.0.113.20".parse().unwrap();
         // A binary-scoped fqdn allow rule; the pin only stores the name, so the
         // filter is applied fresh against the connecting caller.
-        state.policy.write().unwrap().tcp_egress = vec![fqdn_rule(
-            "db.example.com",
-            Some(5432),
+        state.policy.write().unwrap().tcp_egress = vec![tcp_rule(
+            "db.example.com:5432",
             Verdict::Allow,
-            Some(vec![std::path::PathBuf::from("/usr/bin/psql")]),
+            Some(vec!["/usr/bin/psql"]),
         )];
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
@@ -3443,16 +3423,12 @@ pub(crate) mod tests {
         // binary-excluded match must not be re-opened by the later unrestricted
         // rule — the no-reopen guard runs across the single ordered list.
         state.policy.write().unwrap().tcp_egress = vec![
-            RouteRule {
-                matcher: crate::routing::RouteMatcher::Cidr("203.0.113.0/24".parse().unwrap()),
-                verdict: Verdict::Allow,
-                transport: Transport::Direct,
-                tls_terminate: false,
-                http_rules: Vec::new(),
-                scheme: None,
-                binaries: Some(vec![std::path::PathBuf::from("/usr/bin/psql")]),
-            },
-            fqdn_rule("db.example.com", None, Verdict::Allow, None),
+            tcp_rule(
+                "203.0.113.0/24:5432",
+                Verdict::Allow,
+                Some(vec!["/usr/bin/psql"]),
+            ),
+            fqdn_rule("db.example.com", 5432, Verdict::Allow),
         ];
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
@@ -3494,17 +3470,15 @@ pub(crate) mod tests {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.60".parse().unwrap();
         state.policy.write().unwrap().tcp_egress = vec![
-            fqdn_rule(
-                "db.example.com",
-                None,
+            tcp_rule(
+                "db.example.com:5432",
                 Verdict::Deny,
-                Some(vec![std::path::PathBuf::from("/usr/bin/bad-parent")]),
+                Some(vec!["/usr/bin/bad-parent"]),
             ),
-            fqdn_rule(
-                "db.example.com",
-                None,
+            tcp_rule(
+                "db.example.com:5432",
                 Verdict::Allow,
-                Some(vec![std::path::PathBuf::from("/usr/bin/client")]),
+                Some(vec!["/usr/bin/client"]),
             ),
         ];
 
@@ -3548,8 +3522,8 @@ pub(crate) mod tests {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.70".parse().unwrap();
         state.policy.write().unwrap().tcp_egress = vec![
-            fqdn_rule("db.example.com", Some(5432), Verdict::Allow, None),
-            fqdn_rule("db.example.com", Some(6379), Verdict::Allow, None),
+            fqdn_rule("db.example.com", 5432, Verdict::Allow),
+            fqdn_rule("db.example.com", 6379, Verdict::Allow),
         ];
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
@@ -3575,8 +3549,8 @@ pub(crate) mod tests {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.71".parse().unwrap();
         state.policy.write().unwrap().tcp_egress = vec![
-            fqdn_rule("db.example.com", Some(5432), Verdict::Deny, None),
-            fqdn_rule("db.example.com", Some(6379), Verdict::Allow, None),
+            fqdn_rule("db.example.com", 5432, Verdict::Deny),
+            fqdn_rule("db.example.com", 6379, Verdict::Allow),
         ];
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
@@ -3599,8 +3573,8 @@ pub(crate) mod tests {
         // outcome must not depend on which name's answer was pinned first.
         let rules = || {
             vec![
-                fqdn_rule("blocked.example.com", None, Verdict::Deny, None),
-                fqdn_rule("db.example.com", None, Verdict::Allow, None),
+                fqdn_rule("blocked.example.com", 5432, Verdict::Deny),
+                fqdn_rule("db.example.com", 5432, Verdict::Allow),
             ]
         };
         let ip: IpAddr = "203.0.113.80".parse().unwrap();
@@ -3631,7 +3605,7 @@ pub(crate) mod tests {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.90".parse().unwrap();
         state.policy.write().unwrap().tcp_egress = vec![
-            fqdn_rule("db.example.com", Some(5432), Verdict::Ask, None),
+            fqdn_rule("db.example.com", 5432, Verdict::Ask),
             RouteRule {
                 matcher: crate::routing::RouteMatcher::CidrPort(
                     "203.0.113.0/24".parse().unwrap(),
@@ -3674,7 +3648,7 @@ pub(crate) mod tests {
                 scheme: None,
                 binaries: None,
             },
-            fqdn_rule("db.example.com", Some(5432), Verdict::Deny, None),
+            fqdn_rule("db.example.com", 5432, Verdict::Deny),
         ];
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
