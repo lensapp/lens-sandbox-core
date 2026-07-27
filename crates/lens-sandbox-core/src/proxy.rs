@@ -57,6 +57,63 @@ pub struct PinnedIp {
     pub expiry: Instant,
 }
 
+/// The complete network egress policy as one atomically-published snapshot:
+/// the L7 routes and their default verdict/transport, the raw-TCP static and
+/// FQDN rules, the live DNS pins, and a generation counter. Every allow / deny
+/// / transport decision reads these fields in combination (an L7 verdict falls
+/// back to the default; a DNS classification pairs the L7 routes with the FQDN
+/// rules and the generation; a raw-TCP connect pairs the static rules with the
+/// pins), so they must move together. Bundling them under one lock makes that
+/// consistency structural rather than by-convention: a reader takes a single
+/// consistent snapshot and a reload swaps the whole thing at once, so no
+/// decision can ever combine fields from two different policy generations.
+pub struct NetworkPolicy {
+    /// Application-layer routes (`egress.l7` / the deprecated `allowedRoutes`),
+    /// consulted after protocol classification.
+    pub routes: Vec<RouteRule>,
+    /// Verdict applied when no `routes` entry matches the host.
+    pub default_verdict: Verdict,
+    /// Transport applied when no `routes` entry matches the host.
+    pub default_transport: Transport,
+    /// Raw-TCP egress rules with a literal IP/CIDR match (`egress.tcp`),
+    /// consulted before classification. Each splices its match through as an
+    /// opaque byte tunnel.
+    pub tcp_egress: Vec<RouteRule>,
+    /// Raw-TCP egress rules with a hostname match (`egress.tcp` FQDN entries).
+    /// The raw path never sees a name, so these drive DNS-answer pinning: the
+    /// stub consults them to gate the lookup and record the answer IPs into
+    /// [`pins`](Self::pins).
+    pub tcp_fqdn: Vec<RouteRule>,
+    /// IPs pinned from DNS answers of `tcp_fqdn` names, each carrying the
+    /// originating rule's decision and a TTL-bounded expiry. Consulted by
+    /// [`resolve_tcp_egress`] after the static rules.
+    pub pins: HashMap<IpAddr, Vec<PinnedIp>>,
+    /// Bumped every time the policy is (re)applied. The DNS stub captures it
+    /// when it authorizes a lookup and hands it back at pin-insertion time; an
+    /// in-flight answer whose generation no longer matches is dropped, so a
+    /// lookup authorized under a revoked policy can't reinstate its pin after
+    /// the new policy cleared it. Living under the same lock as the rules is
+    /// what keeps the capture consistent with the rule reads.
+    pub generation: u64,
+}
+
+impl Default for NetworkPolicy {
+    /// The pre-policy state: no routes or tcp rules, and an allow-all default
+    /// via the upstream (matching the constructor's historical initial values;
+    /// the first policy frame replaces it).
+    fn default() -> Self {
+        Self {
+            routes: Vec::new(),
+            default_verdict: Verdict::Allow,
+            default_transport: Transport::Upstream,
+            tcp_egress: Vec::new(),
+            tcp_fqdn: Vec::new(),
+            pins: HashMap::new(),
+            generation: 0,
+        }
+    }
+}
+
 /// A single header injection for a credential bound to a domain.
 #[derive(Debug, Clone)]
 pub struct CredentialInjection {
@@ -101,24 +158,11 @@ impl Clone for ClientCertConfig {
 /// Shared state for the proxy — upstream + routes can be updated at runtime.
 pub struct ProxyState {
     pub upstream: Mutex<Option<SandboxUpstream>>,
-    /// Application-layer routes (`egress.l7` / the deprecated `allowedRoutes`),
-    /// consulted after protocol classification.
-    pub routes: RwLock<Vec<RouteRule>>,
-    /// Raw-TCP egress rules with a literal IP/CIDR match (`egress.tcp`),
-    /// consulted before classification. Each splices its match through as an
-    /// opaque byte tunnel.
-    pub tcp_egress: RwLock<Vec<RouteRule>>,
-    /// Raw-TCP egress rules with a hostname match (`egress.tcp` FQDN entries).
-    /// The raw path never sees a name, so these drive DNS-answer pinning: the
-    /// stub consults them to gate the lookup and record the answer IPs into
-    /// [`pinned_ips`](Self::pinned_ips).
-    pub tcp_fqdn: RwLock<Vec<RouteRule>>,
-    /// IPs pinned from DNS answers of `tcp_fqdn` names, each carrying the
-    /// originating rule's decision and a TTL-bounded expiry. Consulted by
-    /// [`resolve_tcp_egress`] after the static rules.
-    pub pinned_ips: RwLock<HashMap<IpAddr, Vec<PinnedIp>>>,
-    pub default_verdict: RwLock<Verdict>,
-    pub default_transport: RwLock<Transport>,
+    /// The complete network egress policy — L7 routes + defaults, raw-TCP
+    /// rules, DNS pins, and the generation — under one lock so every egress
+    /// decision reads a consistent snapshot and a reload swaps it atomically.
+    /// See [`NetworkPolicy`] for why these fields must live together.
+    pub policy: RwLock<NetworkPolicy>,
     pub audit_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
     pub(crate) deny_dedup: std::sync::Mutex<HashMap<String, Instant>>,
     /// Credential injections received via policy — maps domain to headers.
@@ -297,12 +341,7 @@ impl ProxyServer {
     ) -> (Self, Arc<ProxyState>) {
         let state = Arc::new(ProxyState {
             upstream: Mutex::new(None),
-            routes: RwLock::new(Vec::new()),
-            tcp_egress: RwLock::new(Vec::new()),
-            tcp_fqdn: RwLock::new(Vec::new()),
-            pinned_ips: RwLock::new(HashMap::new()),
-            default_verdict: RwLock::new(Verdict::Allow),
-            default_transport: RwLock::new(Transport::Upstream),
+            policy: RwLock::new(NetworkPolicy::default()),
             audit_tx: std::sync::Mutex::new(None),
             deny_dedup: std::sync::Mutex::new(HashMap::new()),
             credential_injections: RwLock::new(HashMap::new()),
@@ -500,10 +539,12 @@ fn resolve_route(
     scheme: Scheme,
     caller: Option<&crate::peer_process::PeerProcess>,
 ) -> Option<RouteDecision> {
-    let routes = state.routes.read().unwrap();
-    let default_verdict = *state.default_verdict.read().unwrap();
-    let default_transport = *state.default_transport.read().unwrap();
-    match find_matching_route(&routes, host, scheme, caller) {
+    // One snapshot: the routes and the defaults they fall back to must come
+    // from the same policy generation.
+    let policy = state.policy.read().unwrap();
+    let default_verdict = policy.default_verdict;
+    let default_transport = policy.default_transport;
+    match find_matching_route(&policy.routes, host, scheme, caller) {
         RouteOutcome::Matched(rule) => Some((
             rule.verdict,
             rule.transport,
@@ -1231,23 +1272,31 @@ fn resolve_tcp_egress(
     raw_target: &str,
     caller: Option<&crate::peer_process::PeerProcess>,
 ) -> Option<Verdict> {
+    // Read the static rules and the pins under one policy snapshot. A reload
+    // swaps both (and clears the pins) atomically under the write lock, so a
+    // connection sees either the old rules with the old pins or the new rules
+    // with the pins cleared — never the new rules combined with a superseded
+    // policy's pins.
+    let policy = state.policy.read().unwrap();
+    if let RouteOutcome::Matched(rule) =
+        find_matching_route(&policy.tcp_egress, raw_target, Scheme::Https, caller)
     {
-        let tcp = state.tcp_egress.read().unwrap();
-        if let RouteOutcome::Matched(rule) =
-            find_matching_route(&tcp, raw_target, Scheme::Https, caller)
-        {
-            return Some(rule.verdict);
-        }
+        return Some(rule.verdict);
     }
-    resolve_pinned(state, raw_target, caller)
+    resolve_pinned(&policy, raw_target, caller)
 }
 
 /// Match `raw_target` against the IPs pinned from `tcp_fqdn` DNS answers. A pin
 /// admits the connection when it is unexpired, its port is unset or equals the
-/// target port, and its `binaries` filter admits the caller. Expired pins for
-/// the looked-up IP are pruned lazily on the way through.
+/// target port, and its `binaries` filter admits the caller.
+///
+/// Read-only over the held [`NetworkPolicy`] snapshot — expired pins are
+/// skipped here rather than pruned, so the connect path needs only the read
+/// lock (their storage is reclaimed at insert time and on reload). Takes the
+/// policy by reference so pins are always read under the same lock as the
+/// static rules.
 fn resolve_pinned(
-    state: &Arc<ProxyState>,
+    policy: &NetworkPolicy,
     raw_target: &str,
     caller: Option<&crate::peer_process::PeerProcess>,
 ) -> Option<Verdict> {
@@ -1255,26 +1304,55 @@ fn resolve_pinned(
     let port = extract_port(raw_target, 0);
     let now = Instant::now();
 
-    let mut pinned = state.pinned_ips.write().unwrap();
-    let entry = pinned.get_mut(&ip)?;
-    entry.retain(|p| p.expiry > now);
-    let decision = entry
+    policy
+        .pins
+        .get(&ip)?
         .iter()
         .find(|p| {
-            p.pin.port.is_none_or(|want| want == port)
+            p.expiry > now
+                && p.pin.port.is_none_or(|want| want == port)
                 && binaries_admit_caller(p.pin.binaries.as_deref(), caller)
         })
-        .map(|p| p.pin.verdict);
-    if entry.is_empty() {
-        pinned.remove(&ip);
-    }
-    decision
+        .map(|p| p.pin.verdict)
+}
+
+/// (Re)apply the entire network egress policy in one atomic swap: publish the
+/// L7 `routes` and their `default_verdict`/`default_transport`, the raw-TCP
+/// static and FQDN rules, clear the pins from the previous policy, and bump the
+/// generation — all under one `policy` write lock. This is the ONLY entry point
+/// for changing the egress policy, and its single atomic publication is what
+/// closes the reload races: every reader (L7 connect, raw-TCP connect,
+/// DNS-classify) takes a consistent snapshot, so no decision can combine one
+/// policy's routes/defaults with another's tcp rules or pins, and the
+/// generation bump can't be observed before the rules it accompanies. Pass
+/// empty vectors / the deny defaults to reset. The bump paired with the pin
+/// clear also makes [`pin_dns_answers`]'s check race-free: an in-flight answer
+/// from the old generation either inserted before this ran (and is cleared
+/// here) or runs after (and is rejected by the check), never surviving.
+///
+/// Takes the next policy as a whole `NetworkPolicy` value so callers name every
+/// field — the rules, defaults, and tcp lists can't be transposed at a call
+/// site the way positional same-typed `Vec`s could. Whatever `next` carries for
+/// `pins`/`generation` is ignored: pins always reset and the generation always
+/// advances monotonically, controlled here.
+pub(crate) fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
+    let mut policy = state.policy.write().unwrap();
+    *policy = NetworkPolicy {
+        generation: policy.generation + 1,
+        pins: HashMap::new(),
+        ..next
+    };
 }
 
 /// Record `ips` (from a DNS answer) against `pin` (the `tcp_fqdn` rule the
 /// queried name matched), expiring after `ttl_secs` clamped to
 /// [`PIN_TTL_FLOOR_SECS`, `PIN_TTL_CAP_SECS`]. Called by the DNS stub after it
 /// forwards an allowed answer. A no-op when there are no IPs.
+///
+/// `generation` is the policy generation in force when the lookup was
+/// authorized; if a policy has since been applied (bumping the generation and
+/// clearing pins) the answer is stale and dropped, so a lookup authorized under
+/// a now-revoked policy can't reinstate its pin.
 ///
 /// Re-resolving the same name refreshes an existing equivalent pin's expiry
 /// rather than appending a duplicate, so a hot name's per-IP list stays bounded
@@ -1284,6 +1362,7 @@ pub(crate) fn pin_dns_answers(
     ips: &[IpAddr],
     pin: &FqdnPin,
     ttl_secs: u32,
+    generation: u64,
 ) {
     if ips.is_empty() {
         return;
@@ -1291,22 +1370,29 @@ pub(crate) fn pin_dns_answers(
     let ttl = (ttl_secs as u64).clamp(PIN_TTL_FLOOR_SECS, PIN_TTL_CAP_SECS);
     let expiry = Instant::now() + Duration::from_secs(ttl);
 
-    let mut pinned = state.pinned_ips.write().unwrap();
+    let mut policy = state.policy.write().unwrap();
+    // Reject an answer whose authorizing policy has since been replaced. The
+    // check and the generation bump happen under the same `policy` lock, so
+    // there is no window where a stale pin slips in between the bump and the
+    // clear.
+    if policy.generation != generation {
+        return;
+    }
     // Backstop against unbounded growth: once at the cap, drop everything
     // expired, and if that didn't get us back under, refuse to grow further.
     // The follow-up connect then finds no pin and is denied — fail closed.
-    if pinned.len() >= MAX_PINNED_IPS {
+    if policy.pins.len() >= MAX_PINNED_IPS {
         let now = Instant::now();
-        pinned.retain(|_, v| {
+        policy.pins.retain(|_, v| {
             v.retain(|p| p.expiry > now);
             !v.is_empty()
         });
-        if pinned.len() >= MAX_PINNED_IPS {
+        if policy.pins.len() >= MAX_PINNED_IPS {
             return;
         }
     }
     for &ip in ips {
-        let entry = pinned.entry(ip).or_default();
+        let entry = policy.pins.entry(ip).or_default();
         match entry.iter_mut().find(|p| p.pin == *pin) {
             Some(existing) => existing.expiry = expiry,
             None => entry.push(PinnedIp {
@@ -2500,12 +2586,7 @@ pub(crate) mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let state = Arc::new(ProxyState {
             upstream: Mutex::new(None),
-            routes: RwLock::new(Vec::new()),
-            tcp_egress: RwLock::new(Vec::new()),
-            tcp_fqdn: RwLock::new(Vec::new()),
-            pinned_ips: RwLock::new(HashMap::new()),
-            default_verdict: RwLock::new(Verdict::Allow),
-            default_transport: RwLock::new(Transport::Upstream),
+            policy: RwLock::new(NetworkPolicy::default()),
             audit_tx: std::sync::Mutex::new(Some(tx)),
             deny_dedup: std::sync::Mutex::new(HashMap::new()),
             credential_injections: RwLock::new(HashMap::new()),
@@ -2617,7 +2698,7 @@ pub(crate) mod tests {
     fn resolve_route_fails_closed_when_the_binaries_filter_excludes_the_caller() {
         let (state, _rx) = test_state();
         // One rule, matching the host but only for /usr/bin/curl.
-        *state.routes.write().unwrap() = vec![crate::routing::RouteRule {
+        state.policy.write().unwrap().routes = vec![crate::routing::RouteRule {
             matcher: crate::routing::RouteMatcher::Domain("api.openai.com".to_string()),
             verdict: Verdict::Allow,
             transport: Transport::Direct,
@@ -2663,7 +2744,7 @@ pub(crate) mod tests {
             verdict: Verdict::Allow,
             binaries: None,
         };
-        pin_dns_answers(&state, &[ip], &pin, 300);
+        pin_dns_answers(&state, &[ip], &pin, 300, 0);
 
         // A connect to the pinned ip:port resolves to the pin's verdict.
         let verdict =
@@ -2677,13 +2758,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn expired_pins_are_pruned_and_do_not_resolve() {
+    fn expired_pins_do_not_resolve() {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         // Insert a pin that is already expired.
         {
-            let mut pinned = state.pinned_ips.write().unwrap();
-            pinned.insert(
+            let mut policy = state.policy.write().unwrap();
+            policy.pins.insert(
                 ip,
                 vec![PinnedIp {
                     pin: FqdnPin {
@@ -2696,9 +2777,10 @@ pub(crate) mod tests {
             );
         }
 
+        // An expired pin is skipped at connect time, so the connection is
+        // denied. The read path no longer prunes — storage is reclaimed at
+        // insert time and on reload — so the entry may still be present.
         assert!(resolve_tcp_egress(&state, "203.0.113.9:5432", None).is_none());
-        // The lazy prune drops the now-empty entry entirely.
-        assert!(state.pinned_ips.read().unwrap().is_empty());
     }
 
     #[test]
@@ -2710,8 +2792,8 @@ pub(crate) mod tests {
             binaries: None,
         };
 
-        pin_dns_answers(&state, &[], &pin, 300);
-        assert!(state.pinned_ips.read().unwrap().is_empty());
+        pin_dns_answers(&state, &[], &pin, 300, 0);
+        assert!(state.policy.read().unwrap().pins.is_empty());
     }
 
     #[test]
@@ -2725,12 +2807,12 @@ pub(crate) mod tests {
         };
 
         // Re-resolving the same name to the same IP must not grow the per-IP list.
-        pin_dns_answers(&state, &[ip], &pin, 300);
-        pin_dns_answers(&state, &[ip], &pin, 300);
-        pin_dns_answers(&state, &[ip], &pin, 300);
+        pin_dns_answers(&state, &[ip], &pin, 300, 0);
+        pin_dns_answers(&state, &[ip], &pin, 300, 0);
+        pin_dns_answers(&state, &[ip], &pin, 300, 0);
 
-        let pinned = state.pinned_ips.read().unwrap();
-        assert_eq!(pinned.get(&ip).map(Vec::len), Some(1));
+        let policy = state.policy.read().unwrap();
+        assert_eq!(policy.pins.get(&ip).map(Vec::len), Some(1));
     }
 
     #[test]
@@ -2743,11 +2825,11 @@ pub(crate) mod tests {
         };
         // Fill the store to the cap with distinct, unexpired IPs.
         {
-            let mut pinned = state.pinned_ips.write().unwrap();
+            let mut policy = state.policy.write().unwrap();
             let expiry = Instant::now() + Duration::from_secs(300);
             for i in 0..MAX_PINNED_IPS {
                 let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000u32 + i as u32));
-                pinned.insert(
+                policy.pins.insert(
                     ip,
                     vec![PinnedIp {
                         pin: pin.clone(),
@@ -2760,11 +2842,104 @@ pub(crate) mod tests {
         // A fresh IP over the cap (nothing expired to reclaim) must be refused,
         // not appended — the map stays bounded.
         let overflow: IpAddr = "203.0.113.250".parse().unwrap();
-        pin_dns_answers(&state, &[overflow], &pin, 300);
+        pin_dns_answers(&state, &[overflow], &pin, 300, 0);
 
-        let pinned = state.pinned_ips.read().unwrap();
-        assert_eq!(pinned.len(), MAX_PINNED_IPS);
-        assert!(!pinned.contains_key(&overflow));
+        let policy = state.policy.read().unwrap();
+        assert_eq!(policy.pins.len(), MAX_PINNED_IPS);
+        assert!(!policy.pins.contains_key(&overflow));
+    }
+
+    #[test]
+    fn pin_dns_answers_drops_a_stale_generation_insert() {
+        let (state, _rx) = test_state();
+        let pin = FqdnPin {
+            port: None,
+            verdict: Verdict::Allow,
+            binaries: None,
+        };
+        let ip: IpAddr = "203.0.113.30".parse().unwrap();
+
+        // An in-flight DNS response was classified under generation 0, but a
+        // policy revocation cleared the pins and bumped the generation before
+        // its answer landed. The stale insert must be dropped, not applied.
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                default_verdict: Verdict::Deny,
+                ..Default::default()
+            },
+        );
+        pin_dns_answers(&state, &[ip], &pin, 300, 0);
+
+        assert!(state.policy.read().unwrap().pins.is_empty());
+    }
+
+    #[test]
+    fn pin_dns_answers_applies_a_current_generation_insert() {
+        let (state, _rx) = test_state();
+        let pin = FqdnPin {
+            port: None,
+            verdict: Verdict::Allow,
+            binaries: None,
+        };
+        let ip: IpAddr = "203.0.113.31".parse().unwrap();
+
+        // After a revocation, a response classified under the new generation
+        // still pins normally.
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                default_verdict: Verdict::Deny,
+                ..Default::default()
+            },
+        );
+        let generation = state.policy.read().unwrap().generation;
+        pin_dns_answers(&state, &[ip], &pin, 300, generation);
+
+        assert!(state.policy.read().unwrap().pins.contains_key(&ip));
+    }
+
+    #[test]
+    fn reload_supersedes_old_pins() {
+        let (state, _rx) = test_state();
+        let target = "203.0.113.40:5432";
+        let x: IpAddr = "203.0.113.40".parse().unwrap();
+
+        // Policy A: an allow-pin for X plus a CIDR deny covering it. The static
+        // deny wins at resolution, so X is denied under the complete policy.
+        state.policy.write().unwrap().tcp_egress = vec![RouteRule {
+            matcher: crate::routing::RouteMatcher::Cidr("203.0.113.0/24".parse().unwrap()),
+            verdict: Verdict::Deny,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: None,
+        }];
+        let pin = FqdnPin {
+            port: None,
+            verdict: Verdict::Allow,
+            binaries: None,
+        };
+        let generation = state.policy.read().unwrap().generation;
+        pin_dns_answers(&state, &[x], &pin, 300, generation);
+        assert_eq!(
+            resolve_tcp_egress(&state, target, None),
+            Some(Verdict::Deny)
+        );
+
+        // Reload to policy B (no static rules, default deny). Publishing the
+        // empty rules and clearing the pin happen together, so the allow-pin
+        // from A can never combine with B's empty rules to open a splice.
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                default_verdict: Verdict::Deny,
+                ..Default::default()
+            },
+        );
+        assert_eq!(resolve_tcp_egress(&state, target, None), None);
+        assert!(state.policy.read().unwrap().pins.is_empty());
     }
 
     #[test]
@@ -2776,7 +2951,7 @@ pub(crate) mod tests {
             verdict: Verdict::Allow,
             binaries: Some(vec![std::path::PathBuf::from("/usr/bin/psql")]),
         };
-        pin_dns_answers(&state, &[ip], &pin, 300);
+        pin_dns_answers(&state, &[ip], &pin, 300, 0);
 
         let psql = crate::peer_process::PeerProcess {
             pid: 200,
@@ -3035,9 +3210,10 @@ pub(crate) mod tests {
     /// rule (transport defaulted to `Upstream`) for `domain`.
     fn install_ask_route(state: &Arc<ProxyState>, domain: &str) {
         state
-            .routes
+            .policy
             .write()
             .unwrap()
+            .routes
             .push(crate::routing::RouteRule {
                 matcher: crate::routing::RouteMatcher::Domain(domain.to_string()),
                 verdict: Verdict::Ask,
@@ -3185,8 +3361,8 @@ pub(crate) mod tests {
         // dispatch, never on the plain relay, so its presence proves the resumed
         // connection was terminated rather than forwarded raw.
         let (state, mut rx) = test_state();
-        *state.default_verdict.write().unwrap() = Verdict::Ask;
-        *state.default_transport.write().unwrap() = Transport::Direct;
+        state.policy.write().unwrap().default_verdict = Verdict::Ask;
+        state.policy.write().unwrap().default_transport = Transport::Direct;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

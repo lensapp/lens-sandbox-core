@@ -607,6 +607,55 @@ fn parse_default_verdict(raw: Option<&str>) -> crate::routing::Verdict {
     }
 }
 
+/// Resolve the effective default verdict + transport from the raw policy
+/// strings. Transport is required per schema: a missing or malformed transport
+/// paired with a non-deny verdict is a fail-closed downgrade to `Deny`, so we
+/// never silently pick a transport the operator didn't choose. Returns the pair
+/// ready to publish; only called on the success path (a malformed policy shape
+/// forces deny before reaching here).
+fn resolve_default_verdict_transport(
+    default_verdict: Option<&str>,
+    default_transport: Option<&str>,
+) -> (crate::routing::Verdict, crate::routing::Transport) {
+    let verdict = parse_default_verdict(default_verdict);
+    let (transport, transport_valid) = match default_transport {
+        Some("upstream") => (crate::routing::Transport::Upstream, true),
+        Some("direct") => (crate::routing::Transport::Direct, true),
+        Some(other) => {
+            if matches!(verdict, crate::routing::Verdict::Deny) {
+                tracing::warn!(
+                    transport = other,
+                    "unknown network.defaultTransport in policy; ignored (deny verdict)"
+                );
+            } else {
+                tracing::error!(
+                    transport = other,
+                    "unknown network.defaultTransport in policy; forcing deny"
+                );
+            }
+            (crate::routing::Transport::Upstream, false)
+        }
+        None => {
+            if !matches!(verdict, crate::routing::Verdict::Deny) {
+                tracing::error!(
+                    "network.defaultTransport missing with non-deny verdict; forcing deny"
+                );
+            }
+            (crate::routing::Transport::Upstream, false)
+        }
+    };
+    let effective_verdict = if matches!(
+        verdict,
+        crate::routing::Verdict::Allow | crate::routing::Verdict::Ask
+    ) && !transport_valid
+    {
+        crate::routing::Verdict::Deny
+    } else {
+        verdict
+    };
+    (effective_verdict, transport)
+}
+
 /// Parse and apply a policy message. Returns the env vars for the session handler,
 /// or a version mismatch if the sandbox protocol date is too old.
 async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> PolicyResult {
@@ -750,19 +799,20 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     // network policy. Routes with a `forward` field carry mTLS config inline —
     // we parse PEM from the forward config and populate state.client_certs. If
     // PEM parsing fails, the route verdict is overridden to Deny (fail-closed).
-    let mut routes_valid = false;
     match msg.network {
         Some(network) => {
             // Clear all network policy and fail closed (deny via upstream).
             // Shared by every invalid-policy branch so they can't drift.
             let force_deny = || {
-                state.routes.write().unwrap().clear();
-                state.tcp_egress.write().unwrap().clear();
-                state.tcp_fqdn.write().unwrap().clear();
-                state.pinned_ips.write().unwrap().clear();
+                crate::proxy::apply_network_policy(
+                    state,
+                    crate::proxy::NetworkPolicy {
+                        default_verdict: crate::routing::Verdict::Deny,
+                        default_transport: crate::routing::Transport::Upstream,
+                        ..Default::default()
+                    },
+                );
                 state.client_certs.write().unwrap().clear();
-                *state.default_verdict.write().unwrap() = crate::routing::Verdict::Deny;
-                *state.default_transport.write().unwrap() = crate::routing::Transport::Upstream;
             };
 
             // Resolve the l7 source. egress.l7 wins; else the deprecated
@@ -858,21 +908,42 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                             route_rules.push(parsed.rule);
                         }
 
+                        // Resolve the default verdict/transport here so the whole
+                        // policy — routes, defaults, and tcp rules — publishes in
+                        // one atomic swap below. Computing it after the swap (as a
+                        // separate write) is what let a DNS/connect decision pair
+                        // this policy's routes with the previous policy's defaults.
+                        let (default_verdict, default_transport) =
+                            resolve_default_verdict_transport(
+                                network.default_verdict.as_deref(),
+                                network.default_transport.as_deref(),
+                            );
                         tracing::info!(
                             route_count = route_rules.len(),
                             tcp_egress_count = tcp_rules.ip_rules.len(),
                             tcp_fqdn_count = tcp_rules.fqdn_rules.len(),
                             client_cert_count = cert_map.len(),
                             client_cert_keys = ?cert_map.keys().collect::<Vec<_>>(),
-                            "proxy routes, tcp egress, and forward certs updated from policy"
+                            verdict = ?default_verdict,
+                            transport = ?default_transport,
+                            "proxy routes, tcp egress, defaults, and forward certs updated from policy"
                         );
                         *state.client_certs.write().unwrap() = cert_map;
-                        *state.routes.write().unwrap() = route_rules;
-                        *state.tcp_egress.write().unwrap() = tcp_rules.ip_rules;
-                        *state.tcp_fqdn.write().unwrap() = tcp_rules.fqdn_rules;
-                        // A fresh policy invalidates pins from the previous one.
-                        state.pinned_ips.write().unwrap().clear();
-                        routes_valid = true;
+                        // Publish routes, defaults, and the static/fqdn tcp rules,
+                        // clear the previous policy's pins, and bump the generation
+                        // in one atomic swap, so no connection or DNS lookup can
+                        // combine these with a superseded policy's fields.
+                        crate::proxy::apply_network_policy(
+                            state,
+                            crate::proxy::NetworkPolicy {
+                                routes: route_rules,
+                                default_verdict,
+                                default_transport,
+                                tcp_egress: tcp_rules.ip_rules,
+                                tcp_fqdn: tcp_rules.fqdn_rules,
+                                ..Default::default()
+                            },
+                        );
                     }
                     (Err(e), _) => {
                         tracing::error!(
@@ -900,69 +971,19 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                     force_deny();
                 }
             }
-
-            // Only apply defaultVerdict/defaultTransport when routes parsed
-            // successfully. Otherwise the fallback above already forced Deny.
-            if routes_valid {
-                let verdict = parse_default_verdict(network.default_verdict.as_deref());
-                // Transport is required per schema. Missing OR malformed means
-                // we don't know what the operator chose; on a non-deny verdict
-                // that's a fail-closed downgrade so we never silently pick a
-                // transport for them.
-                let (transport, transport_valid) = match network.default_transport.as_deref() {
-                    Some("upstream") => (crate::routing::Transport::Upstream, true),
-                    Some("direct") => (crate::routing::Transport::Direct, true),
-                    Some(other) => {
-                        if matches!(verdict, crate::routing::Verdict::Deny) {
-                            tracing::warn!(
-                                transport = other,
-                                "unknown network.defaultTransport in policy; ignored (deny verdict)"
-                            );
-                        } else {
-                            tracing::error!(
-                                transport = other,
-                                "unknown network.defaultTransport in policy; forcing deny"
-                            );
-                        }
-                        (crate::routing::Transport::Upstream, false)
-                    }
-                    None => {
-                        if !matches!(verdict, crate::routing::Verdict::Deny) {
-                            tracing::error!(
-                                "network.defaultTransport missing with non-deny verdict; forcing deny"
-                            );
-                        }
-                        (crate::routing::Transport::Upstream, false)
-                    }
-                };
-                let effective_verdict = if matches!(
-                    verdict,
-                    crate::routing::Verdict::Allow | crate::routing::Verdict::Ask
-                ) && !transport_valid
-                {
-                    crate::routing::Verdict::Deny
-                } else {
-                    verdict
-                };
-                tracing::info!(
-                    verdict = ?effective_verdict,
-                    transport = ?transport,
-                    "proxy default verdict/transport updated from policy"
-                );
-                *state.default_verdict.write().unwrap() = effective_verdict;
-                *state.default_transport.write().unwrap() = transport;
-            }
         }
         None => {
             // No network field means no domain restrictions — reset to allow-all via Lens Sandbox.
             tracing::info!("network policy absent; resetting to allow-all via lens");
-            state.routes.write().unwrap().clear();
-            state.tcp_egress.write().unwrap().clear();
-            state.tcp_fqdn.write().unwrap().clear();
-            state.pinned_ips.write().unwrap().clear();
+            crate::proxy::apply_network_policy(
+                state,
+                crate::proxy::NetworkPolicy {
+                    default_verdict: crate::routing::Verdict::Allow,
+                    default_transport: crate::routing::Transport::Upstream,
+                    ..Default::default()
+                },
+            );
             state.client_certs.write().unwrap().clear();
-            *state.default_verdict.write().unwrap() = crate::routing::Verdict::Allow;
-            *state.default_transport.write().unwrap() = crate::routing::Transport::Upstream;
         }
     }
 
@@ -2222,11 +2243,11 @@ mod tests {
         connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
 
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Allow
         );
         assert_eq!(
-            *state.default_transport.read().unwrap(),
+            state.policy.read().unwrap().default_transport,
             crate::routing::Transport::Direct
         );
     }
@@ -2272,7 +2293,7 @@ mod tests {
         connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
 
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny
         );
     }
@@ -2316,7 +2337,7 @@ mod tests {
         connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
 
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny
         );
     }
@@ -2395,10 +2416,11 @@ mod tests {
         );
 
         // Route should still be allow-via-direct (not Deny)
-        let routes = state.routes.read().unwrap();
+        let policy = state.policy.read().unwrap();
+        let routes = &policy.routes;
         assert_eq!(
             crate::routing::match_route(
-                &routes,
+                routes,
                 "host.docker.internal:6443",
                 crate::routing::Scheme::Https,
                 crate::routing::Verdict::Deny,
@@ -2496,9 +2518,10 @@ mod tests {
 
         apply_local_policy(&policy_json.to_string(), &proxy_state).await;
 
-        // l7 rule landed in routes; tcp rule landed in tcp_egress.
-        assert_eq!(state.routes.read().unwrap().len(), 1);
-        let tcp = state.tcp_egress.read().unwrap();
+        // l7 rule landed in routes; tcp rule landed in the tcp policy.
+        assert_eq!(state.policy.read().unwrap().routes.len(), 1);
+        let policy = state.policy.read().unwrap();
+        let tcp = &policy.tcp_egress;
         assert_eq!(tcp.len(), 1);
         assert!(matches!(
             &tcp[0].matcher,
@@ -2535,10 +2558,10 @@ mod tests {
 
         // tcp rule kept, no l7 rules, and the operator's default verdict applied
         // (NOT force-denied by a spurious "malformed policy" path).
-        assert_eq!(state.tcp_egress.read().unwrap().len(), 1);
-        assert!(state.routes.read().unwrap().is_empty());
+        assert_eq!(state.policy.read().unwrap().tcp_egress.len(), 1);
+        assert!(state.policy.read().unwrap().routes.is_empty());
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny
         );
     }
@@ -2567,8 +2590,8 @@ mod tests {
 
         apply_local_policy(&policy_json.to_string(), &proxy_state).await;
 
-        assert_eq!(state.routes.read().unwrap().len(), 1);
-        assert!(state.tcp_egress.read().unwrap().is_empty());
+        assert_eq!(state.policy.read().unwrap().routes.len(), 1);
+        assert!(state.policy.read().unwrap().tcp_egress.is_empty());
     }
 
     #[tokio::test]
@@ -2602,7 +2625,7 @@ mod tests {
         apply_local_policy(&policy_json.to_string(), &proxy_state).await;
 
         assert_eq!(
-            state.routes.read().unwrap().len(),
+            state.policy.read().unwrap().routes.len(),
             2,
             "egress.l7 should win over the deprecated allowedRoutes alias"
         );
@@ -2636,11 +2659,11 @@ mod tests {
 
         apply_local_policy(&policy_json.to_string(), &proxy_state).await;
 
-        assert!(state.routes.read().unwrap().is_empty());
-        assert!(state.tcp_egress.read().unwrap().is_empty());
-        assert!(state.tcp_fqdn.read().unwrap().is_empty());
+        assert!(state.policy.read().unwrap().routes.is_empty());
+        assert!(state.policy.read().unwrap().tcp_egress.is_empty());
+        assert!(state.policy.read().unwrap().tcp_fqdn.is_empty());
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny,
             "invalid egress.tcp must force the default verdict to deny"
         );
@@ -2672,9 +2695,9 @@ mod tests {
 
         apply_local_policy(&policy_json.to_string(), &proxy_state).await;
 
-        assert!(state.routes.read().unwrap().is_empty());
+        assert!(state.policy.read().unwrap().routes.is_empty());
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny,
             "a malformed egress.l7 must force deny, not fall through to default-allow"
         );
@@ -2704,7 +2727,7 @@ mod tests {
             }
         });
         apply_local_policy(&good.to_string(), &proxy_state).await;
-        assert_eq!(state.routes.read().unwrap().len(), 1);
+        assert_eq!(state.policy.read().unwrap().routes.len(), 1);
 
         // Now a policy whose `egress` is a non-object (operator typo). It must
         // fail closed — NOT be dropped, which would leave the permissive policy
@@ -2719,11 +2742,11 @@ mod tests {
         apply_local_policy(&malformed.to_string(), &proxy_state).await;
 
         assert!(
-            state.routes.read().unwrap().is_empty(),
+            state.policy.read().unwrap().routes.is_empty(),
             "a malformed egress must clear the prior policy's routes"
         );
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny,
             "a malformed egress must force deny, not retain the prior default-allow"
         );
@@ -2757,8 +2780,8 @@ mod tests {
 
         apply_local_policy(&policy_json.to_string(), &proxy_state).await;
 
-        assert_eq!(state.tcp_fqdn.read().unwrap().len(), 1);
-        assert_eq!(state.tcp_egress.read().unwrap().len(), 1);
+        assert_eq!(state.policy.read().unwrap().tcp_fqdn.len(), 1);
+        assert_eq!(state.policy.read().unwrap().tcp_egress.len(), 1);
     }
 
     // Test with the exact JSON the Go CLI produces for a real k3s kubeconfig.
@@ -2811,10 +2834,11 @@ mod tests {
         );
 
         // Verify route is allow-via-direct (not overridden to Deny)
-        let routes = state.routes.read().unwrap();
+        let policy = state.policy.read().unwrap();
+        let routes = &policy.routes;
         assert_eq!(
             crate::routing::match_route(
-                &routes,
+                routes,
                 "host.docker.internal:6443",
                 crate::routing::Scheme::Https,
                 crate::routing::Verdict::Deny,
@@ -2870,7 +2894,7 @@ mod tests {
 
         // defaultVerdict should be forced to Deny, NOT "allow" from the policy
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny,
             "malformed routes should force defaultVerdict to Deny"
         );
@@ -2929,10 +2953,11 @@ mod tests {
         connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
 
         // The domain route with forward should be denied, not allow
-        let routes = state.routes.read().unwrap();
+        let policy = state.policy.read().unwrap();
+        let routes = &policy.routes;
         assert_eq!(
             crate::routing::match_route(
-                &routes,
+                routes,
                 "example.com:443",
                 crate::routing::Scheme::Https,
                 crate::routing::Verdict::Deny,
@@ -3000,14 +3025,15 @@ mod tests {
         connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
 
         // The malformed cert should have overridden the route verdict to Deny
-        let routes = state.routes.read().unwrap();
+        let policy = state.policy.read().unwrap();
+        let routes = &policy.routes;
         assert!(
             !routes.is_empty(),
             "should have at least the deny override route"
         );
         assert_eq!(
             crate::routing::match_route(
-                &routes,
+                routes,
                 "host.docker.internal:6443",
                 crate::routing::Scheme::Https,
                 crate::routing::Verdict::Deny,
@@ -3405,7 +3431,7 @@ mod tests {
         });
         handle_policy(&policy.to_string(), &Some(state.clone())).await;
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Ask,
             "defaultVerdict=\"ask\" must enable the gate"
         );
@@ -3425,7 +3451,7 @@ mod tests {
         });
         handle_policy(&policy.to_string(), &Some(state.clone())).await;
         assert_eq!(
-            *state.default_verdict.read().unwrap(),
+            state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny,
             "Ask without transport must fail closed"
         );

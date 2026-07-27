@@ -146,10 +146,22 @@ async fn handle_query(
     let decision = resolve_decision(&packet, peer, state).await;
 
     match decision {
-        Decision::Allow { qname, pin } => {
+        Decision::Allow {
+            qname,
+            pin,
+            generation,
+        } => {
             tracing::debug!(qname = %qname, "dns stub forwarding");
-            if let Err(e) =
-                forward_upstream(&packet, upstream, socket, peer, state, pin.as_ref()).await
+            if let Err(e) = forward_upstream(
+                &packet,
+                upstream,
+                socket,
+                peer,
+                state,
+                pin.as_ref(),
+                generation,
+            )
+            .await
             {
                 tracing::warn!(qname = %qname, "dns stub upstream error: {e}");
             }
@@ -177,9 +189,12 @@ async fn handle_query(
 enum Decision {
     /// Resolve the name. `pin` is the `tcp_fqdn` pin spec its A answers should
     /// be recorded against (`None` for names with no fqdn tcp rule).
+    /// `generation` is the policy generation this decision was made under, so a
+    /// pin from an answer that lands after a policy change can be dropped.
     Allow {
         qname: String,
         pin: Option<FqdnPin>,
+        generation: u64,
     },
     Deny {
         qname: String,
@@ -212,18 +227,13 @@ const BINARY_DENY_REASON: &str = "dns-binary-not-allowed";
 /// would be wrongly NXDOMAIN'd. The walk under a binary policy is bounded by
 /// the inflight semaphore.
 async fn resolve_decision(packet: &[u8], peer: SocketAddr, state: &ProxyState) -> Decision {
-    let has_binary_rule = state
-        .routes
-        .read()
-        .unwrap()
-        .iter()
-        .any(|r| r.binaries.is_some())
-        || state
-            .tcp_fqdn
-            .read()
-            .unwrap()
-            .iter()
-            .any(|r| r.binaries.is_some());
+    // Scoped so the policy read guard drops before the `.await` below — a
+    // std RwLock guard must never be held across an await point.
+    let has_binary_rule = {
+        let policy = state.policy.read().unwrap();
+        policy.routes.iter().any(|r| r.binaries.is_some())
+            || policy.tcp_fqdn.iter().any(|r| r.binaries.is_some())
+    };
     let caller = if has_binary_rule {
         resolve_udp_offloaded(peer).await
     } else {
@@ -269,19 +279,30 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         query.query_type(),
         RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB | RecordType::ANY
     );
-    // Pin for this name from the raw-TCP fqdn rules (`None` for names with no
-    // fqdn tcp rule). Attached to any allow so the stub records the answer IPs
-    // for the TCP layer. Computed once and reused across the allow branches.
-    let fqdn = state.tcp_fqdn.read().unwrap();
-    let pin = matching_fqdn_pin(&fqdn, &normalized, caller);
-    let fqdn_match = hostname_match_for_caller(&fqdn, &normalized, caller);
-    drop(fqdn);
+    // Read the L7 routes, the FQDN rules, and the generation under ONE policy
+    // snapshot. The DNS verdict pairs an L7-route match with an FQDN-derived
+    // pin stamped with the generation, so all three must come from the same
+    // policy — reading them separately would let a reload pair one policy's L7
+    // allow with another policy's FQDN pin (and stamp it with a generation the
+    // pin doesn't belong to). A reload swaps the whole snapshot and bumps the
+    // generation atomically, so an equal generation at pin-insertion time still
+    // proves the pin matches the policy in force. `pin` is `None` for names
+    // with no fqdn tcp rule; it is attached to any allow so the stub records
+    // the answer IPs for the TCP layer.
+    let policy = state.policy.read().unwrap();
+    let generation = policy.generation;
+    let pin = matching_fqdn_pin(&policy.tcp_fqdn, &normalized, caller);
+    let fqdn_match = hostname_match_for_caller(&policy.tcp_fqdn, &normalized, caller);
 
     let allow = |qname, pin| {
         if should_suppress {
             Decision::SuppressNodata { qname }
         } else {
-            Decision::Allow { qname, pin }
+            Decision::Allow {
+                qname,
+                pin,
+                generation,
+            }
         }
     };
 
@@ -296,13 +317,12 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         return allow(normalized, pin);
     }
 
-    let routes = state.routes.read().unwrap();
     // DNS matches on hostname only (no scheme/port); port- and scheme-aware
     // enforcement still applies at the subsequent TCP step. `caller` applies
     // any `binaries` filter, so a name reachable only by other binaries fails
     // closed here just as it would at the TCP layer.
-    let matched = hostname_match_for_caller(&routes, &normalized, caller);
-    drop(routes);
+    let matched = hostname_match_for_caller(&policy.routes, &normalized, caller);
+    drop(policy);
     match matched {
         HostnameMatch::Allowed => return allow(normalized, pin),
         HostnameMatch::Denied => {
@@ -391,6 +411,7 @@ async fn forward_upstream(
     client_peer: SocketAddr,
     state: &Arc<ProxyState>,
     pin: Option<&FqdnPin>,
+    generation: u64,
 ) -> Result<(), String> {
     // SO_MARK on the upstream socket so the nftables NAT chain doesn't
     // redirect the stub's own query packet back at itself. The listening
@@ -422,7 +443,7 @@ async fn forward_upstream(
     // A records (IPv4) are pinned — the transparent interceptor is IPv4-only and
     // AAAA is already suppressed to NODATA upstream of here.
     if let Some(pin) = pin {
-        pin_answer_ips(&resp_buf[..n], state, pin);
+        pin_answer_ips(&resp_buf[..n], state, pin, generation);
     }
 
     client_socket
@@ -435,7 +456,7 @@ async fn forward_upstream(
 /// Parse an upstream response and pin its A-record IPs against `pin`, using the
 /// smallest TTL across every answer-section record. A malformed response is
 /// ignored (the bytes are still relayed to the client by the caller).
-fn pin_answer_ips(response: &[u8], state: &Arc<ProxyState>, pin: &FqdnPin) {
+fn pin_answer_ips(response: &[u8], state: &Arc<ProxyState>, pin: &FqdnPin, generation: u64) {
     let Ok(msg) = Message::from_vec(response) else {
         return;
     };
@@ -464,7 +485,7 @@ fn pin_answer_ips(response: &[u8], state: &Arc<ProxyState>, pin: &FqdnPin) {
     // `min_ttl` is set from at least the A record(s) above, so it is never `MAX`
     // once `ips` is non-empty; `pin_dns_answers` clamps a 0 up to the floor.
     let ttl = min_ttl;
-    pin_dns_answers(state, &ips, pin, ttl);
+    pin_dns_answers(state, &ips, pin, ttl, generation);
 }
 
 /// Parse `/etc/resolv.conf` for the first `nameserver` line. In Docker this
@@ -554,7 +575,7 @@ mod tests {
             None,
             Vec::new(),
         );
-        *state.routes.write().unwrap() = routes;
+        state.policy.write().unwrap().routes = routes;
         state
     }
 
@@ -615,10 +636,11 @@ mod tests {
             verdict: Verdict::Allow,
             binaries: None,
         };
-        pin_answer_ips(&bytes, &state, &pin);
+        let generation = state.policy.read().unwrap().generation;
+        pin_answer_ips(&bytes, &state, &pin, generation);
 
-        let pinned = state.pinned_ips.read().unwrap();
-        let entry = pinned.get(&IpAddr::V4(a_ip)).expect("A record pinned");
+        let policy = state.policy.read().unwrap();
+        let entry = policy.pins.get(&IpAddr::V4(a_ip)).expect("A record pinned");
         // 60s CNAME TTL (> the 30s floor) bounds the pin. Without honoring the
         // CNAME the A's 3600s would apply, pushing expiry ~an hour out.
         assert!(
@@ -649,6 +671,116 @@ mod tests {
         match classify_query(&packet, &state, None) {
             Decision::Deny { .. } => {}
             other => panic!("non-bootstrap should deny, got: {}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn classify_captures_generation_and_fqdn_from_one_snapshot() {
+        // The pin's generation must come from the same snapshot as the fqdn
+        // rule that produced it. A reload bumps the generation and swaps the
+        // fqdn rules atomically under one lock, so classify can never pair a new
+        // generation with a stale fqdn rule — the race that would let a revoked
+        // allow-pin survive under the new policy.
+        let fqdn_allow = |host: &str| RouteRule {
+            matcher: RouteMatcher::Domain(host.to_string()),
+            verdict: Verdict::Allow,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: None,
+        };
+        let state = state_with_routes(Vec::new());
+        state.policy.write().unwrap().tcp_fqdn = vec![fqdn_allow("db.internal")];
+
+        let packet = make_query("db.internal", RecordType::A);
+        let (pin, generation) = match classify_query(&packet, &state, None) {
+            Decision::Allow {
+                pin, generation, ..
+            } => (pin, generation),
+            other => panic!("expected Allow, got: {}", describe(&other)),
+        };
+        let current = state.policy.read().unwrap().generation;
+        assert_eq!(
+            generation, current,
+            "captured generation must match the snapshot the fqdn was read from"
+        );
+        assert!(pin.is_some(), "the fqdn allow rule must yield a pin");
+
+        // A reload bumps the generation and re-publishes the fqdn rules in one
+        // atomic swap; the next classify captures the new generation together
+        // with the fqdn read.
+        crate::proxy::apply_network_policy(
+            &state,
+            crate::proxy::NetworkPolicy {
+                tcp_fqdn: vec![fqdn_allow("db.internal")],
+                ..Default::default()
+            },
+        );
+        let generation2 = match classify_query(&packet, &state, None) {
+            Decision::Allow { generation, .. } => generation,
+            other => panic!("expected Allow after reload, got: {}", describe(&other)),
+        };
+        assert_eq!(
+            generation2,
+            current + 1,
+            "generation must advance with the reload"
+        );
+    }
+
+    #[test]
+    fn classify_pairs_routes_and_fqdn_from_one_snapshot() {
+        // The DNS verdict pairs an L7-route match with an FQDN-derived pin, so
+        // both must come from the same policy snapshot. The race this guards
+        // against was a reload publishing new L7 routes before the tcp policy,
+        // letting classify see policy B's L7 allow with policy A's FQDN pin and
+        // pin an IP neither complete policy would. `apply_network_policy` swaps
+        // routes and fqdn rules together, so a routes-allow only ever carries a
+        // pin from the same snapshot's fqdn rules.
+        let route = |host: &str, verdict| RouteRule {
+            matcher: RouteMatcher::Domain(host.to_string()),
+            verdict,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: None,
+        };
+        let state = state_with_routes(Vec::new());
+        let packet = make_query("h.internal", RecordType::A);
+
+        // Policy A: L7 denies H, but a tcp_fqdn rule allows it. The L7 deny
+        // wins, so the lookup is denied and no pin is produced.
+        crate::proxy::apply_network_policy(
+            &state,
+            crate::proxy::NetworkPolicy {
+                routes: vec![route("h.internal", Verdict::Deny)],
+                default_verdict: Verdict::Deny,
+                tcp_fqdn: vec![route("h.internal", Verdict::Allow)],
+                ..Default::default()
+            },
+        );
+        match classify_query(&packet, &state, None) {
+            Decision::Deny { .. } => {}
+            other => panic!("policy A must deny H at DNS, got: {}", describe(&other)),
+        }
+
+        // Policy B: L7 allows H, no tcp_fqdn rule. The lookup is allowed but
+        // carries no pin — a routes-allow never pairs with a stale fqdn pin.
+        crate::proxy::apply_network_policy(
+            &state,
+            crate::proxy::NetworkPolicy {
+                routes: vec![route("h.internal", Verdict::Allow)],
+                default_verdict: Verdict::Deny,
+                ..Default::default()
+            },
+        );
+        match classify_query(&packet, &state, None) {
+            Decision::Allow { pin, .. } => assert!(
+                pin.is_none(),
+                "a routes-allow must not carry an fqdn pin from another snapshot"
+            ),
+            other => panic!("policy B must allow H at DNS, got: {}", describe(&other)),
         }
     }
 
