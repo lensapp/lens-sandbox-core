@@ -1961,12 +1961,20 @@ async fn handle_transparent_tls(
     if let Some(decision) =
         tcp_egress_verdict_for_hostport(state, &target_host, 443, actor.process())
     {
+        // A deny is a deny on whichever door the workload picked, so it audits
+        // as one here too. The other verdicts would have been spliced had the
+        // pin been live, and the trail should say that is what they lost.
+        let reason = match decision.verdict {
+            Verdict::Deny => "policy-deny",
+            _ => "egress-tcp-unpinned",
+        };
         tracing::info!(
             target = %target_host,
             verdict = ?decision.verdict,
-            "transparent TLS DENIED (egress.tcp claims this name, no pin to splice through)"
+            reason,
+            "transparent TLS DENIED (egress.tcp claims this name)"
         );
-        emit_policy_deny_connect(state, &target_host, "egress-tcp-unpinned", &actor);
+        emit_policy_deny_connect(state, &target_host, reason, &actor);
         drop(start);
         return Ok(());
     }
@@ -4136,10 +4144,35 @@ pub(crate) mod tests {
         // the SNI. Binding hostname rules only through a live DNS pin would
         // make a lapsed pin — a long-TTL name, or a pin store the workload
         // filled — the difference between a deny and an MITM'd allow, and the
-        // workload picks the door.
+        // workload picks the door. A deny audits as one wherever it lands.
+        assert_eq!(
+            transparent_tls_deny_reason(r#"[{"match": "db.internal:443", "verdict": "deny"}]"#)
+                .await,
+            Some("policy-deny".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn transparent_tls_refuses_even_a_tcp_allow_it_cannot_splice() {
+        // The ClientHello is spent by the time the SNI is readable, so an allow
+        // has no raw splice left to grant. MITM-ing it instead would inspect
+        // exactly the traffic the rule opted out of inspecting; the audit says
+        // what the connection actually lost.
+        assert_eq!(
+            transparent_tls_deny_reason(r#"[{"match": "db.internal:443", "verdict": "allow"}]"#)
+                .await,
+            Some("egress-tcp-unpinned".to_string())
+        );
+    }
+
+    /// Drive `handle_transparent_tls` with SNI `db.internal` against a tcp
+    /// table that claims the name but not the address, and report the audited
+    /// deny reason. The catch-all http allow is what the refusal has to beat:
+    /// without the SNI check the handler MITMs the connection instead.
+    async fn transparent_tls_deny_reason(tcp_rules: &str) -> Option<String> {
         let (state, mut rx) = test_state();
         install_catch_all_allow(&state);
-        install_tcp_deny(&state, "db.internal:443");
+        install_tcp_rules(&state, tcp_rules);
         // No `pin_dns_answers`: the address is unknown to the tcp table, so the
         // pre-classification check in `handle_transparent_connection` passes.
         assert!(
@@ -4174,17 +4207,14 @@ pub(crate) mod tests {
         .await
         .expect("handler must not park on an upstream dial");
 
-        // Asserted before the handler's own result: without the SNI check it
-        // gets as far as presenting an ephemeral cert, and the client's alert
-        // would otherwise be the failure the test reports.
-        let events = drain_audit(&mut rx);
-        assert!(
-            events
-                .iter()
-                .any(|e| e["metadata"]["reason"] == "egress-tcp-unpinned"),
-            "the SNI must be matched against the tcp table; got {events:?}"
-        );
-        outcome.expect("a refused connection closes cleanly");
+        let reason = drain_audit(&mut rx)
+            .iter()
+            .find_map(|e| e["metadata"]["reason"].as_str().map(str::to_string));
+        // A refusal closes the socket and returns. Reaching the MITM pipeline
+        // instead is the regression this test exists for, and it surfaces here:
+        // the client trusts no CA, so the ephemeral cert draws an alert.
+        outcome.expect("the connection must be refused, not intercepted");
+        reason
     }
 
     #[tokio::test]
