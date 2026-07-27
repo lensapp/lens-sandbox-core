@@ -1313,14 +1313,13 @@ async fn handle_transparent_connection(
     // Raw TCP egress: an `egress.tcp` rule matching the raw destination splices
     // bytes through untouched — no protocol peek, no TLS interception. Decided
     // before classification so TLS-speaking databases are not MITM'd.
-    let raw_target = orig_dst.to_string();
     if let Some(decision) = tcp_egress_verdict(
         &state,
         &orig_dst.ip().to_string(),
         orig_dst.port(),
         actor.process(),
     ) {
-        return handle_raw_passthrough(stream, &raw_target, &decision, &state, &actor).await;
+        return handle_raw_passthrough(stream, orig_dst, &decision, &state, &actor).await;
     }
 
     // 8 bytes covers every classifier prefix: TLS needs 3, `OPTIONS ` and
@@ -1455,12 +1454,29 @@ async fn connect_egress_under_policy(
 ) -> std::io::Result<TcpStream> {
     let port = extract_port(target_host, default_port);
     sock_mark::connect_tcp_egress_where(target_host, |ip| {
-        matches!(
-            tcp_egress_verdict(state, &ip.to_string(), port, caller).map(|d| d.verdict),
-            None | Some(Verdict::Allow)
-        )
+        tcp_egress_admits(state, ip, port, caller)
     })
     .await
+}
+
+/// Whether the `egress.tcp` table, as it stands *now*, still admits this
+/// resolved address. Only an allow (or no claim at all) admits: no gate can run
+/// here, so an `ask` refuses rather than answering more permissively than the
+/// door that would have put it to a human.
+///
+/// Every door commits through this one question, which is what keeps a verdict
+/// from outliving the rule that produced it — see the re-check in
+/// [`handle_raw_passthrough`].
+fn tcp_egress_admits(
+    state: &Arc<ProxyState>,
+    ip: IpAddr,
+    port: u16,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> bool {
+    matches!(
+        tcp_egress_verdict(state, &ip.to_string(), port, caller).map(|d| d.verdict),
+        None | Some(Verdict::Allow)
+    )
 }
 
 /// (Re)apply the entire network egress policy in one atomic swap: publish the
@@ -1630,40 +1646,57 @@ async fn open_upstream_tunnel(
 /// without interpreting the payload. Raw TCP always egresses directly: a
 /// SO_MARK'd socket dials the destination, bypassing the nftables cage, and the
 /// bytes are spliced through untouched. Honors `deny`/`ask` exactly as the
-/// transparent TLS path does. `raw_target` is the pre-redirect `ip:port`.
+/// transparent TLS path does. `orig_dst` is the pre-redirect destination.
 async fn handle_raw_passthrough(
     mut stream: TcpStream,
-    raw_target: &str,
+    orig_dst: SocketAddr,
     decision: &TcpDecision,
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let raw_target = orig_dst.to_string();
     // Same destination guard the L7 CONNECT/TLS paths run: a raw connection
     // egresses directly via SO_MARK, so a loopback or link-local target (e.g. a
     // pinned or CIDR-matched `169.254.169.254`) would reach the host itself or
     // cloud metadata, bypassing the cage. Reject before any dial, regardless of
     // verdict — this is not policy, it is a hard floor.
-    if let Err(e) = validate_connect_target(raw_target) {
-        emit_policy_deny_connect(state, raw_target, "blocked-destination", actor);
+    if let Err(e) = validate_connect_target(&raw_target) {
+        emit_policy_deny_connect(state, &raw_target, "blocked-destination", actor);
         tracing::debug!(target = %raw_target, "raw passthrough blocked: {e}");
         return Ok(());
     }
 
-    if !raw_verdict_admits(state, raw_target, decision, actor).await {
+    // The generation this verdict — and any approval of it — belongs to. An
+    // `ask` parks the connection for up to `DECISION_TIMEOUT`, long enough for a
+    // policy to land.
+    let granted_under = state.policy.read().unwrap().generation;
+
+    if !raw_verdict_admits(state, &raw_target, decision, actor).await {
+        return Ok(());
+    }
+
+    // Consent is scoped to the generation it was given under, so a reload sends
+    // the destination back through the table. The proxy doors get this from
+    // re-reading at their dial; this door resolves nothing, so it asks here.
+    if state.policy.read().unwrap().generation != granted_under
+        && !tcp_egress_admits(state, orig_dst.ip(), orig_dst.port(), actor.process())
+    {
+        emit_policy_deny_connect(state, &raw_target, "policy-deny", actor);
+        tracing::info!(target = %raw_target, "raw passthrough DENIED (policy reloaded)");
         return Ok(());
     }
 
     // Raw TCP always egresses directly: SO_MARK bypasses the nftables cage and
     // the bytes are spliced through untouched.
-    let mut upstream = match sock_mark::connect_tcp_egress(raw_target).await {
+    let mut upstream = match sock_mark::connect_tcp_egress(&raw_target).await {
         Ok(s) => s,
         Err(e) => {
-            emit_audit(state, raw_target, "error", 502, actor);
+            emit_audit(state, &raw_target, "error", 502, actor);
             return Err(format!("passthrough connect to {raw_target}: {e}").into());
         }
     };
     tracing::debug!(target = %raw_target, "transparent passthrough DIRECT");
-    emit_audit(state, raw_target, "success", 200, actor);
+    emit_audit(state, &raw_target, "success", 200, actor);
     tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
     Ok(())
 }
@@ -3882,6 +3915,20 @@ pub(crate) mod tests {
             crate::routing::parse_tcp_egress(&parsed).unwrap();
     }
 
+    /// Publish a new tcp table through the real reload entry point, so the
+    /// policy generation advances exactly as it does for an operator's frame.
+    /// `install_tcp_rules` writes the field directly and deliberately does not.
+    fn reload_tcp_rules(state: &Arc<ProxyState>, json: &str) {
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        apply_network_policy(
+            state,
+            NetworkPolicy {
+                tcp_egress: crate::routing::parse_tcp_egress(&parsed).unwrap(),
+                ..Default::default()
+            },
+        );
+    }
+
     fn install_tcp_deny(state: &Arc<ProxyState>, pattern: &str) {
         install_tcp_rules(
             state,
@@ -4036,7 +4083,7 @@ pub(crate) mod tests {
             let actor = test_actor();
             handle_raw_passthrough(
                 server,
-                "203.0.113.9:5432",
+                "203.0.113.9:5432".parse().unwrap(),
                 &decision,
                 &state_for_handler,
                 &actor,
@@ -4075,6 +4122,123 @@ pub(crate) mod tests {
         })
         .await;
         assert!(resolved.is_ok(), "the approved name must be recorded");
+    }
+
+    /// Every audit event queued so far, parsed. Assertions read better against
+    /// the whole batch than against a positional `try_recv` chain.
+    fn drain_audit(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(serde_json::from_str(&msg).unwrap());
+        }
+        out
+    }
+
+    /// Drive `handle_raw_passthrough` to completion, answering its dialog with
+    /// `answer` once the prompt appears. `before_answer` runs while the prompt
+    /// is still open, which is where a policy reload lands.
+    async fn raw_passthrough_answering(
+        state: &Arc<ProxyState>,
+        rx: &mut mpsc::UnboundedReceiver<String>,
+        dst: SocketAddr,
+        answer: crate::protocol::Decision,
+        before_answer: impl FnOnce(),
+    ) {
+        let decision = tcp_egress_verdict(state, &dst.ip().to_string(), dst.port(), None)
+            .expect("the rule under test must claim this address");
+        let (_client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            let actor = test_actor();
+            handle_raw_passthrough(server, dst, &decision, &state_for_handler, &actor).await
+        });
+
+        let prompt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a dialog must be raised")
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&prompt).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        before_answer();
+        assert!(crate::gate::resolve_pending(state, &id, answer));
+
+        // A handler that gets past policy parks on the dial — for an approval
+        // that *is* the success case, so completion is not required. Every audit
+        // the callers assert on is emitted before any dial is attempted.
+        let _ = tokio::time::timeout(Duration::from_millis(500), handler).await;
+    }
+
+    #[tokio::test]
+    async fn a_policy_reload_during_the_dialog_refuses_the_approved_splice() {
+        // The gate parks the connection for up to DECISION_TIMEOUT and a policy
+        // can land in that window. The proxy doors re-read the table at their
+        // dial; this door resolves nothing, so it has to re-read explicitly.
+        // Otherwise an approval outlives the rule that prompted it — and the
+        // workload, which picks its own door, would pick this one.
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "203.0.113.0/24:5432", "verdict": "ask"}]"#,
+        );
+
+        raw_passthrough_answering(
+            &state,
+            &mut rx,
+            "203.0.113.9:5432".parse().unwrap(),
+            crate::protocol::Decision::AllowAlways,
+            // The operator revokes the rule while the prompt is still on screen.
+            || {
+                reload_tcp_rules(
+                    &state,
+                    r#"[{"match": "203.0.113.0/24:5432", "verdict": "deny"}]"#,
+                )
+            },
+        )
+        .await;
+
+        let events = drain_audit(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["metadata"]["reason"] == "policy-deny"),
+            "the revoked rule must refuse the approved splice; got {events:#?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["result"] == "success"),
+            "nothing may splice under a rule that no longer exists; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approved_ask_still_splices_when_the_policy_has_not_moved() {
+        // The rule stays `ask` after the click — an approval is not written back
+        // into the table. A re-check that simply re-asks the table would refuse
+        // every connection the developer just allowed.
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "203.0.113.0/24:5432", "verdict": "ask"}]"#,
+        );
+
+        raw_passthrough_answering(
+            &state,
+            &mut rx,
+            "203.0.113.9:5432".parse().unwrap(),
+            crate::protocol::Decision::AllowAlways,
+            || {},
+        )
+        .await;
+
+        let events = drain_audit(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["metadata"]["reason"] == "policy-deny"),
+            "an approval under an unchanged policy must be honored; got {events:#?}"
+        );
     }
 
     #[test]
