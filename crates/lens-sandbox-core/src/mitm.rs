@@ -114,6 +114,7 @@ pub async fn handle_mitm_pre_accepted(
                 &format!("{host}:{port}"),
                 port,
                 ctx.actor.process(),
+                crate::proxy::Gated::NotAsked,
             )
             .await?;
             let mut tls_upstream =

@@ -779,6 +779,7 @@ async fn handle_http_forward(
                 target_host,
                 80,
                 actor.process(),
+                Gated::NotAsked,
             )
             .await
             {
@@ -1132,16 +1133,21 @@ async fn handle_connect(
                 .await?;
             } else {
                 // Neither → plain TCP relay
-                let mut target =
-                    match connect_egress_under_policy(state, target_host, 443, actor.process())
-                        .await
-                    {
-                        Ok(t) => t,
-                        Err(e) => {
-                            emit_audit(state, target_host, "error", 502, actor);
-                            return Err(format!("direct connect to {target_host}: {e}").into());
-                        }
-                    };
+                let mut target = match connect_egress_under_policy(
+                    state,
+                    target_host,
+                    443,
+                    actor.process(),
+                    Gated::NotAsked,
+                )
+                .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        emit_audit(state, target_host, "error", 502, actor);
+                        return Err(format!("direct connect to {target_host}: {e}").into());
+                    }
+                };
                 tracing::debug!(target = %target_host, "proxy DIRECT");
                 tokio::io::copy_bidirectional(&mut client, &mut target).await?;
             }
@@ -1478,33 +1484,63 @@ pub(crate) async fn connect_egress_under_policy(
     target_host: &str,
     default_port: u16,
     caller: Option<&crate::peer_process::PeerProcess>,
+    already_gated: Gated,
 ) -> std::io::Result<TcpStream> {
     let port = extract_port(target_host, default_port);
     sock_mark::connect_tcp_egress_where(target_host, |ip| {
-        tcp_egress_admits(state, ip, port, caller)
+        tcp_egress_admits(state, ip, port, caller, already_gated)
     })
     .await
 }
 
+/// Whether *this* connection already carries a developer's answer, which is
+/// what decides how the dial guard may treat an `ask` it finds on the resolved
+/// address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gated {
+    /// A gate ran for this connection and the developer allowed it.
+    ByTheDeveloper,
+    /// No gate ran. An `ask` here has never been seen by anyone.
+    NotAsked,
+}
+
+/// What a raw door's already-resolved verdict says about the dial that follows.
+/// Only an `ask` reached a human — an `allow` was never put to anyone, so a
+/// CIDR `ask` waiting on the resolved address is still an unanswered question
+/// and the dial must refuse it.
+fn gated_by(decision: &TcpDecision) -> Gated {
+    match decision.verdict {
+        Verdict::Ask => Gated::ByTheDeveloper,
+        _ => Gated::NotAsked,
+    }
+}
+
 /// Whether the `egress.tcp` table, as it stands *now*, admits this resolved
-/// address. An `ask` refuses: no gate can run inside a dial, so answering
-/// otherwise would be more permissive than the door that puts it to a human. No
-/// claim at all admits, because the destination was authorized by the L7 table
-/// and the tcp table simply has nothing to say about it.
+/// address. This guards a dial against a rule the target could not be tested
+/// against while it was still a name. It is not what keeps an approval from
+/// outliving its policy — see the generation check in [`raw_verdict_admits`].
 ///
-/// This guards a dial against a rule the target could not be tested against
-/// while it was still a name. It is not what keeps an approval from outliving
-/// its policy — see the generation check in [`raw_verdict_admits`].
+/// No claim at all admits: the destination was authorized by the L7 table and
+/// the tcp table has nothing to say about it.
+///
+/// An `ask` depends on whether this connection already carries an answer. No
+/// gate can run inside a dial, so an ungated connection must refuse rather than
+/// answer more permissively than the door that puts it to a human. But an
+/// approval is never written back into the table, so a gated connection meets
+/// the very rule it was just approved under — refusing there would make `ask`
+/// unusable on every door that resolves a name.
 fn tcp_egress_admits(
     state: &Arc<ProxyState>,
     ip: IpAddr,
     port: u16,
     caller: Option<&crate::peer_process::PeerProcess>,
+    already_gated: Gated,
 ) -> bool {
-    matches!(
-        tcp_egress_verdict(state, &ip.to_string(), port, caller).map(|d| d.verdict),
-        None | Some(Verdict::Allow)
-    )
+    match tcp_egress_verdict(state, &ip.to_string(), port, caller).map(|d| d.verdict) {
+        None | Some(Verdict::Allow) => true,
+        Some(Verdict::Ask) => already_gated == Gated::ByTheDeveloper,
+        Some(Verdict::Deny) => false,
+    }
 }
 
 /// (Re)apply the entire network egress policy in one atomic swap: publish the
@@ -1793,17 +1829,24 @@ async fn connect_raw_passthrough(
         return Ok(());
     }
 
-    let mut upstream =
-        match connect_egress_under_policy(state, target_host, 443, actor.process()).await {
-            Ok(s) => s,
-            Err(e) => {
-                emit_audit(state, target_host, "error", 502, actor);
-                client
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                    .await?;
-                return Err(format!("raw passthrough connect to {target_host}: {e}").into());
-            }
-        };
+    let mut upstream = match connect_egress_under_policy(
+        state,
+        target_host,
+        443,
+        actor.process(),
+        gated_by(decision),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            emit_audit(state, target_host, "error", 502, actor);
+            client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await?;
+            return Err(format!("raw passthrough connect to {target_host}: {e}").into());
+        }
+    };
 
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -1842,19 +1885,26 @@ async fn http_forward_raw_passthrough(
         return Ok(());
     }
 
-    let mut upstream =
-        match connect_egress_under_policy(state, target_host, 80, actor.process()).await {
-            Ok(s) => s,
-            Err(e) => {
-                emit_audit(state, target_host, "error", 502, actor);
-                client
+    let mut upstream = match connect_egress_under_policy(
+        state,
+        target_host,
+        80,
+        actor.process(),
+        gated_by(decision),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            emit_audit(state, target_host, "error", 502, actor);
+            client
                 .write_all(
                     b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
                 )
                 .await?;
-                return Err(format!("raw passthrough connect to {target_host}: {e}").into());
-            }
-        };
+            return Err(format!("raw passthrough connect to {target_host}: {e}").into());
+        }
+    };
 
     upstream
         .write_all(format!("{request_head}\r\n\r\n").as_bytes())
@@ -4598,6 +4648,63 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_approved_ask_still_splices_on_the_proxy_door() {
+        // The allow side of the test above. An approval is not written back into
+        // the table, so the rule is still `ask` when the dial re-reads it — a
+        // guard that simply refuses every `ask` refuses every connection the
+        // developer just allowed, and `ask` becomes unusable on this door.
+        let (state, mut rx) = test_state();
+        install_catch_all_allow(&state);
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "203.0.113.0/24:5432", "verdict": "ask"}]"#,
+        );
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            handle_connect(server, "203.0.113.9:5432", &actor, &state_for_handler).await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("request_pending arrived")
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&pending).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(crate::gate::resolve_pending(
+            &state,
+            &id,
+            crate::protocol::Decision::AllowAlways,
+        ));
+
+        let response = read_response(&mut client).await;
+        assert!(
+            !response.starts_with("HTTP/1.1 403") && !response.starts_with("HTTP/1.1 502"),
+            "the approved ask must reach the dial, not be refused by it; got {response:?}"
+        );
+    }
+
+    #[test]
+    fn only_an_ask_carries_a_developer_answer_into_the_dial() {
+        // The dial guard relaxes for an `ask` because the developer already
+        // answered that exact question. An `allow` answered nothing, so a CIDR
+        // `ask` waiting on the resolved address is still unseen and must refuse
+        // — treating every raw door as "gated" would reopen exactly that hole.
+        let at = |verdict| TcpDecision {
+            verdict,
+            matched_target: None,
+            generation: 0,
+        };
+        assert_eq!(gated_by(&at(Verdict::Ask)), Gated::ByTheDeveloper);
+        assert_eq!(gated_by(&at(Verdict::Allow)), Gated::NotAsked);
+        assert_eq!(gated_by(&at(Verdict::Deny)), Gated::NotAsked);
+    }
+
+    #[tokio::test]
     async fn connect_egress_under_policy_refuses_a_post_resolution_ask() {
         // No gate can run inside the dial, and admitting would let this door
         // skip a decision the transparent door asks a human for — the workload
@@ -4607,7 +4714,8 @@ pub(crate) mod tests {
             &state,
             r#"[{"match": "10.0.0.0/8:5432", "verdict": "ask"}]"#,
         );
-        let dial = connect_egress_under_policy(&state, "10.0.0.5:5432", 5432, None);
+        let dial =
+            connect_egress_under_policy(&state, "10.0.0.5:5432", 5432, None, Gated::NotAsked);
         let err = tokio::time::timeout(Duration::from_secs(2), dial)
             .await
             .expect("policy must refuse before dialing")
@@ -4624,7 +4732,8 @@ pub(crate) mod tests {
             &state,
             r#"[{"match": "[2001:db8::/32]:443", "verdict": "deny"}]"#,
         );
-        let dial = connect_egress_under_policy(&state, "[2001:db8::1]:443", 443, None);
+        let dial =
+            connect_egress_under_policy(&state, "[2001:db8::1]:443", 443, None, Gated::NotAsked);
         let err = tokio::time::timeout(Duration::from_secs(2), dial)
             .await
             .expect("policy must refuse before dialing")
