@@ -8,8 +8,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use crate::routing::{
-    FqdnPin, HttpRule, RouteOutcome, RouteRule, Scheme, Transport, Verdict, binaries_admit_caller,
-    find_matching_route,
+    HttpRule, RouteOutcome, RouteRule, Scheme, Transport, Verdict, find_matching_route,
+    find_matching_tcp_egress,
 };
 use crate::sock_mark;
 use crate::transparent::{self, Protocol};
@@ -50,23 +50,31 @@ const PIN_TTL_CAP_SECS: u64 = 3600;
 /// unbounded growth from a name that resolves to churning addresses.
 const MAX_PINNED_IPS: usize = 4096;
 
-/// An IP pinned from a DNS answer for a `tcp_fqdn` name, plus its expiry.
+/// An IP pinned from a DNS answer for a hostname `egress.tcp` rule, plus its
+/// expiry.
+///
+/// Stores the originating `qname`, not the winning rule: a DNS caller may skip
+/// an earlier caller-scoped deny and pin from a later allow, so admitting a
+/// raw-TCP connection must re-evaluate the ordered `tcp_egress` rules for this
+/// name against the *connecting* caller — see [`resolve_tcp_egress`]. Storing
+/// only the selected allow rule would let a different caller, one an earlier
+/// deny would reject, reuse the pin.
 #[derive(Debug, Clone)]
 pub struct PinnedIp {
-    pub pin: FqdnPin,
+    pub qname: String,
     pub expiry: Instant,
 }
 
 /// The complete network egress policy as one atomically-published snapshot:
-/// the L7 routes and their default verdict/transport, the raw-TCP static and
-/// FQDN rules, the live DNS pins, and a generation counter. Every allow / deny
-/// / transport decision reads these fields in combination (an L7 verdict falls
-/// back to the default; a DNS classification pairs the L7 routes with the FQDN
-/// rules and the generation; a raw-TCP connect pairs the static rules with the
-/// pins), so they must move together. Bundling them under one lock makes that
-/// consistency structural rather than by-convention: a reader takes a single
-/// consistent snapshot and a reload swaps the whole thing at once, so no
-/// decision can ever combine fields from two different policy generations.
+/// the L7 routes and their default verdict/transport, the raw-TCP rules, the
+/// live DNS pins, and a generation counter. Every allow / deny / transport
+/// decision reads these fields in combination (an L7 verdict falls back to the
+/// default; a DNS classification pairs the L7 routes with the tcp rules and the
+/// generation; a raw-TCP connect pairs the tcp rules with the pins), so they
+/// must move together. Bundling them under one lock makes that consistency
+/// structural rather than by-convention: a reader takes a single consistent
+/// snapshot and a reload swaps the whole thing at once, so no decision can ever
+/// combine fields from two different policy generations.
 pub struct NetworkPolicy {
     /// Application-layer routes (`egress.l7` / the deprecated `allowedRoutes`),
     /// consulted after protocol classification.
@@ -75,18 +83,18 @@ pub struct NetworkPolicy {
     pub default_verdict: Verdict,
     /// Transport applied when no `routes` entry matches the host.
     pub default_transport: Transport,
-    /// Raw-TCP egress rules with a literal IP/CIDR match (`egress.tcp`),
-    /// consulted before classification. Each splices its match through as an
-    /// opaque byte tunnel.
+    /// The `egress.tcp` rules as ONE ordered list, consulted before protocol
+    /// classification. `Cidr`/`CidrPort` matchers match the resolved dst IP
+    /// directly; `Domain`/`HostPort` matchers match only a dst IP that a live
+    /// DNS pin bound to a name the rule covers (the raw path never sees a name,
+    /// so hostname rules drive DNS-answer pinning). Both kinds are evaluated in
+    /// one ordered pass by [`resolve_tcp_egress`] / `find_matching_tcp_egress`,
+    /// and the DNS stub gates lookups against the hostname entries of this same
+    /// list via `hostname_match_for_caller`.
     pub tcp_egress: Vec<RouteRule>,
-    /// Raw-TCP egress rules with a hostname match (`egress.tcp` FQDN entries).
-    /// The raw path never sees a name, so these drive DNS-answer pinning: the
-    /// stub consults them to gate the lookup and record the answer IPs into
-    /// [`pins`](Self::pins).
-    pub tcp_fqdn: Vec<RouteRule>,
-    /// IPs pinned from DNS answers of `tcp_fqdn` names, each carrying the
-    /// originating rule's decision and a TTL-bounded expiry. Consulted by
-    /// [`resolve_tcp_egress`] after the static rules.
+    /// IPs pinned from DNS answers of hostname `tcp_egress` names, each carrying
+    /// the originating `qname` and a TTL-bounded expiry. Consulted by
+    /// [`resolve_tcp_egress`] to match hostname rules against a raw connection.
     pub pins: HashMap<IpAddr, Vec<PinnedIp>>,
     /// Bumped every time the policy is (re)applied. The DNS stub captures it
     /// when it authorizes a lookup and hands it back at pin-insertion time; an
@@ -107,7 +115,6 @@ impl Default for NetworkPolicy {
             default_verdict: Verdict::Allow,
             default_transport: Transport::Upstream,
             tcp_egress: Vec::new(),
-            tcp_fqdn: Vec::new(),
             pins: HashMap::new(),
             generation: 0,
         }
@@ -1258,67 +1265,61 @@ async fn handle_transparent_connection(
     }
 }
 
-/// Resolve `raw_target` (an `ip:port`) against the `egress.tcp` rules. Checks
-/// the static IP/CIDR rules first, then any live pin recorded from a `tcp_fqdn`
-/// DNS answer. Returns the matched verdict, or `None` when nothing matches (the
-/// connection then falls through to classification and the `egress.l7` routes)
-/// or when a `binaries` filter excluded the caller — never re-opened here. Raw
-/// TCP always egresses directly, so no transport is returned.
-///
-/// An opaque tunnel carries no HTTP scheme, so the probe scheme is arbitrary;
-/// `egress.tcp` rules never set one.
+/// Resolve `raw_target` (an `ip:port`) against the `egress.tcp` rules in ONE
+/// ordered pass. `Cidr`/`CidrPort` rules match the dst IP directly; hostname
+/// (`Domain`/`HostPort`) rules match a dst IP that a live DNS pin bound to a
+/// name the rule covers. Walking the single policy-ordered list is what lets a
+/// static IP rule and a pinned hostname rule compete by their real position —
+/// an earlier rule wins whichever kind it is (the bug was checking every IP
+/// rule before any hostname rule). Returns the matched verdict, or `None` when
+/// nothing matches (the connection then falls through to classification and the
+/// `egress.l7` routes) or when a `binaries` filter excluded the caller — never
+/// re-opened here. A matched deny (IP or hostname) is terminal for the raw path.
+/// Raw TCP always egresses directly, so no transport is returned.
 fn resolve_tcp_egress(
     state: &Arc<ProxyState>,
     raw_target: &str,
     caller: Option<&crate::peer_process::PeerProcess>,
 ) -> Option<Verdict> {
-    // Read the static rules and the pins under one policy snapshot. A reload
-    // swaps both (and clears the pins) atomically under the write lock, so a
-    // connection sees either the old rules with the old pins or the new rules
-    // with the pins cleared — never the new rules combined with a superseded
-    // policy's pins.
-    let policy = state.policy.read().unwrap();
-    if let RouteOutcome::Matched(rule) =
-        find_matching_route(&policy.tcp_egress, raw_target, Scheme::Https, caller)
-    {
-        return Some(rule.verdict);
-    }
-    resolve_pinned(&policy, raw_target, caller)
-}
-
-/// Match `raw_target` against the IPs pinned from `tcp_fqdn` DNS answers. A pin
-/// admits the connection when it is unexpired, its port is unset or equals the
-/// target port, and its `binaries` filter admits the caller.
-///
-/// Read-only over the held [`NetworkPolicy`] snapshot — expired pins are
-/// skipped here rather than pruned, so the connect path needs only the read
-/// lock (their storage is reclaimed at insert time and on reload). Takes the
-/// policy by reference so pins are always read under the same lock as the
-/// static rules.
-fn resolve_pinned(
-    policy: &NetworkPolicy,
-    raw_target: &str,
-    caller: Option<&crate::peer_process::PeerProcess>,
-) -> Option<Verdict> {
     let ip: IpAddr = extract_hostname(raw_target).parse().ok()?;
     let port = extract_port(raw_target, 0);
-    let now = Instant::now();
 
-    policy
+    // Read the rules and the pins under ONE policy snapshot. A reload swaps both
+    // (and clears the pins) atomically under the write lock, so a connection
+    // sees either the old rules with the old pins or the new rules with the pins
+    // cleared — never the new rules combined with a superseded policy's pins.
+    let policy = state.policy.read().unwrap();
+
+    // Live (unexpired) qnames pinned to this IP. A hostname rule matches only if
+    // one of these names is covered by its pattern; storing only the name means
+    // the ordered rules — including any earlier caller-scoped deny — are
+    // re-evaluated against the *connecting* caller here, not the DNS caller.
+    let now = Instant::now();
+    let pinned_qnames: Vec<&str> = policy
         .pins
-        .get(&ip)?
-        .iter()
-        .find(|p| {
-            p.expiry > now
-                && p.pin.port.is_none_or(|want| want == port)
-                && binaries_admit_caller(p.pin.binaries.as_deref(), caller)
+        .get(&ip)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|p| p.expiry > now)
+                .map(|p| p.qname.as_str())
+                .collect()
         })
-        .map(|p| p.pin.verdict)
+        .unwrap_or_default();
+
+    match find_matching_tcp_egress(&policy.tcp_egress, ip, port, caller, &pinned_qnames) {
+        RouteOutcome::Matched(rule) => Some(rule.verdict),
+        // Nothing matched, or a rule matched but its `binaries` filter excluded
+        // the caller. Either way there is no verdict from the raw layer; the
+        // no-reopen guard already ran inside the single ordered walk, so a
+        // binary-excluded rule can't be re-opened by a later unrestricted one.
+        RouteOutcome::NoMatch { .. } => None,
+    }
 }
 
 /// (Re)apply the entire network egress policy in one atomic swap: publish the
-/// L7 `routes` and their `default_verdict`/`default_transport`, the raw-TCP
-/// static and FQDN rules, clear the pins from the previous policy, and bump the
+/// L7 `routes` and their `default_verdict`/`default_transport`, the ordered
+/// `tcp_egress` rules, clear the pins from the previous policy, and bump the
 /// generation — all under one `policy` write lock. This is the ONLY entry point
 /// for changing the egress policy, and its single atomic publication is what
 /// closes the reload races: every reader (L7 connect, raw-TCP connect,
@@ -1344,23 +1345,27 @@ pub(crate) fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
     };
 }
 
-/// Record `ips` (from a DNS answer) against `pin` (the `tcp_fqdn` rule the
-/// queried name matched), expiring after `ttl_secs` clamped to
+/// Record `ips` (from a DNS answer) against `qname` (the normalized name whose
+/// lookup was authorized), expiring after `ttl_secs` clamped to
 /// [`PIN_TTL_FLOOR_SECS`, `PIN_TTL_CAP_SECS`]. Called by the DNS stub after it
 /// forwards an allowed answer. A no-op when there are no IPs.
+///
+/// Only the name is stored — not the `tcp_egress` rule it matched — so the
+/// connect path re-evaluates the ordered rules against the *connecting* caller
+/// (see [`resolve_tcp_egress`]) rather than trusting the DNS caller's verdict.
 ///
 /// `generation` is the policy generation in force when the lookup was
 /// authorized; if a policy has since been applied (bumping the generation and
 /// clearing pins) the answer is stale and dropped, so a lookup authorized under
 /// a now-revoked policy can't reinstate its pin.
 ///
-/// Re-resolving the same name refreshes an existing equivalent pin's expiry
-/// rather than appending a duplicate, so a hot name's per-IP list stays bounded
-/// by the number of *distinct* rules that resolve to it, not the resolve rate.
+/// Re-resolving the same name refreshes an existing pin's expiry rather than
+/// appending a duplicate, so a hot name's per-IP list stays bounded by the
+/// number of *distinct* names that resolve to it, not the resolve rate.
 pub(crate) fn pin_dns_answers(
     state: &Arc<ProxyState>,
     ips: &[IpAddr],
-    pin: &FqdnPin,
+    qname: &str,
     ttl_secs: u32,
     generation: u64,
 ) {
@@ -1393,10 +1398,10 @@ pub(crate) fn pin_dns_answers(
     }
     for &ip in ips {
         let entry = policy.pins.entry(ip).or_default();
-        match entry.iter_mut().find(|p| p.pin == *pin) {
+        match entry.iter_mut().find(|p| p.qname == qname) {
             Some(existing) => existing.expiry = expiry,
             None => entry.push(PinnedIp {
-                pin: pin.clone(),
+                qname: qname.to_owned(),
                 expiry,
             }),
         }
@@ -2610,6 +2615,31 @@ pub(crate) mod tests {
         (state, rx)
     }
 
+    /// Build a hostname `tcp_egress` rule so the pin tests can exercise the
+    /// connect-time re-evaluation via `find_matching_tcp_egress`. A `Some(port)`
+    /// scopes the rule via a `HostPort` matcher; `None` uses a bare `Domain`
+    /// matcher (any port).
+    fn fqdn_rule(
+        host: &str,
+        port: Option<u16>,
+        verdict: Verdict,
+        binaries: Option<Vec<std::path::PathBuf>>,
+    ) -> RouteRule {
+        let matcher = match port {
+            Some(p) => crate::routing::RouteMatcher::HostPort(host.to_string(), p),
+            None => crate::routing::RouteMatcher::Domain(host.to_string()),
+        };
+        RouteRule {
+            matcher,
+            verdict,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries,
+        }
+    }
+
     /// A throwaway actor for the `emit_*` unit tests. Off a booted Linux guest
     /// the `/proc` walk finds nothing, so `process` stays `None` — the tests
     /// that care about attribution assert on `src_endpoint`, which is always
@@ -2739,19 +2769,21 @@ pub(crate) mod tests {
     fn pinned_dns_answer_resolves_the_raw_target() {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
-        let pin = FqdnPin {
-            port: Some(5432),
-            verdict: Verdict::Allow,
-            binaries: None,
-        };
-        pin_dns_answers(&state, &[ip], &pin, 300, 0);
+        // A port-scoped fqdn allow rule for the resolved name, plus its pin.
+        state.policy.write().unwrap().tcp_egress = vec![fqdn_rule(
+            "db.example.com",
+            Some(5432),
+            Verdict::Allow,
+            None,
+        )];
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
-        // A connect to the pinned ip:port resolves to the pin's verdict.
+        // A connect to the pinned ip:port re-evaluates the rule and admits it.
         let verdict =
             resolve_tcp_egress(&state, "203.0.113.7:5432", None).expect("pin should match");
         assert_eq!(verdict, Verdict::Allow);
 
-        // A different port on the same ip is not covered by the port-scoped pin.
+        // A different port on the same ip is not covered by the port-scoped rule.
         assert!(resolve_tcp_egress(&state, "203.0.113.7:6379", None).is_none());
         // An ip that was never pinned does not match.
         assert!(resolve_tcp_egress(&state, "198.51.100.1:5432", None).is_none());
@@ -2761,17 +2793,15 @@ pub(crate) mod tests {
     fn expired_pins_do_not_resolve() {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
-        // Insert a pin that is already expired.
+        // Insert a pin that is already expired. Its name still has a live allow
+        // rule, so only the expiry — checked before re-evaluation — keeps it out.
         {
             let mut policy = state.policy.write().unwrap();
+            policy.tcp_egress = vec![fqdn_rule("db.example.com", None, Verdict::Allow, None)];
             policy.pins.insert(
                 ip,
                 vec![PinnedIp {
-                    pin: FqdnPin {
-                        port: None,
-                        verdict: Verdict::Allow,
-                        binaries: None,
-                    },
+                    qname: "db.example.com".to_string(),
                     expiry: Instant::now() - Duration::from_secs(1),
                 }],
             );
@@ -2786,13 +2816,8 @@ pub(crate) mod tests {
     #[test]
     fn pin_dns_answers_is_a_noop_without_ips() {
         let (state, _rx) = test_state();
-        let pin = FqdnPin {
-            port: None,
-            verdict: Verdict::Allow,
-            binaries: None,
-        };
 
-        pin_dns_answers(&state, &[], &pin, 300, 0);
+        pin_dns_answers(&state, &[], "db.example.com", 300, 0);
         assert!(state.policy.read().unwrap().pins.is_empty());
     }
 
@@ -2800,16 +2825,11 @@ pub(crate) mod tests {
     fn pin_dns_answers_refreshes_expiry_instead_of_duplicating() {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.30".parse().unwrap();
-        let pin = FqdnPin {
-            port: Some(5432),
-            verdict: Verdict::Allow,
-            binaries: None,
-        };
 
         // Re-resolving the same name to the same IP must not grow the per-IP list.
-        pin_dns_answers(&state, &[ip], &pin, 300, 0);
-        pin_dns_answers(&state, &[ip], &pin, 300, 0);
-        pin_dns_answers(&state, &[ip], &pin, 300, 0);
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
         let policy = state.policy.read().unwrap();
         assert_eq!(policy.pins.get(&ip).map(Vec::len), Some(1));
@@ -2818,11 +2838,6 @@ pub(crate) mod tests {
     #[test]
     fn pin_dns_answers_bounds_growth_at_the_cap() {
         let (state, _rx) = test_state();
-        let pin = FqdnPin {
-            port: None,
-            verdict: Verdict::Allow,
-            binaries: None,
-        };
         // Fill the store to the cap with distinct, unexpired IPs.
         {
             let mut policy = state.policy.write().unwrap();
@@ -2832,7 +2847,7 @@ pub(crate) mod tests {
                 policy.pins.insert(
                     ip,
                     vec![PinnedIp {
-                        pin: pin.clone(),
+                        qname: "db.example.com".to_string(),
                         expiry,
                     }],
                 );
@@ -2842,7 +2857,7 @@ pub(crate) mod tests {
         // A fresh IP over the cap (nothing expired to reclaim) must be refused,
         // not appended — the map stays bounded.
         let overflow: IpAddr = "203.0.113.250".parse().unwrap();
-        pin_dns_answers(&state, &[overflow], &pin, 300, 0);
+        pin_dns_answers(&state, &[overflow], "db.example.com", 300, 0);
 
         let policy = state.policy.read().unwrap();
         assert_eq!(policy.pins.len(), MAX_PINNED_IPS);
@@ -2852,11 +2867,6 @@ pub(crate) mod tests {
     #[test]
     fn pin_dns_answers_drops_a_stale_generation_insert() {
         let (state, _rx) = test_state();
-        let pin = FqdnPin {
-            port: None,
-            verdict: Verdict::Allow,
-            binaries: None,
-        };
         let ip: IpAddr = "203.0.113.30".parse().unwrap();
 
         // An in-flight DNS response was classified under generation 0, but a
@@ -2869,7 +2879,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         );
-        pin_dns_answers(&state, &[ip], &pin, 300, 0);
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
         assert!(state.policy.read().unwrap().pins.is_empty());
     }
@@ -2877,11 +2887,6 @@ pub(crate) mod tests {
     #[test]
     fn pin_dns_answers_applies_a_current_generation_insert() {
         let (state, _rx) = test_state();
-        let pin = FqdnPin {
-            port: None,
-            verdict: Verdict::Allow,
-            binaries: None,
-        };
         let ip: IpAddr = "203.0.113.31".parse().unwrap();
 
         // After a revocation, a response classified under the new generation
@@ -2894,7 +2899,7 @@ pub(crate) mod tests {
             },
         );
         let generation = state.policy.read().unwrap().generation;
-        pin_dns_answers(&state, &[ip], &pin, 300, generation);
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, generation);
 
         assert!(state.policy.read().unwrap().pins.contains_key(&ip));
     }
@@ -2905,24 +2910,23 @@ pub(crate) mod tests {
         let target = "203.0.113.40:5432";
         let x: IpAddr = "203.0.113.40".parse().unwrap();
 
-        // Policy A: an allow-pin for X plus a CIDR deny covering it. The static
-        // deny wins at resolution, so X is denied under the complete policy.
-        state.policy.write().unwrap().tcp_egress = vec![RouteRule {
-            matcher: crate::routing::RouteMatcher::Cidr("203.0.113.0/24".parse().unwrap()),
-            verdict: Verdict::Deny,
-            transport: Transport::Direct,
-            tls_terminate: false,
-            http_rules: Vec::new(),
-            scheme: None,
-            binaries: None,
-        }];
-        let pin = FqdnPin {
-            port: None,
-            verdict: Verdict::Allow,
-            binaries: None,
-        };
+        // Policy A: a CIDR deny covering X listed BEFORE a hostname allow for
+        // the name that resolves into it. First-match by policy order means the
+        // earlier deny wins, so X is denied under the complete policy.
+        state.policy.write().unwrap().tcp_egress = vec![
+            RouteRule {
+                matcher: crate::routing::RouteMatcher::Cidr("203.0.113.0/24".parse().unwrap()),
+                verdict: Verdict::Deny,
+                transport: Transport::Direct,
+                tls_terminate: false,
+                http_rules: Vec::new(),
+                scheme: None,
+                binaries: None,
+            },
+            fqdn_rule("db.example.com", None, Verdict::Allow, None),
+        ];
         let generation = state.policy.read().unwrap().generation;
-        pin_dns_answers(&state, &[x], &pin, 300, generation);
+        pin_dns_answers(&state, &[x], "db.example.com", 300, generation);
         assert_eq!(
             resolve_tcp_egress(&state, target, None),
             Some(Verdict::Deny)
@@ -2946,12 +2950,15 @@ pub(crate) mod tests {
     fn pinned_binaries_filter_is_rechecked_at_connect() {
         let (state, _rx) = test_state();
         let ip: IpAddr = "203.0.113.20".parse().unwrap();
-        let pin = FqdnPin {
-            port: Some(5432),
-            verdict: Verdict::Allow,
-            binaries: Some(vec![std::path::PathBuf::from("/usr/bin/psql")]),
-        };
-        pin_dns_answers(&state, &[ip], &pin, 300, 0);
+        // A binary-scoped fqdn allow rule; the pin only stores the name, so the
+        // filter is applied fresh against the connecting caller.
+        state.policy.write().unwrap().tcp_egress = vec![fqdn_rule(
+            "db.example.com",
+            Some(5432),
+            Verdict::Allow,
+            Some(vec![std::path::PathBuf::from("/usr/bin/psql")]),
+        )];
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
 
         let psql = crate::peer_process::PeerProcess {
             pid: 200,
@@ -2973,6 +2980,255 @@ pub(crate) mod tests {
         );
         // A different binary is not — the pin's filter fails closed.
         assert!(resolve_tcp_egress(&state, "203.0.113.20:5432", Some(&curl)).is_none());
+    }
+
+    #[test]
+    fn binary_scoped_static_rule_is_not_reopened_by_a_pin() {
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.50".parse().unwrap();
+
+        // A static CIDR rule allows the IP, but only for /usr/bin/psql, listed
+        // BEFORE an unrestricted hostname rule that resolves to the same IP. The
+        // binary-excluded match must not be re-opened by the later unrestricted
+        // rule — the no-reopen guard runs across the single ordered list.
+        state.policy.write().unwrap().tcp_egress = vec![
+            RouteRule {
+                matcher: crate::routing::RouteMatcher::Cidr("203.0.113.0/24".parse().unwrap()),
+                verdict: Verdict::Allow,
+                transport: Transport::Direct,
+                tls_terminate: false,
+                http_rules: Vec::new(),
+                scheme: None,
+                binaries: Some(vec![std::path::PathBuf::from("/usr/bin/psql")]),
+            },
+            fqdn_rule("db.example.com", None, Verdict::Allow, None),
+        ];
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
+
+        let curl = crate::peer_process::PeerProcess {
+            pid: 201,
+            name: "curl".to_string(),
+            exe: Some(std::path::PathBuf::from("/usr/bin/curl")),
+            ancestors: Vec::new(),
+        };
+        let psql = crate::peer_process::PeerProcess {
+            pid: 200,
+            name: "psql".to_string(),
+            exe: Some(std::path::PathBuf::from("/usr/bin/psql")),
+            ancestors: Vec::new(),
+        };
+
+        // curl is excluded by the static rule's binary filter. The unrestricted
+        // pin must NOT re-open the connection — the binary-excluded match fails
+        // closed rather than falling through to the pin.
+        assert!(resolve_tcp_egress(&state, "203.0.113.50:5432", Some(&curl)).is_none());
+        // psql is admitted by the static rule directly.
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.50:5432", Some(&psql)),
+            Some(Verdict::Allow)
+        );
+    }
+
+    #[test]
+    fn pin_reevaluates_an_earlier_caller_scoped_deny() {
+        // Ordered fqdn rules: deny for anything under `bad-parent`, then allow
+        // `client`. A direct client skips the deny and creates a pin; a client
+        // launched under `bad-parent` must still hit the earlier deny at
+        // connect, not ride the pin the direct client left behind. The pin
+        // stores only the QNAME, so the ordered rules are re-evaluated against
+        // the connecting caller's ancestry.
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.60".parse().unwrap();
+        state.policy.write().unwrap().tcp_egress = vec![
+            fqdn_rule(
+                "db.example.com",
+                None,
+                Verdict::Deny,
+                Some(vec![std::path::PathBuf::from("/usr/bin/bad-parent")]),
+            ),
+            fqdn_rule(
+                "db.example.com",
+                None,
+                Verdict::Allow,
+                Some(vec![std::path::PathBuf::from("/usr/bin/client")]),
+            ),
+        ];
+
+        // The direct client's DNS lookup lands on the allow rule and pins the IP.
+        let direct = crate::peer_process::PeerProcess {
+            pid: 300,
+            name: "client".to_string(),
+            exe: Some(std::path::PathBuf::from("/usr/bin/client")),
+            ancestors: Vec::new(),
+        };
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
+
+        // Direct client connecting is admitted by the allow rule.
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.60:5432", Some(&direct)),
+            Some(Verdict::Allow)
+        );
+
+        // A client under `bad-parent` matches the earlier deny at connect and is
+        // refused with an explicit Deny, even though the direct client's pin
+        // already exists — the name-scoped deny is terminal, not a fall-through.
+        let under_bad_parent = crate::peer_process::PeerProcess {
+            pid: 301,
+            name: "client".to_string(),
+            exe: Some(std::path::PathBuf::from("/usr/bin/client")),
+            ancestors: vec![std::path::PathBuf::from("/usr/bin/bad-parent")],
+        };
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.60:5432", Some(&under_bad_parent)),
+            Some(Verdict::Deny),
+            "the earlier caller-scoped deny must apply to the reused pin"
+        );
+    }
+
+    #[test]
+    fn pin_resolves_per_destination_port_across_rules() {
+        // Two allows for the same host on different ports. Connect-time
+        // evaluation must pick the rule matching the actual destination port,
+        // not just the first hostname match — otherwise the second port is
+        // wrongly denied.
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.70".parse().unwrap();
+        state.policy.write().unwrap().tcp_egress = vec![
+            fqdn_rule("db.example.com", Some(5432), Verdict::Allow, None),
+            fqdn_rule("db.example.com", Some(6379), Verdict::Allow, None),
+        ];
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
+
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.70:5432", None),
+            Some(Verdict::Allow),
+            "the first port-scoped allow must admit its port"
+        );
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.70:6379", None),
+            Some(Verdict::Allow),
+            "a later port-scoped allow must admit its port too"
+        );
+        // A port neither rule covers stays unmatched.
+        assert!(resolve_tcp_egress(&state, "203.0.113.70:9999", None).is_none());
+    }
+
+    #[test]
+    fn pin_honors_a_port_scoped_deny_before_an_allow() {
+        // Ordered deny :5432 then allow :6379 for one host. The name resolves
+        // and pins (DNS is port-blind), but at connect the deny binds :5432 and
+        // the allow binds :6379.
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.71".parse().unwrap();
+        state.policy.write().unwrap().tcp_egress = vec![
+            fqdn_rule("db.example.com", Some(5432), Verdict::Deny, None),
+            fqdn_rule("db.example.com", Some(6379), Verdict::Allow, None),
+        ];
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
+
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.71:5432", None),
+            Some(Verdict::Deny),
+            "the port-scoped deny must bind its port"
+        );
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.71:6379", None),
+            Some(Verdict::Allow),
+            "the later allow must bind its own port"
+        );
+    }
+
+    #[test]
+    fn pin_shared_ip_resolves_by_policy_order_not_insertion_order() {
+        // Two names resolve to one IP (CDN-style). The rules are ordered deny
+        // `blocked` BEFORE allow `db`, so the earlier deny wins — and that
+        // outcome must not depend on which name's answer was pinned first.
+        let rules = || {
+            vec![
+                fqdn_rule("blocked.example.com", None, Verdict::Deny, None),
+                fqdn_rule("db.example.com", None, Verdict::Allow, None),
+            ]
+        };
+        let ip: IpAddr = "203.0.113.80".parse().unwrap();
+
+        for order in [
+            ["blocked.example.com", "db.example.com"],
+            ["db.example.com", "blocked.example.com"],
+        ] {
+            let (state, _rx) = test_state();
+            state.policy.write().unwrap().tcp_egress = rules();
+            for name in order {
+                pin_dns_answers(&state, &[ip], name, 300, 0);
+            }
+            assert_eq!(
+                resolve_tcp_egress(&state, "203.0.113.80:5432", None),
+                Some(Verdict::Deny),
+                "the earlier deny rule wins regardless of pin insertion order"
+            );
+        }
+    }
+
+    #[test]
+    fn earlier_hostname_rule_beats_a_later_ip_rule() {
+        // The reviewer's regression: a hostname `ask` listed BEFORE a CIDR
+        // `allow` that covers the resolved IP. Splitting the list into IP-first
+        // and FQDN-second let the later CIDR allow bypass the earlier ask; a
+        // single ordered pass must honour the earlier ask.
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.90".parse().unwrap();
+        state.policy.write().unwrap().tcp_egress = vec![
+            fqdn_rule("db.example.com", Some(5432), Verdict::Ask, None),
+            RouteRule {
+                matcher: crate::routing::RouteMatcher::CidrPort(
+                    "203.0.113.0/24".parse().unwrap(),
+                    5432,
+                ),
+                verdict: Verdict::Allow,
+                transport: Transport::Direct,
+                tls_terminate: false,
+                http_rules: Vec::new(),
+                scheme: None,
+                binaries: None,
+            },
+        ];
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
+
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.90:5432", None),
+            Some(Verdict::Ask),
+            "the earlier hostname rule must win over the later CIDR allow"
+        );
+    }
+
+    #[test]
+    fn earlier_ip_rule_beats_a_later_hostname_rule() {
+        // The mirror of the above: a CIDR `allow` listed BEFORE a hostname
+        // `deny` for a name resolving into it. Global first-match means the
+        // earlier IP allow wins, so the pinned deny does not apply.
+        let (state, _rx) = test_state();
+        let ip: IpAddr = "203.0.113.95".parse().unwrap();
+        state.policy.write().unwrap().tcp_egress = vec![
+            RouteRule {
+                matcher: crate::routing::RouteMatcher::CidrPort(
+                    "203.0.113.0/24".parse().unwrap(),
+                    5432,
+                ),
+                verdict: Verdict::Allow,
+                transport: Transport::Direct,
+                tls_terminate: false,
+                http_rules: Vec::new(),
+                scheme: None,
+                binaries: None,
+            },
+            fqdn_rule("db.example.com", Some(5432), Verdict::Deny, None),
+        ];
+        pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
+
+        assert_eq!(
+            resolve_tcp_egress(&state, "203.0.113.95:5432", None),
+            Some(Verdict::Allow),
+            "the earlier CIDR allow must win over the later hostname deny"
+        );
     }
 
     #[test]

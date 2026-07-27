@@ -854,17 +854,17 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             };
             // egress.tcp is the raw-L4 list: absent means none, present-but-
             // invalid fails closed alongside the l7 list.
-            let tcp_result: Result<crate::routing::TcpEgress, String> = match &egress {
+            let tcp_result: Result<Vec<crate::routing::RouteRule>, String> = match &egress {
                 Err(e) => Err(e.clone()),
-                Ok(Some(e)) if e.tcp.is_null() => Ok(crate::routing::TcpEgress::default()),
+                Ok(Some(e)) if e.tcp.is_null() => Ok(Vec::new()),
                 Ok(Some(e)) if e.tcp.is_array() => crate::routing::parse_tcp_egress(&e.tcp),
                 Ok(Some(_)) => Err("egress.tcp must be an array".to_string()),
-                Ok(None) => Ok(crate::routing::TcpEgress::default()),
+                Ok(None) => Ok(Vec::new()),
             };
 
             match l7_value {
                 Ok(Some(l7_value)) => match (parse_proxy_routes(l7_value), tcp_result) {
-                    (Ok(parsed_routes), Ok(tcp_rules)) => {
+                    (Ok(parsed_routes), Ok(tcp_egress_rules)) => {
                         let mut route_rules = Vec::with_capacity(parsed_routes.len());
                         let mut cert_map: HashMap<String, crate::proxy::ClientCertConfig> =
                             HashMap::new();
@@ -920,8 +920,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                             );
                         tracing::info!(
                             route_count = route_rules.len(),
-                            tcp_egress_count = tcp_rules.ip_rules.len(),
-                            tcp_fqdn_count = tcp_rules.fqdn_rules.len(),
+                            tcp_egress_count = tcp_egress_rules.len(),
                             client_cert_count = cert_map.len(),
                             client_cert_keys = ?cert_map.keys().collect::<Vec<_>>(),
                             verdict = ?default_verdict,
@@ -929,18 +928,18 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                             "proxy routes, tcp egress, defaults, and forward certs updated from policy"
                         );
                         *state.client_certs.write().unwrap() = cert_map;
-                        // Publish routes, defaults, and the static/fqdn tcp rules,
-                        // clear the previous policy's pins, and bump the generation
-                        // in one atomic swap, so no connection or DNS lookup can
-                        // combine these with a superseded policy's fields.
+                        // Publish routes, defaults, and the ordered tcp egress
+                        // rules, clear the previous policy's pins, and bump the
+                        // generation in one atomic swap, so no connection or DNS
+                        // lookup can combine these with a superseded policy's
+                        // fields.
                         crate::proxy::apply_network_policy(
                             state,
                             crate::proxy::NetworkPolicy {
                                 routes: route_rules,
                                 default_verdict,
                                 default_transport,
-                                tcp_egress: tcp_rules.ip_rules,
-                                tcp_fqdn: tcp_rules.fqdn_rules,
+                                tcp_egress: tcp_egress_rules,
                                 ..Default::default()
                             },
                         );
@@ -2661,7 +2660,6 @@ mod tests {
 
         assert!(state.policy.read().unwrap().routes.is_empty());
         assert!(state.policy.read().unwrap().tcp_egress.is_empty());
-        assert!(state.policy.read().unwrap().tcp_fqdn.is_empty());
         assert_eq!(
             state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny,
@@ -2753,7 +2751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn egress_tcp_hostname_populates_fqdn_list() {
+    async fn egress_tcp_preserves_hostname_and_ip_rules_in_one_ordered_list() {
         let (_proxy_server, state) = crate::proxy::ProxyServer::new(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2763,8 +2761,9 @@ mod tests {
         );
         let proxy_state = Some(state.clone());
 
-        // A hostname rule lands in tcp_fqdn (for DNS-answer pinning); an IP rule
-        // lands in tcp_egress (static match). Both from one egress.tcp list.
+        // A hostname rule and an IP rule from one egress.tcp list land in a
+        // single ordered `tcp_egress` vec, keeping their original positions so
+        // connect resolution can honour global first-match order.
         let policy_json = serde_json::json!({
             "network": {
                 "egress": {
@@ -2780,8 +2779,16 @@ mod tests {
 
         apply_local_policy(&policy_json.to_string(), &proxy_state).await;
 
-        assert_eq!(state.policy.read().unwrap().tcp_fqdn.len(), 1);
-        assert_eq!(state.policy.read().unwrap().tcp_egress.len(), 1);
+        let policy = state.policy.read().unwrap();
+        assert_eq!(policy.tcp_egress.len(), 2);
+        assert!(matches!(
+            &policy.tcp_egress[0].matcher,
+            crate::routing::RouteMatcher::HostPort(h, 5432) if h == "db.internal"
+        ));
+        assert!(matches!(
+            &policy.tcp_egress[1].matcher,
+            crate::routing::RouteMatcher::CidrPort(_, 6379)
+        ));
     }
 
     // Test with the exact JSON the Go CLI produces for a real k3s kubeconfig.
