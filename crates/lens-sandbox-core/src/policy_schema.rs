@@ -229,7 +229,7 @@ pub struct RouteRule {
 }
 
 /// HTTP method/path restriction within a route rule.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRule {
     /// HTTP method (GET, POST, * for any). Omit for any method.
     #[serde(default, skip_serializing_if = "Option::is_none")]

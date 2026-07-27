@@ -49,7 +49,7 @@ use tokio::time::timeout;
 
 use crate::peer_process::{PeerProcess, resolve_udp_offloaded};
 use crate::proxy::{ProxyState, emit_deny_event, pin_dns_answers};
-use crate::routing::{HostnameMatch, hostname_match_for_caller};
+use crate::routing::{HostnameMatch, PortScope, hostname_match_for_caller};
 use crate::sock_mark;
 
 /// Receive buffer for incoming DNS *queries*. 1232 is the EDNS0-recommended
@@ -300,15 +300,18 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
     // generation atomically, so an equal generation at pin-insertion time still
     // proves the pin matches the policy in force. One `tcp_egress` evaluation
     // decides both whether the name resolves and whether to pin: the IP-only
-    // matchers (`Cidr`/`CidrPort`) are transparent to the hostname gate, so
-    // `should_pin` is exactly "a hostname tcp rule allows this name", and the
+    // matchers (`Cidr`/`CidrPort`) are transparent to the hostname gate, so the
     // stub records the answer IPs against the QNAME for the connect layer to
     // re-evaluate (port-aware) against the connector. Computing it from the same
     // match the verdict uses is what keeps the two from ever disagreeing.
     let policy = state.policy.read().unwrap();
     let generation = policy.generation;
-    let fqdn_match = hostname_match_for_caller(&policy.tcp_egress, &normalized, caller);
-    let should_pin = fqdn_match == HostnameMatch::Allowed;
+    let fqdn_match =
+        hostname_match_for_caller(&policy.tcp_egress, &normalized, caller, PortScope::PerPort);
+    // Pin on any hostname tcp match, deny included: the raw path can only bind
+    // hostname rules through pins, and a pin carries no verdict — connect
+    // re-evaluates.
+    let should_pin = fqdn_match != HostnameMatch::Unmatched;
 
     let allow = |qname| {
         if should_suppress {
@@ -337,7 +340,8 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
     // enforcement still applies at the subsequent TCP step. `caller` applies
     // any `binaries` filter, so a name reachable only by other binaries fails
     // closed here just as it would at the TCP layer.
-    let matched = hostname_match_for_caller(&policy.routes, &normalized, caller);
+    let matched =
+        hostname_match_for_caller(&policy.routes, &normalized, caller, PortScope::FirstMatch);
     drop(policy);
     match matched {
         HostnameMatch::Allowed => return allow(normalized),
@@ -723,11 +727,12 @@ mod tests {
 
         // A reload bumps the generation and re-publishes the fqdn rules in one
         // atomic swap; the next classify captures the new generation together
-        // with the fqdn read.
+        // with the fqdn read. The rule set has to actually differ — re-applying
+        // an unchanged egress policy is deliberately a no-op.
         crate::proxy::apply_network_policy(
             &state,
             crate::proxy::NetworkPolicy {
-                tcp_egress: vec![fqdn_allow("db.internal")],
+                tcp_egress: vec![fqdn_allow("db.internal"), fqdn_allow("other.internal")],
                 ..Default::default()
             },
         );
@@ -796,6 +801,33 @@ mod tests {
                 "a routes-allow must not carry an fqdn pin from another snapshot"
             ),
             other => panic!("policy B must allow H at DNS, got: {}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn a_hostname_tcp_deny_pins_so_it_can_bind_at_connect() {
+        let tcp_deny = RouteRule {
+            matcher: RouteMatcher::HostPort("db.internal".to_string(), 443),
+            verdict: Verdict::Deny,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: None,
+        };
+        let state = state_with_routes(vec![rule("*")]);
+        state.policy.write().unwrap().tcp_egress = vec![tcp_deny];
+
+        let packet = make_query("db.internal", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Allow { should_pin, .. } => assert!(
+                should_pin,
+                "a hostname tcp deny must pin, or the connect layer can't apply it"
+            ),
+            other => panic!(
+                "expected Allow from the l7 catch-all, got: {}",
+                describe(&other)
+            ),
         }
     }
 
