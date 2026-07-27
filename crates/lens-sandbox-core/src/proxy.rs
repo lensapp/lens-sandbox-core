@@ -895,9 +895,6 @@ async fn handle_http_forward(
     Ok(())
 }
 
-/// Rewrite an HTTP forward proxy request from absolute URL to relative path.
-/// Input:  "GET http://host:port/path HTTP/1.1\r\nHost: ...\r\n..."
-/// Output: "GET /path HTTP/1.1\r\nHost: host:port\r\n..."
 /// Whether the rewritten head keeps the client's connection semantics or forces
 /// the origin to close after one response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -912,6 +909,9 @@ enum Reuse {
     OneRequestOnly,
 }
 
+/// Rewrite an HTTP forward proxy request from absolute URL to relative path.
+/// Input:  "GET http://host:port/path HTTP/1.1\r\nHost: ...\r\n..."
+/// Output: "GET /path HTTP/1.1\r\nHost: host:port\r\n..."
 fn rewrite_http_forward_request(
     header_str: &str,
     path: &str,
@@ -1370,6 +1370,10 @@ pub(crate) struct TcpDecision {
     /// Owned: the name may come from a pin borrowed under the policy lock, and
     /// re-deriving it later could observe a different pin after a reload.
     pub(crate) matched_target: Option<String>,
+    /// The policy generation this verdict was read from. Stamped under the same
+    /// lock that produced the verdict, so a reload landing between the two
+    /// cannot leave a stale verdict wearing the current generation.
+    pub(crate) generation: u64,
 }
 
 /// The `egress.tcp` table's decision for one destination, or `None` when no
@@ -1400,16 +1404,19 @@ fn tcp_egress_verdict(
     let target = TcpTarget::at(hostname, &pinned_qnames);
     let found = find_matching_tcp_egress(&policy.tcp_egress, target, port, caller);
     let matched_target = found.matched_name.map(|n| format!("{n}:{port}"));
+    let generation = policy.generation;
     match found.outcome {
         RouteOutcome::Matched(rule) => Some(TcpDecision {
             verdict: rule.verdict,
             matched_target,
+            generation,
         }),
         RouteOutcome::NoMatch {
             binary_filtered: true,
         } => Some(TcpDecision {
             verdict: Verdict::Deny,
             matched_target,
+            generation,
         }),
         RouteOutcome::NoMatch { .. } => None,
     }
@@ -1481,14 +1488,15 @@ async fn connect_egress_under_policy(
     .await
 }
 
-/// Whether the `egress.tcp` table, as it stands *now*, still admits this
-/// resolved address. Only an allow (or no claim at all) admits: no gate can run
-/// here, so an `ask` refuses rather than answering more permissively than the
-/// door that would have put it to a human.
+/// Whether the `egress.tcp` table, as it stands *now*, admits this resolved
+/// address. An `ask` refuses: no gate can run inside a dial, so answering
+/// otherwise would be more permissive than the door that puts it to a human. No
+/// claim at all admits, because the destination was authorized by the L7 table
+/// and the tcp table simply has nothing to say about it.
 ///
-/// Every door commits through this one question, which is what keeps a verdict
-/// from outliving the rule that produced it — see the re-check in
-/// [`handle_raw_passthrough`].
+/// That last part is why [`handle_raw_passthrough`]'s post-reload re-check does
+/// not reuse this: there, an unclaimed destination means the rule that justified
+/// splicing it raw is gone.
 fn tcp_egress_admits(
     state: &Arc<ProxyState>,
     ip: IpAddr,
@@ -1686,20 +1694,28 @@ async fn handle_raw_passthrough(
         return Ok(());
     }
 
-    // The generation this verdict — and any approval of it — belongs to. An
-    // `ask` parks the connection for up to `DECISION_TIMEOUT`, long enough for a
-    // policy to land.
-    let granted_under = state.policy.read().unwrap().generation;
-
     if !raw_verdict_admits(state, &raw_target, decision, actor).await {
         return Ok(());
     }
 
-    // Consent is scoped to the generation it was given under, so a reload sends
-    // the destination back through the table. The proxy doors get this from
-    // re-reading at their dial; this door resolves nothing, so it asks here.
-    if state.policy.read().unwrap().generation != granted_under
-        && !tcp_egress_admits(state, orig_dst.ip(), orig_dst.port(), actor.process())
+    // An `ask` parks the connection for up to `DECISION_TIMEOUT`, long enough
+    // for a policy to land, and consent is scoped to the generation that granted
+    // it. On a reload only a rule the *new* policy carries can re-admit: a
+    // vanished rule refuses rather than consenting by silence, which is the one
+    // way this differs from the dial guard, where an unclaimed destination is
+    // simply the L7 table's business. A reload also clears the pins, so a
+    // hostname rule cannot re-match an address either — the connection is
+    // dropped and the workload redials to be judged fresh.
+    if state.policy.read().unwrap().generation != decision.generation
+        && !matches!(
+            tcp_egress_verdict(
+                state,
+                &orig_dst.ip().to_string(),
+                orig_dst.port(),
+                actor.process()
+            ),
+            Some(d) if d.verdict == Verdict::Allow
+        )
     {
         emit_policy_deny_connect(state, &raw_target, "policy-deny", actor);
         tracing::info!(target = %raw_target, "raw passthrough DENIED (policy reloaded)");
@@ -4214,6 +4230,39 @@ pub(crate) mod tests {
         assert!(
             !events.iter().any(|e| e["result"] == "success"),
             "nothing may splice under a rule that no longer exists; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_deleted_during_the_dialog_refuses_the_approved_splice() {
+        // Revoking by deletion is the ordinary way to withdraw a grant, and it
+        // must land as hard as swapping in a deny. Silence from the new table is
+        // not consent: the rule that justified splicing this raw is gone.
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "203.0.113.0/24:5432", "verdict": "ask"}]"#,
+        );
+
+        raw_passthrough_answering(
+            &state,
+            &mut rx,
+            "203.0.113.9:5432".parse().unwrap(),
+            crate::protocol::Decision::AllowAlways,
+            || reload_tcp_rules(&state, "[]"),
+        )
+        .await;
+
+        let events = drain_audit(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["metadata"]["reason"] == "policy-deny"),
+            "a deleted rule must refuse the approved splice; got {events:#?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["result"] == "success"),
+            "nothing may splice once the rule is gone; got {events:#?}"
         );
     }
 
