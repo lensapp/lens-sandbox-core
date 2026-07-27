@@ -1718,6 +1718,14 @@ async fn raw_verdict_admits(
             false
         }
         Verdict::Ask => {
+            // The dialog names the destination the way the policy author wrote
+            // it, so the gate events carry that name and stay correlated with
+            // the prompt. That name is not enough on its own: on the transparent
+            // door it came from a DNS pin, and several names can share one
+            // address, so it attributes the attempt to an arbitrary one of them.
+            // An allow is followed by a success audit naming the address; a
+            // denial has to record it here or the trail never says where the
+            // workload was going.
             let shown = decision.matched_target.as_deref().unwrap_or(target);
             let action_str = format!("CONNECT {shown}");
             let answer = crate::gate::gate_or_deny(
@@ -1733,6 +1741,7 @@ async fn raw_verdict_admits(
                 tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough ALLOWED (gated)");
             } else {
                 emit_gate_denied(state, &action_str, answer);
+                emit_audit(state, target, "failure", 403, actor);
                 tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough DENIED (gated)");
             }
             answer.is_allow()
@@ -4238,6 +4247,50 @@ pub(crate) mod tests {
                 .iter()
                 .any(|e| e["metadata"]["reason"] == "policy-deny"),
             "an approval under an unchanged policy must be honored; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gate_denied_raw_connection_audits_the_address_it_was_reaching() {
+        // The dialog names the pinned hostname, because that is the rule the
+        // author wrote. The trail must still name the address: several names can
+        // pin to one address and `matching_name` takes the first, so the name
+        // alone attributes a denied attempt to an arbitrary one of them.
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "db.internal:5432", "verdict": "ask"}]"#,
+        );
+        pin_dns_answers(
+            &state,
+            &["203.0.113.9".parse().unwrap()],
+            "db.internal",
+            300,
+            0,
+        );
+
+        raw_passthrough_answering(
+            &state,
+            &mut rx,
+            "203.0.113.9:5432".parse().unwrap(),
+            crate::protocol::Decision::DenyOnce,
+            || {},
+        )
+        .await;
+
+        let events = drain_audit(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["action"] == "CONNECT db.internal:5432"
+                    && e["metadata"]["reason"] == "user-denied-once"),
+            "the gate event must stay correlated with the prompt; got {events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["action"] == "CONNECT 203.0.113.9:5432" && e["result"] == "failure"),
+            "the denied attempt must record the address; got {events:#?}"
         );
     }
 
