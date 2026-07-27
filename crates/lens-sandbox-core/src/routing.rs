@@ -168,28 +168,6 @@ fn parse_cidr_port(pattern: &str) -> Option<(IpNet, u16)> {
     Some((net_str.parse().ok()?, port_str.parse().ok()?))
 }
 
-/// Parse the `egress.tcp` list into ONE ordered `Vec<RouteRule>`, preserving the
-/// original rule order. Connect resolution ([`find_matching_tcp_egress`]) walks
-/// this single list in policy order so a static IP rule and a hostname (pinned)
-/// rule compete by their real position — an earlier rule always wins, whichever
-/// kind it is. The matcher kind is the connect-vs-pin discriminator:
-/// `CidrPort` matches the resolved dst IP directly; `HostPort` matches only a
-/// dst IP that a live DNS pin bound to a name the rule covers.
-///
-/// Every `egress.tcp` rule MUST carry a port. A raw connection is opaquely
-/// spliced with no inspection, so a portless "any port to this host/subnet"
-/// grant is a broad hole; requiring a port keeps rules least-privilege and
-/// removes the ambiguity where a bare IP literal (which does not parse as a
-/// prefixed `IpNet`) fell through to a `Domain` matcher that could never match
-/// a resolved IP — a silently dead rule, and a dead *deny* fails open. A
-/// portless pattern is rejected here, which fails the whole policy closed.
-///
-/// An IP-literal `HostPort` (`10.0.0.5:5432`) is normalized to `CidrPort` so it
-/// stays a direct IP match rather than a hostname rule: the discriminator is
-/// then purely the matcher kind, and the DNS gate (which skips `CidrPort`,
-/// never `HostPort`) can share this list without an IP literal leaking in as a
-/// QNAME. Normalization is scoped to `egress.tcp` — the L7 `parse_matcher` path
-/// keeps its string semantics untouched.
 /// Whether two host patterns can name the same host, either one possibly a
 /// wildcard. Two disjoint wildcards that nonetheless share hosts (`*.a.com` vs
 /// `b.*.com`) are not detected: this backs a warning, so a miss costs a log
@@ -229,6 +207,27 @@ pub(crate) fn shadowed_http_rules<'a>(
     shadowed
 }
 
+/// Parse the `egress.tcp` list into ONE ordered `Vec<RouteRule>`, preserving the
+/// original rule order. Connect resolution ([`find_matching_tcp_egress`]) walks
+/// this single list in policy order so a static IP rule and a hostname (pinned)
+/// rule compete by their real position — an earlier rule always wins, whichever
+/// kind it is. The matcher kind is the connect-vs-pin discriminator:
+/// `CidrPort` matches the resolved dst IP directly; `HostPort` matches only a
+/// dst IP that a live DNS pin bound to a name the rule covers.
+///
+/// Every rule MUST carry a port, so only the port-scoped matchers survive here.
+/// A raw connection is spliced opaquely, so a portless "any port to this
+/// host/subnet" grant is a broad hole. Rejecting one fails the whole policy
+/// closed, which is the point: a rule that can never match is worse than no rule
+/// at all, because a dead *deny* fails open. That is the standard every shape
+/// below is held to.
+///
+/// An IP-literal `HostPort` (`10.0.0.5:5432`) is normalized to `CidrPort` so it
+/// stays a direct IP match rather than a hostname rule: the discriminator is
+/// then purely the matcher kind, and the DNS gate (which skips `CidrPort`,
+/// never `HostPort`) can share this list without an IP literal leaking in as a
+/// QNAME. Normalization is scoped to `egress.tcp` — the L7 `parse_matcher` path
+/// keeps its string semantics untouched.
 pub fn parse_tcp_egress(json: &serde_json::Value) -> Result<Vec<RouteRule>, String> {
     let arr = json.as_array().ok_or("egress.tcp must be an array")?;
     let mut out = Vec::with_capacity(arr.len());
@@ -236,12 +235,9 @@ pub fn parse_tcp_egress(json: &serde_json::Value) -> Result<Vec<RouteRule>, Stri
         let raw: crate::policy_schema::TcpEgressRule =
             serde_json::from_value(v.clone()).map_err(|e| format!("invalid tcp rule: {e}"))?;
         let matcher = normalize_ip_literal(parse_matcher(&raw.match_pattern)?);
-        // A port is mandatory: only the port-scoped matchers are accepted. A
-        // bare IP/CIDR/hostname is rejected rather than silently admitted at any
-        // port (or, for a bare IP, silently doing nothing at all). Port 0 is
-        // likewise rejected — no connection can target it, so such a rule would
-        // resolve and pin at DNS yet never match a real connect: the same
-        // silently-dead class the port requirement exists to close.
+        // Port 0 joins the portless patterns in being rejected: no connection
+        // can target it, so the rule would resolve and pin at DNS yet never
+        // match a real connect.
         match matcher {
             RouteMatcher::CidrPort(_, 0) | RouteMatcher::HostPort(_, 0) => {
                 return Err(format!(
@@ -280,8 +276,7 @@ pub fn parse_tcp_egress(json: &serde_json::Value) -> Result<Vec<RouteRule>, Stri
 ///
 /// The literal is canonicalized first, so a mapped form (`[::ffff:10.0.0.5]`)
 /// folds to the IPv4 `/32` it actually addresses rather than a `/128` V6 net
-/// that the always-V4 `SO_ORIGINAL_DST` could never match — a silently dead
-/// rule, and a dead deny fails open.
+/// that the always-V4 `SO_ORIGINAL_DST` could never match.
 fn normalize_ip_literal(matcher: RouteMatcher) -> RouteMatcher {
     match matcher {
         RouteMatcher::HostPort(host, port) => match host.parse::<std::net::IpAddr>() {

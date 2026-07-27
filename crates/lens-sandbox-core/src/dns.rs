@@ -293,13 +293,10 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         query.query_type(),
         RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB | RecordType::ANY
     );
-    // Read both tables and the generation under ONE policy snapshot: the
-    // verdict, the pin it implies, and the generation stamped on that pin must
-    // come from the same policy, or a reload could pair one policy's allow with
-    // another's pin. The generation check at pin-insertion time then still
-    // proves the pin matches the policy in force. The same `tcp_egress`
-    // evaluation decides whether the name resolves and whether to pin, so those
-    // two can never disagree.
+    // Both tables and the generation come from one snapshot (see `NetworkPolicy`),
+    // so the verdict, the pin it implies, and the generation stamped on that pin
+    // all belong to the same policy. The same `tcp_egress` evaluation decides
+    // whether the name resolves and whether to pin, so those two cannot disagree.
     let policy = state.policy.read().unwrap();
     let generation = policy.generation;
     let tcp_match =
