@@ -208,11 +208,13 @@ pub async fn gate_or_deny(
     let timeout = *state.decision_timeout.read().unwrap();
     let decision = await_decision(rx, timeout, Decision::Timeout).await;
     cleanup_after_decision(&state.pending, action, &id);
-    if decision.is_allow() {
-        // Let the DNS stub resolve this host even with no standing route:
-        // "allow once" persists none, and "allow always"'s route arrives in
-        // a later `policy` frame this request can't await. Lowercased to
-        // match the stub's normalized QNAME (see `dns::classify_query`).
+    // Let the DNS stub resolve this host even with no standing route: "allow
+    // once" persists none, and "allow always"'s route arrives in a later
+    // `policy` frame this request can't await. Lowercased to match the stub's
+    // normalized QNAME (see `dns::classify_query`), and skipped for an address —
+    // the raw doors gate on one when no rule named the destination, and a QNAME
+    // is never an IP literal, so it could only ever sit in the set unmatched.
+    if decision.is_allow() && host.parse::<std::net::IpAddr>().is_err() {
         state
             .gate_resolved_hosts
             .write()
@@ -427,6 +429,29 @@ mod tests {
                 .unwrap()
                 .contains("example.com"),
             "an allow decision must record the host (lowercased) for the DNS stub"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approved_address_is_not_recorded_for_dns_resolution() {
+        // A raw `ask` that no rule named gates on the bare address. The stub
+        // compares this set against QNAMEs, so an address could only ever sit
+        // there unmatched.
+        let (state, mut rx) = test_state();
+        let handle = tokio::spawn({
+            let state = state.clone();
+            async move { gate(&state, "203.0.113.9", "CONNECT 203.0.113.9:5432").await }
+        });
+        let frame = rx.recv().await.unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&frame).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(resolve_pending(&state, &id, Decision::AllowAlways));
+        assert_eq!(handle.await.unwrap(), Decision::AllowAlways);
+        assert!(
+            state.gate_resolved_hosts.read().unwrap().is_empty(),
+            "an address is not a name the stub can ever match"
         );
     }
 
