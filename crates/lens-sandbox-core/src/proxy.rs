@@ -1622,8 +1622,11 @@ pub(crate) fn pin_dns_answers(
         return;
     }
     // Backstop against unbounded growth (see MAX_PINNED_ENTRIES): once at the
-    // cap, drop everything expired; if still at the cap, refuse to grow. The
-    // follow-up connect then finds no pin and is denied — fail closed.
+    // cap, drop everything expired; if still at the cap, refuse to grow. A
+    // hostname `egress.tcp` rule still binds without a pin, because both the
+    // CONNECT/forward doors and the transparent TLS door match it against the
+    // name the client supplied; what a missing pin costs is the raw splice, not
+    // the rule.
     let total_entries =
         |pins: &HashMap<IpAddr, Vec<PinnedIp>>| pins.values().map(Vec::len).sum::<usize>();
     if total_entries(&policy.pins) >= MAX_PINNED_ENTRIES {
@@ -1955,6 +1958,31 @@ async fn handle_transparent_tls(
 
     if let Err(e) = validate_connect_target(&target_host) {
         emit_transparent_deny(state, orig_dst, &format!("blocked-target: {e}"));
+        drop(start);
+        return Ok(());
+    }
+
+    // `egress.tcp` claims are final on every door — see `tcp_egress_verdict`.
+    // The check in `handle_transparent_connection` had only the address, so a
+    // hostname rule bound there only through a live DNS pin. The SNI is the
+    // same client-supplied name the CONNECT door matches by, so the rule has
+    // to bind here too — otherwise a name whose pin has lapsed slips past a
+    // deny this door alone would miss, and the workload picks the door.
+    //
+    // A claim can only refuse here: the ClientHello is already consumed, so
+    // there is nothing left to splice. That includes an allow — the developer
+    // asked for a raw splice, and MITM-ing it instead is the wrong answer.
+    // Re-resolving the name repins it and the pre-classification check takes
+    // the connection down the raw path where it belongs.
+    if let Some(decision) =
+        tcp_egress_verdict_for_hostport(state, &target_host, 443, actor.process())
+    {
+        tracing::info!(
+            target = %target_host,
+            verdict = ?decision.verdict,
+            "transparent TLS DENIED (egress.tcp claims this name, no pin to splice through)"
+        );
+        emit_policy_deny_connect(state, &target_host, "egress-tcp-unpinned", &actor);
         drop(start);
         return Ok(());
     }
@@ -4116,6 +4144,63 @@ pub(crate) mod tests {
             response.starts_with("HTTP/1.1 403"),
             "tcp deny must be terminal on the http forward path; got {response:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn transparent_tls_applies_a_hostname_tcp_deny_without_a_pin() {
+        // The other doors read the name off the request; this one reads it off
+        // the SNI. Binding hostname rules only through a live DNS pin would
+        // make a lapsed pin — a long-TTL name, or a pin store the workload
+        // filled — the difference between a deny and an MITM'd allow, and the
+        // workload picks the door.
+        let (state, mut rx) = test_state();
+        install_catch_all_allow(&state);
+        install_tcp_deny(&state, "db.internal:443");
+        // No `pin_dns_answers`: the address is unknown to the tcp table, so the
+        // pre-classification check in `handle_transparent_connection` passes.
+        assert!(
+            tcp_egress_verdict(&state, "203.0.113.9", 443, None).is_none(),
+            "the address alone must not match, or the test proves nothing"
+        );
+
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let name = rustls::pki_types::ServerName::try_from("db.internal").unwrap();
+            // The handler closes on us; we only need the ClientHello on the wire.
+            let _ = connector.connect(name, stream).await;
+        });
+
+        let (server, peer) = listener.accept().await.unwrap();
+        let actor = crate::peer_process::ActorContext::resolve(peer);
+        let orig_dst: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle_transparent_tls(server, orig_dst, actor, &state),
+        )
+        .await
+        .expect("handler must not park on an upstream dial");
+
+        // Asserted before the handler's own result: without the SNI check it
+        // gets as far as presenting an ephemeral cert, and the client's alert
+        // would otherwise be the failure the test reports.
+        let events = drain_audit(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["metadata"]["reason"] == "egress-tcp-unpinned"),
+            "the SNI must be matched against the tcp table; got {events:?}"
+        );
+        outcome.expect("a refused connection closes cleanly");
     }
 
     #[tokio::test]
