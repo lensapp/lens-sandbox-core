@@ -376,11 +376,10 @@ pub(crate) enum PortScope {
     /// [`HostnameMatch::union`].
     FirstMatch,
     /// `egress.tcp` rules: *port-existential*. One answer serves every port, so
-    /// the name resolves when some port survives to an allow. A port-scoped
-    /// deny rules out only its own port (and kills a later allow on it); a
-    /// portless deny is still terminal. Safe because the per-port decision is
-    /// re-made at connect against the real `host:port`, and a name left with
-    /// only denies still reports `Denied`.
+    /// the name resolves when some port survives to an allow. A deny rules out
+    /// only its own port (and kills a later allow on it). Safe because the
+    /// per-port decision is re-made at connect against the real `host:port`,
+    /// and a name left with only denies still reports `Denied`.
     PerPort,
 }
 
