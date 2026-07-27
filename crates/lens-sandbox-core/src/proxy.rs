@@ -1500,19 +1500,10 @@ pub(crate) async fn connect_egress_under_policy(
 pub(crate) enum Gated {
     /// A gate ran for this connection and the developer allowed it.
     ByTheDeveloper,
-    /// No gate ran. An `ask` here has never been seen by anyone.
+    /// No gate ran. An `ask` here has never been seen by anyone — an `allow`
+    /// on the name was never put to a human, so a CIDR `ask` waiting on the
+    /// resolved address is still an unanswered question.
     NotAsked,
-}
-
-/// What a raw door's already-resolved verdict says about the dial that follows.
-/// Only an `ask` reached a human — an `allow` was never put to anyone, so a
-/// CIDR `ask` waiting on the resolved address is still an unanswered question
-/// and the dial must refuse it.
-fn gated_by(decision: &TcpDecision) -> Gated {
-    match decision.verdict {
-        Verdict::Ask => Gated::ByTheDeveloper,
-        _ => Gated::NotAsked,
-    }
 }
 
 /// Whether the `egress.tcp` table, as it stands *now*, admits this resolved
@@ -1731,7 +1722,12 @@ async fn handle_raw_passthrough(
         return Ok(());
     }
 
-    if !raw_verdict_admits(state, &raw_target, decision, actor).await {
+    // No `Gated` to carry: this door already holds the resolved address, so
+    // there is no post-resolution re-check for an approval to have to survive.
+    if raw_verdict_admits(state, &raw_target, decision, actor)
+        .await
+        .is_none()
+    {
         return Ok(());
     }
 
@@ -1754,17 +1750,21 @@ async fn handle_raw_passthrough(
 /// gate for `Ask` and emitting the deny audit. How a refusal reaches the client
 /// — a 403 on the explicit-proxy doors, a silent close on the transparent one —
 /// is the caller's business.
+///
+/// The admitting answer carries the [`Gated`] the dial then needs, because that
+/// value is only meaningful once the verdict has been resolved here: deriving
+/// it separately would let the two drift apart.
 async fn raw_verdict_admits(
     state: &Arc<ProxyState>,
     target: &str,
     decision: &TcpDecision,
     actor: &crate::peer_process::ActorContext,
-) -> bool {
+) -> Option<Gated> {
     match decision.verdict {
-        Verdict::Allow => true,
+        Verdict::Allow => Some(Gated::NotAsked),
         Verdict::Deny => {
             emit_policy_deny_connect(state, target, "policy-deny", actor);
-            false
+            None
         }
         Verdict::Ask => {
             // The dialog names the destination the way the policy author wrote
@@ -1789,7 +1789,7 @@ async fn raw_verdict_admits(
                 emit_gate_denied(state, &action_str, answer);
                 emit_audit(state, target, "failure", 403, actor);
                 tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough DENIED (gated)");
-                return false;
+                return None;
             }
             emit_gate_resolved(state, &action_str, answer);
             // The gate can hold a connection for `DECISION_TIMEOUT`, long enough
@@ -1804,10 +1804,10 @@ async fn raw_verdict_admits(
             if state.policy.read().unwrap().generation != decision.generation {
                 emit_policy_deny_connect(state, target, "policy-changed", actor);
                 tracing::info!(target = %target, "raw passthrough DENIED (policy changed under the dialog)");
-                return false;
+                return None;
             }
             tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough ALLOWED (gated)");
-            true
+            Some(Gated::ByTheDeveloper)
         }
     }
 }
@@ -1826,30 +1826,23 @@ async fn connect_raw_passthrough(
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !raw_verdict_admits(state, target_host, decision, actor).await {
+    let Some(gated) = raw_verdict_admits(state, target_host, decision, actor).await else {
         tracing::info!(target = %target_host, "proxy DENIED (egress.tcp)");
         client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
         return Ok(());
-    }
-
-    let mut upstream = match connect_egress_under_policy(
-        state,
-        target_host,
-        443,
-        actor.process(),
-        gated_by(decision),
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            emit_audit(state, target_host, "error", 502, actor);
-            client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                .await?;
-            return Err(format!("raw passthrough connect to {target_host}: {e}").into());
-        }
     };
+
+    let mut upstream =
+        match connect_egress_under_policy(state, target_host, 443, actor.process(), gated).await {
+            Ok(s) => s,
+            Err(e) => {
+                emit_audit(state, target_host, "error", 502, actor);
+                client
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    .await?;
+                return Err(format!("raw passthrough connect to {target_host}: {e}").into());
+            }
+        };
 
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -1880,34 +1873,27 @@ async fn http_forward_raw_passthrough(
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if !raw_verdict_admits(state, target_host, decision, actor).await {
+    let Some(gated) = raw_verdict_admits(state, target_host, decision, actor).await else {
         tracing::info!(target = %target_host, "HTTP forward proxy DENIED (egress.tcp)");
         client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
             .await?;
         return Ok(());
-    }
+    };
 
-    let mut upstream = match connect_egress_under_policy(
-        state,
-        target_host,
-        80,
-        actor.process(),
-        gated_by(decision),
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            emit_audit(state, target_host, "error", 502, actor);
-            client
+    let mut upstream =
+        match connect_egress_under_policy(state, target_host, 80, actor.process(), gated).await {
+            Ok(s) => s,
+            Err(e) => {
+                emit_audit(state, target_host, "error", 502, actor);
+                client
                 .write_all(
                     b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
                 )
                 .await?;
-            return Err(format!("raw passthrough connect to {target_host}: {e}").into());
-        }
-    };
+                return Err(format!("raw passthrough connect to {target_host}: {e}").into());
+            }
+        };
 
     upstream
         .write_all(format!("{request_head}\r\n\r\n").as_bytes())
@@ -4773,20 +4759,30 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn only_an_ask_carries_a_developer_answer_into_the_dial() {
-        // The dial guard relaxes for an `ask` because the developer already
-        // answered that exact question. An `allow` answered nothing, so a CIDR
-        // `ask` waiting on the resolved address is still unseen and must refuse
-        // — treating every raw door as "gated" would reopen exactly that hole.
+    #[tokio::test]
+    async fn an_allow_carries_no_developer_answer_into_the_dial() {
+        // The dial guard relaxes only for an `ask`, because that is the one
+        // verdict a developer actually answered. An `allow` answered nothing,
+        // so a CIDR `ask` waiting on the resolved address is still unseen and
+        // must refuse — treating every raw door as "gated" would reopen exactly
+        // that hole. The `ask` half is
+        // `an_approved_ask_still_splices_on_the_proxy_door`, which needs a
+        // live gate.
+        let (state, _rx) = test_state();
         let at = |verdict| TcpDecision {
             verdict,
             matched_target: None,
-            generation: 0,
+            generation: state.policy.read().unwrap().generation,
         };
-        assert_eq!(gated_by(&at(Verdict::Ask)), Gated::ByTheDeveloper);
-        assert_eq!(gated_by(&at(Verdict::Allow)), Gated::NotAsked);
-        assert_eq!(gated_by(&at(Verdict::Deny)), Gated::NotAsked);
+        let actor = test_actor();
+        assert_eq!(
+            raw_verdict_admits(&state, "10.0.0.5:5432", &at(Verdict::Allow), &actor).await,
+            Some(Gated::NotAsked)
+        );
+        assert_eq!(
+            raw_verdict_admits(&state, "10.0.0.5:5432", &at(Verdict::Deny), &actor).await,
+            None
+        );
     }
 
     #[tokio::test]
