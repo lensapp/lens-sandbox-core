@@ -85,9 +85,9 @@ async fn spawn_mock_upstream_with_a(answer: Ipv4Addr) -> SocketAddr {
     addr
 }
 
-/// Fresh `ProxyState` whose `tcp_fqdn` list allows `host` over raw TCP. A DNS
+/// Fresh `ProxyState` whose `tcp_egress` list allows `host` over raw TCP. A DNS
 /// answer for that host should pin the resolved IP.
-fn state_with_tcp_fqdn(host: &str) -> Arc<ProxyState> {
+fn state_with_tcp_hostname(host: &str) -> Arc<ProxyState> {
     let (_srv, state) = ProxyServer::new(
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".parse().unwrap(),
@@ -95,7 +95,7 @@ fn state_with_tcp_fqdn(host: &str) -> Arc<ProxyState> {
         None,
         Vec::new(),
     );
-    state.policy.write().unwrap().tcp_fqdn = vec![RouteRule {
+    state.policy.write().unwrap().tcp_egress = vec![RouteRule {
         matcher: RouteMatcher::Domain(host.to_string()),
         verdict: Verdict::Allow,
         transport: Transport::Direct,
@@ -197,10 +197,10 @@ async fn denied_query_returns_nxdomain_without_hitting_upstream() {
 }
 
 #[tokio::test]
-async fn tcp_fqdn_answer_pins_resolved_ip() {
+async fn tcp_hostname_answer_pins_resolved_ip() {
     let resolved = Ipv4Addr::new(203, 0, 113, 42);
     let upstream = spawn_mock_upstream_with_a(resolved).await;
-    let state = state_with_tcp_fqdn("db.example.com");
+    let state = state_with_tcp_hostname("db.example.com");
     let stub_addr = spawn_stub_with_upstream(state.clone(), upstream).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -218,23 +218,24 @@ async fn tcp_fqdn_answer_pins_resolved_ip() {
     let resp = Message::from_vec(&buf[..n]).unwrap();
     assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
 
-    // The stub should have pinned the answer's IP for the raw TCP layer.
+    // The stub should have pinned the answer's IP for the raw TCP layer,
+    // recording the originating QNAME so the connect path can re-evaluate it.
     let policy = state.policy.read().unwrap();
     let entry = policy
         .pins
         .get(&IpAddr::V4(resolved))
         .expect("resolved IP must be pinned");
-    assert!(entry.iter().any(|p| p.pin.verdict == Verdict::Allow));
+    assert!(entry.iter().any(|p| p.qname == "db.example.com"));
 }
 
 #[tokio::test]
 async fn link_local_answer_is_not_pinned() {
-    // A tcp_fqdn rule whose name resolves (via attacker-controlled DNS) to the
-    // cloud metadata address must NOT be pinned — otherwise the raw TCP layer
-    // would splice straight to 169.254.169.254, bypassing the cage.
+    // A hostname egress.tcp rule whose name resolves (via attacker-controlled
+    // DNS) to the cloud metadata address must NOT be pinned — otherwise the raw
+    // TCP layer would splice straight to 169.254.169.254, bypassing the cage.
     let resolved = Ipv4Addr::new(169, 254, 169, 254);
     let upstream = spawn_mock_upstream_with_a(resolved).await;
-    let state = state_with_tcp_fqdn("metadata.evil.example");
+    let state = state_with_tcp_hostname("metadata.evil.example");
     let stub_addr = spawn_stub_with_upstream(state.clone(), upstream).await;
 
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -260,8 +261,8 @@ async fn link_local_answer_is_not_pinned() {
 async fn answer_for_unlisted_host_is_not_pinned() {
     let resolved = Ipv4Addr::new(198, 51, 100, 5);
     let upstream = spawn_mock_upstream_with_a(resolved).await;
-    // Allow the query at the L7 layer so it forwards, but it is NOT a tcp_fqdn
-    // rule — no pin should be recorded.
+    // Allow the query at the L7 layer so it forwards, but it is NOT a hostname
+    // egress.tcp rule — no pin should be recorded.
     let state = state_with_allow(&["web.example.com"]);
     let stub_addr = spawn_stub_with_upstream(state.clone(), upstream).await;
 

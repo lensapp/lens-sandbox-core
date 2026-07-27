@@ -165,45 +165,29 @@ pub fn parse_matcher(pattern: &str) -> Result<RouteMatcher, String> {
     }
 }
 
-/// Raw-TCP egress rules, split by how the destination is matched.
+/// Parse the `egress.tcp` list into ONE ordered `Vec<RouteRule>`, preserving the
+/// original rule order. Connect resolution ([`find_matching_tcp_egress`]) walks
+/// this single list in policy order so a static IP rule and a hostname (pinned)
+/// rule compete by their real position — an earlier rule always wins, whichever
+/// kind it is. The matcher kind is the connect-vs-pin discriminator:
+/// `Cidr`/`CidrPort` match the resolved dst IP directly; `Domain`/`HostPort`
+/// match only a dst IP that a live DNS pin bound to a name the rule covers.
 ///
-/// - [`ip_rules`](Self::ip_rules) match a literal IP/CIDR (optionally
-///   `:port`) at connect time via [`find_matching_route`].
-/// - [`fqdn_rules`](Self::fqdn_rules) match by hostname: the raw path never
-///   sees a name, so these instead drive DNS-answer *pinning* — when the stub
-///   resolves a matching name it records the answer IPs so the subsequent TCP
-///   connection to one of them is admitted (see [`matching_fqdn_pins`]).
-#[derive(Debug, Default)]
-pub struct TcpEgress {
-    pub ip_rules: Vec<RouteRule>,
-    pub fqdn_rules: Vec<RouteRule>,
-}
-
-/// The connect-time decision to pin against a DNS-resolved IP: the fqdn rule's
-/// verdict, the port it is scoped to (`None` = any), and its `binaries` filter
-/// (re-checked against the TCP caller). Raw TCP always egresses directly, so
-/// there is no transport to carry. `PartialEq` lets the pin store refresh an
-/// equivalent entry's expiry instead of appending a duplicate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FqdnPin {
-    pub port: Option<u16>,
-    pub verdict: Verdict,
-    pub binaries: Option<Vec<PathBuf>>,
-}
-
-/// Parse the `egress.tcp` list, splitting IP/CIDR rules (matched at connect
-/// time) from hostname rules (which drive DNS-answer pinning). Both are held
-/// separately from `allowedRoutes`/`egress.l7` and consulted before protocol
-/// classification, so no per-rule flag is needed to mark them raw.
-pub fn parse_tcp_egress(json: &serde_json::Value) -> Result<TcpEgress, String> {
+/// An IP-literal `HostPort` (`10.0.0.5:5432`) is normalized to `CidrPort` here
+/// so it stays a direct IP match rather than a hostname rule: the discriminator
+/// is then purely the matcher kind, and the DNS gate (which skips `Cidr`/
+/// `CidrPort`, never `HostPort`) can share this list without an IP literal
+/// leaking in as a QNAME. Normalization is scoped to `egress.tcp` — the L7
+/// `parse_matcher` path keeps its string semantics untouched.
+pub fn parse_tcp_egress(json: &serde_json::Value) -> Result<Vec<RouteRule>, String> {
     let arr = json.as_array().ok_or("egress.tcp must be an array")?;
-    let mut out = TcpEgress::default();
+    let mut out = Vec::with_capacity(arr.len());
     for v in arr {
         let raw: crate::policy_schema::TcpEgressRule =
             serde_json::from_value(v.clone()).map_err(|e| format!("invalid tcp rule: {e}"))?;
-        let matcher = parse_matcher(&raw.match_pattern)?;
+        let matcher = normalize_ip_literal(parse_matcher(&raw.match_pattern)?);
         let binaries = raw.binaries.map(parse_binaries).transpose()?;
-        let rule = RouteRule {
+        out.push(RouteRule {
             matcher,
             verdict: raw.verdict,
             // Raw TCP always egresses directly; the shared `RouteRule` still
@@ -213,54 +197,23 @@ pub fn parse_tcp_egress(json: &serde_json::Value) -> Result<TcpEgress, String> {
             http_rules: Vec::new(),
             scheme: None,
             binaries,
-        };
-        // IP/CIDR match the resolved dst directly; hostnames can only match via
-        // DNS-answer pinning. `HostPort` straddles both: an IP-literal host is a
-        // direct match, a hostname host is an fqdn rule.
-        match &rule.matcher {
-            RouteMatcher::Cidr(_) | RouteMatcher::CidrPort(_, _) => out.ip_rules.push(rule),
-            RouteMatcher::HostPort(host, _) if host.parse::<std::net::IpAddr>().is_ok() => {
-                out.ip_rules.push(rule)
-            }
-            RouteMatcher::HostPort(_, _) | RouteMatcher::Domain(_) => out.fqdn_rules.push(rule),
-        }
+        });
     }
     Ok(out)
 }
 
-/// The pin spec for the first `fqdn_rules` entry whose host matches `qname` and
-/// whose `binaries` filter admits `caller`, when its verdict is not `Deny`.
-/// First-match, mirroring every other route decision; `None` when nothing
-/// matches or the first match is a `Deny`. Used by the DNS stub to pin the
-/// resolved A-record IPs.
-pub fn matching_fqdn_pin(
-    fqdn_rules: &[RouteRule],
-    qname: &str,
-    caller: Option<&crate::peer_process::PeerProcess>,
-) -> Option<FqdnPin> {
-    let lower = qname.to_ascii_lowercase();
-    let mut binary_filtered = false;
-    for rule in fqdn_rules {
-        if !qname_matches_rule(rule, &lower) {
-            continue;
-        }
-        if caller_admits_rule(rule, caller, binary_filtered) {
-            if rule.verdict == Verdict::Deny {
-                return None;
-            }
-            let port = match &rule.matcher {
-                RouteMatcher::HostPort(_, p) => Some(*p),
-                _ => None,
-            };
-            return Some(FqdnPin {
-                port,
-                verdict: rule.verdict,
-                binaries: rule.binaries.clone(),
-            });
-        }
-        binary_filtered = true;
+/// Fold an IP-literal `HostPort` into the equivalent single-address `CidrPort`
+/// so the raw-TCP layer treats it as a direct IP match. A hostname `HostPort`
+/// (and every other matcher) is returned unchanged. This also gives IPv6
+/// literals canonical numeric matching instead of string comparison.
+fn normalize_ip_literal(matcher: RouteMatcher) -> RouteMatcher {
+    match matcher {
+        RouteMatcher::HostPort(host, port) => match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => RouteMatcher::CidrPort(IpNet::from(ip), port),
+            Err(_) => RouteMatcher::HostPort(host, port),
+        },
+        other => other,
     }
-    None
 }
 
 /// Whether a pin's `binaries` filter admits `caller` — the same check the route
@@ -375,6 +328,18 @@ pub(crate) fn hostname_match(routes: &[RouteRule], hostname: &str) -> HostnameMa
 /// DNS gate and `find_matching_route` never diverge on binary-scoping (the
 /// no-reopen guard included). Passing `None` fails a binary-scoped host closed,
 /// exactly as an unresolved caller does at the TCP layer.
+///
+/// DNS has no destination port — one answer serves every port — so this is
+/// *port-existential*: it resolves the name when some port survives ordered
+/// first-match evaluation to an allow. A portless (`Domain`) deny is terminal;
+/// a port-scoped (`HostPort`) deny only rules out that one port and is recorded
+/// so a later allow on the same port is dead. A portless allow always wins (a
+/// finite set of denied ports can't cover them all); a port-scoped allow wins
+/// unless its port was already denied. The per-port enforcement itself happens
+/// at connect ([`find_matching_route`] against the real `host:port`), so
+/// resolving a name reachable on only some ports is safe. Names with only
+/// denies (no live allow) stay `Denied`, preserving the no-upstream-leak
+/// property documented on [`hostname_allowed`].
 pub(crate) fn hostname_match_for_caller(
     routes: &[RouteRule],
     hostname: &str,
@@ -382,26 +347,46 @@ pub(crate) fn hostname_match_for_caller(
 ) -> HostnameMatch {
     let lower = hostname.to_ascii_lowercase();
     let mut binary_filtered = false;
+    let mut denied_ports: Vec<u16> = Vec::new();
     for rule in routes {
         if !qname_matches_rule(rule, &lower) {
             continue;
         }
-        if caller_admits_rule(rule, caller, binary_filtered) {
-            // First-match semantics (same as `find_matching_route`): a
-            // `Deny evil.example.com` before `Allow *.example.com` denies the
-            // lookup for `evil.example.com`, even though the wildcard matches.
-            return if rule.verdict == Verdict::Deny {
-                HostnameMatch::Denied
-            } else {
-                HostnameMatch::Allowed
-            };
+        if !caller_admits_rule(rule, caller, binary_filtered) {
+            // A binary-scoped rule matched the hostname but excluded the caller
+            // (or a later unrestricted rule was suppressed). Remember it so the
+            // tail fails closed instead of falling back to the JIT-approved set.
+            binary_filtered = true;
+            continue;
         }
-        // A binary-scoped rule matched the hostname but excluded the caller (or
-        // a later unrestricted rule was suppressed). Remember it so the tail
-        // fails closed instead of falling back to the JIT-approved set.
-        binary_filtered = true;
+        let port = match &rule.matcher {
+            RouteMatcher::HostPort(_, p) => Some(*p),
+            _ => None,
+        };
+        match (rule.verdict, port) {
+            // A portless deny kills every port — no later allow can survive it.
+            (Verdict::Deny, None) => return HostnameMatch::Denied,
+            // A port-scoped deny only rules out that port; keep scanning for an
+            // allow on a different port.
+            (Verdict::Deny, Some(p)) => denied_ports.push(p),
+            // A portless allow admits some surviving port (an earlier
+            // port-scoped deny can't shadow it), so the name resolves.
+            (_, None) => return HostnameMatch::Allowed,
+            // A port-scoped allow resolves the name unless an earlier deny
+            // already shadowed its port, in which case it is dead — keep going.
+            (_, Some(p)) => {
+                if !denied_ports.contains(&p) {
+                    return HostnameMatch::Allowed;
+                }
+            }
+        }
     }
-    if binary_filtered {
+    // No live allow survived. An admitted deny (even a port-scoped one that
+    // shadowed the only allow) denies the name outright; otherwise fail closed
+    // on any binary exclusion, else report no match.
+    if !denied_ports.is_empty() {
+        HostnameMatch::Denied
+    } else if binary_filtered {
         HostnameMatch::BinaryDenied
     } else {
         HostnameMatch::Unmatched
@@ -497,6 +482,57 @@ pub fn find_matching_route<'a>(
         // rule that admits it, but remember the exclusion so the proxy fails
         // closed instead of leaking through the default action or a broad
         // unrestricted rule.
+        binary_filtered = true;
+    }
+    RouteOutcome::NoMatch { binary_filtered }
+}
+
+/// Match a raw-TCP connection (`ip:port`) against the ordered `egress.tcp` rules
+/// in one pass, so static IP rules and hostname (pinned) rules compete by their
+/// real policy position — the fix for splitting the list into IP-first and
+/// FQDN-second, which let a later IP rule beat an earlier hostname rule.
+///
+/// `Cidr`/`CidrPort` match `ip` (and `port`) directly. `Domain`/`HostPort` match
+/// only when some name in `pinned_qnames` — the live (unexpired) DNS pins
+/// recorded for `ip` — is covered by the rule's host pattern, and (for
+/// `HostPort`) the rule's port equals `port`. `egress.tcp` rules carry no
+/// scheme, so there is no scheme filter here. Binary scoping and the no-reopen
+/// guard run through the same [`caller_admits_rule`] helper as
+/// [`find_matching_route`], so first-match / deny / binary semantics are
+/// identical across the two paths.
+pub fn find_matching_tcp_egress<'a>(
+    rules: &'a [RouteRule],
+    ip: std::net::IpAddr,
+    port: u16,
+    caller: Option<&crate::peer_process::PeerProcess>,
+    pinned_qnames: &[&str],
+) -> RouteOutcome<'a> {
+    let mut binary_filtered = false;
+    for rule in rules {
+        let matched = match &rule.matcher {
+            RouteMatcher::Cidr(cidr) => cidr.contains(&ip),
+            RouteMatcher::CidrPort(cidr, pattern_port) => {
+                cidr.contains(&ip) && *pattern_port == port
+            }
+            RouteMatcher::Domain(pattern) => {
+                pinned_qnames.iter().any(|q| domain_matches(pattern, q))
+            }
+            RouteMatcher::HostPort(pattern_host, pattern_port) => {
+                *pattern_port == port
+                    && pinned_qnames
+                        .iter()
+                        .any(|q| domain_matches(pattern_host, q))
+            }
+        };
+        if !matched {
+            continue;
+        }
+        if caller_admits_rule(rule, caller, binary_filtered) {
+            return RouteOutcome::Matched(rule);
+        }
+        // Matched the target but the binary filter excluded the caller (or a
+        // later unrestricted rule was suppressed). Keep scanning, but remember
+        // the exclusion so the proxy fails closed rather than falling through.
         binary_filtered = true;
     }
     RouteOutcome::NoMatch { binary_filtered }
@@ -1015,101 +1051,146 @@ mod tests {
         );
     }
 
-    fn parse_tcp(json: &str) -> Result<TcpEgress, String> {
+    fn parse_tcp(json: &str) -> Result<Vec<RouteRule>, String> {
         let val: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         parse_tcp_egress(&val)
     }
 
     #[test]
     fn parse_tcp_egress_cidr_port() {
-        let egress = parse_tcp(r#"[{"match": "10.0.0.0/24:5432", "verdict": "allow"}]"#).unwrap();
-        assert_eq!(egress.ip_rules.len(), 1);
-        assert!(egress.fqdn_rules.is_empty());
+        let rules = parse_tcp(r#"[{"match": "10.0.0.0/24:5432", "verdict": "allow"}]"#).unwrap();
+        assert_eq!(rules.len(), 1);
         assert!(matches!(
-            &egress.ip_rules[0].matcher,
+            &rules[0].matcher,
             RouteMatcher::CidrPort(net, 5432) if net.to_string() == "10.0.0.0/24"
         ));
-        assert_eq!(egress.ip_rules[0].verdict, Verdict::Allow);
+        assert_eq!(rules[0].verdict, Verdict::Allow);
         // Raw TCP always egresses directly.
-        assert_eq!(egress.ip_rules[0].transport, Transport::Direct);
+        assert_eq!(rules[0].transport, Transport::Direct);
     }
 
     #[test]
-    fn parse_tcp_egress_ip_port_and_bare_cidr_are_ip_rules() {
-        let egress = parse_tcp(
+    fn parse_tcp_egress_ip_literal_hostport_normalizes_to_cidrport() {
+        // An IP-literal `HostPort` folds into a single-address `CidrPort` so it
+        // stays a direct IP match (and gets numeric, not string, comparison); a
+        // bare CIDR stays `Cidr`. Both keep their position in the one list.
+        let rules = parse_tcp(
             r#"[
                 {"match": "10.0.0.5:5432", "verdict": "allow"},
                 {"match": "10.0.0.0/8", "verdict": "allow"}
             ]"#,
         )
         .unwrap();
-        assert_eq!(egress.ip_rules.len(), 2);
-        assert!(egress.fqdn_rules.is_empty());
+        assert_eq!(rules.len(), 2);
         assert!(matches!(
-            &egress.ip_rules[0].matcher,
-            RouteMatcher::HostPort(h, 5432) if h == "10.0.0.5"
+            &rules[0].matcher,
+            RouteMatcher::CidrPort(net, 5432) if net.to_string() == "10.0.0.5/32"
         ));
-        assert!(matches!(&egress.ip_rules[1].matcher, RouteMatcher::Cidr(_)));
+        assert!(matches!(&rules[1].matcher, RouteMatcher::Cidr(_)));
     }
 
     #[test]
-    fn parse_tcp_egress_hostname_becomes_fqdn_rule() {
-        // A hostname can't match the resolved IP directly, so it routes to the
-        // fqdn list, which drives DNS-answer pinning instead of a static match.
-        let egress = parse_tcp(
+    fn parse_tcp_egress_keeps_hostname_rules_in_order() {
+        // Hostname rules stay `Domain`/`HostPort` (they can't match a raw IP
+        // directly; they drive DNS-answer pinning) and keep their list position.
+        let rules = parse_tcp(
             r#"[
                 {"match": "db.internal:5432", "verdict": "allow"},
                 {"match": "*.rds.amazonaws.com", "verdict": "allow"}
             ]"#,
         )
         .unwrap();
-        assert!(egress.ip_rules.is_empty());
-        assert_eq!(egress.fqdn_rules.len(), 2);
+        assert_eq!(rules.len(), 2);
         assert!(matches!(
-            &egress.fqdn_rules[0].matcher,
+            &rules[0].matcher,
             RouteMatcher::HostPort(h, 5432) if h == "db.internal"
         ));
-        assert!(matches!(
-            &egress.fqdn_rules[1].matcher,
-            RouteMatcher::Domain(_)
-        ));
+        assert!(matches!(&rules[1].matcher, RouteMatcher::Domain(_)));
     }
 
     #[test]
     fn parse_tcp_egress_honors_binaries_filter() {
-        let egress = parse_tcp(
+        let rules = parse_tcp(
             r#"[{"match": "10.0.0.0/24:5432", "verdict": "allow", "binaries": ["/usr/bin/psql"]}]"#,
         )
         .unwrap();
         assert_eq!(
-            egress.ip_rules[0].binaries.as_deref(),
+            rules[0].binaries.as_deref(),
             Some(&[PathBuf::from("/usr/bin/psql")][..])
         );
     }
 
     #[test]
-    fn matching_fqdn_pin_returns_first_admitting_rule() {
-        let egress = parse_tcp(r#"[{"match": "db.internal:5432", "verdict": "allow"}]"#).unwrap();
-        let pin = matching_fqdn_pin(&egress.fqdn_rules, "db.internal", None).unwrap();
-        assert_eq!(pin.port, Some(5432));
-        assert_eq!(pin.verdict, Verdict::Allow);
+    fn fqdn_hostname_match_resolves_a_port_scoped_allow() {
+        let rules = parse_tcp(r#"[{"match": "db.internal:5432", "verdict": "allow"}]"#).unwrap();
+        // DNS is port-blind: a port-scoped allow still resolves the name so the
+        // answer can be pinned; the port itself is enforced at connect.
+        assert_eq!(
+            hostname_match_for_caller(&rules, "db.internal", None),
+            HostnameMatch::Allowed
+        );
+        assert_eq!(
+            hostname_match_for_caller(&rules, "other.example.com", None),
+            HostnameMatch::Unmatched
+        );
     }
 
     #[test]
-    fn matching_fqdn_pin_wildcard_any_port() {
-        let egress =
-            parse_tcp(r#"[{"match": "*.rds.amazonaws.com", "verdict": "allow"}]"#).unwrap();
-        let pin = matching_fqdn_pin(&egress.fqdn_rules, "prod.rds.amazonaws.com", None).unwrap();
-        assert_eq!(pin.port, None, "bare domain rule pins any port");
-        assert!(matching_fqdn_pin(&egress.fqdn_rules, "other.example.com", None).is_none());
+    fn fqdn_hostname_match_port_scoped_deny_does_not_block_another_port() {
+        // Ordered: deny :5432, allow :6379. The port-scoped deny must not veto
+        // resolution the allowed port needs — the name resolves, and per-port
+        // enforcement happens at connect.
+        let rules = parse_tcp(
+            r#"[{"match": "db.internal:5432", "verdict": "deny"},
+                {"match": "db.internal:6379", "verdict": "allow"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hostname_match_for_caller(&rules, "db.internal", None),
+            HostnameMatch::Allowed
+        );
     }
 
     #[test]
-    fn matching_fqdn_pin_deny_yields_no_pin() {
-        let egress = parse_tcp(r#"[{"match": "db.internal:5432", "verdict": "deny"}]"#).unwrap();
-        assert!(
-            matching_fqdn_pin(&egress.fqdn_rules, "db.internal", None).is_none(),
-            "a deny fqdn rule must not pin"
+    fn fqdn_hostname_match_portless_deny_is_terminal() {
+        // A portless deny before an allow kills every port — the name cannot
+        // resolve, matching the connect-time first-match evaluation.
+        let rules = parse_tcp(
+            r#"[{"match": "db.internal", "verdict": "deny"},
+                {"match": "db.internal:6379", "verdict": "allow"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hostname_match_for_caller(&rules, "db.internal", None),
+            HostnameMatch::Denied
+        );
+    }
+
+    #[test]
+    fn fqdn_hostname_match_same_port_deny_shadows_the_allow() {
+        // deny :5432 then allow :5432 — the only allow is dead under first-match,
+        // so resolving would leak the qname for a name that can never connect.
+        let rules = parse_tcp(
+            r#"[{"match": "db.internal:5432", "verdict": "deny"},
+                {"match": "db.internal:5432", "verdict": "allow"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hostname_match_for_caller(&rules, "db.internal", None),
+            HostnameMatch::Denied
+        );
+    }
+
+    #[test]
+    fn fqdn_hostname_match_wildcard_any_port() {
+        let rules = parse_tcp(r#"[{"match": "*.rds.amazonaws.com", "verdict": "allow"}]"#).unwrap();
+        assert_eq!(
+            hostname_match_for_caller(&rules, "prod.rds.amazonaws.com", None),
+            HostnameMatch::Allowed
+        );
+        assert_eq!(
+            hostname_match_for_caller(&rules, "other.example.com", None),
+            HostnameMatch::Unmatched
         );
     }
 
