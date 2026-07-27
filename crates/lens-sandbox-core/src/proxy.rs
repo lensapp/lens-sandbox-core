@@ -76,7 +76,7 @@ pub struct PinnedIp {
 /// snapshot and a reload swaps the whole thing at once, so no decision can ever
 /// combine fields from two different policy generations.
 pub struct NetworkPolicy {
-    /// Application-layer routes (`egress.l7` / the deprecated `allowedRoutes`),
+    /// Application-layer routes (`egress.http` / the deprecated `allowedRoutes`),
     /// consulted after protocol classification.
     pub routes: Vec<RouteRule>,
     /// Verdict applied when no `routes` entry matches the host.
@@ -1273,7 +1273,7 @@ async fn handle_transparent_connection(
 /// an earlier rule wins whichever kind it is (the bug was checking every IP
 /// rule before any hostname rule). Returns the matched verdict, or `None` when
 /// nothing matches (the connection then falls through to classification and the
-/// `egress.l7` routes) or when a `binaries` filter excluded the caller — never
+/// `egress.http` routes) or when a `binaries` filter excluded the caller — never
 /// re-opened here. A matched deny (IP or hostname) is terminal for the raw path.
 /// Raw TCP always egresses directly, so no transport is returned.
 fn resolve_tcp_egress(

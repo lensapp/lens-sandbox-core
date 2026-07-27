@@ -50,8 +50,8 @@ pub struct PolicyDocument {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicy {
-    /// **Deprecated** — use [`egress.l7`](Egress::l7). Accepted as a
-    /// back-compat alias: when both are present, `egress.l7` wins. Ordered
+    /// **Deprecated** — use [`egress.http`](Egress::http). Accepted as a
+    /// back-compat alias: when both are present, `egress.http` wins. Ordered
     /// list of application-layer route rules (first match wins).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_routes: Option<Vec<RouteRule>>,
@@ -70,10 +70,10 @@ pub struct NetworkPolicy {
     pub default_transport: Transport,
 }
 
-/// Egress rules split by the layer at which the destination is filtered.
+/// Egress rules split by the protocol at which the destination is filtered.
 ///
-/// - [`l7`](Self::l7) filters by hostname and can see and rewrite the payload
-///   (HTTP rules, TLS termination, credential injection).
+/// - [`http`](Self::http) filters by hostname and can see and rewrite the
+///   payload (HTTP rules, TLS termination, credential injection).
 /// - [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the
 ///   payload — an opaque byte splice for non-HTTP services.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -82,16 +82,16 @@ pub struct Egress {
     /// Application-layer (hostname + HTTP/TLS) route rules, first match wins.
     /// Same rule type as the deprecated top-level `allowedRoutes`.
     #[serde(default)]
-    pub l7: Vec<RouteRule>,
+    pub http: Vec<RouteRule>,
 
     /// Raw TCP rules, first match wins. Each matches a destination by IP/CIDR
-    /// or hostname (optionally scoped to a port) and splices the connection
+    /// or hostname scoped to a required port, and splices the connection
     /// through opaquely — no protocol classification, no TLS interception, no
     /// HTTP rules. Intended for databases, brokers, and caches, including those
     /// that speak TLS (the connection is not intercepted, so pinning works).
     ///
     /// A hostname rule permits its own DNS lookup and pins the resolved IPs, so
-    /// it needs no paired [`l7`](Self::l7) rule (see [`TcpEgressRule`]).
+    /// it needs no paired [`http`](Self::http) rule (see [`TcpEgressRule`]).
     #[serde(default)]
     pub tcp: Vec<TcpEgressRule>,
 }
@@ -100,16 +100,18 @@ pub struct Egress {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TcpEgressRule {
-    /// Destination as an IP, CIDR, `ip:port`, `cidr:port`, hostname, or
-    /// `hostname:port` (e.g. `10.20.0.0/24:5432`, `[2001:db8::/32]:5432`,
-    /// `db.internal:5432`). A bare IP/CIDR/hostname matches any port.
+    /// Destination as `ip:port`, `cidr:port`, or `hostname:port` (e.g.
+    /// `10.20.5.10:6379`, `10.20.0.0/24:5432`, `[2001:db8::/32]:5432`,
+    /// `db.internal:5432`). A port is **required** — a raw connection is spliced
+    /// opaquely with no inspection, so a portless "any port" grant would be too
+    /// broad; a pattern without a port is rejected and fails the policy closed.
     ///
     /// IP/CIDR patterns match the resolved destination directly at connect
     /// time. Hostname patterns can only match via DNS forward-pinning: the DNS
     /// stub permits the lookup for a matching hostname rule, then pins the
     /// resolved A-record IPs so the raw TCP layer admits the follow-up
     /// connection. A hostname rule is self-sufficient — it gates its own DNS
-    /// lookup, so no paired [`l7`](Egress::l7) rule is required.
+    /// lookup, so no paired [`http`](Egress::http) rule is required.
     #[serde(rename = "match")]
     pub match_pattern: String,
 
