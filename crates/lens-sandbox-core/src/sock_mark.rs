@@ -11,7 +11,7 @@
 //! `CAP_NET_ADMIN`, which is dropped before exec'ing the agent.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsFd;
 
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
@@ -47,14 +47,74 @@ fn mark<F: AsFd>(_fd: &F) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether `ip` is link-local — IPv4 `169.254.0.0/16` or IPv6 `fe80::/10`.
+/// These reach the host's own metadata/autoconfig surface (notably the cloud
+/// IMDS at `169.254.169.254`) and are never a legitimate sandbox egress target.
+pub fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.octets()[0] == 169 && v4.octets()[1] == 254,
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// Whether `ip` is a destination the sandbox must never reach directly:
+/// loopback, unspecified (`0.0.0.0` / `::`), or link-local. Canonicalizes first
+/// so an IPv4-mapped IPv6 form (`::ffff:127.0.0.1`) — which the raw
+/// `is_loopback`/`is_link_local` checks miss but Linux still routes to the host
+/// — is judged as its IPv4 form. Shared by every egress enforcement point (the
+/// connect guard, the DNS pin filter, the CONNECT/SNI target check) so they
+/// can't drift. Private ranges (10/8, 172.16/12, 192.168/16) deliberately pass:
+/// reaching a private DB is the whole point of raw egress.
+pub fn is_disallowed_egress_ip(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback() || ip.is_unspecified() || is_link_local(ip)
+}
+
 /// Resolve `addr` (host:port) and connect via a marked TCP socket. Picks
 /// the first DNS result; reconnect loops at the call site cover transient
 /// failures of any single address.
+///
+/// UNCHECKED: connects to whatever `addr` resolves to, including loopback and
+/// link-local. Use only for trusted infra dials (the Lens upstream relay, the
+/// control-plane socket, a server-injected forward bridge). For sandbox egress
+/// — where `addr` is a policy/SNI/Host hostname whose resolution an attacker
+/// may influence — use [`connect_tcp_egress`], which rejects those addresses.
 pub async fn connect_tcp_resolve(addr: &str) -> io::Result<TcpStream> {
-    let resolved = tokio::net::lookup_host(addr)
+    let resolved = resolve_first(addr).await?;
+    connect_marked(resolved).await
+}
+
+/// Like [`connect_tcp_resolve`], but refuses a destination that resolves to a
+/// loopback, link-local, or unspecified address (see [`is_disallowed_egress_ip`]
+/// for the IPv4-mapped-IPv6 canonicalization). This is the SSRF floor for every
+/// sandbox egress dial: an allowed *hostname* whose DNS answer (possibly
+/// attacker-controlled — a wildcard-allowed name, DNS spoofing) points at
+/// `127.0.0.1` or `169.254.169.254` would otherwise reach the host itself or
+/// cloud metadata, since the marked socket bypasses the nftables cage. The IP
+/// is checked *after* resolution, closing the gap that a string-level target
+/// check (which only sees the hostname) leaves open.
+pub async fn connect_tcp_egress(addr: &str) -> io::Result<TcpStream> {
+    let resolved = resolve_first(addr).await?;
+    if is_disallowed_egress_ip(resolved.ip()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "egress to {} (loopback/link-local/unspecified) denied",
+                resolved.ip()
+            ),
+        ));
+    }
+    connect_marked(resolved).await
+}
+
+async fn resolve_first(addr: &str) -> io::Result<SocketAddr> {
+    tokio::net::lookup_host(addr)
         .await?
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no addrs for {addr}")))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no addrs for {addr}")))
+}
+
+async fn connect_marked(resolved: SocketAddr) -> io::Result<TcpStream> {
     let socket = if resolved.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
@@ -70,4 +130,77 @@ pub async fn bind_udp(local: SocketAddr) -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind(local).await?;
     mark(&socket)?;
     Ok(socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_local_classification() {
+        assert!(is_link_local("169.254.169.254".parse().unwrap()));
+        assert!(is_link_local("169.254.0.1".parse().unwrap()));
+        assert!(is_link_local("fe80::1".parse().unwrap()));
+        assert!(is_link_local("febf::1".parse().unwrap()));
+        // Not link-local: public, private, and the .254 boundary of 169.x.
+        assert!(!is_link_local("1.2.3.4".parse().unwrap()));
+        assert!(!is_link_local("10.20.0.5".parse().unwrap()));
+        assert!(!is_link_local("169.253.0.1".parse().unwrap()));
+        assert!(!is_link_local("fec0::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn egress_rejects_loopback_literal() {
+        let err = connect_tcp_egress("127.0.0.1:9").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn egress_rejects_link_local_literal() {
+        let err = connect_tcp_egress("169.254.169.254:9").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn egress_rejects_mapped_loopback_literal() {
+        // IPv4-mapped IPv6 must be canonicalized before the check — Linux still
+        // routes ::ffff:127.0.0.1 to the host.
+        let err = connect_tcp_egress("[::ffff:127.0.0.1]:9")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn egress_rejects_unspecified_literal() {
+        // 0.0.0.0 is a plausible (blackhole-list) A record and connect(2) sends
+        // it to a host-local service.
+        let err = connect_tcp_egress("0.0.0.0:9").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn egress_rejects_hostname_resolving_to_loopback() {
+        // The actual attack shape: an allowed hostname whose DNS answer points
+        // back at the host. `localhost` resolves to a loopback address.
+        let err = connect_tcp_egress("localhost:9").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn resolve_still_connects_to_loopback() {
+        // The unchecked primitive must remain usable for trusted infra dials
+        // (e.g. a loopback Lens upstream relay) — guarding it would break them.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let _ = l.accept().await;
+        });
+        let stream = connect_tcp_resolve(&addr.to_string()).await;
+        assert!(
+            stream.is_ok(),
+            "trusted primitive must still reach loopback"
+        );
+        accept.abort();
+    }
 }

@@ -227,6 +227,35 @@ async fn tcp_fqdn_answer_pins_resolved_ip() {
 }
 
 #[tokio::test]
+async fn link_local_answer_is_not_pinned() {
+    // A tcp_fqdn rule whose name resolves (via attacker-controlled DNS) to the
+    // cloud metadata address must NOT be pinned — otherwise the raw TCP layer
+    // would splice straight to 169.254.169.254, bypassing the cage.
+    let resolved = Ipv4Addr::new(169, 254, 169, 254);
+    let upstream = spawn_mock_upstream_with_a(resolved).await;
+    let state = state_with_tcp_fqdn("metadata.evil.example");
+    let stub_addr = spawn_stub_with_upstream(state.clone(), upstream).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(stub_addr).await.unwrap();
+    client
+        .send(&build_query("metadata.evil.example", RecordType::A, 0x5510))
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 1500];
+    tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+        .await
+        .expect("reply before timeout")
+        .expect("recv ok");
+
+    assert!(
+        state.pinned_ips.read().unwrap().is_empty(),
+        "a link-local DNS answer must never be pinned"
+    );
+}
+
+#[tokio::test]
 async fn answer_for_unlisted_host_is_not_pinned() {
     let resolved = Ipv4Addr::new(198, 51, 100, 5);
     let upstream = spawn_mock_upstream_with_a(resolved).await;

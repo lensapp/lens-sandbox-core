@@ -685,7 +685,7 @@ async fn handle_http_forward(
     match effective_transport {
         Transport::Direct => {
             // Direct connection to upstream — send modified request, relay response
-            let mut upstream = match sock_mark::connect_tcp_resolve(target_host).await {
+            let mut upstream = match sock_mark::connect_tcp_egress(target_host).await {
                 Ok(t) => t,
                 Err(e) => {
                     emit_http_audit(state, target_host, method, &path, "error", 502, actor);
@@ -998,7 +998,7 @@ async fn handle_connect(
                 .await?;
             } else {
                 // Neither → plain TCP relay
-                let mut target = match sock_mark::connect_tcp_resolve(target_host).await {
+                let mut target = match sock_mark::connect_tcp_egress(target_host).await {
                     Ok(t) => t,
                     Err(e) => {
                         emit_audit(state, target_host, "error", 502, actor);
@@ -1385,6 +1385,17 @@ async fn handle_raw_passthrough(
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Same destination guard the L7 CONNECT/TLS paths run: a raw connection
+    // egresses directly via SO_MARK, so a loopback or link-local target (e.g. a
+    // pinned or CIDR-matched `169.254.169.254`) would reach the host itself or
+    // cloud metadata, bypassing the cage. Reject before any dial, regardless of
+    // verdict — this is not policy, it is a hard floor.
+    if let Err(e) = validate_connect_target(raw_target) {
+        emit_policy_deny_connect(state, raw_target, "blocked-destination", actor);
+        tracing::debug!(target = %raw_target, "raw passthrough blocked: {e}");
+        return Ok(());
+    }
+
     match verdict {
         Verdict::Deny => {
             emit_policy_deny_connect(state, raw_target, "policy-deny", actor);
@@ -1408,7 +1419,7 @@ async fn handle_raw_passthrough(
 
     // Raw TCP always egresses directly: SO_MARK bypasses the nftables cage and
     // the bytes are spliced through untouched.
-    let mut upstream = match sock_mark::connect_tcp_resolve(raw_target).await {
+    let mut upstream = match sock_mark::connect_tcp_egress(raw_target).await {
         Ok(s) => s,
         Err(e) => {
             emit_audit(state, raw_target, "error", 502, actor);
@@ -2027,24 +2038,10 @@ fn validate_connect_target(target: &str) -> Result<(), Box<dyn std::error::Error
         return Err("CONNECT to localhost denied".into());
     }
 
-    if let Ok(ip) = hostname.parse::<std::net::IpAddr>() {
-        if ip.is_loopback() {
-            return Err("CONNECT to loopback denied".into());
-        }
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                // 169.254.0.0/16
-                if v4.octets()[0] == 169 && v4.octets()[1] == 254 {
-                    return Err("CONNECT to link-local denied".into());
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                // fe80::/10
-                if (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                    return Err("CONNECT to link-local denied".into());
-                }
-            }
-        }
+    if let Ok(ip) = hostname.parse::<std::net::IpAddr>()
+        && sock_mark::is_disallowed_egress_ip(ip)
+    {
+        return Err("CONNECT to loopback/link-local/unspecified denied".into());
     }
 
     Ok(())
@@ -2437,6 +2434,17 @@ pub(crate) mod tests {
     #[test]
     fn validate_rejects_link_local_v6() {
         assert!(validate_connect_target("[fe80::1]:80").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unspecified() {
+        assert!(validate_connect_target("0.0.0.0:80").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_mapped_loopback() {
+        // IPv4-mapped IPv6 must canonicalize to its v4 form before the check.
+        assert!(validate_connect_target("[::ffff:127.0.0.1]:80").is_err());
     }
 
     #[test]
