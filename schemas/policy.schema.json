@@ -196,6 +196,28 @@
         }
       ]
     },
+    "Egress": {
+      "description": "Egress rules split by the layer at which the destination is filtered.\n\n- [`l7`](Self::l7) filters by hostname and can see and rewrite the payload\n  (HTTP rules, TLS termination, credential injection).\n- [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the\n  payload — an opaque byte splice for non-HTTP services.",
+      "type": "object",
+      "properties": {
+        "l7": {
+          "description": "Application-layer (hostname + HTTP/TLS) route rules, first match wins.\nSame rule type as the deprecated top-level `allowedRoutes`.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RouteRule"
+          }
+        },
+        "tcp": {
+          "description": "Raw TCP rules, first match wins. Each matches a destination by IP/CIDR\nor hostname (optionally scoped to a port) and splices the connection\nthrough opaquely — no protocol classification, no TLS interception, no\nHTTP rules. Intended for databases, brokers, and caches, including those\nthat speak TLS (the connection is not intercepted, so pinning works).\n\nA hostname rule permits its own DNS lookup and pins the resolved IPs, so\nit needs no paired [`l7`](Self::l7) rule (see [`TcpEgressRule`]).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TcpEgressRule"
+          }
+        }
+      }
+    },
     "ForwardConfig": {
       "description": "TLS bridge forwarding config for tunnel-routed connections.",
       "type": "object",
@@ -259,12 +281,15 @@
       }
     },
     "NetworkPolicy": {
-      "description": "Network policy controlling which domains the sandbox can reach.",
+      "description": "Network policy controlling what the sandbox can reach.",
       "type": "object",
       "properties": {
         "allowedRoutes": {
-          "description": "Ordered list of route rules (first match wins).",
-          "type": "array",
+          "description": "**Deprecated** — use [`egress.l7`](Egress::l7). Accepted as a\nback-compat alias: when both are present, `egress.l7` wins. Ordered\nlist of application-layer route rules (first match wins).",
+          "type": [
+            "array",
+            "null"
+          ],
           "items": {
             "$ref": "#/$defs/RouteRule"
           }
@@ -274,12 +299,22 @@
           "$ref": "#/$defs/Transport"
         },
         "defaultVerdict": {
-          "description": "Verdict for destinations not matching any route rule.",
+          "description": "Verdict for destinations not matching any rule.",
           "$ref": "#/$defs/Verdict"
+        },
+        "egress": {
+          "description": "Egress rules grouped by the layer they filter at. Optional so older\npolicies that only set the deprecated top-level `allowedRoutes` still\nparse.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Egress"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
-        "allowedRoutes",
         "defaultVerdict",
         "defaultTransport"
       ]
@@ -365,6 +400,41 @@
       "enum": [
         "http",
         "https"
+      ]
+    },
+    "TcpEgressRule": {
+      "description": "A single first-match-wins raw-TCP egress rule.",
+      "type": "object",
+      "properties": {
+        "binaries": {
+          "description": "Restrict this rule to connections initiated by specific binaries. Same\nsemantics as [`RouteRule::binaries`].",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "description": "Human-readable description of this rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "match": {
+          "description": "Destination as an IP, CIDR, `ip:port`, `cidr:port`, hostname, or\n`hostname:port` (e.g. `10.20.0.0/24:5432`, `[2001:db8::/32]:5432`,\n`db.internal:5432`). A bare IP/CIDR/hostname matches any port.\n\nIP/CIDR patterns match the resolved destination directly at connect\ntime. Hostname patterns can only match via DNS forward-pinning: the DNS\nstub permits the lookup for a matching hostname rule, then pins the\nresolved A-record IPs so the raw TCP layer admits the follow-up\nconnection. A hostname rule is self-sufficient — it gates its own DNS\nlookup, so no paired [`l7`](Egress::l7) rule is required.",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "Policy verdict: allow, deny, or ask.",
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "match",
+        "verdict"
       ]
     },
     "TempFile": {

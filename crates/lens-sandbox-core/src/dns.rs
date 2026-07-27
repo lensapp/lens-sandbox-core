@@ -37,19 +37,19 @@
 //!   `192.168.5.1`) already caches.
 //! - DNSSEC validation — out of scope; we forward DNSSEC records opaquely.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, ResponseCode};
-use hickory_proto::rr::RecordType;
+use hickory_proto::rr::{RData, RecordType};
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::peer_process::{PeerProcess, resolve_udp_offloaded};
-use crate::proxy::{ProxyState, emit_deny_event};
-use crate::routing::{HostnameMatch, hostname_match_for_caller};
+use crate::proxy::{ProxyState, emit_deny_event, pin_dns_answers};
+use crate::routing::{FqdnPin, HostnameMatch, hostname_match_for_caller, matching_fqdn_pin};
 use crate::sock_mark;
 
 /// Receive buffer for incoming DNS *queries*. 1232 is the EDNS0-recommended
@@ -146,9 +146,11 @@ async fn handle_query(
     let decision = resolve_decision(&packet, peer, state).await;
 
     match decision {
-        Decision::Allow { qname } => {
+        Decision::Allow { qname, pin } => {
             tracing::debug!(qname = %qname, "dns stub forwarding");
-            if let Err(e) = forward_upstream(&packet, upstream, socket, peer).await {
+            if let Err(e) =
+                forward_upstream(&packet, upstream, socket, peer, state, pin.as_ref()).await
+            {
                 tracing::warn!(qname = %qname, "dns stub upstream error: {e}");
             }
         }
@@ -173,9 +175,19 @@ async fn handle_query(
 }
 
 enum Decision {
-    Allow { qname: String },
-    Deny { qname: String, reason: &'static str },
-    SuppressNodata { qname: String },
+    /// Resolve the name. `pin` is the `tcp_fqdn` pin spec its A answers should
+    /// be recorded against (`None` for names with no fqdn tcp rule).
+    Allow {
+        qname: String,
+        pin: Option<FqdnPin>,
+    },
+    Deny {
+        qname: String,
+        reason: &'static str,
+    },
+    SuppressNodata {
+        qname: String,
+    },
     Malformed,
 }
 
@@ -205,7 +217,13 @@ async fn resolve_decision(packet: &[u8], peer: SocketAddr, state: &ProxyState) -
         .read()
         .unwrap()
         .iter()
-        .any(|r| r.binaries.is_some());
+        .any(|r| r.binaries.is_some())
+        || state
+            .tcp_fqdn
+            .read()
+            .unwrap()
+            .iter()
+            .any(|r| r.binaries.is_some());
     let caller = if has_binary_rule {
         resolve_udp_offloaded(peer).await
     } else {
@@ -251,11 +269,19 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         query.query_type(),
         RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB | RecordType::ANY
     );
-    let allow = |qname| {
+    // Pin for this name from the raw-TCP fqdn rules (`None` for names with no
+    // fqdn tcp rule). Attached to any allow so the stub records the answer IPs
+    // for the TCP layer. Computed once and reused across the allow branches.
+    let fqdn = state.tcp_fqdn.read().unwrap();
+    let pin = matching_fqdn_pin(&fqdn, &normalized, caller);
+    let fqdn_match = hostname_match_for_caller(&fqdn, &normalized, caller);
+    drop(fqdn);
+
+    let allow = |qname, pin| {
         if should_suppress {
             Decision::SuppressNodata { qname }
         } else {
-            Decision::Allow { qname }
+            Decision::Allow { qname, pin }
         }
     };
 
@@ -267,7 +293,7 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         .iter()
         .any(|h| h == &normalized)
     {
-        return allow(normalized);
+        return allow(normalized, pin);
     }
 
     let routes = state.routes.read().unwrap();
@@ -278,7 +304,7 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
     let matched = hostname_match_for_caller(&routes, &normalized, caller);
     drop(routes);
     match matched {
-        HostnameMatch::Allowed => return allow(normalized),
+        HostnameMatch::Allowed => return allow(normalized, pin),
         HostnameMatch::Denied => {
             return Decision::Deny {
                 qname: normalized,
@@ -289,6 +315,26 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         // closed with its own reason, and — unlike an unmatched name — do not
         // consult the JIT-approved set: that set is host-keyed, so honouring it
         // would let any binary re-open a host once any binary got it approved.
+        HostnameMatch::BinaryDenied => {
+            return Decision::Deny {
+                qname: normalized,
+                reason: BINARY_DENY_REASON,
+            };
+        }
+        HostnameMatch::Unmatched => {}
+    }
+
+    // No l7 route matched — a raw-TCP fqdn rule may still permit the lookup so
+    // its answer IPs can be pinned for the TCP layer. Same first-match / deny /
+    // binary-scoping semantics as the l7 gate above.
+    match fqdn_match {
+        HostnameMatch::Allowed => return allow(normalized, pin),
+        HostnameMatch::Denied => {
+            return Decision::Deny {
+                qname: normalized,
+                reason: DENY_REASON,
+            };
+        }
         HostnameMatch::BinaryDenied => {
             return Decision::Deny {
                 qname: normalized,
@@ -310,7 +356,7 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         .unwrap()
         .contains(&normalized)
     {
-        return allow(normalized);
+        return allow(normalized, pin);
     }
 
     Decision::Deny {
@@ -343,6 +389,8 @@ async fn forward_upstream(
     upstream: SocketAddr,
     client_socket: &UdpSocket,
     client_peer: SocketAddr,
+    state: &Arc<ProxyState>,
+    pin: Option<&FqdnPin>,
 ) -> Result<(), String> {
     // SO_MARK on the upstream socket so the nftables NAT chain doesn't
     // redirect the stub's own query packet back at itself. The listening
@@ -369,11 +417,43 @@ async fn forward_upstream(
         .map_err(|_| "upstream timeout".to_string())?
         .map_err(|e| format!("upstream recv: {e}"))?;
 
+    // Pin the answer's A-record IPs for the fqdn tcp rule this name matched, so
+    // the raw TCP layer admits the follow-up connection to a resolved IP. Only
+    // A records (IPv4) are pinned — the transparent interceptor is IPv4-only and
+    // AAAA is already suppressed to NODATA upstream of here.
+    if let Some(pin) = pin {
+        pin_answer_ips(&resp_buf[..n], state, pin);
+    }
+
     client_socket
         .send_to(&resp_buf[..n], client_peer)
         .await
         .map_err(|e| format!("client reply: {e}"))?;
     Ok(())
+}
+
+/// Parse an upstream response and pin its A-record IPs against `pin`, using the
+/// smallest answer TTL. A malformed response is ignored (the bytes are still
+/// relayed to the client by the caller).
+fn pin_answer_ips(response: &[u8], state: &Arc<ProxyState>, pin: &FqdnPin) {
+    let Ok(msg) = Message::from_vec(response) else {
+        return;
+    };
+    let mut ips = Vec::new();
+    let mut min_ttl = u32::MAX;
+    for record in &msg.answers {
+        if let RData::A(a) = &record.data {
+            ips.push(IpAddr::V4(a.0));
+            min_ttl = min_ttl.min(record.ttl);
+        }
+    }
+    if ips.is_empty() {
+        return;
+    }
+    // `min_ttl` is set on every A record, so it is never `MAX` once `ips` is
+    // non-empty; `pin_dns_answers` clamps a 0 up to the floor regardless.
+    let ttl = min_ttl;
+    pin_dns_answers(state, &ips, pin, ttl);
 }
 
 /// Parse `/etc/resolv.conf` for the first `nameserver` line. In Docker this
@@ -510,7 +590,7 @@ mod tests {
         );
         let packet = make_query("host.docker.internal", RecordType::A);
         match classify_query(&packet, &state, None) {
-            Decision::Allow { qname } => assert_eq!(qname, "host.docker.internal"),
+            Decision::Allow { qname, .. } => assert_eq!(qname, "host.docker.internal"),
             other => panic!("bootstrap host should resolve, got: {}", describe(&other)),
         }
 
@@ -551,7 +631,7 @@ mod tests {
         let state = state_with_routes(vec![rule("example.com")]);
         let packet = make_query("example.com", RecordType::A);
         match classify_query(&packet, &state, None) {
-            Decision::Allow { qname } => assert_eq!(qname, "example.com"),
+            Decision::Allow { qname, .. } => assert_eq!(qname, "example.com"),
             other => panic!("expected Allow, got: {}", describe(&other)),
         }
     }
@@ -582,7 +662,7 @@ mod tests {
         let packet = make_query("api.example.com", RecordType::A);
         let curl = caller("/usr/bin/curl");
         match classify_query(&packet, &state, Some(&curl)) {
-            Decision::Allow { qname } => assert_eq!(qname, "api.example.com"),
+            Decision::Allow { qname, .. } => assert_eq!(qname, "api.example.com"),
             other => panic!("listed caller should resolve, got: {}", describe(&other)),
         }
     }

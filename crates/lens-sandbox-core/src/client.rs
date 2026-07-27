@@ -630,17 +630,29 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         files: Option<Vec<crate::protocol::TempFile>>,
     }
 
-    // Loose deserialization — allowed_routes stays as Value so individual
-    // route errors are handled gracefully in parse_proxy_routes.
+    // Loose deserialization — route lists stay as Value so individual route
+    // errors are handled gracefully in parse_proxy_routes / parse_tcp_egress.
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct NetworkPolicyRaw {
+        /// Deprecated alias for `egress.l7`. `egress.l7` wins when both are set.
         #[serde(default)]
         allowed_routes: serde_json::Value,
+        #[serde(default)]
+        egress: Option<EgressRaw>,
         #[serde(default)]
         default_verdict: Option<String>,
         #[serde(default)]
         default_transport: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct EgressRaw {
+        #[serde(default)]
+        l7: serde_json::Value,
+        #[serde(default)]
+        tcp: serde_json::Value,
     }
 
     // Parsed first, alone — the version gate must fire before the full typed
@@ -737,9 +749,45 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     let mut routes_valid = false;
     match msg.network {
         Some(network) => {
-            if network.allowed_routes.is_array() {
-                match parse_proxy_routes(&network.allowed_routes) {
-                    Ok(parsed_routes) => {
+            // Clear all network policy and fail closed (deny via upstream).
+            // Shared by every invalid-policy branch so they can't drift.
+            let force_deny = || {
+                state.routes.write().unwrap().clear();
+                state.tcp_egress.write().unwrap().clear();
+                state.tcp_fqdn.write().unwrap().clear();
+                state.pinned_ips.write().unwrap().clear();
+                state.client_certs.write().unwrap().clear();
+                *state.default_verdict.write().unwrap() = crate::routing::Verdict::Deny;
+                *state.default_transport.write().unwrap() = crate::routing::Transport::Upstream;
+            };
+
+            // Resolve the l7 source. egress.l7 wins; else the deprecated
+            // top-level allowedRoutes. When the operator opted into the egress
+            // block at all, an absent l7 is simply "no l7 rules" (a tcp-only
+            // policy is valid) — not malformed. Only a legacy policy with
+            // neither egress nor a valid allowedRoutes is treated as malformed
+            // and fails closed.
+            let empty = serde_json::Value::Array(Vec::new());
+            let l7_value: Option<&serde_json::Value> = match &network.egress {
+                Some(e) if e.l7.is_array() => Some(&e.l7),
+                Some(_) if network.allowed_routes.is_array() => Some(&network.allowed_routes),
+                Some(_) => Some(&empty),
+                None if network.allowed_routes.is_array() => Some(&network.allowed_routes),
+                None => None,
+            };
+            // egress.tcp is the raw-L4 list: absent means none, present-but-
+            // invalid fails closed alongside the l7 list.
+            let tcp_result: Result<crate::routing::TcpEgress, String> =
+                match network.egress.as_ref().map(|e| &e.tcp) {
+                    None => Ok(crate::routing::TcpEgress::default()),
+                    Some(v) if v.is_null() => Ok(crate::routing::TcpEgress::default()),
+                    Some(v) if v.is_array() => crate::routing::parse_tcp_egress(v),
+                    Some(_) => Err("egress.tcp must be an array".to_string()),
+                };
+
+            if let Some(l7_value) = l7_value {
+                match (parse_proxy_routes(l7_value), tcp_result) {
+                    (Ok(parsed_routes), Ok(tcp_rules)) => {
                         let mut route_rules = Vec::with_capacity(parsed_routes.len());
                         let mut cert_map: HashMap<String, crate::proxy::ClientCertConfig> =
                             HashMap::new();
@@ -785,34 +833,38 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
 
                         tracing::info!(
                             route_count = route_rules.len(),
+                            tcp_egress_count = tcp_rules.ip_rules.len(),
+                            tcp_fqdn_count = tcp_rules.fqdn_rules.len(),
                             client_cert_count = cert_map.len(),
                             client_cert_keys = ?cert_map.keys().collect::<Vec<_>>(),
-                            "proxy routes and forward certs updated from policy"
+                            "proxy routes, tcp egress, and forward certs updated from policy"
                         );
                         *state.client_certs.write().unwrap() = cert_map;
                         *state.routes.write().unwrap() = route_rules;
+                        *state.tcp_egress.write().unwrap() = tcp_rules.ip_rules;
+                        *state.tcp_fqdn.write().unwrap() = tcp_rules.fqdn_rules;
+                        // A fresh policy invalidates pins from the previous one.
+                        state.pinned_ips.write().unwrap().clear();
                         routes_valid = true;
                     }
-                    Err(e) => {
+                    (Err(e), _) => {
                         tracing::error!(
-                            "invalid network.allowedRoutes in policy: {e}; clearing routes and forcing deny"
+                            "invalid network egress.l7/allowedRoutes in policy: {e}; clearing routes and forcing deny"
                         );
-                        state.routes.write().unwrap().clear();
-                        state.client_certs.write().unwrap().clear();
-
-                        *state.default_verdict.write().unwrap() = crate::routing::Verdict::Deny;
-                        *state.default_transport.write().unwrap() =
-                            crate::routing::Transport::Upstream;
+                        force_deny();
+                    }
+                    (_, Err(e)) => {
+                        tracing::error!(
+                            "invalid network.egress.tcp in policy: {e}; clearing routes and forcing deny"
+                        );
+                        force_deny();
                     }
                 }
             } else {
                 tracing::info!(
-                    "network.allowedRoutes missing or not an array; clearing routes and forcing deny"
+                    "network policy has neither egress nor a valid allowedRoutes; clearing routes and forcing deny"
                 );
-                state.routes.write().unwrap().clear();
-                state.client_certs.write().unwrap().clear();
-                *state.default_verdict.write().unwrap() = crate::routing::Verdict::Deny;
-                *state.default_transport.write().unwrap() = crate::routing::Transport::Upstream;
+                force_deny();
             }
 
             // Only apply defaultVerdict/defaultTransport when routes parsed
@@ -871,6 +923,9 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             // No network field means no domain restrictions — reset to allow-all via Lens Sandbox.
             tracing::info!("network policy absent; resetting to allow-all via lens");
             state.routes.write().unwrap().clear();
+            state.tcp_egress.write().unwrap().clear();
+            state.tcp_fqdn.write().unwrap().clear();
+            state.pinned_ips.write().unwrap().clear();
             state.client_certs.write().unwrap().clear();
             *state.default_verdict.write().unwrap() = crate::routing::Verdict::Allow;
             *state.default_transport.write().unwrap() = crate::routing::Transport::Upstream;
@@ -2377,6 +2432,216 @@ mod tests {
             state.ephemeral_ca.get().is_some(),
             "ephemeral CA should be initialized"
         );
+    }
+
+    #[tokio::test]
+    async fn egress_tcp_populates_tcp_egress_list() {
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        let policy_json = serde_json::json!({
+            "network": {
+                "egress": {
+                    "l7": [
+                        {"match": "api.github.com", "verdict": "allow", "transport": "upstream"}
+                    ],
+                    "tcp": [
+                        {"match": "10.20.0.0/24:5432", "verdict": "allow"}
+                    ]
+                },
+                "defaultVerdict": "deny",
+                "defaultTransport": "upstream"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        // l7 rule landed in routes; tcp rule landed in tcp_egress.
+        assert_eq!(state.routes.read().unwrap().len(), 1);
+        let tcp = state.tcp_egress.read().unwrap();
+        assert_eq!(tcp.len(), 1);
+        assert!(matches!(
+            &tcp[0].matcher,
+            crate::routing::RouteMatcher::CidrPort(net, 5432) if net.to_string() == "10.20.0.0/24"
+        ));
+    }
+
+    #[tokio::test]
+    async fn tcp_only_policy_keeps_tcp_rules_and_applies_defaults() {
+        // A pure IP-based DB policy (egress.tcp, no l7) must stay live — this is
+        // the first-class "connect by IP, no DNS" case the schema advertises.
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        let policy_json = serde_json::json!({
+            "network": {
+                "egress": {
+                    "tcp": [
+                        {"match": "10.20.0.0/24:5432", "verdict": "allow"}
+                    ]
+                },
+                "defaultVerdict": "deny",
+                "defaultTransport": "upstream"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        // tcp rule kept, no l7 rules, and the operator's default verdict applied
+        // (NOT force-denied by a spurious "malformed policy" path).
+        assert_eq!(state.tcp_egress.read().unwrap().len(), 1);
+        assert!(state.routes.read().unwrap().is_empty());
+        assert_eq!(
+            *state.default_verdict.read().unwrap(),
+            crate::routing::Verdict::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_routes_still_works_as_l7_alias() {
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        // Deprecated top-level allowedRoutes with no egress block.
+        let policy_json = serde_json::json!({
+            "network": {
+                "allowedRoutes": [
+                    {"match": "api.github.com", "verdict": "allow", "transport": "upstream"}
+                ],
+                "defaultVerdict": "deny",
+                "defaultTransport": "upstream"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        assert_eq!(state.routes.read().unwrap().len(), 1);
+        assert!(state.tcp_egress.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn egress_l7_wins_over_allowed_routes() {
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        // Both present: egress.l7 (two rules) must win over allowedRoutes (one rule).
+        let policy_json = serde_json::json!({
+            "network": {
+                "allowedRoutes": [
+                    {"match": "old.example.com", "verdict": "allow", "transport": "upstream"}
+                ],
+                "egress": {
+                    "l7": [
+                        {"match": "a.example.com", "verdict": "allow", "transport": "upstream"},
+                        {"match": "b.example.com", "verdict": "allow", "transport": "upstream"}
+                    ]
+                },
+                "defaultVerdict": "deny",
+                "defaultTransport": "upstream"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        assert_eq!(
+            state.routes.read().unwrap().len(),
+            2,
+            "egress.l7 should win over the deprecated allowedRoutes alias"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_egress_tcp_fails_closed() {
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        // A malformed egress.tcp (not an array) is rejected — the whole policy
+        // fails closed rather than partially applying.
+        let policy_json = serde_json::json!({
+            "network": {
+                "egress": {
+                    "l7": [
+                        {"match": "api.github.com", "verdict": "allow", "transport": "upstream"}
+                    ],
+                    "tcp": "not-an-array"
+                },
+                "defaultVerdict": "allow",
+                "defaultTransport": "upstream"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        assert!(state.routes.read().unwrap().is_empty());
+        assert!(state.tcp_egress.read().unwrap().is_empty());
+        assert!(state.tcp_fqdn.read().unwrap().is_empty());
+        assert_eq!(
+            *state.default_verdict.read().unwrap(),
+            crate::routing::Verdict::Deny,
+            "invalid egress.tcp must force the default verdict to deny"
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_tcp_hostname_populates_fqdn_list() {
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        // A hostname rule lands in tcp_fqdn (for DNS-answer pinning); an IP rule
+        // lands in tcp_egress (static match). Both from one egress.tcp list.
+        let policy_json = serde_json::json!({
+            "network": {
+                "egress": {
+                    "tcp": [
+                        {"match": "db.internal:5432", "verdict": "allow"},
+                        {"match": "10.0.0.0/24:6379", "verdict": "allow"}
+                    ]
+                },
+                "defaultVerdict": "deny",
+                "defaultTransport": "upstream"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        assert_eq!(state.tcp_fqdn.read().unwrap().len(), 1);
+        assert_eq!(state.tcp_egress.read().unwrap().len(), 1);
     }
 
     // Test with the exact JSON the Go CLI produces for a real k3s kubeconfig.
