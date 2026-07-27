@@ -95,7 +95,7 @@ fn state_with_tcp_fqdn(host: &str) -> Arc<ProxyState> {
         None,
         Vec::new(),
     );
-    *state.tcp_fqdn.write().unwrap() = vec![RouteRule {
+    state.policy.write().unwrap().tcp_fqdn = vec![RouteRule {
         matcher: RouteMatcher::Domain(host.to_string()),
         verdict: Verdict::Allow,
         transport: Transport::Direct,
@@ -130,7 +130,7 @@ fn state_with_allow(patterns: &[&str]) -> Arc<ProxyState> {
             binaries: None,
         })
         .collect();
-    *state.routes.write().unwrap() = rules;
+    state.policy.write().unwrap().routes = rules;
     state
 }
 
@@ -219,8 +219,9 @@ async fn tcp_fqdn_answer_pins_resolved_ip() {
     assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
 
     // The stub should have pinned the answer's IP for the raw TCP layer.
-    let pinned = state.pinned_ips.read().unwrap();
-    let entry = pinned
+    let policy = state.policy.read().unwrap();
+    let entry = policy
+        .pins
         .get(&IpAddr::V4(resolved))
         .expect("resolved IP must be pinned");
     assert!(entry.iter().any(|p| p.pin.verdict == Verdict::Allow));
@@ -250,7 +251,7 @@ async fn link_local_answer_is_not_pinned() {
         .expect("recv ok");
 
     assert!(
-        state.pinned_ips.read().unwrap().is_empty(),
+        state.policy.read().unwrap().pins.is_empty(),
         "a link-local DNS answer must never be pinned"
     );
 }
@@ -278,7 +279,7 @@ async fn answer_for_unlisted_host_is_not_pinned() {
         .expect("recv ok");
 
     assert!(
-        state.pinned_ips.read().unwrap().is_empty(),
+        state.policy.read().unwrap().pins.is_empty(),
         "an L7-only host must not create a raw-TCP pin"
     );
 }
