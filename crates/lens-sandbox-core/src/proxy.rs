@@ -1494,9 +1494,9 @@ async fn connect_egress_under_policy(
 /// claim at all admits, because the destination was authorized by the L7 table
 /// and the tcp table simply has nothing to say about it.
 ///
-/// That last part is why [`handle_raw_passthrough`]'s post-reload re-check does
-/// not reuse this: there, an unclaimed destination means the rule that justified
-/// splicing it raw is gone.
+/// This guards a dial against a rule the target could not be tested against
+/// while it was still a name. It is not what keeps an approval from outliving
+/// its policy — see the generation check in [`raw_verdict_admits`].
 fn tcp_egress_admits(
     state: &Arc<ProxyState>,
     ip: IpAddr,
@@ -1698,30 +1698,6 @@ async fn handle_raw_passthrough(
         return Ok(());
     }
 
-    // An `ask` parks the connection for up to `DECISION_TIMEOUT`, long enough
-    // for a policy to land, and consent is scoped to the generation that granted
-    // it. On a reload only a rule the *new* policy carries can re-admit: a
-    // vanished rule refuses rather than consenting by silence, which is the one
-    // way this differs from the dial guard, where an unclaimed destination is
-    // simply the L7 table's business. A reload also clears the pins, so a
-    // hostname rule cannot re-match an address either — the connection is
-    // dropped and the workload redials to be judged fresh.
-    if state.policy.read().unwrap().generation != decision.generation
-        && !matches!(
-            tcp_egress_verdict(
-                state,
-                &orig_dst.ip().to_string(),
-                orig_dst.port(),
-                actor.process()
-            ),
-            Some(d) if d.verdict == Verdict::Allow
-        )
-    {
-        emit_policy_deny_connect(state, &raw_target, "policy-deny", actor);
-        tracing::info!(target = %raw_target, "raw passthrough DENIED (policy reloaded)");
-        return Ok(());
-    }
-
     // Raw TCP always egresses directly: SO_MARK bypasses the nftables cage and
     // the bytes are spliced through untouched.
     let mut upstream = match sock_mark::connect_tcp_egress(&raw_target).await {
@@ -1772,15 +1748,29 @@ async fn raw_verdict_admits(
                 crate::protocol::Treatment::Raw,
             )
             .await;
-            if answer.is_allow() {
-                emit_gate_resolved(state, &action_str, answer);
-                tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough ALLOWED (gated)");
-            } else {
+            if !answer.is_allow() {
                 emit_gate_denied(state, &action_str, answer);
                 emit_audit(state, target, "failure", 403, actor);
                 tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough DENIED (gated)");
+                return false;
             }
-            answer.is_allow()
+            emit_gate_resolved(state, &action_str, answer);
+            // The gate can hold a connection for `DECISION_TIMEOUT`, long enough
+            // for an operator to publish a policy. Consent belongs to the
+            // generation that granted it, so any egress change voids it: the
+            // rule may have been deleted, narrowed, or turned into a deny, and
+            // the reload cleared the pins a hostname rule needed to bind at all.
+            // Refusing outright beats re-asking the table, which would have to
+            // answer for whichever of a name or an address this door happens to
+            // hold. The workload redials and is judged fresh; if the new policy
+            // simply allows the destination, that redial needs no dialog.
+            if state.policy.read().unwrap().generation != decision.generation {
+                emit_policy_deny_connect(state, target, "policy-changed", actor);
+                tracing::info!(target = %target, "raw passthrough DENIED (policy changed under the dialog)");
+                return false;
+            }
+            tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough ALLOWED (gated)");
+            true
         }
     }
 }
@@ -4224,12 +4214,63 @@ pub(crate) mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e["metadata"]["reason"] == "policy-deny"),
+                .any(|e| e["metadata"]["reason"] == "policy-changed"),
             "the revoked rule must refuse the approved splice; got {events:#?}"
         );
         assert!(
             !events.iter().any(|e| e["result"] == "success"),
             "nothing may splice under a rule that no longer exists; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_deleted_during_the_dialog_refuses_on_the_proxy_door_too() {
+        // The transparent door refuses this. The workload picks its door, so
+        // the CONNECT door must not be the softer one — its dial guard asks
+        // about the resolved address, and a table that no longer claims that
+        // address reads as "not my business" rather than "the grant is gone".
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "203.0.113.0/24:5432", "verdict": "ask"}]"#,
+        );
+        let decision = tcp_egress_verdict_for_hostport(&state, "203.0.113.9:5432", 443, None)
+            .expect("the cidr rule must claim this address");
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            connect_raw_passthrough(
+                server,
+                "203.0.113.9:5432",
+                &decision,
+                &state_for_handler,
+                &actor,
+            )
+            .await
+        });
+
+        let prompt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a dialog must be raised")
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&prompt).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        reload_tcp_rules(&state, "[]");
+        assert!(crate::gate::resolve_pending(
+            &state,
+            &id,
+            crate::protocol::Decision::AllowAlways
+        ));
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a deleted rule must refuse before the dial; got {response:?}"
         );
     }
 
@@ -4257,7 +4298,7 @@ pub(crate) mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e["metadata"]["reason"] == "policy-deny"),
+                .any(|e| e["metadata"]["reason"] == "policy-changed"),
             "a deleted rule must refuse the approved splice; got {events:#?}"
         );
         assert!(
