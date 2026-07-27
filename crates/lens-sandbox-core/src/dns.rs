@@ -690,15 +690,7 @@ mod tests {
         // fqdn rules atomically under one lock, so classify can never pair a new
         // generation with a stale fqdn rule — the race that would let a revoked
         // allow-pin survive under the new policy.
-        let fqdn_allow = |host: &str| RouteRule {
-            matcher: RouteMatcher::Domain(host.to_string()),
-            verdict: Verdict::Allow,
-            transport: Transport::Direct,
-            tls_terminate: false,
-            http_rules: Vec::new(),
-            scheme: None,
-            binaries: None,
-        };
+        let fqdn_allow = |host: &str| tcp_rule(host, 5432, Verdict::Allow);
         let state = state_with_routes(Vec::new());
         state.policy.write().unwrap().tcp_egress = vec![fqdn_allow("db.internal")];
 

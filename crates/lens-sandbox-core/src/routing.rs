@@ -601,12 +601,14 @@ pub struct TcpMatch<'a> {
 /// Match a raw-TCP destination against the ordered `egress.tcp` rules in one
 /// pass, so IP rules and hostname rules compete by their real policy position.
 ///
-/// `Cidr`/`CidrPort` match the destination IP, canonicalized so an IPv4-mapped
-/// IPv6 literal cannot slip past a v4 CIDR; `Domain`/`HostPort` match any name
-/// the destination is known by. `egress.tcp` rules carry no scheme, so there is
-/// no scheme filter here. Binary scoping and the no-reopen guard run through
-/// the same [`caller_admits_rule`] helper as [`find_matching_route`], so
-/// first-match / deny / binary semantics are identical across every door.
+/// Only the port-scoped matchers occur here — [`parse_tcp_egress`] rejects the
+/// portless ones, so an any-port raw grant cannot exist. `CidrPort` matches the
+/// destination IP, canonicalized so an IPv4-mapped IPv6 literal cannot slip past
+/// a v4 CIDR; `HostPort` matches any name the destination is known by.
+/// `egress.tcp` rules carry no scheme, so there is no scheme filter here. Binary
+/// scoping and the no-reopen guard run through the same [`caller_admits_rule`]
+/// helper as [`find_matching_route`], so first-match / deny / binary semantics
+/// are identical across every door.
 pub fn find_matching_tcp_egress<'a>(
     rules: &'a [RouteRule],
     target: TcpTarget<'a>,
@@ -617,18 +619,11 @@ pub fn find_matching_tcp_egress<'a>(
     for rule in rules {
         let mut matched_name = None;
         let matched = match &rule.matcher {
-            RouteMatcher::Cidr(cidr) => target
-                .ip
-                .is_some_and(|ip| cidr.contains(&ip.to_canonical())),
             RouteMatcher::CidrPort(cidr, pattern_port) => {
                 *pattern_port == port
                     && target
                         .ip
                         .is_some_and(|ip| cidr.contains(&ip.to_canonical()))
-            }
-            RouteMatcher::Domain(pattern) => {
-                matched_name = target.matching_name(|n| domain_matches(pattern, n));
-                matched_name.is_some()
             }
             RouteMatcher::HostPort(pattern_host, pattern_port) => {
                 matched_name = (*pattern_port == port)
@@ -636,6 +631,9 @@ pub fn find_matching_tcp_egress<'a>(
                     .flatten();
                 matched_name.is_some()
             }
+            // Rejected at parse time: a portless raw grant is exactly what the
+            // port requirement exists to forbid, so there is nothing to match.
+            RouteMatcher::Cidr(_) | RouteMatcher::Domain(_) => false,
         };
         if !matched {
             continue;
@@ -1334,16 +1332,18 @@ mod tests {
     /// `egress.tcp` port requirement. `hostname_match_for_caller` is shared with
     /// the L7 gate (where portless hostnames are the norm), so its port-blind
     /// resolution logic is exercised here with rules constructed directly.
+    /// One `egress.tcp` rule, built through the real parser so a test can only
+    /// construct shapes a policy could actually carry — a hand-assembled
+    /// `RouteRule` could carry a matcher the port requirement rules out, and
+    /// keep the matching code for it alive on that basis alone.
     fn hostname_rule(pattern: &str, verdict: Verdict) -> RouteRule {
-        RouteRule {
-            matcher: normalize_ip_literal(parse_matcher(pattern).unwrap()),
-            verdict,
-            transport: Transport::Direct,
-            tls_terminate: false,
-            http_rules: Vec::new(),
-            scheme: None,
-            binaries: None,
-        }
+        parse_tcp(&format!(
+            r#"[{{"match": "{pattern}", "verdict": "{}"}}]"#,
+            serde_json::to_value(verdict).unwrap().as_str().unwrap()
+        ))
+        .expect("test rule must be a shape production accepts")
+        .pop()
+        .expect("one rule in, one rule out")
     }
 
     #[test]
@@ -1473,16 +1473,19 @@ mod tests {
     }
 
     #[test]
-    fn fqdn_hostname_match_portless_deny_is_terminal() {
-        // A portless deny before an allow kills every port — the name cannot
-        // resolve, matching the connect-time first-match evaluation. (Portless
-        // rules come from the L7 gate; `egress.tcp` requires a port.)
-        let rules = [
-            hostname_rule("db.internal", Verdict::Deny),
-            hostname_rule("db.internal:6379", Verdict::Allow),
-        ];
+    fn hostname_match_portless_deny_is_terminal_under_first_match() {
+        // A portless deny reaches only the L7 table, which is `FirstMatch` —
+        // `egress.tcp` requires a port on every rule. There an earlier deny
+        // covering the name kills every later allow, so the name cannot resolve.
+        let rules = parse_routes(
+            r#"[
+                {"match": "db.internal", "verdict": "deny", "transport": "direct"},
+                {"match": "db.internal:6379", "verdict": "allow", "transport": "direct"}
+            ]"#,
+        )
+        .unwrap();
         assert_eq!(
-            hostname_match_for_caller(&rules, "db.internal", None, PortScope::PerPort),
+            hostname_match_for_caller(&rules, "db.internal", None, PortScope::FirstMatch),
             HostnameMatch::Denied
         );
     }
@@ -1502,8 +1505,10 @@ mod tests {
     }
 
     #[test]
-    fn fqdn_hostname_match_wildcard_any_port() {
-        let rules = [hostname_rule("*.rds.amazonaws.com", Verdict::Allow)];
+    fn fqdn_hostname_match_resolves_a_wildcard() {
+        // DNS matches the host part alone, so the rule's port plays no role here
+        // — it is enforced at connect.
+        let rules = [hostname_rule("*.rds.amazonaws.com:5432", Verdict::Allow)];
         assert_eq!(
             hostname_match_for_caller(&rules, "prod.rds.amazonaws.com", None, PortScope::PerPort),
             HostnameMatch::Allowed
