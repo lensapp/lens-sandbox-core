@@ -6,12 +6,10 @@
 //! retries to the same host dedup onto one pending entry so the developer
 //! sees a single dialog.
 //!
-//! The relay-side notifier that turns `request_pending` into a developer
-//! dialog and replies with `request_decision` is **not implemented in
-//! this branch** — it lands in a follow-up. Until then, any policy that
-//! emits `Verdict::Ask` will hang until `DECISION_TIMEOUT` and then deny.
-//! Don't ship `verdict: "ask"` in user-visible policies until the
-//! relay-side handler is in place.
+//! The relay side turns `request_pending` into a developer dialog and
+//! replies with `request_decision`. Where no relay is attached — the audit
+//! channel is unwired or its receiver is gone — the gate fails closed at
+//! once rather than parking the request for `DECISION_TIMEOUT`.
 //!
 //! The gate is the v2 replacement for the audit-and-notify flow used today
 //! for `policy-deny`: that flow surfaced the dialog after the request had
@@ -169,12 +167,20 @@ fn resolve<V: Copy>(table: &std::sync::Mutex<PendingTable<V>>, id: &str, decisio
 
 /// Suspend the request until the developer answers the dialog or the
 /// timeout fires. Emits the `request_pending` frame on first sight of an
-/// `action`; subsequent concurrent retries of the *same* request join
-/// the existing entry and inherit its `treatment`, which is well-defined
-/// because treatment is a function of the destination under one policy
-/// generation. Different requests to the same host (e.g.
-/// `GET /safe` and `DELETE /danger`) each get their own dialog so an
-/// `AllowOnce` click releases only what was shown in the prompt.
+/// `action`; subsequent concurrent retries of the *same* request join the
+/// existing entry. Different requests to the same host (e.g. `GET /safe`
+/// and `DELETE /danger`) each get their own dialog so an `AllowOnce`
+/// click releases only what was shown in the prompt.
+///
+/// `treatment` is part of what makes two requests "the same". One
+/// destination can reach different treatments on different doors — a
+/// hostname `egress.tcp` rule claims a CONNECT by name, while the same host
+/// arriving as an address with no live DNS pin falls through to the L7
+/// table — and both render as `CONNECT host:port`. Keyed on the action
+/// alone they would share one dialog, and a joiner would inherit a
+/// treatment the developer was never shown. The workload chooses its door
+/// and whether a pin exists, so that is its choice to make, not an
+/// accident.
 ///
 /// Returns the resolved `Decision` so callers can record the appropriate
 /// audit event with `Decision::audit_reason()`.
@@ -185,7 +191,8 @@ pub async fn gate_or_deny(
     reason: &str,
     treatment: Treatment,
 ) -> Decision {
-    let (rx, id, emitted) = match subscribe_or_open(&state.pending, action, "gate", |id| {
+    let key = format!("{treatment:?}|{action}");
+    let (rx, id, emitted) = match subscribe_or_open(&state.pending, &key, "gate", |id| {
         emit_pending_frame(
             state,
             "gate",
@@ -207,7 +214,7 @@ pub async fn gate_or_deny(
     }
     let timeout = *state.decision_timeout.read().unwrap();
     let decision = await_decision(rx, timeout, Decision::Timeout).await;
-    cleanup_after_decision(&state.pending, action, &id);
+    cleanup_after_decision(&state.pending, &key, &id);
     // Let the DNS stub resolve this host even with no standing route: "allow
     // once" persists none, and "allow always"'s route arrives in a later
     // `policy` frame this request can't await. Lowercased to match the stub's
@@ -616,6 +623,69 @@ mod tests {
         let table = state.pending.lock().unwrap();
         assert!(table.by_key.is_empty());
         assert!(table.key_by_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_same_action_under_two_treatments_gets_two_dialogs() {
+        // One destination renders identically on two doors — a raw `egress.tcp`
+        // splice and an inspected L7 tunnel are both `CONNECT h:443`. Sharing a
+        // dialog would let a joiner be released by a prompt that described the
+        // other treatment, and approving "inspected" would land a raw splice.
+        let (state, mut rx) = test_state();
+        let action = "CONNECT h:443";
+        let raw = tokio::spawn({
+            let state = state.clone();
+            async move { gate_or_deny(&state, "h", action, "policy-ambiguous", Treatment::Raw).await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let inspected = tokio::spawn({
+            let state = state.clone();
+            async move {
+                gate_or_deny(
+                    &state,
+                    "h",
+                    action,
+                    "policy-ambiguous",
+                    Treatment::Inspected,
+                )
+                .await
+            }
+        });
+
+        let mut next = async || -> serde_json::Value {
+            let frame = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("both treatments must raise a dialog; a shared key emits only one")
+                .unwrap();
+            serde_json::from_str(&frame).unwrap()
+        };
+        let f1 = next().await;
+        let f2 = next().await;
+        assert_ne!(f1["id"], f2["id"], "each treatment needs its own dialog");
+        let treatments: std::collections::HashSet<_> = [
+            f1["treatment"].as_str().unwrap(),
+            f2["treatment"].as_str().unwrap(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            treatments,
+            ["raw", "inspected"].into_iter().collect(),
+            "both treatments must be shown; got {treatments:?}"
+        );
+
+        // Answering one must not release the other.
+        for frame in [&f1, &f2] {
+            let id = frame["id"].as_str().unwrap();
+            let decision = if frame["treatment"] == "raw" {
+                Decision::DenyOnce
+            } else {
+                Decision::AllowOnce
+            };
+            assert!(resolve_pending(&state, id, decision));
+        }
+        assert_eq!(raw.await.unwrap(), Decision::DenyOnce);
+        assert_eq!(inspected.await.unwrap(), Decision::AllowOnce);
     }
 
     #[tokio::test]
