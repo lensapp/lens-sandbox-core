@@ -109,7 +109,7 @@
               "type": "array",
               "default": [],
               "items": {
-                "$ref": "#/$defs/HttpRule"
+                "$ref": "#/$defs/HttpRequestMatch"
               }
             },
             "value": {
@@ -140,7 +140,7 @@
               "type": "array",
               "default": [],
               "items": {
-                "$ref": "#/$defs/HttpRule"
+                "$ref": "#/$defs/HttpRequestMatch"
               }
             },
             "value": {
@@ -155,6 +155,7 @@
           ]
         },
         {
+          "description": "Re-signs every request to [`domain`](Self::AwsSigv4::domain). This\nvariant takes no path rules: signing is decided by domain alone, and a\n`rules` key here is read and dropped.",
           "type": "object",
           "properties": {
             "accessKeyId": {
@@ -168,14 +169,6 @@
             "injectionType": {
               "type": "string",
               "const": "awsSigv4"
-            },
-            "rules": {
-              "description": "Optional path rules. When empty, re-sign for all requests.",
-              "type": "array",
-              "default": [],
-              "items": {
-                "$ref": "#/$defs/HttpRule"
-              }
             },
             "secretAccessKey": {
               "description": "Real STS-derived secret access key.",
@@ -260,8 +253,61 @@
         "keyPem"
       ]
     },
-    "HttpRule": {
-      "description": "HTTP method/path restriction within a route rule.",
+    "GraphqlMatcher": {
+      "description": "The GraphQL operations one [`HttpRule`] covers. Every field that is set must\nmatch the operation.",
+      "type": "object",
+      "properties": {
+        "fields": {
+          "description": "The root fields this rule permits, as globs.\n\nThese bound the selection. They do not pick a part of it: **every** root\nfield the operation selects must match one of the patterns. Thus\n`{ viewer deleteRepository }` does not satisfy a rule that lists only\n`viewer`. One rule must cover an operation alone — two rules that each\npermit one half of a selection do not combine.\n\nOmit to put no condition on the fields. A rule that names fields also\ndenies every field it does not name, which includes introspection\nthrough `__schema`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "operationName": {
+          "description": "The operation name the document must declare, as a glob (`Viewer`,\n`Get*`). Omit to cover any name, an unnamed operation included.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operationType": {
+          "description": "The operation type this rule covers. It is required, with `*` for any\ntype: a rule that left the type out would read as a query but would\nalso cover every mutation.",
+          "$ref": "#/$defs/GraphqlOperationTypeMatcher"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationType"
+      ]
+    },
+    "GraphqlOperationTypeMatcher": {
+      "description": "The operation types a [`GraphqlMatcher`] can cover.",
+      "oneOf": [
+        {
+          "description": "A read.",
+          "type": "string",
+          "const": "query"
+        },
+        {
+          "description": "A write.",
+          "type": "string",
+          "const": "mutation"
+        },
+        {
+          "description": "A stream. See the note on [`HttpRule::graphql`] — the proxy denies these.",
+          "type": "string",
+          "const": "subscription"
+        },
+        {
+          "description": "Any operation type.",
+          "type": "string",
+          "const": "*"
+        }
+      ]
+    },
+    "HttpRequestMatch": {
+      "description": "HTTP method/path restriction on a credential injection.\n\nThis is deliberately not [`HttpRule`]. An injection is decided from the\nrequest head alone, so a GraphQL matcher would have nothing here to act on.\nTwo types keep that state unrepresentable instead of quietly ignored — and\nan unknown key fails the policy, so `graphql` written here is refused at the\nparse boundary rather than dropped on the way in.",
       "type": "object",
       "properties": {
         "method": {
@@ -278,7 +324,40 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
+    },
+    "HttpRule": {
+      "description": "A request restriction within a route rule: the method and path it covers,\nand for a GraphQL endpoint the operation it covers.\n\nAn unknown key fails the policy. Every field here narrows what the rule\nadmits, so a key serde could not place is a narrowing that would go missing:\na misspelt `graphql` would leave the bare method and path behind as an\nunconditional allow.",
+      "type": "object",
+      "properties": {
+        "graphql": {
+          "description": "GraphQL operation this rule covers. Set it only for a GraphQL endpoint:\nthe proxy then reads the request body, because a GraphQL request puts\nthe operation there and every call looks like the same `POST /graphql`.\n\nA GraphQL rule is authoritative over the requests its `method` and\n`path` cover. Once one of them matches a request, only a GraphQL rule\ncan admit it — a rule with no `graphql` block does not apply, even if\nits method and path also match. Without that, a broad `POST /**` allow\nbeside a narrow GraphQL rule would leave the GraphQL rule with no\neffect.\n\nA request the proxy cannot read is denied, never passed on. This covers\na compressed or `multipart/*` body, a body above the inspection limit, a\ndocument that does not parse, a persisted query that carries no\ndocument, and a `Connection: upgrade` request. A GraphQL subscription\ntherefore does not work below a GraphQL rule, because its frames travel\non a WebSocket that the proxy relays without reading.\n\nOne destination escapes this rule: a host that an `awsSigv4` credential\nre-signs is handled on a path that enforces no HTTP rule at all, so a\nGraphQL rule written for AWS AppSync does not run. The proxy logs a\nwarning for that combination and permits the request.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphqlMatcher"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "method": {
+          "description": "HTTP method (GET, POST, * for any). Omit for any method.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "URL path glob pattern (/api/v1/*, /health, ** for any). Omit for any path.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "NetworkPolicy": {
       "description": "Network policy controlling what the sandbox can reach.",

@@ -155,7 +155,7 @@ pub struct CredentialInjection {
     pub value: String,
     /// Optional path rules. When present, only inject for matching requests.
     /// When empty, inject for all requests to the domain.
-    pub rules: Vec<crate::policy_schema::HttpRule>,
+    pub rules: Vec<crate::policy_schema::HttpRequestMatch>,
 }
 
 /// Client certificate configuration for mTLS upstream connections.
@@ -596,6 +596,52 @@ fn resolve_route(
     }
 }
 
+/// What a client is told when policy refuses its request. Shared with the TLS
+/// door so both refusals look identical from outside.
+pub(crate) const FORBIDDEN_RESPONSE: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+/// The facts every refusal on this door records, collected once.
+struct ForwardRequest<'a> {
+    state: &'a Arc<ProxyState>,
+    target_host: &'a str,
+    method: &'a str,
+    path: &'a str,
+    actor: &'a crate::peer_process::ActorContext,
+}
+
+impl ForwardRequest<'_> {
+    /// Refuse this request: record it, tell the client, end the connection.
+    ///
+    /// The audit reason stays `policy-deny` whatever the detail, because the
+    /// relay's notify dispatcher matches on that exact value to raise the
+    /// developer's Allow/Skip dialog. `detail` says which rule refused, in the
+    /// log.
+    async fn deny(
+        &self,
+        client: &mut TcpStream,
+        detail: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tracing::info!(
+            target = %self.target_host,
+            method = %self.method,
+            path = %self.path,
+            detail,
+            "HTTP forward proxy request denied by policy rules"
+        );
+        emit_policy_deny_http(
+            self.state,
+            self.target_host,
+            self.method,
+            self.path,
+            "policy-deny",
+            self.actor,
+        );
+        client.write_all(FORBIDDEN_RESPONSE).await?;
+        Ok(())
+    }
+}
+
 /// Handle an HTTP forward proxy request (plain HTTP, not CONNECT).
 ///
 /// The client sent something like `GET http://host:port/path HTTP/1.1`.
@@ -632,6 +678,13 @@ async fn handle_http_forward(
     };
     let raw_no_query = path.split('?').next().unwrap_or(&path);
     let normalized_path = crate::routing::normalize_path(raw_no_query);
+    let refusal = ForwardRequest {
+        state,
+        target_host,
+        method,
+        path: &path,
+        actor,
+    };
 
     // `egress.tcp` claims are final on every door — see `tcp_egress_verdict`.
     // Absolute-form `http://` is port 80, not 443.
@@ -643,13 +696,10 @@ async fn handle_http_forward(
             .await;
     }
 
-    // Origin-form rewrite: proxy framing for the inspected path, which stays in
-    // the loop for every request and so leaves connection reuse to the client.
-    let relative_request =
-        rewrite_http_forward_request(&header_str, &path, target_host, Reuse::AsClientSent);
-
     // Find the matching route rule (same logic as CONNECT, but scheme is http
-    // since the request came in as an absolute-form http:// URL).
+    // since the request came in as an absolute-form http:// URL). It comes
+    // first because whether the route carries HTTP rules decides how the head
+    // below is framed.
     let (verdict, transport, _tls_terminate, domain_http_rules) = match resolve_route(
         state,
         target_host,
@@ -667,30 +717,70 @@ async fn handle_http_forward(
                 "binary-not-allowed",
                 actor,
             );
-            client
-                .write_all(
-                    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await?;
+            client.write_all(FORBIDDEN_RESPONSE).await?;
             return Ok(());
         }
     };
 
-    // Enforce HTTP rules — deny if rules present and no rule matches
-    if !domain_http_rules.is_empty()
-        && !crate::routing::http_request_matches_rules(&domain_http_rules, method, &normalized_path)
-    {
-        tracing::info!(
-            target = %target_host,
-            method = %method,
-            path = %normalized_path,
-            "HTTP forward proxy request denied by policy rules"
-        );
-        emit_policy_deny_http(state, target_host, method, &path, "policy-deny", actor);
-        client
-            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            .await?;
-        return Ok(());
+    // Origin-form rewrite: proxy framing for the inspected path.
+    //
+    // This door judges the first request on a connection and then splices the
+    // rest of it (`copy_bidirectional` below). So where rules apply, the client
+    // must not keep the connection for a second request that nothing would
+    // judge — `OneRequestOnly` makes the origin close after one response.
+    let reuse = if domain_http_rules.is_empty() {
+        Reuse::AsClientSent
+    } else {
+        Reuse::OneRequestOnly
+    };
+
+    // Forcing the origin to close is not enough on its own: an upgrade the
+    // origin accepts with a 101 turns the rest of this connection into a pipe
+    // that `copy_bidirectional` splices unread. Refuse it outright, as the TLS
+    // door does, rather than depend on the origin declining.
+    if !domain_http_rules.is_empty() && crate::mitm::is_upgrade_request(&header_str) {
+        return refusal
+            .deny(
+                &mut client,
+                "connection upgrade is not allowed on a route that carries HTTP rules",
+            )
+            .await;
+    }
+
+    let relative_request = rewrite_http_forward_request(&header_str, &path, target_host, reuse);
+
+    // Enforce HTTP rules. A GraphQL rule reads the body, which is still on the
+    // socket: the head was read one byte at a time, up to its terminator.
+    let mut buffered_body: Option<Vec<u8>> = None;
+    match crate::routing::classify_http_request(&domain_http_rules, method, &normalized_path) {
+        crate::routing::HttpRuleOutcome::Allow => {}
+        crate::routing::HttpRuleOutcome::NoMatch => {
+            return refusal
+                .deny(&mut client, "no HTTP rule permits this method and path")
+                .await;
+        }
+        crate::routing::HttpRuleOutcome::Graphql(matchers) => {
+            let framing = crate::http_body::determine_body_framing(&header_str, method);
+            let body = match crate::graphql::read_body_for_inspection(
+                &mut client,
+                &header_str,
+                method,
+                framing,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(detail) => {
+                    return refusal.deny(&mut client, &detail).await;
+                }
+            };
+            // `path` still carries the query string that `normalized_path` drops,
+            // and a GraphQL GET puts its document there.
+            if let Err(detail) = crate::graphql::check_request(method, &path, &body, &matchers) {
+                return refusal.deny(&mut client, &detail).await;
+            }
+            buffered_body = Some(body);
+        }
     }
 
     // Collect credential injections for this domain
@@ -718,24 +808,42 @@ async fn handle_http_forward(
         let rw_raw_path = rw_parts.get(1).unwrap_or(&"/");
         let rw_no_query = rw_raw_path.split('?').next().unwrap_or(rw_raw_path);
         let rw_normalized = crate::routing::normalize_path(rw_no_query);
-        if !crate::routing::http_request_matches_rules(&domain_http_rules, method, &rw_normalized) {
-            tracing::info!(
-                target = %target_host,
-                method = %method,
-                path = %rw_normalized,
-                "HTTP forward proxy request denied after URI placeholder rewrite"
-            );
-            emit_policy_deny_http(state, target_host, method, &path, "policy-deny", actor);
-            client
-                .write_all(
-                    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await?;
-            return Ok(());
+        let denial =
+            match crate::routing::classify_http_request(&domain_http_rules, method, &rw_normalized)
+            {
+                crate::routing::HttpRuleOutcome::Allow => None,
+                crate::routing::HttpRuleOutcome::NoMatch => {
+                    Some("rewritten URI does not match policy rules".to_string())
+                }
+                // The credential value moved the request onto a GraphQL rule. The
+                // rewrite does not touch the body, so the one already read answers
+                // for it; without one there is nothing to judge the new path with.
+                crate::routing::HttpRuleOutcome::Graphql(matchers) => match &buffered_body {
+                    Some(body) => {
+                        crate::graphql::check_request(method, rw_raw_path, body, &matchers).err()
+                    }
+                    None => Some(
+                        "rewritten URI reaches a GraphQL rule, but the body was not read"
+                            .to_string(),
+                    ),
+                },
+            };
+        if let Some(detail) = denial {
+            return refusal.deny(&mut client, &detail).await;
         }
     }
 
-    let modified_bytes = format!("{modified}\r\n\r\n");
+    // A body that policy had to read is no longer on the socket to relay, so the
+    // head must describe it and the bytes must be replayed with it.
+    let modified_bytes: Vec<u8> = match &buffered_body {
+        Some(body) => {
+            let head = crate::http_body::reframe_head_as_content_length(&modified, body.len());
+            let mut bytes = format!("{head}\r\n\r\n").into_bytes();
+            bytes.extend_from_slice(body);
+            bytes
+        }
+        None => format!("{modified}\r\n\r\n").into_bytes(),
+    };
 
     let effective_transport = match verdict {
         Verdict::Deny => {
@@ -808,7 +916,7 @@ async fn handle_http_forward(
             );
 
             // Send modified headers to upstream
-            upstream.write_all(modified_bytes.as_bytes()).await?;
+            upstream.write_all(&modified_bytes).await?;
 
             // Relay the rest bidirectionally (request body + response)
             emit_http_audit(state, target_host, method, &path, "success", 200, actor);
@@ -890,7 +998,7 @@ async fn handle_http_forward(
             );
 
             // Send modified HTTP request through the tunnel
-            upstream_stream.write_all(modified_bytes.as_bytes()).await?;
+            upstream_stream.write_all(&modified_bytes).await?;
 
             // Relay the rest bidirectionally (request body + response)
             emit_http_audit(state, target_host, method, &path, "success", 200, actor);
@@ -1081,13 +1189,18 @@ async fn handle_connect(
                 // silently ignored here. In practice `*.amazonaws.com`
                 // doesn't carry header injections, but surface the
                 // misconfiguration so it doesn't fail silently.
+                //
+                // HTTP rules are dropped here too, which is a policy bypass and
+                // not merely a lost injection: a rule written for a GraphQL
+                // service behind SigV4 (AppSync is one) does not run on this
+                // path. The warning is all this door does about it today.
                 if needs_mitm {
                     tracing::warn!(
                         target = %target_host,
                         has_header_injections = injections.is_some(),
                         has_http_rules = !domain_http_rules.is_empty(),
                         has_uri_placeholders = !uri_placeholders.is_empty(),
-                        "aws-resign and other injections configured on same host — non-aws injections will be dropped"
+                        "aws-resign owns this host: other injections are dropped and HTTP rules are NOT enforced"
                     );
                 }
                 let ca = get_or_init_ca(state)?;
@@ -4062,6 +4175,143 @@ pub(crate) mod tests {
                 scheme: None,
                 binaries: None,
             });
+    }
+
+    /// A catch-all allow whose HTTP rules permit read-only GraphQL only.
+    fn install_graphql_read_allow(state: &Arc<ProxyState>) {
+        state
+            .policy
+            .write()
+            .unwrap()
+            .routes
+            .push(crate::routing::RouteRule {
+                matcher: crate::routing::RouteMatcher::Domain("*".to_string()),
+                verdict: Verdict::Allow,
+                transport: Transport::Direct,
+                tls_terminate: false,
+                http_rules: vec![crate::policy_schema::HttpRule {
+                    method: Some("POST".to_string()),
+                    path: Some("/graphql".to_string()),
+                    graphql: Some(crate::policy_schema::GraphqlMatcher {
+                        operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
+                        operation_name: None,
+                        fields: vec!["viewer".to_string()],
+                    }),
+                }],
+                scheme: None,
+                binaries: None,
+            });
+    }
+
+    /// The head of an absolute-form forward-proxy GraphQL request.
+    ///
+    /// Head only: this door is handed the head that was already read off the
+    /// socket, and the body is still on the socket for a rule to read.
+    fn graphql_forward_head(body_len: usize) -> Vec<u8> {
+        format!(
+            "POST http://10.0.0.5/graphql HTTP/1.1\r\nHost: 10.0.0.5\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// Drive the forward-proxy door with a GraphQL body and return its answer.
+    async fn forward_graphql(state: &Arc<ProxyState>, body: &'static str) -> String {
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            handle_http_forward(
+                server,
+                "10.0.0.5:80",
+                graphql_forward_head(body.len()),
+                &state_for_handler,
+                &actor,
+            )
+            .await
+        });
+        client.write_all(body.as_bytes()).await.unwrap();
+        read_response(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn http_forward_denies_a_mutation_where_only_queries_are_permitted() {
+        let (state, _rx) = test_state();
+        install_graphql_read_allow(&state);
+
+        let response =
+            forward_graphql(&state, r#"{"query":"mutation { deleteRepository }"}"#).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a mutation must be denied on the plaintext door too; got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_forward_denies_a_forbidden_field_on_a_permitted_operation() {
+        let (state, _rx) = test_state();
+        install_graphql_read_allow(&state);
+
+        let response = forward_graphql(&state, r#"{"query":"{ viewer secrets }"}"#).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "containment applies on this door too; got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_forward_denies_an_upgrade_on_a_rule_carrying_route() {
+        // Closing the connection after one response is not enough: a 101 from a
+        // lenient origin would turn the rest of it into a spliced pipe that no
+        // rule judged. Parity with the TLS door.
+        let (state, _rx) = test_state();
+        install_graphql_read_allow(&state);
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            let headers = b"GET http://10.0.0.5/graphql HTTP/1.1\r\nHost: 10.0.0.5\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec();
+            handle_http_forward(server, "10.0.0.5:80", headers, &state_for_handler, &actor).await
+        });
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "an upgrade must not be granted where rules apply; got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_forward_denies_a_path_no_rule_covers() {
+        let (state, _rx) = test_state();
+        install_graphql_read_allow(&state);
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            let headers =
+                b"GET http://10.0.0.5/rest/things HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n".to_vec();
+            handle_http_forward(server, "10.0.0.5:80", headers, &state_for_handler, &actor).await
+        });
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "only the GraphQL rule is installed; got {response:?}"
+        );
+    }
+
+    #[test]
+    fn a_rule_carrying_route_forces_the_origin_to_close_after_one_response() {
+        // This door judges the first request and then splices, so a client must
+        // not be able to keep the connection for a second, unjudged one.
+        let head = "GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
+        let rewritten =
+            rewrite_http_forward_request(head, "/x", "example.com:80", Reuse::OneRequestOnly);
+        let lower = rewritten.to_ascii_lowercase();
+        assert!(lower.contains("connection: close"), "{rewritten}");
+        assert!(!lower.contains("keep-alive"), "{rewritten}");
     }
 
     /// The tcp table's verdict for `target`; tests that also care about the

@@ -245,8 +245,15 @@ pub struct RouteRule {
     pub binaries: Option<Vec<String>>,
 }
 
-/// HTTP method/path restriction within a route rule.
+/// A request restriction within a route rule: the method and path it covers,
+/// and for a GraphQL endpoint the operation it covers.
+///
+/// An unknown key fails the policy. Every field here narrows what the rule
+/// admits, so a key serde could not place is a narrowing that would go missing:
+/// a misspelt `graphql` would leave the bare method and path behind as an
+/// unconditional allow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HttpRule {
     /// HTTP method (GET, POST, * for any). Omit for any method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +262,120 @@ pub struct HttpRule {
     /// URL path glob pattern (/api/v1/*, /health, ** for any). Omit for any path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+
+    /// GraphQL operation this rule covers. Set it only for a GraphQL endpoint:
+    /// the proxy then reads the request body, because a GraphQL request puts
+    /// the operation there and every call looks like the same `POST /graphql`.
+    ///
+    /// A GraphQL rule is authoritative over the requests its `method` and
+    /// `path` cover. Once one of them matches a request, only a GraphQL rule
+    /// can admit it — a rule with no `graphql` block does not apply, even if
+    /// its method and path also match. Without that, a broad `POST /**` allow
+    /// beside a narrow GraphQL rule would leave the GraphQL rule with no
+    /// effect.
+    ///
+    /// A request the proxy cannot read is denied, never passed on. This covers
+    /// a compressed or `multipart/*` body, a body above the inspection limit, a
+    /// document that does not parse, a persisted query that carries no
+    /// document, and a `Connection: upgrade` request. A GraphQL subscription
+    /// therefore does not work below a GraphQL rule, because its frames travel
+    /// on a WebSocket that the proxy relays without reading.
+    ///
+    /// One destination escapes this rule: a host that an `awsSigv4` credential
+    /// re-signs is handled on a path that enforces no HTTP rule at all, so a
+    /// GraphQL rule written for AWS AppSync does not run. The proxy logs a
+    /// warning for that combination and permits the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql: Option<GraphqlMatcher>,
+}
+
+/// The GraphQL operations one [`HttpRule`] covers. Every field that is set must
+/// match the operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GraphqlMatcher {
+    /// The operation type this rule covers. It is required, with `*` for any
+    /// type: a rule that left the type out would read as a query but would
+    /// also cover every mutation.
+    pub operation_type: GraphqlOperationTypeMatcher,
+
+    /// The operation name the document must declare, as a glob (`Viewer`,
+    /// `Get*`). Omit to cover any name, an unnamed operation included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_name: Option<String>,
+
+    /// The root fields this rule permits, as globs.
+    ///
+    /// These bound the selection. They do not pick a part of it: **every** root
+    /// field the operation selects must match one of the patterns. Thus
+    /// `{ viewer deleteRepository }` does not satisfy a rule that lists only
+    /// `viewer`. One rule must cover an operation alone — two rules that each
+    /// permit one half of a selection do not combine.
+    ///
+    /// Omit to put no condition on the fields. A rule that names fields also
+    /// denies every field it does not name, which includes introspection
+    /// through `__schema`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+/// The operation types a [`GraphqlMatcher`] can cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphqlOperationTypeMatcher {
+    /// A read.
+    Query,
+    /// A write.
+    Mutation,
+    /// A stream. See the note on [`HttpRule::graphql`] — the proxy denies these.
+    Subscription,
+    /// Any operation type.
+    #[serde(rename = "*")]
+    Any,
+}
+
+/// HTTP method/path restriction on a credential injection.
+///
+/// This is deliberately not [`HttpRule`]. An injection is decided from the
+/// request head alone, so a GraphQL matcher would have nothing here to act on.
+/// Two types keep that state unrepresentable instead of quietly ignored — and
+/// an unknown key fails the policy, so `graphql` written here is refused at the
+/// parse boundary rather than dropped on the way in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRequestMatch {
+    /// HTTP method (GET, POST, * for any). Omit for any method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+
+    /// URL path glob pattern (/api/v1/*, /health, ** for any). Omit for any path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// What a GraphQL operation does. Names the three operation types the GraphQL
+/// specification defines, with no wildcard: this is what a request *is*, either
+/// as parsed from its document or as recorded for a persisted query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphqlOperationType {
+    /// A read.
+    Query,
+    /// A write.
+    Mutation,
+    /// A long-lived stream. Served over a WebSocket upgrade, whose frames this
+    /// proxy does not inspect — see [`crate::graphql`].
+    Subscription,
+}
+
+impl std::fmt::Display for GraphqlOperationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Query => write!(f, "query"),
+            Self::Mutation => write!(f, "mutation"),
+            Self::Subscription => write!(f, "subscription"),
+        }
+    }
 }
 
 /// TLS bridge forwarding config for tunnel-routed connections.
@@ -339,7 +460,7 @@ pub enum CredentialInjection {
         value: String,
         /// Optional path rules. When empty, inject for all requests.
         #[serde(default)]
-        rules: Vec<HttpRule>,
+        rules: Vec<HttpRequestMatch>,
     },
     UriPlaceholder {
         /// Domain this injection applies to.
@@ -348,8 +469,11 @@ pub enum CredentialInjection {
         value: String,
         /// Optional path rules. When empty, rewrite for all requests.
         #[serde(default)]
-        rules: Vec<HttpRule>,
+        rules: Vec<HttpRequestMatch>,
     },
+    /// Re-signs every request to [`domain`](Self::AwsSigv4::domain). This
+    /// variant takes no path rules: signing is decided by domain alone, and a
+    /// `rules` key here is read and dropped.
     AwsSigv4 {
         /// Domain pattern this credential re-signs (e.g. `*.amazonaws.com`).
         domain: String,
@@ -359,9 +483,6 @@ pub enum CredentialInjection {
         secret_access_key: String,
         /// Real STS session token.
         session_token: String,
-        /// Optional path rules. When empty, re-sign for all requests.
-        #[serde(default)]
-        rules: Vec<HttpRule>,
     },
 }
 
@@ -416,7 +537,6 @@ mod tests {
             access_key_id: String::new(),
             secret_access_key: String::new(),
             session_token: String::new(),
-            rules: vec![],
         };
 
         assert_eq!(armed_header.unarmed_domain(), None);

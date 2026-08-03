@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use ipnet::IpNet;
 
-pub use crate::policy_schema::{HttpRule, Scheme, Transport, Verdict};
+pub use crate::policy_schema::{
+    GraphqlMatcher, HttpRequestMatch, HttpRule, Scheme, Transport, Verdict,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteRule {
@@ -77,17 +79,35 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             .rules
             .into_iter()
             .filter_map(|r| {
-                // Filter out empty rules — both fields absent is a match-all that
-                // would silently bypass deny-by-default semantics.
-                if r.method.is_none() && r.path.is_none() {
+                // Filter out empty rules — every field absent is a match-all that
+                // would silently bypass deny-by-default semantics. A rule that
+                // carries only a `graphql` block is not empty: it constrains the
+                // operation on every method and path.
+                if r.method.is_none() && r.path.is_none() && r.graphql.is_none() {
                     return None;
                 }
                 Some(HttpRule {
                     method: r.method,
                     path: r.path,
+                    graphql: r.graphql,
                 })
             })
             .collect();
+
+        // A GraphQL rule governs the requests its head covers, so a bodiless
+        // rule beside it does not admit them. That is worth saying out loud at
+        // load: the operator sees which shape wins before a request is denied
+        // by it. Mirrors how an egress `tcp`/`http` overlap is logged, not
+        // rejected — deciding glob subsumption between rules is its own
+        // problem, and the runtime precedence already removes the ambiguity.
+        if http_rules.iter().any(|r| r.graphql.is_some())
+            && http_rules.iter().any(|r| r.graphql.is_none())
+        {
+            tracing::info!(
+                pattern = %raw.match_pattern,
+                "route mixes GraphQL and non-GraphQL HTTP rules: a request matching a GraphQL rule's method and path is decided by the GraphQL rules alone"
+            );
+        }
 
         let binaries = raw.binaries.map(parse_binaries).transpose()?;
 
@@ -951,29 +971,303 @@ fn glob_match_segments(pattern: &[&str], path: &[&str]) -> bool {
     si == path.len()
 }
 
-/// Check if an HTTP request matches any of the given rules.
-/// Returns true if rules is empty (no restrictions) or any rule matches.
-pub fn http_request_matches_rules(rules: &[HttpRule], method: &str, path: &str) -> bool {
+/// What a route's HTTP rules make of a request head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpRuleOutcome<'a> {
+    /// No rule covers this method and path. The caller denies the request.
+    NoMatch,
+    /// A rule with no GraphQL condition covers it. The caller allows it, and
+    /// no body is read.
+    Allow,
+    /// GraphQL rules cover it, and they decide it once the body is read. Each
+    /// matcher listed is a candidate; one of them must cover the operation
+    /// whole.
+    Graphql(Vec<&'a GraphqlMatcher>),
+}
+
+/// Decide what a route's HTTP rules make of a request head.
+///
+/// An empty rule list puts no restriction on the route, which is the
+/// deny-by-default contract on [`crate::policy_schema::RouteRule::rules`].
+///
+/// Where both kinds of rule cover the same head, the GraphQL rules win and the
+/// body decides. [`crate::policy_schema::HttpRule::graphql`] says why.
+pub fn classify_http_request<'a>(
+    rules: &'a [HttpRule],
+    method: &str,
+    path: &str,
+) -> HttpRuleOutcome<'a> {
     if rules.is_empty() {
-        return true;
+        return HttpRuleOutcome::Allow;
     }
-    rules.iter().any(|rule| {
-        let method_ok = match &rule.method {
-            None => true,
-            Some(m) if m == "*" => true,
-            Some(m) => m.eq_ignore_ascii_case(method),
-        };
-        let path_ok = match &rule.path {
-            None => true,
-            Some(p) => path_glob_matches(p, path),
-        };
-        method_ok && path_ok
-    })
+
+    let mut graphql = Vec::new();
+    let mut covered_by_head_alone = false;
+    for rule in rules
+        .iter()
+        .filter(|rule| head_matches(rule.method.as_deref(), rule.path.as_deref(), method, path))
+    {
+        match &rule.graphql {
+            Some(matcher) => graphql.push(matcher),
+            None => covered_by_head_alone = true,
+        }
+    }
+
+    if !graphql.is_empty() {
+        HttpRuleOutcome::Graphql(graphql)
+    } else if covered_by_head_alone {
+        HttpRuleOutcome::Allow
+    } else {
+        HttpRuleOutcome::NoMatch
+    }
+}
+
+/// Whether a credential injection's rules cover a request.
+///
+/// Head-only by construction — see [`crate::policy_schema::HttpRequestMatch`].
+/// An empty list covers every request to the domain.
+pub fn injection_covers_request(rules: &[HttpRequestMatch], method: &str, path: &str) -> bool {
+    rules.is_empty()
+        || rules
+            .iter()
+            .any(|rule| head_matches(rule.method.as_deref(), rule.path.as_deref(), method, path))
+}
+
+/// Whether a request's method and path satisfy a rule's head conditions. An
+/// absent condition places no restriction.
+fn head_matches(
+    rule_method: Option<&str>,
+    rule_path: Option<&str>,
+    method: &str,
+    path: &str,
+) -> bool {
+    let method_ok = match rule_method {
+        None | Some("*") => true,
+        Some(wanted) => wanted.eq_ignore_ascii_case(method),
+    };
+    let path_ok = match rule_path {
+        None => true,
+        Some(pattern) => path_glob_matches(pattern, path),
+    };
+    method_ok && path_ok
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether the rules permit a request on its head alone.
+    fn allows(rules: &[HttpRule], method: &str, path: &str) -> bool {
+        matches!(
+            classify_http_request(rules, method, path),
+            HttpRuleOutcome::Allow
+        )
+    }
+
+    fn head_rule(method: &str, path: &str) -> HttpRule {
+        HttpRule {
+            method: Some(method.to_string()),
+            path: Some(path.to_string()),
+            graphql: None,
+        }
+    }
+
+    fn graphql_rule(method: &str, path: &str, fields: &[&str]) -> HttpRule {
+        HttpRule {
+            method: Some(method.to_string()),
+            path: Some(path.to_string()),
+            graphql: Some(crate::policy_schema::GraphqlMatcher {
+                operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
+                operation_name: None,
+                fields: fields.iter().map(ToString::to_string).collect(),
+            }),
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // GraphQL rule precedence
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn a_graphql_rule_claims_the_head_it_covers() {
+        let rules = vec![graphql_rule("POST", "/graphql", &["viewer"])];
+        assert!(matches!(
+            classify_http_request(&rules, "POST", "/graphql"),
+            HttpRuleOutcome::Graphql(matchers) if matchers.len() == 1
+        ));
+    }
+
+    #[test]
+    fn a_graphql_rule_wins_over_a_bodiless_rule_on_the_same_head() {
+        // The whole point: a broad allow beside a GraphQL rule must not let a
+        // request past unread, or the GraphQL rule would do nothing at all.
+        let rules = vec![
+            head_rule("POST", "/**"),
+            graphql_rule("POST", "/graphql", &["viewer"]),
+        ];
+        assert!(matches!(
+            classify_http_request(&rules, "POST", "/graphql"),
+            HttpRuleOutcome::Graphql(_)
+        ));
+    }
+
+    #[test]
+    fn rule_order_does_not_change_which_kind_wins() {
+        let graphql_first = vec![
+            graphql_rule("POST", "/graphql", &["viewer"]),
+            head_rule("POST", "/**"),
+        ];
+        assert!(matches!(
+            classify_http_request(&graphql_first, "POST", "/graphql"),
+            HttpRuleOutcome::Graphql(_)
+        ));
+    }
+
+    #[test]
+    fn a_bodiless_rule_still_covers_a_head_no_graphql_rule_claims() {
+        let rules = vec![
+            head_rule("POST", "/**"),
+            graphql_rule("POST", "/graphql", &["viewer"]),
+        ];
+        assert!(allows(&rules, "POST", "/rest/things"));
+    }
+
+    #[test]
+    fn every_graphql_rule_covering_the_head_becomes_a_candidate() {
+        let rules = vec![
+            graphql_rule("POST", "/graphql", &["viewer"]),
+            graphql_rule("POST", "/**", &["rateLimit"]),
+            head_rule("GET", "/health"),
+        ];
+        match classify_http_request(&rules, "POST", "/graphql") {
+            HttpRuleOutcome::Graphql(matchers) => assert_eq!(matchers.len(), 2),
+            other => panic!("expected two candidates, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_head_no_rule_covers_matches_nothing() {
+        let rules = vec![graphql_rule("POST", "/graphql", &["viewer"])];
+        assert!(matches!(
+            classify_http_request(&rules, "DELETE", "/graphql"),
+            HttpRuleOutcome::NoMatch
+        ));
+    }
+
+    #[test]
+    fn an_empty_rule_list_places_no_restriction() {
+        assert!(matches!(
+            classify_http_request(&[], "POST", "/graphql"),
+            HttpRuleOutcome::Allow
+        ));
+    }
+
+    #[test]
+    fn a_rule_of_only_a_graphql_block_survives_parsing_and_covers_any_head() {
+        let json = r#"[{
+            "match": "api.github.com",
+            "verdict": "allow",
+            "transport": "direct",
+            "rules": [{ "graphql": { "operationType": "query" } }]
+        }]"#;
+        let routes = parse_routes(json).unwrap();
+        assert_eq!(
+            routes[0].http_rules.len(),
+            1,
+            "the rule must not be dropped"
+        );
+        assert!(matches!(
+            classify_http_request(&routes[0].http_rules, "POST", "/anything"),
+            HttpRuleOutcome::Graphql(_)
+        ));
+    }
+
+    #[test]
+    fn a_rule_with_no_condition_at_all_is_still_dropped() {
+        let json = r#"[{
+            "match": "api.github.com",
+            "verdict": "allow",
+            "transport": "direct",
+            "rules": [{}]
+        }]"#;
+        let routes = parse_routes(json).unwrap();
+        assert!(
+            routes[0].http_rules.is_empty(),
+            "a match-all rule would bypass deny-by-default"
+        );
+    }
+
+    #[test]
+    fn a_graphql_rule_parses_its_matcher() {
+        let json = r#"[{
+            "match": "api.github.com",
+            "verdict": "allow",
+            "transport": "direct",
+            "rules": [{
+                "method": "POST",
+                "path": "/graphql",
+                "graphql": {
+                    "operationType": "mutation",
+                    "operationName": "Create*",
+                    "fields": ["createIssue"]
+                }
+            }]
+        }]"#;
+        let routes = parse_routes(json).unwrap();
+        let matcher = routes[0].http_rules[0]
+            .graphql
+            .as_ref()
+            .expect("matcher parsed");
+        assert_eq!(
+            matcher.operation_type,
+            crate::policy_schema::GraphqlOperationTypeMatcher::Mutation
+        );
+        assert_eq!(matcher.operation_name.as_deref(), Some("Create*"));
+        assert_eq!(matcher.fields, ["createIssue"]);
+    }
+
+    #[test]
+    fn a_graphql_matcher_rejects_an_unknown_key() {
+        let json = r#"[{
+            "match": "api.github.com",
+            "verdict": "allow",
+            "transport": "direct",
+            "rules": [{ "graphql": { "operationType": "query", "opration_nmae": "typo" } }]
+        }]"#;
+        let err = parse_routes(json).expect_err("a misspelled key must fail the policy");
+        assert!(err.contains("opration_nmae"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_key_on_an_http_rule_fails_the_policy() {
+        // A misspelt `graphql` would otherwise leave the bare method and path
+        // behind as an unconditional allow — the narrowing would go missing
+        // without a sound.
+        let json = r#"[{
+            "match": "api.github.com",
+            "verdict": "allow",
+            "transport": "direct",
+            "rules": [{
+                "method": "POST",
+                "path": "/graphql",
+                "grapql": { "operationType": "query" }
+            }]
+        }]"#;
+        let err = parse_routes(json).expect_err("a misspelt narrowing key must fail the policy");
+        assert!(err.contains("grapql"), "{err}");
+    }
+
+    #[test]
+    fn a_graphql_matcher_requires_an_operation_type() {
+        let json = r#"[{
+            "match": "api.github.com",
+            "verdict": "allow",
+            "transport": "direct",
+            "rules": [{ "graphql": { "fields": ["viewer"] } }]
+        }]"#;
+        let err = parse_routes(json).expect_err("an absent operation type must fail the policy");
+        assert!(err.contains("operationType"), "{err}");
+    }
 
     fn parse_routes(json: &str) -> Result<Vec<RouteRule>, String> {
         let val: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
@@ -2391,8 +2685,8 @@ mod tests {
 
     #[test]
     fn http_rules_empty_allows_all() {
-        assert!(http_request_matches_rules(&[], "GET", "/anything"));
-        assert!(http_request_matches_rules(&[], "POST", "/anything"));
+        assert!(allows(&[], "GET", "/anything"));
+        assert!(allows(&[], "POST", "/anything"));
     }
 
     #[test]
@@ -2400,10 +2694,11 @@ mod tests {
         let rules = vec![HttpRule {
             method: Some("GET".to_string()),
             path: None,
+            graphql: None,
         }];
-        assert!(http_request_matches_rules(&rules, "GET", "/foo"));
-        assert!(http_request_matches_rules(&rules, "get", "/foo"));
-        assert!(!http_request_matches_rules(&rules, "POST", "/foo"));
+        assert!(allows(&rules, "GET", "/foo"));
+        assert!(allows(&rules, "get", "/foo"));
+        assert!(!allows(&rules, "POST", "/foo"));
     }
 
     #[test]
@@ -2411,18 +2706,11 @@ mod tests {
         let rules = vec![HttpRule {
             method: None,
             path: Some("/api/v1/*".to_string()),
+            graphql: None,
         }];
-        assert!(http_request_matches_rules(
-            &rules,
-            "GET",
-            "/api/v1/download"
-        ));
-        assert!(http_request_matches_rules(&rules, "POST", "/api/v1/upload"));
-        assert!(!http_request_matches_rules(
-            &rules,
-            "GET",
-            "/api/v2/download"
-        ));
+        assert!(allows(&rules, "GET", "/api/v1/download"));
+        assert!(allows(&rules, "POST", "/api/v1/upload"));
+        assert!(!allows(&rules, "GET", "/api/v2/download"));
     }
 
     #[test]
@@ -2430,22 +2718,11 @@ mod tests {
         let rules = vec![HttpRule {
             method: Some("GET".to_string()),
             path: Some("/api/v1/*".to_string()),
+            graphql: None,
         }];
-        assert!(http_request_matches_rules(
-            &rules,
-            "GET",
-            "/api/v1/download"
-        ));
-        assert!(!http_request_matches_rules(
-            &rules,
-            "POST",
-            "/api/v1/download"
-        ));
-        assert!(!http_request_matches_rules(
-            &rules,
-            "GET",
-            "/api/v2/download"
-        ));
+        assert!(allows(&rules, "GET", "/api/v1/download"));
+        assert!(!allows(&rules, "POST", "/api/v1/download"));
+        assert!(!allows(&rules, "GET", "/api/v2/download"));
     }
 
     #[test]
@@ -2454,28 +2731,18 @@ mod tests {
             HttpRule {
                 method: Some("GET".to_string()),
                 path: Some("/api/v1/*".to_string()),
+                graphql: None,
             },
             HttpRule {
                 method: Some("POST".to_string()),
                 path: Some("/api/v1/upload".to_string()),
+                graphql: None,
             },
         ];
-        assert!(http_request_matches_rules(
-            &rules,
-            "GET",
-            "/api/v1/download"
-        ));
-        assert!(http_request_matches_rules(&rules, "POST", "/api/v1/upload"));
-        assert!(!http_request_matches_rules(
-            &rules,
-            "DELETE",
-            "/api/v1/download"
-        ));
-        assert!(!http_request_matches_rules(
-            &rules,
-            "POST",
-            "/api/v1/download"
-        ));
+        assert!(allows(&rules, "GET", "/api/v1/download"));
+        assert!(allows(&rules, "POST", "/api/v1/upload"));
+        assert!(!allows(&rules, "DELETE", "/api/v1/download"));
+        assert!(!allows(&rules, "POST", "/api/v1/download"));
     }
 
     #[test]
@@ -2503,10 +2770,11 @@ mod tests {
         let rules = vec![HttpRule {
             method: Some("*".to_string()),
             path: Some("/health".to_string()),
+            graphql: None,
         }];
-        assert!(http_request_matches_rules(&rules, "GET", "/health"));
-        assert!(http_request_matches_rules(&rules, "POST", "/health"));
-        assert!(!http_request_matches_rules(&rules, "GET", "/other"));
+        assert!(allows(&rules, "GET", "/health"));
+        assert!(allows(&rules, "POST", "/health"));
+        assert!(!allows(&rules, "GET", "/other"));
     }
 
     #[test]
@@ -2547,13 +2815,10 @@ mod tests {
         let rules = vec![HttpRule {
             method: None,
             path: Some("/repos/**".to_string()),
+            graphql: None,
         }];
-        assert!(http_request_matches_rules(
-            &rules,
-            "GET",
-            &normalize_path("/repos/v1/list")
-        ));
-        assert!(!http_request_matches_rules(
+        assert!(allows(&rules, "GET", &normalize_path("/repos/v1/list")));
+        assert!(!allows(
             &rules,
             "GET",
             &normalize_path("/repos/%2e%2e/admin")
@@ -2618,17 +2883,9 @@ mod tests {
         assert_eq!(matched.http_rules[0].path.as_deref(), Some("/api/v1/*"));
 
         // POST /api/v1/upload should be denied by the exact match's rules
-        assert!(!http_request_matches_rules(
-            &matched.http_rules,
-            "POST",
-            "/api/v1/upload"
-        ));
+        assert!(!allows(&matched.http_rules, "POST", "/api/v1/upload"));
         // GET /api/v1/repos should be allowed
-        assert!(http_request_matches_rules(
-            &matched.http_rules,
-            "GET",
-            "/api/v1/repos"
-        ));
+        assert!(allows(&matched.http_rules, "GET", "/api/v1/repos"));
     }
 
     // --- binaries filter ---
