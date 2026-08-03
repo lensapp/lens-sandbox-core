@@ -24,6 +24,7 @@ pub mod exec_manager;
 pub mod exec_protocol;
 pub mod gate;
 pub mod graphql;
+pub(crate) mod graphql_ws;
 pub mod http_body;
 pub mod lifecycle;
 pub mod mitm;

@@ -276,10 +276,19 @@ pub struct HttpRule {
     ///
     /// A request the proxy cannot read is denied, never passed on. This covers
     /// a compressed or `multipart/*` body, a body above the inspection limit, a
-    /// document that does not parse, a persisted query that carries no
-    /// document, and a `Connection: upgrade` request. A GraphQL subscription
-    /// therefore does not work below a GraphQL rule, because its frames travel
-    /// on a WebSocket that the proxy relays without reading.
+    /// document that does not parse, and a persisted query that carries no
+    /// document.
+    ///
+    /// A GraphQL rule also covers the WebSocket that carries subscriptions, on
+    /// an `https` connection that the proxy terminates. It is the only rule that
+    /// grants a `Connection: upgrade`, because it is the only one that can go on
+    /// judging what crosses the connection: every graphql-ws message the sandbox
+    /// sends is matched against these same rules, and one that no rule permits
+    /// closes the connection. The handshake drops the client's compression
+    /// offer, because a compressed frame hides the operation. Plain `ws://`
+    /// through the forward proxy stays refused: that door relays a response
+    /// without reading it, so it cannot tell an accepted upgrade from a
+    /// declined one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlMatcher>,
 }

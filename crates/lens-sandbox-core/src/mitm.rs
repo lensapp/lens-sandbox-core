@@ -12,6 +12,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::ca::EphemeralCa;
 use crate::http_body::{BodyFraming, determine_body_framing};
+use crate::policy_schema::GraphqlMatcher;
 use crate::proxy::CredentialInjection;
 use crate::routing::HttpRule;
 use crate::sock_mark;
@@ -54,7 +55,7 @@ pub struct MitmContext<'a> {
 /// `mitm_accept_and_inject` returns.
 struct RequestMeta {
     /// True if the original (pre-strip) request advertised an HTTP/1.1 upgrade
-    /// (WebSocket, SPDY...). Drives the dispatch to `copy_bidirectional`.
+    /// (WebSocket, SPDY...). Drives the dispatch to a raw pipe.
     is_upgrade: bool,
     /// How to bound the client→upstream body forwarding.
     body_mode: BodyFraming,
@@ -62,6 +63,14 @@ struct RequestMeta {
     /// caller replays these bytes after the head, and `body_mode` is
     /// [`BodyFraming::None`] so the relay does not look for them again.
     buffered_body: Option<Vec<u8>>,
+    /// The rules that judge each operation the client sends over an upgraded
+    /// connection. Empty unless a GraphQL rule granted the upgrade, in which
+    /// case the pipe is policed instead of spliced.
+    graphql_frames: Vec<GraphqlMatcher>,
+    /// The request line, for the audit of a decision taken after the head has
+    /// gone: a frame is refused long after the request that opened the socket.
+    method: String,
+    path: String,
 }
 
 /// Handle a MITM connection: terminate TLS from the client,
@@ -112,17 +121,64 @@ pub async fn handle_mitm_pre_accepted(
             let mut tls_upstream =
                 connect_upstream_tls(target_stream, &host, None, None, ctx.extra_ca_certs).await?;
             write_request_head_and_body(&mut tls_upstream, &modified, &meta).await?;
-            forward_or_bridge(tls_client, tls_upstream, &meta).await?;
+            let denial = forward_or_bridge(tls_client, tls_upstream, &meta).await?;
+            audit_frame_denial(ctx, target_host, is_tunnel, &meta, denial);
         }
         UpstreamMode::TunnelTls(upstream) => {
             let mut tls_upstream =
                 connect_upstream_tls(upstream, target_host, None, None, ctx.extra_ca_certs).await?;
             write_request_head_and_body(&mut tls_upstream, &modified, &meta).await?;
-            forward_or_bridge(tls_client, tls_upstream, &meta).await?;
+            let denial = forward_or_bridge(tls_client, tls_upstream, &meta).await?;
+            audit_frame_denial(ctx, target_host, is_tunnel, &meta, denial);
         }
     }
 
     Ok(())
+}
+
+/// Record a client operation that the route's GraphQL rules refused mid-stream.
+///
+/// The request that opened the socket was already audited as a success, so this
+/// is the only record of the refusal. It takes the shape [`RequestFacts::deny`]
+/// uses for every other rule refusal on this door: the flag names the refusal
+/// and `reason` carries the sentence.
+fn audit_frame_denial(
+    ctx: &MitmContext<'_>,
+    target_host: &str,
+    is_tunnel: bool,
+    meta: &RequestMeta,
+    denial: Option<String>,
+) {
+    let Some(reason) = denial else {
+        return;
+    };
+    tracing::info!(
+        target_host = %target_host,
+        method = %meta.method,
+        path = %meta.path,
+        reason,
+        "GraphQL WebSocket message denied by policy rules"
+    );
+    if let Some(tx) = ctx.audit_tx {
+        let event = serde_json::json!({
+            "type": "audit_event",
+            "source": "sandbox-proxy",
+            "action": format!("{} {}{}", meta.method, target_host, meta.path),
+            "method": meta.method,
+            "host": target_host,
+            "path": meta.path,
+            "result": "failure",
+            "status_code": 403,
+            "metadata": {
+                "host": target_host,
+                "mitm": true,
+                "tunnel": is_tunnel,
+                "graphql_frame_denied": true,
+                "reason": reason,
+            }
+        });
+        send_audit(tx, event, ctx.actor);
+    }
 }
 
 /// Send the request head upstream, followed by a body that policy had to read.
@@ -177,8 +233,11 @@ pub(crate) fn is_upgrade_request(header_block: &str) -> bool {
     false
 }
 
-/// Drive the client↔upstream relay: one response, or a raw pipe once upstream
-/// has switched protocols. An ordinary response guarantees that
+/// Drive the client↔upstream relay: one response, or a pipe once upstream has
+/// switched protocols.
+///
+/// Returns the reason a client message on an upgraded connection was refused,
+/// for the caller to record. An ordinary response guarantees that
 ///   1. it carries `Connection: close`, so any pooling HTTP client (reqwest,
 ///      undici, fetch...) drops the inner TLS connection after one request;
 ///   2. the inner TLS is explicitly shut down once the body finishes, so even a
@@ -194,19 +253,27 @@ async fn forward_or_bridge<C, U>(
     mut tls_client: C,
     mut tls_upstream: U,
     meta: &RequestMeta,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
     if matches!(
         forward_response(&mut tls_client, &mut tls_upstream, meta).await?,
-        ResponseOutcome::Switched
+        ResponseOutcome::Complete
     ) {
-        // The negotiated protocol owns the connection now, so relay it verbatim.
-        tokio::io::copy_bidirectional(&mut tls_client, &mut tls_upstream).await?;
+        return Ok(None);
     }
-    Ok(())
+
+    // Upstream switched protocols. A GraphQL rule granted this upgrade, so it
+    // goes on judging what crosses the pipe; anything else is relayed verbatim,
+    // because the negotiated protocol owns the connection now.
+    let matchers: Vec<&GraphqlMatcher> = meta.graphql_frames.iter().collect();
+    if matchers.is_empty() {
+        tokio::io::copy_bidirectional(&mut tls_client, &mut tls_upstream).await?;
+        return Ok(None);
+    }
+    crate::graphql_ws::relay(&mut tls_client, &mut tls_upstream, &matchers).await
 }
 
 /// What the response did to the connection.
@@ -300,6 +367,16 @@ where
             let header_bytes = read_until_double_crlf(&mut upstream_read).await?;
             match parse_status_code(&header_bytes) {
                 Some(101) if meta.is_upgrade => {
+                    // The offer of an extension was stripped from the request, so
+                    // one in the answer would compress frames a rule must read.
+                    if !meta.graphql_frames.is_empty()
+                        && crate::graphql_ws::answer_negotiates_extension(&header_bytes)
+                    {
+                        return Err(
+                            "upstream negotiated a WebSocket extension the proxy cannot read"
+                                .into(),
+                        );
+                    }
                     client_write.write_all(&header_bytes).await?;
                     return Ok::<ResponseOutcome, Box<dyn std::error::Error + Send + Sync>>(
                         ResponseOutcome::Switched,
@@ -650,26 +727,27 @@ async fn mitm_inject_after_accept(
         is_tunnel,
     };
 
-    // A route that carries HTTP rules judges each request on its head. An
-    // upgrade replaces that with a raw pipe (see `forward_or_bridge`), and
-    // everything the client then sends reaches the origin judged by nothing —
-    // so a rule-carrying route does not grant one.
-    if !ctx.http_rules.is_empty() && is_upgrade {
-        return Err(facts
-            .deny(
-                &mut tls_client,
-                "upgrade_denied",
-                "connection upgrade is not allowed on a route that carries HTTP rules",
-            )
-            .await);
-    }
-
     // Enforce HTTP rules. A GraphQL rule needs the body, which is still on the
     // socket: both doors read the head one byte at a time, so nothing of the
     // body has been consumed yet.
     let mut buffered_body: Option<Vec<u8>> = None;
+    let mut graphql_frames: Vec<GraphqlMatcher> = Vec::new();
     match crate::routing::classify_http_request(ctx.http_rules, method, path) {
-        crate::routing::HttpRuleOutcome::Allow => {}
+        crate::routing::HttpRuleOutcome::Allow => {
+            // An upgrade replaces the head this rule judged with a raw pipe, and
+            // everything the client then sends would reach the origin judged by
+            // nothing. Only a GraphQL rule can go on judging an upgraded
+            // connection, so any other rule-carrying route refuses one.
+            if is_upgrade && !ctx.http_rules.is_empty() {
+                return Err(facts
+                    .deny(
+                        &mut tls_client,
+                        "upgrade_denied",
+                        "connection upgrade is not allowed on a route that carries HTTP rules",
+                    )
+                    .await);
+            }
+        }
         crate::routing::HttpRuleOutcome::NoMatch => {
             return Err(facts
                 .deny(
@@ -678,6 +756,23 @@ async fn mitm_inject_after_accept(
                     "no HTTP rule permits this method and path",
                 )
                 .await);
+        }
+        // The handshake of an upgrade carries no operation — the frames do. The
+        // rules that cover this head go on to judge each one of them.
+        crate::routing::HttpRuleOutcome::Graphql(matchers) if is_upgrade => {
+            // A handshake declares no body (RFC 6455 §4.1). A declared one would
+            // be relayed as a body while the response is awaited, which hands the
+            // origin the frames before a rule has read a single one.
+            if body_mode != BodyFraming::None {
+                return Err(facts
+                    .deny(
+                        &mut tls_client,
+                        "upgrade_denied",
+                        "a connection upgrade must not declare a request body",
+                    )
+                    .await);
+            }
+            graphql_frames = matchers.into_iter().cloned().collect();
         }
         crate::routing::HttpRuleOutcome::Graphql(matchers) => {
             let body = match crate::graphql::read_body_for_inspection(
@@ -835,7 +930,17 @@ async fn mitm_inject_after_accept(
             let rw_no_query = rw_raw_path.split('?').next().unwrap_or(rw_raw_path);
             let rw_normalized = crate::routing::normalize_path(rw_no_query);
             match crate::routing::classify_http_request(ctx.http_rules, rw_method, &rw_normalized) {
-                crate::routing::HttpRuleOutcome::Allow => {}
+                crate::routing::HttpRuleOutcome::Allow => {
+                    if is_upgrade {
+                        return Err(facts
+                            .deny(
+                                &mut tls_client,
+                                "rewritten_path_denied",
+                                "rewritten URI leaves the GraphQL rule that would judge the upgraded connection",
+                            )
+                            .await);
+                    }
+                }
                 crate::routing::HttpRuleOutcome::NoMatch => {
                     return Err(facts
                         .deny(
@@ -844,6 +949,11 @@ async fn mitm_inject_after_accept(
                             "rewritten URI does not match policy rules",
                         )
                         .await);
+                }
+                // The rewrite may have moved the connection onto other GraphQL
+                // rules. Those are the ones its frames answer to.
+                crate::routing::HttpRuleOutcome::Graphql(matchers) if is_upgrade => {
+                    graphql_frames = matchers.into_iter().cloned().collect();
                 }
                 // The credential value moved the request onto a GraphQL rule.
                 // The body does not change under the rewrite, so the one already
@@ -898,6 +1008,14 @@ async fn mitm_inject_after_accept(
         send_audit(tx, event, ctx.actor);
     }
 
+    // A compressed frame hides the operation, so the client's offer of one does
+    // not reach upstream.
+    let modified = if graphql_frames.is_empty() {
+        modified
+    } else {
+        crate::graphql_ws::strip_extension_offer(&modified)
+    };
+
     Ok((
         tls_client,
         modified,
@@ -905,6 +1023,9 @@ async fn mitm_inject_after_accept(
             is_upgrade,
             body_mode,
             buffered_body,
+            graphql_frames,
+            method: (*method).to_string(),
+            path: path.to_string(),
         },
     ))
 }
@@ -2965,12 +3086,28 @@ mod tests {
         tokio::io::DuplexStream,
         tokio::task::JoinHandle<()>,
     ) {
+        upgrade_bridge_with(body_mode, vec![])
+    }
+
+    /// As `upgrade_bridge`, with the GraphQL rules that judge the frames of the
+    /// upgraded connection.
+    fn upgrade_bridge_with(
+        body_mode: BodyFraming,
+        graphql_frames: Vec<crate::policy_schema::GraphqlMatcher>,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (client_far, client_near) = tokio::io::duplex(4096);
         let (upstream_far, upstream_near) = tokio::io::duplex(4096);
         let meta = RequestMeta {
             is_upgrade: true,
             body_mode,
             buffered_body: None,
+            graphql_frames,
+            method: "GET".to_string(),
+            path: "/graphql".to_string(),
         };
         let task = tokio::spawn(async move {
             let _ = forward_or_bridge(client_near, upstream_near, &meta).await;
@@ -2984,6 +3121,9 @@ mod tests {
             is_upgrade: false,
             body_mode,
             buffered_body: None,
+            graphql_frames: vec![],
+            method: "GET".to_string(),
+            path: "/".to_string(),
         }
     }
 
@@ -3120,6 +3260,162 @@ mod tests {
             "an unasked switch must not reach the client: {}",
             String::from_utf8_lossy(&seen)
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // A GraphQL rule grants an upgrade and goes on judging it
+    // ----------------------------------------------------------------------
+
+    /// A rule permitting one subscription on the GraphQL socket.
+    fn graphql_subscription_rule() -> crate::policy_schema::GraphqlMatcher {
+        crate::policy_schema::GraphqlMatcher {
+            operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Subscription,
+            operation_name: None,
+            fields: vec!["messageAdded".to_string()],
+        }
+    }
+
+    /// The handshake a graphql-ws client sends, offering compression.
+    const WS_HANDSHAKE: &[u8] = b"GET /graphql HTTP/1.1\r\nHost: test.example.com\r\n\
+        Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+        Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+        Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+
+    /// One client text frame. The mask is all zeros, which RFC 6455 §5.3 allows
+    /// and which leaves the payload readable in the test.
+    fn masked_text_frame(text: &str) -> Vec<u8> {
+        assert!(text.len() < 126, "test frames stay in the short form");
+        let mut frame = vec![0x81, 0x80 | text.len() as u8, 0, 0, 0, 0];
+        frame.extend_from_slice(text.as_bytes());
+        frame
+    }
+
+    #[tokio::test]
+    async fn a_graphql_rule_grants_the_upgrade_and_strips_the_compression_offer() {
+        let rules = vec![HttpRule {
+            method: Some("GET".to_string()),
+            path: Some("/graphql".to_string()),
+            graphql: Some(graphql_subscription_rule()),
+        }];
+        let (upstream_saw, response, _audits) =
+            run_mitm_harness_with_rules(vec![], rules, WS_HANDSHAKE, true).await;
+
+        assert!(
+            upstream_saw.contains("GET /graphql HTTP/1.1"),
+            "the handshake must reach the origin: {upstream_saw}"
+        );
+        assert!(
+            !upstream_saw
+                .to_ascii_lowercase()
+                .contains("permessage-deflate"),
+            "a compressed frame cannot be read, so the offer must not go on: {upstream_saw}"
+        );
+        assert!(
+            upstream_saw
+                .to_ascii_lowercase()
+                .contains("upgrade: websocket"),
+            "the upgrade itself must survive: {upstream_saw}"
+        );
+        // This origin declines the upgrade, so the client gets an ordinary answer.
+        assert!(response.contains("200 OK"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_handshake_that_declares_a_body_is_denied() {
+        // A declared body is relayed while the response is awaited, so the frames
+        // would reach the origin before a rule read one of them. The harness
+        // origin waits for the body it was promised, so a proxy that forwards
+        // this head hangs instead of answering — the timeout turns that into a
+        // failure rather than a stuck run.
+        let rules = vec![HttpRule {
+            method: Some("GET".to_string()),
+            path: Some("/graphql".to_string()),
+            graphql: Some(graphql_subscription_rule()),
+        }];
+        let request: &[u8] = b"GET /graphql HTTP/1.1\r\nHost: test.example.com\r\n\
+            Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+            Content-Length: 4096\r\n\r\n";
+        let (upstream_saw, response, audits) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_mitm_harness_with_rules(vec![], rules, request, true),
+        )
+        .await
+        .expect("the handshake must be refused, not forwarded to the origin");
+
+        assert!(
+            response.contains("403"),
+            "expected a 403 for a handshake with a body, got: {response}"
+        );
+        assert!(
+            !upstream_saw.contains("/graphql"),
+            "nothing may reach the origin: {upstream_saw}"
+        );
+        assert!(
+            audits.iter().any(|event| {
+                event["metadata"]["upgrade_denied"] == true
+                    && event["metadata"]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("request body"))
+            }),
+            "the refusal must be audited: {audits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_operation_closes_the_upgraded_connection() {
+        let (mut client, mut upstream, _task) =
+            upgrade_bridge_with(BodyFraming::None, vec![graphql_subscription_rule()]);
+
+        upstream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+        // A subscription no rule names, sent after the protocol changed.
+        client
+            .write_all(&masked_text_frame(
+                r#"{"id":"1","type":"subscribe","payload":{"query":"subscription S { auditLog }"}}"#,
+            ))
+            .await
+            .unwrap();
+
+        let mut seen = Vec::new();
+        upstream.read_to_end(&mut seen).await.unwrap();
+        assert!(
+            seen.is_empty(),
+            "the origin must not see a refused operation: {seen:?}"
+        );
+        let mut closed = Vec::new();
+        client.read_to_end(&mut closed).await.unwrap();
+        assert_eq!(
+            closed,
+            vec![0x88, 0x02, 0x03, 0xF0],
+            "the client is told the policy refused it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permitted_operation_crosses_the_upgraded_connection() {
+        let (mut client, mut upstream, _task) =
+            upgrade_bridge_with(BodyFraming::None, vec![graphql_subscription_rule()]);
+
+        upstream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+        let frame = masked_text_frame(
+            r#"{"id":"1","type":"subscribe","payload":{"query":"subscription S { messageAdded }"}}"#,
+        );
+        client.write_all(&frame).await.unwrap();
+
+        let mut seen = vec![0u8; frame.len()];
+        upstream.read_exact(&mut seen).await.unwrap();
+        assert_eq!(seen, frame, "a permitted frame arrives byte for byte");
     }
 
     // ----------------------------------------------------------------------
