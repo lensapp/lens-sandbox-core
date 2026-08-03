@@ -51,6 +51,9 @@ pub struct AwsResignContext<'a> {
     /// against a target the client named.
     pub state: &'a std::sync::Arc<crate::proxy::ProxyState>,
     pub actor: &'a crate::peer_process::ActorContext,
+    /// The matched route's HTTP rules. This path owns its own MITM, so it has
+    /// to run them itself; nothing upstream of here does it for us.
+    pub http_rules: &'a [crate::policy_schema::HttpRule],
 }
 
 /// Owns the mutable state the AWS SigV4 re-sign MITM needs: the placeholder
@@ -102,14 +105,14 @@ impl AwsResignInterceptor {
         client: TcpStream,
         target_host: &str,
         target_port: u16,
-        ca: &EphemeralCa,
         state: &std::sync::Arc<crate::proxy::ProxyState>,
         actor: &crate::peer_process::ActorContext,
+        http_rules: &[crate::policy_schema::HttpRule],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let configs = self.configs_snapshot();
-        // Snapshotted here rather than passed in: both are plain reads off
-        // `state`, which this now takes anyway, and one fewer parameter each is
-        // one fewer thing a call site can get wrong.
+        // Taken off `state` rather than passed in: each is a plain read, and one
+        // fewer parameter is one fewer thing a call site can get wrong.
+        let ca = crate::proxy::get_or_init_ca(state)?;
         let audit_tx = state.audit_tx.lock().unwrap().clone();
         let extra_ca_certs = state.extra_ca_certs.read().unwrap().clone();
         let ctx = AwsResignContext {
@@ -119,6 +122,7 @@ impl AwsResignInterceptor {
             audit_tx: &audit_tx,
             state,
             actor,
+            http_rules,
         };
         handle_aws_resign(client, target_host, target_port, &ctx).await
     }
@@ -143,6 +147,10 @@ pub async fn handle_aws_resign(
         Some(v) => v,
         None => return Ok(()), // client already saw a 4xx
     };
+
+    if !enforce_http_rules(&mut tls_client, target_host, ctx, &prepared).await? {
+        return Ok(());
+    }
 
     // Connect upstream only after we've committed to forwarding.
     let upstream = crate::proxy::connect_egress_under_policy(
@@ -253,6 +261,7 @@ async fn prepare_resigned_request(
         new_head,
         outgoing_body,
         method: parsed.method,
+        uri: parsed.uri,
         path: parsed.path,
         service: auth.service,
     }))
@@ -263,6 +272,10 @@ struct PreparedResign {
     new_head: String,
     outgoing_body: OutgoingBody,
     method: String,
+    /// The request target, query string attached: a GraphQL GET carries its
+    /// document there.
+    uri: String,
+    /// The request target with the query string removed.
     path: String,
     service: String,
 }
@@ -595,6 +608,63 @@ async fn write_client_error(
     Ok(())
 }
 
+/// Apply the matched route's HTTP rules and answer 403 if they refuse.
+///
+/// Returns whether the request may go upstream. Signing does not exempt a
+/// destination from its rules: AWS AppSync speaks GraphQL, so a rule written
+/// for a signed host has to reach this path or it would be absent exactly
+/// where an operator believed it applied.
+async fn enforce_http_rules(
+    tls_client: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    target_host: &str,
+    ctx: &AwsResignContext<'_>,
+    prepared: &PreparedResign,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Err(detail) = check_http_rules(ctx.http_rules, prepared) else {
+        return Ok(true);
+    };
+    tracing::info!(
+        target = %target_host,
+        method = %prepared.method,
+        path = %prepared.path,
+        detail,
+        "aws-resign request denied by policy rules"
+    );
+    crate::proxy::emit_policy_deny_resigned(
+        ctx.state,
+        target_host,
+        &prepared.method,
+        &prepared.path,
+        &detail,
+        ctx.actor,
+    );
+    write_client_error(tls_client, 403, "Forbidden").await?;
+    Ok(false)
+}
+
+fn check_http_rules(
+    http_rules: &[crate::policy_schema::HttpRule],
+    prepared: &PreparedResign,
+) -> Result<(), String> {
+    let normalized = crate::routing::normalize_path(&prepared.path);
+    match crate::routing::classify_http_request(http_rules, &prepared.method, &normalized) {
+        crate::routing::HttpRuleOutcome::Allow => Ok(()),
+        crate::routing::HttpRuleOutcome::NoMatch => {
+            Err("no HTTP rule permits this method and path".to_string())
+        }
+        crate::routing::HttpRuleOutcome::Graphql(matchers) => match &prepared.outgoing_body {
+            OutgoingBody::Buffered { bytes, .. } => {
+                crate::graphql::check_request(&prepared.method, &prepared.uri, bytes, &matchers)
+            }
+            // A streamed payload is relayed without being held, so its
+            // operation cannot be read and no GraphQL rule can judge it.
+            OutgoingBody::Stream => {
+                Err("a GraphQL rule cannot read a streamed request payload".to_string())
+            }
+        },
+    }
+}
+
 fn emit_resign_audit(
     audit_tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
     target_host: &str,
@@ -629,10 +699,20 @@ mod tests {
         std::sync::Arc<crate::proxy::ProxyState>,
         crate::peer_process::ActorContext,
     ) {
-        let (state, rx) = crate::proxy::tests::test_state();
+        let (state, actor, rx) = policy_ctx_with_audit();
         std::mem::forget(rx);
-        let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:54321".parse().unwrap());
         (state, actor)
+    }
+
+    /// As `policy_ctx`, keeping the audit channel so a test can read the events.
+    fn policy_ctx_with_audit() -> (
+        std::sync::Arc<crate::proxy::ProxyState>,
+        crate::peer_process::ActorContext,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (state, rx) = crate::proxy::tests::test_state();
+        let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:54321".parse().unwrap());
+        (state, actor, rx)
     }
     use super::*;
 
@@ -870,6 +950,14 @@ mod tests {
     /// Run the end-to-end flow: sandbox client → MITM resign → TLS upstream.
     /// Returns the headers the upstream observed + the request body.
     async fn run_resign_harness(spec: &HarnessRequest<'_>) -> (String, Vec<u8>) {
+        run_resign_harness_with_rules(spec, &[]).await
+    }
+
+    /// As `run_resign_harness`, with the route's HTTP rules in force.
+    async fn run_resign_harness_with_rules(
+        spec: &HarnessRequest<'_>,
+        http_rules: &[HttpRule],
+    ) -> (String, Vec<u8>) {
         let body = spec.body;
         let hostname = spec.hostname;
         rustls::crypto::ring::default_provider()
@@ -958,6 +1046,7 @@ mod tests {
             audit_tx: &None,
             state: &policy_state,
             actor: &policy_actor,
+            http_rules,
         };
 
         // Run the resign. The handler connects to `TEST_HOSTNAME:target_port`
@@ -1009,6 +1098,10 @@ mod tests {
         let prepared = prepare_resigned_request(&mut tls_client, head_str, ctx.configs)
             .await?
             .expect("test request must re-sign successfully");
+        assert!(
+            enforce_http_rules(&mut tls_client, target_host, ctx, &prepared).await?,
+            "harness request must pass the route's HTTP rules"
+        );
 
         // Custom upstream TLS: loopback TCP, but keep TEST_HOSTNAME for cert
         // verification via the ephemeral CA's root store.
@@ -1197,6 +1290,7 @@ mod tests {
             audit_tx: &None,
             state: &policy_state,
             actor: &policy_actor,
+            http_rules: &[],
         };
 
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
@@ -1264,6 +1358,7 @@ mod tests {
             audit_tx: &None,
             state: &policy_state,
             actor: &policy_actor,
+            http_rules: &[],
         };
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
         let response = client_handle.await.unwrap();
@@ -1328,6 +1423,7 @@ mod tests {
             audit_tx: &None,
             state: &policy_state,
             actor: &policy_actor,
+            http_rules: &[],
         };
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
         let response = client_handle.await.unwrap();
@@ -1399,6 +1495,7 @@ mod tests {
             audit_tx: &None,
             state: &policy_state,
             actor: &policy_actor,
+            http_rules: &[],
         };
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
         let response = client_handle.await.unwrap();
@@ -1406,6 +1503,189 @@ mod tests {
             response.contains("411"),
             "expected 411 for non-S3 without Content-Length, got: {response}"
         );
+    }
+
+    // ---- HTTP rules on the re-sign path ----
+
+    use crate::policy_schema::{GraphqlMatcher, GraphqlOperationTypeMatcher, HttpRule};
+
+    /// A rule permitting read-only GraphQL on `/graphql`, as an AppSync policy
+    /// would write it.
+    fn appsync_query_rule() -> Vec<HttpRule> {
+        vec![HttpRule {
+            method: Some("POST".to_string()),
+            path: Some("/graphql".to_string()),
+            graphql: Some(GraphqlMatcher {
+                operation_type: GraphqlOperationTypeMatcher::Query,
+                operation_name: None,
+                fields: vec![],
+            }),
+        }]
+    }
+
+    fn prepared_post(uri: &str, body: OutgoingBody) -> PreparedResign {
+        PreparedResign {
+            new_head: String::new(),
+            outgoing_body: body,
+            method: "POST".to_string(),
+            uri: uri.to_string(),
+            path: uri.split('?').next().unwrap_or(uri).to_string(),
+            service: "appsync".to_string(),
+        }
+    }
+
+    fn buffered(body: &str) -> OutgoingBody {
+        OutgoingBody::Buffered {
+            sha256_hex: String::new(),
+            bytes: body.as_bytes().to_vec(),
+        }
+    }
+
+    const QUERY: &str = r#"{"query":"query Q { listThings { id } }"}"#;
+    const MUTATION: &str = r#"{"query":"mutation M { deleteThing(id: 1) }"}"#;
+
+    #[test]
+    fn a_route_without_rules_permits_a_signed_request() {
+        assert!(check_http_rules(&[], &prepared_post("/graphql", buffered(QUERY))).is_ok());
+    }
+
+    #[test]
+    fn a_graphql_rule_permits_the_operation_it_covers() {
+        let rules = appsync_query_rule();
+        assert!(check_http_rules(&rules, &prepared_post("/graphql", buffered(QUERY))).is_ok());
+    }
+
+    #[test]
+    fn a_graphql_rule_denies_an_operation_of_another_type() {
+        let rules = appsync_query_rule();
+        let detail = check_http_rules(&rules, &prepared_post("/graphql", buffered(MUTATION)))
+            .expect_err("a mutation must not pass a query-only rule");
+        assert!(detail.contains("mutation"), "unexpected detail: {detail}");
+    }
+
+    #[test]
+    fn a_query_string_narrows_neither_the_path_nor_the_operation() {
+        let rules = appsync_query_rule();
+        assert!(
+            check_http_rules(&rules, &prepared_post("/graphql?x=1", buffered(QUERY))).is_ok(),
+            "the query string is not part of the path a rule covers"
+        );
+    }
+
+    #[test]
+    fn rules_deny_a_path_none_of_them_covers() {
+        let rules = appsync_query_rule();
+        let detail = check_http_rules(&rules, &prepared_post("/other", buffered(QUERY)))
+            .expect_err("an uncovered path must not pass");
+        assert!(
+            detail.contains("no HTTP rule"),
+            "unexpected detail: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_graphql_rule_denies_a_streamed_payload() {
+        let rules = appsync_query_rule();
+        let detail = check_http_rules(&rules, &prepared_post("/graphql", OutgoingBody::Stream))
+            .expect_err("an unread payload must not pass");
+        assert!(detail.contains("streamed"), "unexpected detail: {detail}");
+    }
+
+    /// The end-to-end proof that a rule reaches this path: a signed mutation
+    /// under a query-only rule is refused before any upstream dial. The port
+    /// is 1, so a dial would fail instead of answering 403.
+    #[tokio::test]
+    async fn resign_denies_a_signed_request_its_rules_refuse() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let ca = EphemeralCa::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let root_store = ca_root_store(&ca);
+
+        let request_bytes = sandbox_signed_request(&HarnessRequest {
+            method: "POST",
+            uri: "/graphql",
+            body: MUTATION.as_bytes(),
+            service: "appsync",
+            signed_with_unsigned_payload: false,
+            extra_signed: &[],
+            hostname: TEST_HOSTNAME,
+            region: "us-east-1",
+        });
+
+        let client_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let cfg = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(cfg));
+            let server_name = ServerName::try_from(TEST_HOSTNAME).unwrap();
+            let mut tls = connector.connect(server_name, stream).await.unwrap();
+            tls.write_all(&request_bytes).await.unwrap();
+            let mut resp = Vec::new();
+            let _ = tls.read_to_end(&mut resp).await;
+            String::from_utf8_lossy(&resp).to_string()
+        });
+
+        let (client_stream, _) = listener.accept().await.unwrap();
+        let mut configs = HashMap::new();
+        configs.insert(fake_config().access_key_id.clone(), real_config());
+        let (policy_state, policy_actor, mut audits) = policy_ctx_with_audit();
+        let rules = appsync_query_rule();
+        let ctx = AwsResignContext {
+            configs: &configs,
+            ca: &ca,
+            extra_ca_certs: &[],
+            audit_tx: &None,
+            state: &policy_state,
+            actor: &policy_actor,
+            http_rules: &rules,
+        };
+        handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx)
+            .await
+            .expect("a policy refusal is not a handler error");
+        let response = client_handle.await.unwrap();
+        assert!(
+            response.contains("403"),
+            "expected 403 for a mutation below a query-only rule, got: {response}"
+        );
+
+        // The refusal has to reach the relay as a `policy-deny`, the reason that
+        // raises the developer's Allow/Skip dialog.
+        let event: serde_json::Value =
+            serde_json::from_str(&audits.try_recv().expect("a deny must be audited")).unwrap();
+        assert_eq!(event["result"], "failure");
+        assert_eq!(event["status_code"], 403);
+        assert_eq!(event["metadata"]["reason"], "policy-deny");
+        assert_eq!(event["metadata"]["aws_resign"], true);
+    }
+
+    /// The other half: a permitted operation still reaches the origin, signed.
+    #[tokio::test]
+    async fn resign_forwards_a_signed_request_its_rules_permit() {
+        let (head, body_seen) = run_resign_harness_with_rules(
+            &HarnessRequest {
+                method: "POST",
+                uri: "/graphql",
+                body: QUERY.as_bytes(),
+                service: "appsync",
+                signed_with_unsigned_payload: false,
+                extra_signed: &[],
+                hostname: TEST_HOSTNAME,
+                region: "us-east-1",
+            },
+            &appsync_query_rule(),
+        )
+        .await;
+
+        assert!(head.contains("POST /graphql HTTP/1.1"), "head: {head}");
+        assert!(
+            head.contains("Credential=ASIAREALEXAMPLE/"),
+            "the request must still be re-signed: {head}"
+        );
+        assert_eq!(String::from_utf8_lossy(&body_seen), QUERY);
     }
 
     #[tokio::test]
@@ -1467,6 +1747,7 @@ mod tests {
             audit_tx: &None,
             state: &policy_state,
             actor: &policy_actor,
+            http_rules: &[],
         };
         let _ = handle_aws_resign(client_stream, TEST_HOSTNAME, 1, &ctx).await;
         let response = client_handle.await.unwrap();

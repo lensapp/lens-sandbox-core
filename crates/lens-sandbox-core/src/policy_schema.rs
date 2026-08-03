@@ -280,11 +280,6 @@ pub struct HttpRule {
     /// document, and a `Connection: upgrade` request. A GraphQL subscription
     /// therefore does not work below a GraphQL rule, because its frames travel
     /// on a WebSocket that the proxy relays without reading.
-    ///
-    /// One destination escapes this rule: a host that an `awsSigv4` credential
-    /// re-signs is handled on a path that enforces no HTTP rule at all, so a
-    /// GraphQL rule written for AWS AppSync does not run. The proxy logs a
-    /// warning for that combination and permits the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlMatcher>,
 }
