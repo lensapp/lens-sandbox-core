@@ -23,6 +23,8 @@ pub mod dns;
 pub mod exec_manager;
 pub mod exec_protocol;
 pub mod gate;
+pub mod graphql;
+pub mod http_body;
 pub mod lifecycle;
 pub mod mitm;
 pub mod network;

@@ -11,6 +11,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::ca::EphemeralCa;
+use crate::http_body::{BodyFraming, determine_body_framing};
 use crate::proxy::CredentialInjection;
 use crate::routing::HttpRule;
 use crate::sock_mark;
@@ -49,19 +50,6 @@ pub struct MitmContext<'a> {
     pub actor: &'a crate::peer_process::ActorContext,
 }
 
-/// HTTP/1.1 request body framing, derived from the request method + headers.
-/// Used to bound the client→upstream forwarding so a pipelined second request
-/// cannot leak through after the first request body ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestBodyMode {
-    /// No body — request method or framing implies an empty payload.
-    None,
-    /// Body is exactly N bytes (Content-Length).
-    Fixed(u64),
-    /// Body is HTTP/1.1 chunked transfer encoding.
-    Chunked,
-}
-
 /// Outputs from request-head parsing that the relay needs after
 /// `mitm_accept_and_inject` returns.
 struct RequestMeta {
@@ -69,7 +57,11 @@ struct RequestMeta {
     /// (WebSocket, SPDY...). Drives the dispatch to `copy_bidirectional`.
     is_upgrade: bool,
     /// How to bound the client→upstream body forwarding.
-    body_mode: RequestBodyMode,
+    body_mode: BodyFraming,
+    /// The request body, when a GraphQL rule had to read it to decide. The
+    /// caller replays these bytes after the head, and `body_mode` is
+    /// [`BodyFraming::None`] so the relay does not look for them again.
+    buffered_body: Option<Vec<u8>>,
 }
 
 /// Handle a MITM connection: terminate TLS from the client,
@@ -119,19 +111,37 @@ pub async fn handle_mitm_pre_accepted(
             .await?;
             let mut tls_upstream =
                 connect_upstream_tls(target_stream, &host, None, None, ctx.extra_ca_certs).await?;
-            tls_upstream.write_all(modified.as_bytes()).await?;
-            tls_upstream.write_all(b"\r\n\r\n").await?;
+            write_request_head_and_body(&mut tls_upstream, &modified, &meta).await?;
             forward_or_bridge(tls_client, tls_upstream, &meta).await?;
         }
         UpstreamMode::TunnelTls(upstream) => {
             let mut tls_upstream =
                 connect_upstream_tls(upstream, target_host, None, None, ctx.extra_ca_certs).await?;
-            tls_upstream.write_all(modified.as_bytes()).await?;
-            tls_upstream.write_all(b"\r\n\r\n").await?;
+            write_request_head_and_body(&mut tls_upstream, &modified, &meta).await?;
             forward_or_bridge(tls_client, tls_upstream, &meta).await?;
         }
     }
 
+    Ok(())
+}
+
+/// Send the request head upstream, followed by a body that policy had to read.
+///
+/// A body read for a GraphQL rule is replayed here rather than relayed, because
+/// it is no longer on the client socket to relay.
+async fn write_request_head_and_body<U>(
+    tls_upstream: &mut U,
+    head: &str,
+    meta: &RequestMeta,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    U: AsyncWrite + Unpin,
+{
+    tls_upstream.write_all(head.as_bytes()).await?;
+    tls_upstream.write_all(b"\r\n\r\n").await?;
+    if let Some(body) = &meta.buffered_body {
+        tls_upstream.write_all(body).await?;
+    }
     Ok(())
 }
 
@@ -155,7 +165,7 @@ pub fn build_ephemeral_server_config(
 /// True if the request advertises an HTTP/1.1 upgrade (WebSocket, SPDY, etc.)
 /// via `Connection: upgrade`. Operates on the *original* request bytes, before
 /// `inject_headers` rewrites the Connection header.
-fn is_upgrade_request(header_block: &str) -> bool {
+pub(crate) fn is_upgrade_request(header_block: &str) -> bool {
     for line in header_block.split("\r\n") {
         let lower = line.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("connection:")
@@ -165,47 +175,6 @@ fn is_upgrade_request(header_block: &str) -> bool {
         }
     }
     false
-}
-
-/// Determine HTTP/1.1 request body framing from the original request head.
-///
-/// HTTP/1.1 framing rules (RFC 9112 §6.3):
-/// 1. If `Transfer-Encoding` is present and ends with `chunked` → chunked.
-/// 2. Else if `Content-Length` is a non-negative integer → fixed length.
-/// 3. Else, request method conventions: HEAD/GET/DELETE/OPTIONS/TRACE have no
-///    body; POST/PUT/PATCH/etc. without explicit framing default to no body
-///    too (a server is allowed to reject those, but we shouldn't pump bytes
-///    of unknown length to upstream where they'd outlive our session).
-fn determine_body_mode(header_block: &str, method: &str) -> RequestBodyMode {
-    let mut content_length: Option<u64> = None;
-    for line in header_block.split("\r\n").skip(1) {
-        if line.is_empty() {
-            break;
-        }
-        let lower = line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("transfer-encoding:") {
-            // Per RFC, the last coding listed is the outer one. If chunked is
-            // present anywhere we treat it as chunked — a chunked-with-extras
-            // request is rare and the safest thing is to switch to chunk
-            // parsing rather than blindly forwarding bytes by length.
-            if rest.contains("chunked") {
-                return RequestBodyMode::Chunked;
-            }
-        } else if let Some(rest) = lower.strip_prefix("content-length:")
-            && let Ok(n) = rest.trim().parse::<u64>()
-        {
-            content_length = Some(n);
-        }
-    }
-    if let Some(n) = content_length {
-        return RequestBodyMode::Fixed(n);
-    }
-    match method.to_ascii_uppercase().as_str() {
-        "GET" | "HEAD" | "DELETE" | "OPTIONS" | "TRACE" | "CONNECT" => RequestBodyMode::None,
-        // Methods that conventionally carry a body but were sent without
-        // framing — treat as empty rather than forwarding indefinite bytes.
-        _ => RequestBodyMode::None,
-    }
 }
 
 /// Drive the client↔upstream relay. For upgrade requests we keep the legacy
@@ -243,7 +212,7 @@ where
 async fn forward_response_with_close<C, U>(
     tls_client: &mut C,
     tls_upstream: &mut U,
-    body_mode: RequestBodyMode,
+    body_mode: BodyFraming,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -286,8 +255,8 @@ where
     // streaming response down.
     let request_forwarder = async {
         match body_mode {
-            RequestBodyMode::None => {}
-            RequestBodyMode::Fixed(n) => {
+            BodyFraming::None => {}
+            BodyFraming::Fixed(n) => {
                 let mut limited = (&mut client_read).take(n);
                 let copied = tokio::io::copy(&mut limited, &mut upstream_write).await;
                 let incomplete = !matches!(copied, Ok(actual) if actual >= n);
@@ -295,7 +264,7 @@ where
                     let _ = upstream_write.shutdown().await;
                 }
             }
-            RequestBodyMode::Chunked => {
+            BodyFraming::Chunked => {
                 if forward_chunked_body(&mut client_read, &mut upstream_write)
                     .await
                     .is_err()
@@ -528,6 +497,70 @@ fn send_audit(
 }
 
 /// Client-side MITM phase (post-TLS-accept): read HTTP request headers,
+/// The facts that every refusal in one request records.
+///
+/// Collected once so each refusal reads the same, and so a new one cannot
+/// quietly record less than the others.
+struct RequestFacts<'a, 'c> {
+    ctx: &'a MitmContext<'c>,
+    target_host: &'a str,
+    method: &'a str,
+    path: &'a str,
+    is_tunnel: bool,
+}
+
+impl RequestFacts<'_, '_> {
+    /// Refuse this request: record why, tell the client, and end the session.
+    ///
+    /// `flag` names the refusal in the audit metadata; `reason` is the sentence
+    /// that goes to the log and to the caller. Telling the client is
+    /// best-effort — the decision is already made, and a client that has gone
+    /// away does not change it.
+    async fn deny<C>(
+        &self,
+        tls_client: &mut C,
+        flag: &'static str,
+        reason: &str,
+    ) -> Box<dyn std::error::Error + Send + Sync>
+    where
+        C: AsyncWrite + Unpin,
+    {
+        tracing::info!(
+            target_host = %self.target_host,
+            method = %self.method,
+            path = %self.path,
+            reason,
+            "HTTP request denied by policy rules"
+        );
+        if let Some(tx) = self.ctx.audit_tx {
+            let event = serde_json::json!({
+                "type": "audit_event",
+                "source": "sandbox-proxy",
+                "action": format!("{} {}{}", self.method, self.target_host, self.path),
+                "method": self.method,
+                "host": self.target_host,
+                "path": self.path,
+                "result": "failure",
+                "status_code": 403,
+                "metadata": {
+                    "host": self.target_host,
+                    "mitm": true,
+                    "tunnel": self.is_tunnel,
+                    flag: true,
+                    "reason": reason,
+                }
+            });
+            send_audit(tx, event, self.ctx.actor);
+        }
+        tls_client
+            .write_all(crate::proxy::FORBIDDEN_RESPONSE)
+            .await
+            .ok();
+        tls_client.shutdown().await.ok();
+        reason.into()
+    }
+}
+
 /// enforce HTTP rules, inject credentials, rewrite URI placeholders, emit
 /// audit event. Returns the TLS client stream and the modified header
 /// block (ready to send upstream).
@@ -573,42 +606,71 @@ async fn mitm_inject_after_accept(
     let request_line = header_str.lines().next().unwrap_or("UNKNOWN");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     let method = parts.first().unwrap_or(&"UNKNOWN");
-    let body_mode = determine_body_mode(&header_str, method);
+    let body_mode = determine_body_framing(&header_str, method);
     let raw_path = parts.get(1).unwrap_or(&"/");
     // Strip query string and normalize path (collapse //, resolve ..)
     let raw_no_query = raw_path.split('?').next().unwrap_or(raw_path);
     let normalized = crate::routing::normalize_path(raw_no_query);
     let path = normalized.as_str();
 
-    // Enforce HTTP rules — if rules are present and no rule matches, deny the request
-    if !ctx.http_rules.is_empty()
-        && !crate::routing::http_request_matches_rules(ctx.http_rules, method, path)
-    {
-        tracing::info!(
-            target_host = %target_host,
-            method = %method,
-            path = %path,
-            "HTTP request denied by policy rules"
-        );
-        if let Some(tx) = ctx.audit_tx {
-            let event = serde_json::json!({
-                "type": "audit_event",
-                "source": "sandbox-proxy",
-                "action": format!("{method} {target_host}{path}"),
-                "method": method,
-                "host": target_host,
-                "path": path,
-                "result": "failure",
-                "status_code": 403,
-                "metadata": { "host": target_host, "mitm": true, "tunnel": is_tunnel, "http_rule_denied": true }
-            });
-            send_audit(tx, event, ctx.actor);
+    let facts = RequestFacts {
+        ctx,
+        target_host,
+        method,
+        path,
+        is_tunnel,
+    };
+
+    // A route that carries HTTP rules judges each request on its head. An
+    // upgrade replaces that with a raw pipe (see `forward_or_bridge`), and
+    // everything the client then sends reaches the origin judged by nothing —
+    // so a rule-carrying route does not grant one.
+    if !ctx.http_rules.is_empty() && is_upgrade {
+        return Err(facts
+            .deny(
+                &mut tls_client,
+                "upgrade_denied",
+                "connection upgrade is not allowed on a route that carries HTTP rules",
+            )
+            .await);
+    }
+
+    // Enforce HTTP rules. A GraphQL rule needs the body, which is still on the
+    // socket: both doors read the head one byte at a time, so nothing of the
+    // body has been consumed yet.
+    let mut buffered_body: Option<Vec<u8>> = None;
+    match crate::routing::classify_http_request(ctx.http_rules, method, path) {
+        crate::routing::HttpRuleOutcome::Allow => {}
+        crate::routing::HttpRuleOutcome::NoMatch => {
+            return Err(facts
+                .deny(
+                    &mut tls_client,
+                    "http_rule_denied",
+                    "no HTTP rule permits this method and path",
+                )
+                .await);
         }
-        tls_client
-            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            .await?;
-        tls_client.shutdown().await.ok();
-        return Err("HTTP request denied by policy rules".into());
+        crate::routing::HttpRuleOutcome::Graphql(matchers) => {
+            let body = match crate::graphql::read_body_for_inspection(
+                &mut tls_client,
+                &header_str,
+                method,
+                body_mode,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(reason) => {
+                    return Err(facts.deny(&mut tls_client, "graphql_denied", &reason).await);
+                }
+            };
+            // The raw target, not the normalized path: a GraphQL GET carries its
+            // document in the query string that normalization strips.
+            if let Err(reason) = crate::graphql::check_request(method, raw_path, &body, &matchers) {
+                return Err(facts.deny(&mut tls_client, "graphql_denied", &reason).await);
+            }
+            buffered_body = Some(body);
+        }
     }
 
     // Two request-head mutations from policy, applied in order:
@@ -743,43 +805,55 @@ async fn mitm_inject_after_accept(
             let rw_raw_path = rw_parts.get(1).unwrap_or(&"/");
             let rw_no_query = rw_raw_path.split('?').next().unwrap_or(rw_raw_path);
             let rw_normalized = crate::routing::normalize_path(rw_no_query);
-            if !crate::routing::http_request_matches_rules(
-                ctx.http_rules,
-                rw_method,
-                &rw_normalized,
-            ) {
-                tracing::warn!(
-                    target_host = %target_host,
-                    method = %rw_method,
-                    placeholder_path = %path,
-                    "HTTP request denied: rewritten URI does not match policy rules"
-                );
-                if let Some(tx) = ctx.audit_tx {
-                    let event = serde_json::json!({
-                        "type": "audit_event",
-                        "source": "sandbox-proxy",
-                        "action": format!("{rw_method} {target_host}{path}"),
-                        "method": rw_method,
-                        "host": target_host,
-                        "path": path,
-                        "result": "failure",
-                        "status_code": 403,
-                        "metadata": { "host": target_host, "mitm": true, "tunnel": is_tunnel, "rewritten_path_denied": true }
-                    });
-                    send_audit(tx, event, ctx.actor);
+            match crate::routing::classify_http_request(ctx.http_rules, rw_method, &rw_normalized) {
+                crate::routing::HttpRuleOutcome::Allow => {}
+                crate::routing::HttpRuleOutcome::NoMatch => {
+                    return Err(facts
+                        .deny(
+                            &mut tls_client,
+                            "rewritten_path_denied",
+                            "rewritten URI does not match policy rules",
+                        )
+                        .await);
                 }
-                tls_client
-                    .write_all(
-                        b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                    )
-                    .await?;
-                tls_client.shutdown().await.ok();
-                return Err(
-                    "HTTP request denied: rewritten URI does not match policy rules".into(),
-                );
+                // The credential value moved the request onto a GraphQL rule.
+                // The body does not change under the rewrite, so the one already
+                // read still answers for it.
+                crate::routing::HttpRuleOutcome::Graphql(matchers) => match &buffered_body {
+                    Some(body) => {
+                        if let Err(reason) =
+                            crate::graphql::check_request(rw_method, rw_raw_path, body, &matchers)
+                        {
+                            return Err(facts
+                                .deny(&mut tls_client, "rewritten_path_denied", &reason)
+                                .await);
+                        }
+                    }
+                    // The path before the rewrite reached no GraphQL rule, so no
+                    // body was read. There is nothing to judge the new path with.
+                    None => {
+                        return Err(facts
+                            .deny(
+                                &mut tls_client,
+                                "rewritten_path_denied",
+                                "rewritten URI reaches a GraphQL rule, but the body was not read",
+                            )
+                            .await);
+                    }
+                },
             }
         }
     }
+
+    // The body is in hand, so the head must describe it and the relay must not
+    // look for it on the socket a second time.
+    let (modified, body_mode) = match &buffered_body {
+        Some(body) => (
+            crate::http_body::reframe_head_as_content_length(&modified, body.len()),
+            BodyFraming::None,
+        ),
+        None => (modified, body_mode),
+    };
 
     if let Some(tx) = ctx.audit_tx {
         let event = serde_json::json!({
@@ -801,6 +875,7 @@ async fn mitm_inject_after_accept(
         RequestMeta {
             is_upgrade,
             body_mode,
+            buffered_body,
         },
     ))
 }
@@ -1101,7 +1176,7 @@ pub(crate) fn inject_headers(header_block: &str, injections: &[CredentialInjecti
     let matching_injections: Vec<&CredentialInjection> = injections
         .iter()
         .filter(|inj| {
-            crate::routing::http_request_matches_rules(&inj.rules, method, &normalized_path)
+            crate::routing::injection_covers_request(&inj.rules, method, &normalized_path)
         })
         .collect();
 
@@ -1419,14 +1494,14 @@ mod tests {
 
     #[test]
     fn inject_headers_respects_path_rules() {
-        use crate::policy_schema::HttpRule;
+        use crate::policy_schema::HttpRequestMatch;
 
         let headers = "GET /v1/clusters/abc/proxy/api HTTP/1.1\r\nHost: lens.example.com\r\nAuthorization: Bearer lnsc_token";
         // This injection only applies to /v1/projects/*/llm/** paths
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
-            rules: vec![HttpRule {
+            rules: vec![HttpRequestMatch {
                 method: None,
                 path: Some("/v1/projects/*/llm/**".to_string()),
             }],
@@ -1439,7 +1514,7 @@ mod tests {
 
     #[test]
     fn inject_headers_injects_when_path_matches_rules() {
-        use crate::policy_schema::HttpRule;
+        use crate::policy_schema::HttpRequestMatch;
 
         let headers =
             "POST /v1/projects/123/llm/bedrock/us-east-1/invoke HTTP/1.1\r\nHost: lens.example.com";
@@ -1447,7 +1522,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
-            rules: vec![HttpRule {
+            rules: vec![HttpRequestMatch {
                 method: None,
                 path: Some("/v1/projects/*/llm/**".to_string()),
             }],
@@ -1459,7 +1534,7 @@ mod tests {
 
     #[test]
     fn inject_headers_injects_for_global_llm_path() {
-        use crate::policy_schema::HttpRule;
+        use crate::policy_schema::HttpRequestMatch;
 
         // Global LLM endpoint (auto-resolve project)
         let headers = "POST /v1/llm/bedrock/us-east-1/invoke HTTP/1.1\r\nHost: lens.example.com";
@@ -1467,11 +1542,11 @@ mod tests {
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
             rules: vec![
-                HttpRule {
+                HttpRequestMatch {
                     method: None,
                     path: Some("/v1/projects/*/llm/**".to_string()),
                 },
-                HttpRule {
+                HttpRequestMatch {
                     method: None,
                     path: Some("/v1/llm/**".to_string()),
                 },
@@ -1484,7 +1559,7 @@ mod tests {
 
     #[test]
     fn inject_headers_skips_non_llm_paths_with_llm_rules() {
-        use crate::policy_schema::HttpRule;
+        use crate::policy_schema::HttpRequestMatch;
 
         // Kubernetes proxy endpoint - should NOT get sandbox token
         let headers = "GET /v1/clusters/abc/proxy/api/v1/nodes HTTP/1.1\r\nHost: lens.example.com\r\nAuthorization: Bearer lnsc_cluster_token";
@@ -1492,11 +1567,11 @@ mod tests {
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
             rules: vec![
-                HttpRule {
+                HttpRequestMatch {
                     method: None,
                     path: Some("/v1/projects/*/llm/**".to_string()),
                 },
-                HttpRule {
+                HttpRequestMatch {
                     method: None,
                     path: Some("/v1/llm/**".to_string()),
                 },
@@ -1510,14 +1585,14 @@ mod tests {
 
     #[test]
     fn inject_headers_strips_query_string_before_rule_match() {
-        use crate::policy_schema::HttpRule;
+        use crate::policy_schema::HttpRequestMatch;
 
         // Exact-path rule must still match when the request carries a query string.
         let headers = "GET /repos/foo?admin=true HTTP/1.1\r\nHost: api.github.com";
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer ghp_token".to_string(),
-            rules: vec![HttpRule {
+            rules: vec![HttpRequestMatch {
                 method: None,
                 path: Some("/repos/foo".to_string()),
             }],
@@ -1531,7 +1606,7 @@ mod tests {
 
     #[test]
     fn inject_headers_normalizes_path_before_rule_match() {
-        use crate::policy_schema::HttpRule;
+        use crate::policy_schema::HttpRequestMatch;
 
         // Path traversal must not trick a narrow `/repos/**` rule into injecting
         // credentials on `/admin/secret`. Normalization resolves `..` first.
@@ -1539,7 +1614,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer ghp_token".to_string(),
-            rules: vec![HttpRule {
+            rules: vec![HttpRequestMatch {
                 method: None,
                 path: Some("/repos/**".to_string()),
             }],
@@ -1781,11 +1856,28 @@ mod tests {
             }
             let headers = String::from_utf8(buf).unwrap();
 
+            // Read the body too, so a test can assert what actually reached the
+            // origin — a rule that inspects a body must still deliver it.
+            let body_len = headers
+                .split("\r\n")
+                .filter_map(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .next()
+                .unwrap_or(0);
+            let mut body = vec![0u8; body_len];
+            if body_len > 0 {
+                tls.read_exact(&mut body).await.unwrap();
+            }
+
             tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 .await
                 .unwrap();
             tls.shutdown().await.ok();
-            headers
+            format!("{headers}{}", String::from_utf8_lossy(&body))
         });
 
         let upstream_stream = TcpStream::connect(upstream_addr).await.unwrap();
@@ -1854,8 +1946,11 @@ mod tests {
                 .await
                 .unwrap();
 
-        tls_upstream.write_all(modified.as_bytes()).await.unwrap();
-        tls_upstream.write_all(b"\r\n\r\n").await.unwrap();
+        // Through the production writer, so a body that policy buffered is
+        // replayed here exactly as the real door replays it.
+        write_request_head_and_body(&mut tls_upstream, &modified, &meta)
+            .await
+            .unwrap();
         // Drive the production relay so this integration harness exercises
         // forward_response_with_close (response rewrite + explicit shutdown
         // + bounded request body forwarding), not the legacy
@@ -1959,6 +2054,7 @@ mod tests {
         let rules = vec![HttpRule {
             method: Some("GET".to_string()),
             path: Some("/api/v1/*".to_string()),
+            graphql: None,
         }];
         let (_headers, response, audits) = run_mitm_harness_with_rules(
             vec![],
@@ -1977,6 +2073,7 @@ mod tests {
         let rules = vec![HttpRule {
             method: Some("GET".to_string()),
             path: Some("/api/v1/*".to_string()),
+            graphql: None,
         }];
         let (_err, response, audits) = run_mitm_harness_with_rules(
             vec![],
@@ -2004,6 +2101,7 @@ mod tests {
         let rules = vec![HttpRule {
             method: None,
             path: Some("/api/**".to_string()),
+            graphql: None,
         }];
         let (_err, response, audits) = run_mitm_harness_with_rules(
             vec![],
@@ -2025,6 +2123,7 @@ mod tests {
         let rules = vec![HttpRule {
             method: Some("GET".to_string()),
             path: Some("/api/v1/*".to_string()),
+            graphql: None,
         }];
         let (_headers, response, audits) = run_mitm_harness_with_rules(
             vec![],
@@ -2046,6 +2145,7 @@ mod tests {
         let rules = vec![HttpRule {
             method: Some("GET".to_string()),
             path: None,
+            graphql: None,
         }];
         let (headers, response, _audits) = run_mitm_harness_with_rules(
             vec![CredentialInjection {
@@ -2197,6 +2297,7 @@ mod tests {
         let rules = vec![HttpRule {
             method: Some("GET".into()),
             path: Some("/bot/*/sendMessage".into()),
+            graphql: None,
         }];
         let placeholders = vec![("__lens_cred:tg__".to_string(), "123456:ABC-DEF".to_string())];
         let (headers, response, _audits) = run_mitm_harness_full(
@@ -2223,6 +2324,7 @@ mod tests {
         let rules = vec![HttpRule {
             method: Some("GET".into()),
             path: Some("/bot/*/sendMessage".into()),
+            graphql: None,
         }];
         let placeholders = vec![(
             "__lens_cred:tg__".to_string(),
@@ -2389,12 +2491,8 @@ mod tests {
         let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(
-                &mut client_inner,
-                &mut upstream_inner,
-                RequestBodyMode::None,
-            )
-            .await
+            forward_response_with_close(&mut client_inner, &mut upstream_inner, BodyFraming::None)
+                .await
         });
 
         // Upstream returns a keep-alive response with body.
@@ -2431,12 +2529,8 @@ mod tests {
         let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(
-                &mut client_inner,
-                &mut upstream_inner,
-                RequestBodyMode::None,
-            )
-            .await
+            forward_response_with_close(&mut client_inner, &mut upstream_inner, BodyFraming::None)
+                .await
         });
 
         // Upstream sends 100 Continue, then 103 Early Hints, then the final 200.
@@ -2487,7 +2581,7 @@ mod tests {
             forward_response_with_close(
                 &mut client_inner,
                 &mut upstream_inner,
-                RequestBodyMode::Fixed(body_len),
+                BodyFraming::Fixed(body_len),
             )
             .await
         });
@@ -2531,12 +2625,8 @@ mod tests {
         let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(
-                &mut client_inner,
-                &mut upstream_inner,
-                RequestBodyMode::None,
-            )
-            .await
+            forward_response_with_close(&mut client_inner, &mut upstream_inner, BodyFraming::None)
+                .await
         });
 
         upstream_outer
@@ -2559,39 +2649,256 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // Body-mode parsing
+    // GraphQL rules at the door
     // ----------------------------------------------------------------------
 
-    #[test]
-    fn determine_body_mode_get_with_no_framing_is_none() {
-        let req = "GET /api HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n";
-        assert_eq!(determine_body_mode(req, "GET"), RequestBodyMode::None);
+    /// A rule permitting read-only GraphQL on `/graphql`, as a policy for
+    /// `gh pr view` would express it.
+    fn graphql_read_rule() -> Vec<HttpRule> {
+        vec![HttpRule {
+            method: Some("POST".to_string()),
+            path: Some("/graphql".to_string()),
+            graphql: Some(crate::policy_schema::GraphqlMatcher {
+                operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
+                operation_name: None,
+                fields: vec!["viewer".to_string(), "repository".to_string()],
+            }),
+        }]
     }
 
-    #[test]
-    fn determine_body_mode_post_with_content_length() {
-        let req = "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\n\r\n";
-        assert_eq!(determine_body_mode(req, "POST"), RequestBodyMode::Fixed(42));
+    fn graphql_request(body: &str) -> Vec<u8> {
+        format!(
+            "POST /graphql HTTP/1.1\r\nHost: test.example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
     }
 
-    #[test]
-    fn determine_body_mode_chunked_takes_precedence_over_content_length() {
-        let req = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 99\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert_eq!(determine_body_mode(req, "POST"), RequestBodyMode::Chunked);
+    #[tokio::test]
+    async fn a_permitted_graphql_query_reaches_the_origin_unchanged() {
+        let body = r#"{"query":"query Viewer { viewer { login } }"}"#;
+        let request: &'static [u8] = Box::leak(graphql_request(body).into_boxed_slice());
+        let (upstream_saw, response, audits) =
+            run_mitm_harness_with_rules(vec![], graphql_read_rule(), request, true).await;
+
+        assert!(response.contains("200 OK"), "expected 200, got: {response}");
+        assert_eq!(audits[0]["result"], "success");
+        // The body policy read must still arrive, byte for byte.
+        assert!(upstream_saw.ends_with(body), "{upstream_saw}");
+        assert!(
+            upstream_saw.contains(&format!("Content-Length: {}", body.len())),
+            "{upstream_saw}"
+        );
     }
 
-    #[test]
-    fn determine_body_mode_chunked_case_insensitive() {
-        let req = "POST /upload HTTP/1.1\r\nTransfer-Encoding: CHUNKED\r\n\r\n";
-        assert_eq!(determine_body_mode(req, "POST"), RequestBodyMode::Chunked);
+    #[tokio::test]
+    async fn a_mutation_is_denied_where_only_queries_are_permitted() {
+        let body = r#"{"query":"mutation { deleteRepository(id:\"x\") { id } }"}"#;
+        let request: &'static [u8] = Box::leak(graphql_request(body).into_boxed_slice());
+        let (_err, response, audits) =
+            run_mitm_harness_with_rules(vec![], graphql_read_rule(), request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+        assert_eq!(audits[0]["result"], "failure");
+        assert_eq!(audits[0]["status_code"], 403);
+        assert_eq!(audits[0]["metadata"]["graphql_denied"], true);
     }
 
-    #[test]
-    fn determine_body_mode_post_without_framing_treated_as_no_body() {
-        // RFC allows servers to reject; we err on the safe side and don't
-        // pump indefinite bytes from the client into upstream.
-        let req = "POST /api HTTP/1.1\r\nHost: x\r\n\r\n";
-        assert_eq!(determine_body_mode(req, "POST"), RequestBodyMode::None);
+    #[tokio::test]
+    async fn a_forbidden_field_beside_a_permitted_one_is_denied() {
+        let body = r#"{"query":"{ viewer secrets }"}"#;
+        let request: &'static [u8] = Box::leak(graphql_request(body).into_boxed_slice());
+        let (_err, response, _audits) =
+            run_mitm_harness_with_rules(vec![], graphql_read_rule(), request, true).await;
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunked_graphql_body_is_reframed_for_the_origin() {
+        let body = r#"{"query":"query Viewer { viewer { login } }"}"#;
+        let request = format!(
+            "POST /graphql HTTP/1.1\r\nHost: test.example.com\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sig\r\n\r\n{:x}\r\n{body}\r\n0\r\nX-Sig: dropped\r\n\r\n",
+            body.len()
+        );
+        let request: &'static [u8] = Box::leak(request.into_bytes().into_boxed_slice());
+        let (upstream_saw, response, _audits) =
+            run_mitm_harness_with_rules(vec![], graphql_read_rule(), request, true).await;
+
+        assert!(response.contains("200 OK"), "expected 200, got: {response}");
+        // One framing only: chunked and its trailer are gone, a length replaces them.
+        assert!(
+            upstream_saw.contains(&format!("Content-Length: {}", body.len())),
+            "{upstream_saw}"
+        );
+        let head = upstream_saw.to_ascii_lowercase();
+        assert!(!head.contains("transfer-encoding"), "{upstream_saw}");
+        assert!(!head.contains("trailer:"), "{upstream_saw}");
+        assert!(upstream_saw.ends_with(body), "{upstream_saw}");
+    }
+
+    #[tokio::test]
+    async fn a_body_above_the_inspection_limit_is_denied() {
+        let padding = "x".repeat(crate::http_body::MAX_INSPECT_BYTES + 1);
+        let body = format!(r#"{{"query":"{{ viewer }}","padding":"{padding}"}}"#);
+        let request: &'static [u8] = Box::leak(graphql_request(&body).into_boxed_slice());
+        let (_err, response, audits) =
+            run_mitm_harness_with_rules(vec![], graphql_read_rule(), request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "a body too large to read must not pass unread, got: {response}"
+        );
+        assert_eq!(audits[0]["metadata"]["graphql_denied"], true);
+    }
+
+    #[tokio::test]
+    async fn a_compressed_graphql_body_is_denied() {
+        let request: &'static [u8] = b"POST /graphql HTTP/1.1\r\nHost: test.example.com\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nxxxxx";
+        let (_err, response, _audits) =
+            run_mitm_harness_with_rules(vec![], graphql_read_rule(), request, true).await;
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparsable_graphql_body_is_denied() {
+        let request: &'static [u8] =
+            Box::leak(graphql_request(r#"{"query":"query { viewer "}"#).into_boxed_slice());
+        let (_err, response, _audits) =
+            run_mitm_harness_with_rules(vec![], graphql_read_rule(), request, true).await;
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_is_denied_on_a_route_that_carries_http_rules() {
+        // An upgrade replaces the judged relay with a raw pipe, so a route with
+        // rules cannot grant one — otherwise everything after the upgrade
+        // reaches the origin judged by nothing.
+        let request: &'static [u8] = b"GET /api/v1/socket HTTP/1.1\r\nHost: test.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let rules = vec![HttpRule {
+            method: Some("GET".to_string()),
+            path: Some("/api/v1/*".to_string()),
+            graphql: None,
+        }];
+        let (_err, response, audits) =
+            run_mitm_harness_with_rules(vec![], rules, request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+        assert_eq!(audits[0]["metadata"]["upgrade_denied"], true);
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_still_works_where_no_http_rule_applies() {
+        // The bound above is scoped to rule-carrying routes; a route without
+        // rules keeps the upgrade path it always had.
+        let request: &'static [u8] = b"GET /socket HTTP/1.1\r\nHost: test.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let (upstream_saw, _response, _audits) =
+            run_mitm_harness_with_rules(vec![], vec![], request, true).await;
+        assert!(
+            upstream_saw.contains("Upgrade: websocket"),
+            "{upstream_saw}"
+        );
+    }
+
+    /// A rule permitting a read-only GraphQL GET, whose document rides in the
+    /// query string.
+    fn graphql_get_rule() -> Vec<HttpRule> {
+        vec![HttpRule {
+            method: Some("GET".to_string()),
+            path: Some("/graphql".to_string()),
+            graphql: Some(crate::policy_schema::GraphqlMatcher {
+                operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
+                operation_name: None,
+                fields: vec!["viewer".to_string()],
+            }),
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_get_operation_is_read_from_the_query_string() {
+        // Path normalization drops the query string, so the raw target has to
+        // reach the classifier or a GET would carry an operation nobody read.
+        let request: &'static [u8] =
+            b"GET /graphql?query=query+Q+%7B+viewer+%7D HTTP/1.1\r\nHost: test.example.com\r\n\r\n";
+        let (_upstream_saw, response, audits) =
+            run_mitm_harness_with_rules(vec![], graphql_get_rule(), request, true).await;
+
+        assert!(response.contains("200 OK"), "expected 200, got: {response}");
+        assert_eq!(audits[0]["result"], "success");
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_get_operation_is_denied() {
+        let request: &'static [u8] = b"GET /graphql?query=query+Q+%7B+secrets+%7D HTTP/1.1\r\nHost: test.example.com\r\n\r\n";
+        let (_err, response, _audits) =
+            run_mitm_harness_with_rules(vec![], graphql_get_rule(), request, true).await;
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_get_that_also_carries_a_body_is_denied() {
+        // The origin may read the body instead of the query string, and this
+        // door judged the query string.
+        let request: &'static [u8] = b"GET /graphql?query=query+Q+%7B+viewer+%7D HTTP/1.1\r\nHost: test.example.com\r\nContent-Length: 30\r\n\r\n{\"query\":\"{ deleteEverything }\"}";
+        let (_err, response, _audits) =
+            run_mitm_harness_with_rules(vec![], graphql_get_rule(), request, true).await;
+        assert!(
+            response.contains("403 Forbidden"),
+            "a GET with two accounts of itself must be refused, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bodiless_rule_does_not_admit_a_request_a_graphql_rule_claims() {
+        // The precedence invariant, at the door: the broad allow must not let a
+        // mutation through just because its method and path also match.
+        let mut rules = graphql_read_rule();
+        rules.push(HttpRule {
+            method: Some("POST".to_string()),
+            path: Some("/**".to_string()),
+            graphql: None,
+        });
+        let body = r#"{"query":"mutation { deleteRepository(id:\"x\") { id } }"}"#;
+        let request: &'static [u8] = Box::leak(graphql_request(body).into_boxed_slice());
+        let (_err, response, _audits) =
+            run_mitm_harness_with_rules(vec![], rules, request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "a broad allow must not defeat a GraphQL rule, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rest_request_still_passes_through_a_broad_rule_beside_a_graphql_one() {
+        let mut rules = graphql_read_rule();
+        rules.push(HttpRule {
+            method: Some("POST".to_string()),
+            path: Some("/rest/**".to_string()),
+            graphql: None,
+        });
+        let request: &'static [u8] =
+            b"POST /rest/things HTTP/1.1\r\nHost: test.example.com\r\nContent-Length: 2\r\n\r\n{}";
+        let (_upstream_saw, response, _audits) =
+            run_mitm_harness_with_rules(vec![], rules, request, true).await;
+        assert!(response.contains("200 OK"), "expected 200, got: {response}");
     }
 
     // ----------------------------------------------------------------------
@@ -2620,7 +2927,7 @@ mod tests {
             forward_response_with_close(
                 &mut client_inner,
                 &mut upstream_inner,
-                RequestBodyMode::Fixed(body_len),
+                BodyFraming::Fixed(body_len),
             )
             .await
         });
@@ -2680,12 +2987,8 @@ mod tests {
         let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(
-                &mut client_inner,
-                &mut upstream_inner,
-                RequestBodyMode::None,
-            )
-            .await
+            forward_response_with_close(&mut client_inner, &mut upstream_inner, BodyFraming::None)
+                .await
         });
 
         // Malicious client tries to pipeline a second request through the
@@ -2738,7 +3041,7 @@ mod tests {
             forward_response_with_close(
                 &mut client_inner,
                 &mut upstream_inner,
-                RequestBodyMode::Chunked,
+                BodyFraming::Chunked,
             )
             .await
         });
@@ -2800,7 +3103,7 @@ mod tests {
             forward_response_with_close(
                 &mut client_inner,
                 &mut upstream_inner,
-                RequestBodyMode::Fixed(100),
+                BodyFraming::Fixed(100),
             )
             .await
         });
