@@ -1306,8 +1306,10 @@ async fn handle_connect(
 
 /// Entry point for connections redirected by nftables into the transparent
 /// listener. Recovers the pre-redirect destination, classifies the first
-/// bytes, and hands off to the TLS or HTTP handler. Unknown protocols are
-/// dropped with an audit event — matching today's fail-closed semantics.
+/// bytes, and hands off to the TLS or HTTP handler. A connection it cannot
+/// classify is offered to the developer as a raw splice, unless the default
+/// verdict already denies what no rule names — see
+/// [`unclassified_splice_decision`].
 async fn handle_transparent_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -1355,11 +1357,16 @@ async fn handle_transparent_connection(
     match transparent::classify(&first) {
         Protocol::Tls => handle_transparent_tls(stream, orig_dst, actor, &state).await,
         Protocol::Http => handle_transparent_http(stream, orig_dst, actor, &state).await,
-        Protocol::Unknown => {
-            emit_transparent_deny(&state, orig_dst, "unknown-protocol");
-            // Dropping the stream closes the socket.
-            Ok(())
-        }
+        Protocol::Unknown => match unclassified_splice_decision(&state) {
+            Some(decision) => {
+                handle_raw_passthrough(stream, orig_dst, &decision, &state, &actor).await
+            }
+            None => {
+                emit_transparent_deny(&state, orig_dst, "unknown-protocol");
+                // Dropping the stream closes the socket.
+                Ok(())
+            }
+        },
     }
 }
 
@@ -1377,6 +1384,9 @@ pub(crate) struct TcpDecision {
     /// lock that produced the verdict, so a reload landing between the two
     /// cannot leave a stale verdict wearing the current generation.
     pub(crate) generation: u64,
+    /// Why a dialog is being raised, for the card to explain itself with: a rule
+    /// asked, or the protocol could not be classified.
+    pub(crate) reason: &'static str,
 }
 
 /// The `egress.tcp` table's decision for one destination, or `None` when no
@@ -1413,6 +1423,7 @@ fn tcp_egress_verdict(
             verdict: rule.verdict,
             matched_target,
             generation,
+            reason: "policy-ambiguous",
         }),
         RouteOutcome::NoMatch {
             binary_filtered: true,
@@ -1420,6 +1431,7 @@ fn tcp_egress_verdict(
             verdict: Verdict::Deny,
             matched_target,
             generation,
+            reason: "policy-ambiguous",
         }),
         RouteOutcome::NoMatch { .. } => None,
     }
@@ -1779,7 +1791,7 @@ async fn raw_verdict_admits(
                 state,
                 &gate_key(shown),
                 &action_str,
-                "policy-ambiguous",
+                decision.reason,
                 crate::protocol::Treatment::Raw,
             )
             .await;
@@ -1791,15 +1803,18 @@ async fn raw_verdict_admits(
             }
             emit_gate_resolved(state, &action_str, answer);
             // The gate can hold a connection for `DECISION_TIMEOUT`, long enough
-            // for an operator to publish a policy. Consent belongs to the
-            // generation that granted it, so any egress change voids it: the
-            // rule may have been deleted, narrowed, or turned into a deny, and
-            // the reload cleared the pins a hostname rule needed to bind at all.
-            // Refusing outright beats re-asking the table, which would have to
-            // answer for whichever of a name or an address this door happens to
-            // hold. The workload redials and is judged fresh; if the new policy
-            // simply allows the destination, that redial needs no dialog.
-            if state.policy.read().unwrap().generation != decision.generation {
+            // for a policy to land. Consent belongs to the generation that
+            // granted it, so a moved policy is re-read rather than trusted: the
+            // rule may have been deleted, narrowed, or turned into a deny.
+            //
+            // Re-reading, not refusing, is what lets an answer be remembered at
+            // all — writing the approval back as a rule is itself a reload, so a
+            // bare generation check would deny the request that raised the card.
+            // The fresh verdict must be an allow on its own account; anything
+            // else leaves this connection unauthorized and consent stays void.
+            if state.policy.read().unwrap().generation != decision.generation
+                && !reallows_after_reload(state, decision, target, actor)
+            {
                 emit_policy_deny_connect(state, target, "policy-changed", actor);
                 tracing::info!(target = %target, "raw passthrough DENIED (policy changed under the dialog)");
                 return None;
@@ -1808,6 +1823,57 @@ async fn raw_verdict_admits(
             Some(Gated::ByTheDeveloper)
         }
     }
+}
+
+/// The decision for a connection the classifier reported as neither TLS nor HTTP,
+/// on a destination the `egress.tcp` table did not claim: ask whether to splice it
+/// raw, or `None` to drop it as this door always did.
+///
+/// This is the only place a raw splice is discovered rather than declared, and it
+/// has to be: an unclassified connection cannot be matched against `egress.http`
+/// rules or carry credential injection, so dropping it left the developer with a
+/// dead connection and no way to allow it except to hand-write a rule for a
+/// destination they had not been told about. Nothing reaching here can be
+/// classified, so no inspectable destination is diverted into an opaque splice.
+///
+/// A `deny` default is the one answer that is already given: it says block what no
+/// rule names and do not ask, so raising a card would overrule it. Every other
+/// default asks -- including `allow`, because a default is not consent to splice a
+/// connection nothing can inspect, and this door dropped it until now.
+fn unclassified_splice_decision(state: &Arc<ProxyState>) -> Option<TcpDecision> {
+    let policy = state.policy.read().unwrap();
+    if policy.default_verdict == Verdict::Deny {
+        return None;
+    }
+    Some(TcpDecision {
+        verdict: Verdict::Ask,
+        // The table named nothing here, so the address is all the card can show —
+        // and a raw rule must carry a port, which the door's target has.
+        matched_target: None,
+        generation: policy.generation,
+        reason: "unknown-protocol",
+    })
+}
+
+/// Whether the reloaded table allows this destination on its own account, asked
+/// about the destination the door holds: the name the rule bound through when
+/// there was one — which a hostname rule can be re-read by without the pins the
+/// reload cleared — else the address itself.
+fn reallows_after_reload(
+    state: &Arc<ProxyState>,
+    decision: &TcpDecision,
+    target: &str,
+    actor: &crate::peer_process::ActorContext,
+) -> bool {
+    let shown = decision.matched_target.as_deref().unwrap_or(target);
+    // Bracket-aware, so an IPv6 address reaches the table as the address it is
+    // rather than as a hostname no address rule could ever match.
+    let port = extract_port(shown, 0);
+    if port == 0 {
+        return false;
+    }
+    tcp_egress_verdict(state, &extract_hostname(shown), port, actor.process())
+        .is_some_and(|fresh| fresh.verdict == Verdict::Allow)
 }
 
 /// Serve a `CONNECT` whose destination the `egress.tcp` table claimed: refuse
@@ -4455,6 +4521,197 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_rule_an_approval_writes_does_not_void_that_approval() {
+        // "Always allow" is answered by writing the rule, which reloads the
+        // policy and advances the generation — so a bare generation check refuses
+        // the very request that raised the card, and remembering a decision reads
+        // as denying it. The held connection must complete, not just a redial.
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "203.0.113.0/24:5432", "verdict": "ask"}]"#,
+        );
+
+        raw_passthrough_answering(
+            &state,
+            &mut rx,
+            "203.0.113.9:5432".parse().unwrap(),
+            crate::protocol::Decision::AllowAlways,
+            // The approval lands as a rule ahead of the ask that raised it.
+            || {
+                reload_tcp_rules(
+                    &state,
+                    r#"[
+                        {"match": "203.0.113.9:5432", "verdict": "allow"},
+                        {"match": "203.0.113.0/24:5432", "verdict": "ask"}
+                    ]"#,
+                )
+            },
+        )
+        .await;
+
+        let events = drain_audit(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["metadata"]["reason"] == "policy-changed"),
+            "the approval's own rule must not read as a revocation; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rule_an_approval_writes_does_not_void_it_for_an_ipv6_destination() {
+        // The re-read has to reach the table as an address, and an IPv6 door
+        // target is bracketed — split naively it arrives as a hostname that no
+        // address rule can match, so every v6 approval would refuse itself.
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "[2001:db8::/32]:5432", "verdict": "ask"}]"#,
+        );
+
+        raw_passthrough_answering(
+            &state,
+            &mut rx,
+            "[2001:db8::1]:5432".parse().unwrap(),
+            crate::protocol::Decision::AllowAlways,
+            || {
+                reload_tcp_rules(
+                    &state,
+                    r#"[
+                        {"match": "[2001:db8::1]:5432", "verdict": "allow"},
+                        {"match": "[2001:db8::/32]:5432", "verdict": "ask"}
+                    ]"#,
+                )
+            },
+        )
+        .await;
+
+        let events = drain_audit(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["metadata"]["reason"] == "policy-changed"),
+            "a v6 approval's own rule must not read as a revocation; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_narrowing_reload_still_refuses_the_approved_splice() {
+        // The re-check admits only what the fresh table allows: a reload that
+        // keeps the destination claimed but narrows the grant to another caller
+        // leaves this connection unauthorized, so consent stays void.
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "203.0.113.0/24:5432", "verdict": "ask"}]"#,
+        );
+
+        raw_passthrough_answering(
+            &state,
+            &mut rx,
+            "203.0.113.9:5432".parse().unwrap(),
+            crate::protocol::Decision::AllowAlways,
+            || {
+                reload_tcp_rules(
+                    &state,
+                    r#"[{"match": "203.0.113.9:5432", "verdict": "allow",
+                          "binaries": ["/usr/bin/psql"]}]"#,
+                )
+            },
+        )
+        .await;
+
+        let events = drain_audit(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["metadata"]["reason"] == "policy-changed"),
+            "a grant that no longer covers this caller must refuse; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_card_for_an_unclassified_connection_names_the_address_and_port() {
+        // Postgres and SSH are not HTTP, so the classifier reports neither TLS nor
+        // HTTP and no `egress.http` rule can apply. Dropping the connection left
+        // the developer with no way to allow it but to hand-write a rule; the
+        // question is raised on its own now, and an approval writes the
+        // destination it was shown — which a raw rule needs a port for.
+        let (state, mut rx) = test_state();
+        let dst: SocketAddr = "203.0.113.7:4444".parse().unwrap();
+        let decision = unclassified_splice_decision(&state).expect("the default asks");
+        assert_eq!(decision.verdict, Verdict::Ask);
+
+        let (_client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            handle_raw_passthrough(server, dst, &decision, &state_for_handler, &test_actor()).await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a dialog must be raised")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&pending).unwrap();
+        assert_eq!(parsed["action"], "CONNECT 203.0.113.7:4444");
+        assert_eq!(parsed["host"], "203.0.113.7");
+        assert_eq!(parsed["treatment"], "raw");
+        assert_eq!(parsed["reason"], "unknown-protocol");
+    }
+
+    #[test]
+    fn a_deny_default_drops_an_unclassified_connection_rather_than_asking() {
+        // `defaultVerdict: deny` is an answer already given — block what no rule
+        // names, and do not ask. Raising a card would overrule it and prompt the
+        // one operator who said they never wanted prompting.
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        assert!(unclassified_splice_decision(&state).is_none());
+    }
+
+    #[test]
+    fn every_other_default_asks_about_an_unclassified_connection() {
+        // `allow` asks too: a default is not consent to splice a connection
+        // nothing can inspect, and this door dropped it until now — so the answer
+        // moves from dropped to a question, never straight to spliced.
+        for default in [Verdict::Ask, Verdict::Allow] {
+            let (state, _rx) = test_state();
+            state.policy.write().unwrap().default_verdict = default;
+            let decision = unclassified_splice_decision(&state)
+                .unwrap_or_else(|| panic!("{default:?} must raise a question"));
+            assert_eq!(decision.verdict, Verdict::Ask);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_destination_floor_beats_the_card_for_an_unclassified_connection() {
+        // Asking about an undeclared destination is only safe while the hard floor
+        // runs first: a metadata or link-local address reaches the host itself
+        // past the cage, so it must never be offered to a human to approve.
+        let (state, mut rx) = test_state();
+        let dst: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        let decision = unclassified_splice_decision(&state).expect("the default asks");
+
+        let (_client, server) = socket_pair().await;
+        handle_raw_passthrough(server, dst, &decision, &state, &test_actor())
+            .await
+            .unwrap();
+
+        let events = drain_audit(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["metadata"]["reason"] == "blocked-destination"),
+            "the floor must refuse it; got {events:#?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["type"] == "request_pending"),
+            "no dialog may be raised for a blocked destination; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_approved_ask_still_splices_when_the_policy_has_not_moved() {
         // The rule stays `ask` after the click — an approval is not written back
         // into the table. A re-check that simply re-asks the table would refuse
@@ -4808,6 +5065,7 @@ pub(crate) mod tests {
             verdict,
             matched_target: None,
             generation: state.policy.read().unwrap().generation,
+            reason: "policy-ambiguous",
         };
         let actor = test_actor();
         assert_eq!(
