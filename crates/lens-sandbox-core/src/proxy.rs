@@ -334,7 +334,7 @@ pub(crate) fn collect_header_injections(
 /// Get or initialize the ephemeral CA for MITM TLS interception.
 /// Also installs the CA cert into the system trust store (idempotent).
 /// Uses `get_or_init` to ensure only one CA is created under contention.
-fn get_or_init_ca(
+pub(crate) fn get_or_init_ca(
     state: &ProxyState,
 ) -> Result<&Arc<crate::ca::EphemeralCa>, Box<dyn std::error::Error + Send + Sync>> {
     Ok(state.ephemeral_ca.get_or_init(|| {
@@ -1190,25 +1190,21 @@ async fn handle_connect(
                 // doesn't carry header injections, but surface the
                 // misconfiguration so it doesn't fail silently.
                 //
-                // HTTP rules are dropped here too, which is a policy bypass and
-                // not merely a lost injection: a rule written for a GraphQL
-                // service behind SigV4 (AppSync is one) does not run on this
-                // path. The warning is all this door does about it today.
+                // HTTP rules are the exception: they are handed to the re-sign
+                // path below, which applies them itself.
                 if needs_mitm {
                     tracing::warn!(
                         target = %target_host,
                         has_header_injections = injections.is_some(),
-                        has_http_rules = !domain_http_rules.is_empty(),
                         has_uri_placeholders = !uri_placeholders.is_empty(),
-                        "aws-resign owns this host: other injections are dropped and HTTP rules are NOT enforced"
+                        "aws-resign and other injections configured on same host — non-aws injections will be dropped"
                     );
                 }
-                let ca = get_or_init_ca(state)?;
                 tracing::debug!(target = %target_host, "proxy DIRECT+AWS_RESIGN");
                 let port = extract_port(target_host, 443);
                 state
                     .aws_resign
-                    .handle(client, &hostname, port, ca, state, actor)
+                    .handle(client, &hostname, port, state, actor, &domain_http_rules)
                     .await?;
             } else if needs_mitm {
                 let ca = get_or_init_ca(state)?;
@@ -2610,6 +2606,38 @@ fn emit_policy_deny_connect(
             method: "CONNECT",
             host: &host,
             path: None,
+        },
+        actor,
+    );
+}
+
+/// Audit a re-signed request denied by the route's HTTP rules. The reason is
+/// always `policy-deny`; `detail` says which rule refused it.
+pub(crate) fn emit_policy_deny_resigned(
+    state: &Arc<ProxyState>,
+    target_host: &str,
+    method: &str,
+    path: &str,
+    detail: &str,
+    actor: &crate::peer_process::ActorContext,
+) {
+    let host = extract_hostname(target_host);
+    emit_audit_action_with_metadata(
+        state,
+        "failure",
+        403,
+        Some(serde_json::json!({
+            "host": target_host,
+            "mitm": true,
+            "aws_resign": true,
+            "reason": "policy-deny",
+            "detail": detail,
+        })),
+        RequestFacts {
+            action: &format!("{method} https://{target_host}{path}"),
+            method,
+            host: &host,
+            path: Some(path),
         },
         actor,
     );

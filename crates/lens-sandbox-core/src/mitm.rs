@@ -177,21 +177,18 @@ pub(crate) fn is_upgrade_request(header_block: &str) -> bool {
     false
 }
 
-/// Drive the client↔upstream relay. For upgrade requests we keep the legacy
-/// `copy_bidirectional` shape so WebSocket/SPDY framing flows through. For
-/// regular request/response traffic we use `forward_response_with_close`,
-/// which guarantees:
-///   1. The response sent to the client carries `Connection: close`, so any
-///      pooling HTTP client (reqwest, undici, fetch...) drops the inner TLS
-///      connection after one request.
-///   2. The inner TLS is explicitly shut down once the response body finishes,
-///      so even a client that ignores the response header sees a hard EOF
-///      before it can send a second pipelined request through the tunnel.
+/// Drive the client↔upstream relay: one response, or a raw pipe once upstream
+/// has switched protocols. An ordinary response guarantees that
+///   1. it carries `Connection: close`, so any pooling HTTP client (reqwest,
+///      undici, fetch...) drops the inner TLS connection after one request;
+///   2. the inner TLS is explicitly shut down once the body finishes, so even a
+///      client that ignores the response header sees a hard EOF before it can
+///      send a second pipelined request through the tunnel.
 ///
-/// Without (1) and (2) the MITM "one request per session" contract was only
-/// enforced on the upstream leg; the inner client↔MITM TLS appeared
-/// reusable, and a second pooled HTTP/1.1 request would race against the
-/// MITM's teardown and surface as spurious 400s. See the regression test in
+/// Without (1) and (2) the MITM "one request per session" contract holds only
+/// on the upstream leg; the inner client↔MITM TLS looks reusable, and a second
+/// pooled HTTP/1.1 request races the MITM's teardown and surfaces as a spurious
+/// 400. See the regression test in
 /// packages/lens-e2e/src/claude-code-lens-mcp.e2e.test.ts.
 async fn forward_or_bridge<C, U>(
     mut tls_client: C,
@@ -202,18 +199,36 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    if meta.is_upgrade {
+    if matches!(
+        forward_response(&mut tls_client, &mut tls_upstream, meta).await?,
+        ResponseOutcome::Switched
+    ) {
+        // The negotiated protocol owns the connection now, so relay it verbatim.
         tokio::io::copy_bidirectional(&mut tls_client, &mut tls_upstream).await?;
-        return Ok(());
     }
-    forward_response_with_close(&mut tls_client, &mut tls_upstream, meta.body_mode).await
+    Ok(())
 }
 
-async fn forward_response_with_close<C, U>(
+/// What the response did to the connection.
+#[derive(PartialEq, Eq)]
+enum ResponseOutcome {
+    /// One response was relayed and the session is over.
+    Complete,
+    /// Upstream switched protocols; the connection is now a raw pipe.
+    Switched,
+}
+
+/// Forward the response, and report whether the connection became a pipe.
+///
+/// A `Connection: upgrade` header is the client asking, not the protocol
+/// changing, so the switch happens on the answer: `101 Switching Protocols`
+/// against a request that asked to upgrade. Every other final status is an
+/// ordinary response and gets `Connection: close`.
+async fn forward_response<C, U>(
     tls_client: &mut C,
     tls_upstream: &mut U,
-    body_mode: BodyFraming,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    meta: &RequestMeta,
+) -> Result<ResponseOutcome, Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
@@ -254,7 +269,7 @@ where
     // terminator; an explicit shutdown adds nothing and risks tearing the
     // streaming response down.
     let request_forwarder = async {
-        match body_mode {
+        match meta.body_mode {
             BodyFraming::None => {}
             BodyFraming::Fixed(n) => {
                 let mut limited = (&mut client_read).take(n);
@@ -283,23 +298,36 @@ where
         // verbatim — they're not the response we want to rewrite.
         loop {
             let header_bytes = read_until_double_crlf(&mut upstream_read).await?;
-            if let Some(code) = parse_status_code(&header_bytes)
-                && (100..200).contains(&code)
-            {
-                client_write.write_all(&header_bytes).await?;
-                continue;
+            match parse_status_code(&header_bytes) {
+                Some(101) if meta.is_upgrade => {
+                    client_write.write_all(&header_bytes).await?;
+                    return Ok::<ResponseOutcome, Box<dyn std::error::Error + Send + Sync>>(
+                        ResponseOutcome::Switched,
+                    );
+                }
+                // A switch nobody asked for is not one we can honour, and the
+                // client would read every byte after it as the new protocol.
+                Some(101) => {
+                    return Err("upstream switched protocols unasked".into());
+                }
+                Some(code) if (100..200).contains(&code) => {
+                    client_write.write_all(&header_bytes).await?;
+                }
+                _ => {
+                    // Final response — rewrite Connection and stream the body.
+                    let modified = inject_response_connection_close(&header_bytes);
+                    client_write.write_all(&modified).await?;
+                    // Stream the body. Returns on upstream EOF (server honored
+                    // Connection: close) or on a client write error.
+                    let _ = tokio::io::copy(&mut upstream_read, &mut client_write).await;
+                    // Eagerly send TLS close_notify + FIN to the client so its
+                    // connection pool sees the connection as terminated *now*,
+                    // before it can race a second pipelined request through the
+                    // tunnel.
+                    let _ = client_write.shutdown().await;
+                    return Ok(ResponseOutcome::Complete);
+                }
             }
-            // Final response — rewrite Connection and stream the body.
-            let modified = inject_response_connection_close(&header_bytes);
-            client_write.write_all(&modified).await?;
-            // Stream the body. Returns on upstream EOF (server honored
-            // Connection: close) or on a client write error.
-            let _ = tokio::io::copy(&mut upstream_read, &mut client_write).await;
-            // Eagerly send TLS close_notify + FIN to the client so its
-            // connection pool sees the connection as terminated *now*, before
-            // it can race a second pipelined request through the tunnel.
-            let _ = client_write.shutdown().await;
-            return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
         }
     };
 
@@ -307,11 +335,12 @@ where
     // returning a result from. The request body forwarder runs as long as the
     // response forwarder; when the response completes, dropping the future
     // cancels it.
-    tokio::select! {
+    let outcome = tokio::select! {
         result = response_forwarder => result?,
-        _ = request_forwarder => {}
-    }
-    Ok(())
+        // Unreachable: the request forwarder parks instead of returning.
+        _ = request_forwarder => ResponseOutcome::Complete,
+    };
+    Ok(outcome)
 }
 
 /// Forward an HTTP/1.1 chunked-encoded request body verbatim from `reader`
@@ -1952,7 +1981,7 @@ mod tests {
             .await
             .unwrap();
         // Drive the production relay so this integration harness exercises
-        // forward_response_with_close (response rewrite + explicit shutdown
+        // forward_response (response rewrite + explicit shutdown
         // + bounded request body forwarding), not the legacy
         // `copy_bidirectional` path.
         if let Err(e) = forward_or_bridge(tls_client, tls_upstream, &meta).await {
@@ -2484,15 +2513,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_response_with_close_rewrites_keep_alive() {
+    async fn forward_response_rewrites_keep_alive() {
         use tokio::io::AsyncWriteExt;
 
         let (mut client_outer, mut client_inner) = tokio::io::duplex(8192);
         let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(&mut client_inner, &mut upstream_inner, BodyFraming::None)
-                .await
+            forward_response(
+                &mut client_inner,
+                &mut upstream_inner,
+                &relay_meta(BodyFraming::None),
+            )
+            .await
         });
 
         // Upstream returns a keep-alive response with body.
@@ -2522,15 +2555,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_response_with_close_passes_through_1xx_then_rewrites_final() {
+    async fn forward_response_passes_through_1xx_then_rewrites_final() {
         use tokio::io::AsyncWriteExt;
 
         let (mut client_outer, mut client_inner) = tokio::io::duplex(8192);
         let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(&mut client_inner, &mut upstream_inner, BodyFraming::None)
-                .await
+            forward_response(
+                &mut client_inner,
+                &mut upstream_inner,
+                &relay_meta(BodyFraming::None),
+            )
+            .await
         });
 
         // Upstream sends 100 Continue, then 103 Early Hints, then the final 200.
@@ -2568,7 +2605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_response_with_close_forwards_request_body_to_upstream() {
+    async fn forward_response_forwards_request_body_to_upstream() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut client_outer, mut client_inner) = tokio::io::duplex(8192);
@@ -2578,10 +2615,10 @@ mod tests {
         let body_len = body.len() as u64;
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(
+            forward_response(
                 &mut client_inner,
                 &mut upstream_inner,
-                BodyFraming::Fixed(body_len),
+                &relay_meta(BodyFraming::Fixed(body_len)),
             )
             .await
         });
@@ -2618,15 +2655,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_response_with_close_shuts_down_client_after_response() {
+    async fn forward_response_shuts_down_client_after_response() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut client_outer, mut client_inner) = tokio::io::duplex(8192);
         let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(&mut client_inner, &mut upstream_inner, BodyFraming::None)
-                .await
+            forward_response(
+                &mut client_inner,
+                &mut upstream_inner,
+                &relay_meta(BodyFraming::None),
+            )
+            .await
         });
 
         upstream_outer
@@ -2902,11 +2943,191 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
+    // An upgrade becomes a pipe only when upstream agrees
+    // ----------------------------------------------------------------------
+
+    /// Drive `forward_or_bridge` over a pair of in-memory duplexes for a request
+    /// that asked to upgrade, and return handles to the far ends of both.
+    fn upgrade_bridge() -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+    ) {
+        upgrade_bridge_with_body(BodyFraming::None)
+    }
+
+    /// As `upgrade_bridge`, for a request whose body the relay must still
+    /// forward while it waits for the answer.
+    fn upgrade_bridge_with_body(
+        body_mode: BodyFraming,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client_far, client_near) = tokio::io::duplex(4096);
+        let (upstream_far, upstream_near) = tokio::io::duplex(4096);
+        let meta = RequestMeta {
+            is_upgrade: true,
+            body_mode,
+            buffered_body: None,
+        };
+        let task = tokio::spawn(async move {
+            let _ = forward_or_bridge(client_near, upstream_near, &meta).await;
+        });
+        (client_far, upstream_far, task)
+    }
+
+    /// A request that did not ask to upgrade.
+    fn relay_meta(body_mode: BodyFraming) -> RequestMeta {
+        RequestMeta {
+            is_upgrade: false,
+            body_mode,
+            buffered_body: None,
+        }
+    }
+
+    /// Read one response head, up to and including its terminator.
+    async fn read_head(stream: &mut tokio::io::DuplexStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                return String::from_utf8(head).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_101_from_upstream_opens_the_pipe() {
+        let (mut client, mut upstream, _task) = upgrade_bridge();
+
+        upstream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+            .await
+            .unwrap();
+
+        let head = read_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+        // The pipe carries bytes both ways once the protocol has changed.
+        client.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        upstream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping");
+
+        upstream.write_all(b"pong").await.unwrap();
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"pong");
+    }
+
+    #[tokio::test]
+    async fn a_declined_upgrade_is_relayed_as_an_ordinary_response() {
+        // The request asked; upstream said no. The client must get the response
+        // it was sent, not a pipe to a server that never agreed to one.
+        let (mut client, mut upstream, _task) = upgrade_bridge();
+
+        upstream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        drop(upstream);
+
+        let mut seen = Vec::new();
+        client.read_to_end(&mut seen).await.unwrap();
+        let seen = String::from_utf8_lossy(&seen);
+        assert!(seen.starts_with("HTTP/1.1 200 OK"), "{seen}");
+        assert!(
+            seen.to_ascii_lowercase().contains("connection: close"),
+            "{seen}"
+        );
+        assert!(seen.ends_with("ok"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn an_informational_response_does_not_open_the_pipe() {
+        let (mut client, mut upstream, _task) = upgrade_bridge();
+
+        // A 103 is forwarded, and the answer that counts is still awaited.
+        upstream
+            .write_all(b"HTTP/1.1 103 Early Hints\r\n\r\n")
+            .await
+            .unwrap();
+        upstream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .await
+            .unwrap();
+
+        let hint = read_head(&mut client).await;
+        assert!(hint.starts_with("HTTP/1.1 103"), "{hint}");
+        let switched = read_head(&mut client).await;
+        assert!(switched.starts_with("HTTP/1.1 101"), "{switched}");
+
+        client.write_all(b"x").await.unwrap();
+        let mut got = [0u8; 1];
+        upstream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"x");
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_request_body_still_reaches_upstream() {
+        // RFC 9110 §7.8: the server receives the whole request before it
+        // switches. If the relay only listened for the answer, both ends would
+        // wait for each other and the session would hang.
+        let body = b"upgrade payload";
+        let (mut client, mut upstream, _task) =
+            upgrade_bridge_with_body(BodyFraming::Fixed(body.len() as u64));
+
+        client.write_all(body).await.unwrap();
+        let mut seen = vec![0u8; body.len()];
+        upstream.read_exact(&mut seen).await.unwrap();
+        assert_eq!(&seen, body);
+
+        upstream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn a_switch_nobody_asked_for_is_not_relayed() {
+        let (mut client, mut client_near) = tokio::io::duplex(4096);
+        let (mut upstream, mut upstream_near) = tokio::io::duplex(4096);
+        let _task = tokio::spawn(async move {
+            forward_response(
+                &mut client_near,
+                &mut upstream_near,
+                &relay_meta(BodyFraming::None),
+            )
+            .await
+            .is_ok()
+        });
+
+        upstream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut seen = Vec::new();
+        client.read_to_end(&mut seen).await.unwrap();
+        assert!(
+            seen.is_empty(),
+            "an unasked switch must not reach the client: {}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    // ----------------------------------------------------------------------
     // Bounded request body forwarding
     // ----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn forward_response_with_close_does_not_forward_extra_bytes_after_fixed_body() {
+    async fn forward_response_does_not_forward_extra_bytes_after_fixed_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut client_outer, mut client_inner) = tokio::io::duplex(8192);
@@ -2924,10 +3145,10 @@ mod tests {
         combined.extend_from_slice(leaked);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(
+            forward_response(
                 &mut client_inner,
                 &mut upstream_inner,
-                BodyFraming::Fixed(body_len),
+                &relay_meta(BodyFraming::Fixed(body_len)),
             )
             .await
         });
@@ -2980,15 +3201,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_response_with_close_no_body_request_does_not_forward_anything() {
+    async fn forward_response_no_body_request_does_not_forward_anything() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut client_outer, mut client_inner) = tokio::io::duplex(8192);
         let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(&mut client_inner, &mut upstream_inner, BodyFraming::None)
-                .await
+            forward_response(
+                &mut client_inner,
+                &mut upstream_inner,
+                &relay_meta(BodyFraming::None),
+            )
+            .await
         });
 
         // Malicious client tries to pipeline a second request through the
@@ -3025,7 +3250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_response_with_close_chunked_stops_at_terminator() {
+    async fn forward_response_chunked_stops_at_terminator() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (mut client_outer, mut client_inner) = tokio::io::duplex(8192);
@@ -3038,10 +3263,10 @@ mod tests {
         let leaked = b"POST /admin HTTP/1.1\r\nHost: x\r\n\r\n";
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(
+            forward_response(
                 &mut client_inner,
                 &mut upstream_inner,
-                BodyFraming::Chunked,
+                &relay_meta(BodyFraming::Chunked),
             )
             .await
         });
@@ -3087,7 +3312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_response_with_close_signals_eof_to_upstream_on_short_fixed_body() {
+    async fn forward_response_signals_eof_to_upstream_on_short_fixed_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Client advertised Content-Length: 100 but disconnects after 30 bytes.
@@ -3100,10 +3325,10 @@ mod tests {
         let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
 
         let task = tokio::spawn(async move {
-            forward_response_with_close(
+            forward_response(
                 &mut client_inner,
                 &mut upstream_inner,
-                BodyFraming::Fixed(100),
+                &relay_meta(BodyFraming::Fixed(100)),
             )
             .await
         });
