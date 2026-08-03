@@ -20,9 +20,9 @@
 //! its operation, so it is denied. A request that sends the document as well as
 //! the hash is read from the document, which is what the server runs.
 //!
-//! Subscriptions run over a WebSocket upgrade, whose frames the proxy relays
-//! without reading. A GraphQL rule therefore denies the upgrade instead of
-//! admitting a stream it cannot see.
+//! Subscriptions run over a WebSocket upgrade, where the operation is in a
+//! frame rather than in a request body. [`crate::graphql_ws`] reads those, and
+//! judges each one with the [`check_envelope`] entry point here.
 
 use std::collections::{HashMap, HashSet};
 
@@ -479,6 +479,22 @@ pub fn check_request(
     matchers: &[&GraphqlMatcher],
 ) -> Result<(), String> {
     let info = classify_request(method, raw_target, body)?;
+    check_operations(&info, matchers)
+}
+
+/// Read one operation out of a JSON envelope and judge it against the rules
+/// that cover the route.
+///
+/// This is the envelope on its own, without the HTTP request around it: a
+/// GraphQL WebSocket message carries the same `query` / `operationName` /
+/// `extensions` object inside its `payload`.
+pub(crate) fn check_envelope(
+    envelope: &serde_json::Value,
+    matchers: &[&GraphqlMatcher],
+) -> Result<(), String> {
+    let info = RequestInfo {
+        operations: vec![classify_json_envelope(envelope)?],
+    };
     check_operations(&info, matchers)
 }
 
