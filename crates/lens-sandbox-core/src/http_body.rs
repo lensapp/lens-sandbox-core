@@ -233,6 +233,10 @@ where
 /// single `Content-Length`. Leaving the original framing in place beside the
 /// new one is what request smuggling is made of, so all three go.
 ///
+/// `Expect` goes with them. The body is in hand, which means the proxy already
+/// answered the client's `100-continue`; carrying the ask upstream would earn a
+/// second answer for a body that is on its way.
+///
 /// `head` is CRLF-joined and carries no trailing blank line, matching what both
 /// doors hand to upstream.
 pub fn reframe_head_as_content_length(head: &str, body_len: usize) -> String {
@@ -246,7 +250,7 @@ pub fn reframe_head_as_content_length(head: &str, body_len: usize) -> String {
                 .map(|(name, _)| name.trim().to_ascii_lowercase());
             if matches!(
                 name.as_deref(),
-                Some("transfer-encoding" | "content-length" | "trailer")
+                Some("transfer-encoding" | "content-length" | "trailer" | "expect")
             ) {
                 continue;
             }

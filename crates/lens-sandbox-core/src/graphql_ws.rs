@@ -20,6 +20,12 @@ use crate::policy_schema::GraphqlMatcher;
 /// A GraphQL document above this is refused, not passed unread.
 pub(crate) const MAX_TEXT_MESSAGE_BYTES: usize = 64 * 1024;
 
+/// Frames one message may be split across. This bounds what is held for a
+/// message that is still arriving, which the byte limit above cannot: an empty
+/// fragment carries no payload but still carries its framing. A client that
+/// needs more than this to state one operation is not one the proxy can read.
+const MAX_MESSAGE_FRAMES: usize = 64;
+
 const OPCODE_CONTINUATION: u8 = 0x0;
 const OPCODE_TEXT: u8 = 0x1;
 const OPCODE_BINARY: u8 = 0x2;
@@ -96,6 +102,7 @@ where
     let mut fragmenting = false;
     let mut held_raw: Vec<u8> = Vec::new();
     let mut held_text: Vec<u8> = Vec::new();
+    let mut held_frames = 0usize;
     let mut close_seen = false;
 
     loop {
@@ -118,6 +125,15 @@ where
                         "a client WebSocket message above {MAX_TEXT_MESSAGE_BYTES} bytes cannot be read"
                     )));
                 }
+                // The payload bound alone does not bound what is held: an empty
+                // fragment adds no payload but still adds its framing, so a
+                // stream of them would grow `held_raw` without end.
+                held_frames += 1;
+                if held_frames > MAX_MESSAGE_FRAMES {
+                    return Ok(Some(format!(
+                        "a client WebSocket message split across more than {MAX_MESSAGE_FRAMES} frames cannot be read"
+                    )));
+                }
                 held_text.extend_from_slice(&frame.payload);
                 held_raw.extend_from_slice(&frame.raw);
                 if !frame.fin {
@@ -125,6 +141,7 @@ where
                     continue;
                 }
                 fragmenting = false;
+                held_frames = 0;
 
                 let judged = match std::str::from_utf8(&held_text) {
                     Ok(text) => judge_message(text, matchers),
@@ -600,6 +617,75 @@ mod tests {
             "no part of it may go on: {} bytes",
             seen.len()
         );
+    }
+
+    #[tokio::test]
+    async fn a_message_split_across_too_many_frames_is_refused() {
+        // Empty fragments add no payload, so the byte limit never fires on them.
+        // Without a frame limit the proxy would hold their framing for as long as
+        // the client cared to send them.
+        let (mut client, client_near) = tokio::io::duplex(64 * 1024);
+        let (mut upstream, upstream_near) = tokio::io::duplex(4096);
+
+        let task = tokio::spawn(async move {
+            let mut client_near = client_near;
+            let mut upstream_near = upstream_near;
+            let rule = subscription_rule();
+            relay(&mut client_near, &mut upstream_near, &[&rule]).await
+        });
+
+        client
+            .write_all(&masked_frame(OPCODE_TEXT, false, b""))
+            .await
+            .unwrap();
+        for _ in 0..MAX_MESSAGE_FRAMES {
+            client
+                .write_all(&masked_frame(OPCODE_CONTINUATION, false, b""))
+                .await
+                .unwrap();
+        }
+
+        let reason = task.await.unwrap().unwrap().expect("expected a denial");
+        assert!(reason.contains("more than"), "{reason}");
+        let mut seen = Vec::new();
+        upstream.read_to_end(&mut seen).await.unwrap();
+        assert!(seen.is_empty(), "nothing may go on: {} bytes", seen.len());
+    }
+
+    #[tokio::test]
+    async fn a_message_may_still_arrive_in_several_frames() {
+        let (mut client, client_near) = tokio::io::duplex(4096);
+        let (mut upstream, upstream_near) = tokio::io::duplex(4096);
+        let first = masked_frame(
+            OPCODE_TEXT,
+            false,
+            br#"{"id":"1","type":"subscribe","payload":{"query":"#,
+        );
+        let second = masked_frame(
+            OPCODE_CONTINUATION,
+            true,
+            br#""subscription S { messageAdded } "}}"#,
+        );
+
+        let task = tokio::spawn(async move {
+            let mut client_near = client_near;
+            let mut upstream_near = upstream_near;
+            let rule = subscription_rule();
+            relay(&mut client_near, &mut upstream_near, &[&rule]).await
+        });
+
+        client.write_all(&first).await.unwrap();
+        client.write_all(&second).await.unwrap();
+
+        let mut seen = vec![0u8; first.len() + second.len()];
+        upstream.read_exact(&mut seen).await.unwrap();
+        assert_eq!(
+            seen,
+            [first, second].concat(),
+            "both fragments go on, once the whole message has passed"
+        );
+        drop(client);
+        assert_eq!(task.await.unwrap().unwrap(), None);
     }
 
     #[tokio::test]

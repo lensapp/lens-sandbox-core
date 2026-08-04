@@ -136,6 +136,24 @@ pub async fn handle_mitm_pre_accepted(
     Ok(())
 }
 
+/// Whether these rules cover a subscription, the operation an upgrade exists to
+/// carry.
+///
+/// A rule written for HTTP queries can match a handshake head as well — the
+/// handshake is a `GET`, and a rule may name no method. Granting on that would
+/// hand out a long-lived socket its author never asked for, so the grant stays
+/// tied to the operation it is documented to enable. What crosses the socket is
+/// judged by every rule that covers the head, this one included.
+fn grants_an_upgrade(matchers: &[&GraphqlMatcher]) -> bool {
+    matchers.iter().any(|matcher| {
+        matches!(
+            matcher.operation_type,
+            crate::policy_schema::GraphqlOperationTypeMatcher::Subscription
+                | crate::policy_schema::GraphqlOperationTypeMatcher::Any
+        )
+    })
+}
+
 /// Record a client operation that the route's GraphQL rules refused mid-stream.
 ///
 /// The request that opened the socket was already audited as a success, so this
@@ -772,6 +790,15 @@ async fn mitm_inject_after_accept(
                     )
                     .await);
             }
+            if !grants_an_upgrade(&matchers) {
+                return Err(facts
+                    .deny(
+                        &mut tls_client,
+                        "upgrade_denied",
+                        "no GraphQL rule here covers a subscription, so no rule grants an upgrade",
+                    )
+                    .await);
+            }
             graphql_frames = matchers.into_iter().cloned().collect();
         }
         crate::routing::HttpRuleOutcome::Graphql(matchers) => {
@@ -951,8 +978,18 @@ async fn mitm_inject_after_accept(
                         .await);
                 }
                 // The rewrite may have moved the connection onto other GraphQL
-                // rules. Those are the ones its frames answer to.
+                // rules. Those are the ones its frames answer to, and they have to
+                // grant the upgrade in their own right.
                 crate::routing::HttpRuleOutcome::Graphql(matchers) if is_upgrade => {
+                    if !grants_an_upgrade(&matchers) {
+                        return Err(facts
+                            .deny(
+                                &mut tls_client,
+                                "rewritten_path_denied",
+                                "rewritten URI reaches no GraphQL rule that covers a subscription",
+                            )
+                            .await);
+                    }
                     graphql_frames = matchers.into_iter().cloned().collect();
                 }
                 // The credential value moved the request onto a GraphQL rule.
@@ -3318,6 +3355,88 @@ mod tests {
         );
         // This origin declines the upgrade, so the client gets an ordinary answer.
         assert!(response.contains("200 OK"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_query_rule_does_not_grant_an_upgrade() {
+        // A rule written for HTTP queries names no method, so it matches the
+        // handshake head as well. Granting on it would hand out a long-lived
+        // socket its author never asked for.
+        let rules = vec![HttpRule {
+            method: None,
+            path: Some("/graphql".to_string()),
+            graphql: Some(crate::policy_schema::GraphqlMatcher {
+                operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
+                operation_name: None,
+                fields: vec!["viewer".to_string()],
+            }),
+        }];
+        let (upstream_saw, response, _audits) =
+            run_mitm_harness_with_rules(vec![], rules, WS_HANDSHAKE, true).await;
+
+        assert!(
+            response.contains("403"),
+            "expected a 403 for an upgrade no subscription rule covers, got: {response}"
+        );
+        assert!(
+            !upstream_saw.contains("/graphql"),
+            "nothing may reach the origin: {upstream_saw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_that_leaves_the_subscription_rule_denies_the_upgrade() {
+        // A credential in the URI can move the request onto other rules. The
+        // upgrade has to be granted by the rules the rewritten path reaches, not
+        // by the ones the placeholder happened to match.
+        let placeholder = "LNSPLACEHOLDER0000000000000000000000";
+        let rules = vec![
+            HttpRule {
+                method: Some("GET".to_string()),
+                path: Some(format!("/graphql/{placeholder}")),
+                graphql: Some(graphql_subscription_rule()),
+            },
+            HttpRule {
+                method: Some("GET".to_string()),
+                path: Some("/graphql/real-token".to_string()),
+                graphql: Some(crate::policy_schema::GraphqlMatcher {
+                    operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
+                    operation_name: None,
+                    fields: vec![],
+                }),
+            },
+        ];
+        let request: &[u8] = Box::leak(
+            format!(
+                "GET /graphql/{placeholder} HTTP/1.1\r\nHost: test.example.com\r\n\
+                 Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        );
+        let (upstream_saw, response, audits) = run_mitm_harness_full(
+            vec![],
+            rules,
+            vec![(placeholder.to_string(), "real-token".to_string())],
+            request,
+            true,
+        )
+        .await;
+
+        assert!(
+            response.contains("403"),
+            "expected a 403 once the rewrite leaves the subscription rule, got: {response}"
+        );
+        assert!(
+            !upstream_saw.contains("real-token"),
+            "the credential must not reach the origin: {upstream_saw}"
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|event| event["metadata"]["rewritten_path_denied"] == true),
+            "the rewritten path is what must refuse it: {audits:?}"
+        );
     }
 
     #[tokio::test]
