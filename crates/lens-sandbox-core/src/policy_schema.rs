@@ -280,15 +280,19 @@ pub struct HttpRule {
     /// document.
     ///
     /// A GraphQL rule also covers the WebSocket that carries subscriptions, on
-    /// an `https` connection that the proxy terminates. It is the only rule that
-    /// grants a `Connection: upgrade`, because it is the only one that can go on
-    /// judging what crosses the connection: every graphql-ws message the sandbox
-    /// sends is matched against these same rules, and one that no rule permits
-    /// closes the connection. The handshake drops the client's compression
-    /// offer, because a compressed frame hides the operation. Plain `ws://`
-    /// through the forward proxy stays refused: that door relays a response
-    /// without reading it, so it cannot tell an accepted upgrade from a
-    /// declined one.
+    /// an `https` connection that the proxy terminates. A rule whose
+    /// `operationType` is `subscription` or `*` is the only thing that grants a
+    /// `Connection: upgrade`, because a GraphQL rule is the only one that can go
+    /// on judging what crosses the connection: every graphql-ws message the
+    /// sandbox sends is matched against these same rules, and one that no rule
+    /// permits closes the connection. A `query` rule that also matches the
+    /// handshake head grants nothing, so writing one for HTTP does not hand out a
+    /// socket by accident.
+    ///
+    /// The handshake drops the client's compression offer, because a compressed
+    /// frame hides the operation. Plain `ws://` through the forward proxy stays
+    /// refused: that door relays a response without reading it, so it cannot tell
+    /// an accepted upgrade from a declined one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlMatcher>,
 }
@@ -331,9 +335,11 @@ pub enum GraphqlOperationTypeMatcher {
     Query,
     /// A write.
     Mutation,
-    /// A stream. See the note on [`HttpRule::graphql`] — the proxy denies these.
+    /// A stream. This is the type that grants a `Connection: upgrade`, so a rule
+    /// naming it is what lets a subscription open at all. See the note on
+    /// [`HttpRule::graphql`].
     Subscription,
-    /// Any operation type.
+    /// Any operation type, `subscription` included, so this grants an upgrade too.
     #[serde(rename = "*")]
     Any,
 }
@@ -367,8 +373,8 @@ pub enum GraphqlOperationType {
     Query,
     /// A write.
     Mutation,
-    /// A long-lived stream. Served over a WebSocket upgrade, whose frames this
-    /// proxy does not inspect — see [`crate::graphql`].
+    /// A long-lived stream. Served over a WebSocket upgrade, where the proxy
+    /// reads each message the sandbox sends — see [`crate::graphql_ws`].
     Subscription,
 }
 

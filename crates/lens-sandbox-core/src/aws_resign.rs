@@ -293,13 +293,24 @@ async fn forward_resigned(
             if !bytes.is_empty() {
                 tls_upstream.write_all(&bytes).await?;
             }
+            // Nothing drives this write half again, so the last TLS record has to
+            // leave here rather than wait for a copy that only reads.
+            tls_upstream.flush().await?;
+            // The whole body has gone. Anything else the client has to say would
+            // be a second request that no rule judged, so this direction is
+            // finished and only the answer is relayed back.
+            tokio::io::copy(&mut tls_upstream, tls_client).await?;
+            tls_client.shutdown().await.ok();
         }
         OutgoingBody::Stream => {
-            // S3 with UNSIGNED-PAYLOAD: client bytes flow through as-is.
+            // S3 with UNSIGNED-PAYLOAD: the body was never held, so its end is
+            // not known here and the client keeps the floor. `Connection: close`,
+            // which `apply_resigned_headers` puts on the head, is what stops a
+            // compliant origin from acting on a second request spliced behind
+            // this one.
+            tokio::io::copy_bidirectional(tls_client, &mut tls_upstream).await?;
         }
     }
-
-    tokio::io::copy_bidirectional(tls_client, &mut tls_upstream).await?;
     Ok(())
 }
 
