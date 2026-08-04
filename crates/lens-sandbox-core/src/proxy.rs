@@ -40,6 +40,11 @@ pub struct SandboxUpstream {
 /// How long to suppress duplicate audit events for the same host.
 const AUDIT_DEDUP_SECS: u64 = 10;
 
+/// Well-known DNS port. The nat chain only redirects DNS over UDP to the stub, so
+/// this is also the port whose TCP traffic must keep being dropped rather than
+/// offered as a splice — see [`unclassified_splice_decision`].
+const DNS_PORT: u16 = 53;
+
 /// Floor and ceiling applied to a DNS record's TTL when pinning its IPs. The
 /// floor keeps a 0-TTL answer usable long enough for the follow-up connect; the
 /// ceiling bounds how long a stale pin outlives a policy change or a DNS
@@ -1308,8 +1313,8 @@ async fn handle_connect(
 /// listener. Recovers the pre-redirect destination, classifies the first
 /// bytes, and hands off to the TLS or HTTP handler. A connection it cannot
 /// classify is offered to the developer as a raw splice, unless the default
-/// verdict already denies what no rule names — see
-/// [`unclassified_splice_decision`].
+/// verdict already denies what no rule names, or the destination is one this crate
+/// filters itself — see [`unclassified_splice_decision`].
 async fn handle_transparent_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -1357,7 +1362,7 @@ async fn handle_transparent_connection(
     match transparent::classify(&first) {
         Protocol::Tls => handle_transparent_tls(stream, orig_dst, actor, &state).await,
         Protocol::Http => handle_transparent_http(stream, orig_dst, actor, &state).await,
-        Protocol::Unknown => match unclassified_splice_decision(&state) {
+        Protocol::Unknown => match unclassified_splice_decision(&state, orig_dst) {
             Some(decision) => {
                 handle_raw_passthrough(stream, orig_dst, &decision, &state, &actor).await
             }
@@ -1840,7 +1845,22 @@ async fn raw_verdict_admits(
 /// rule names and do not ask, so raising a card would overrule it. Every other
 /// default asks -- including `allow`, because a default is not consent to splice a
 /// connection nothing can inspect, and this door dropped it until now.
-fn unclassified_splice_decision(state: &Arc<ProxyState>) -> Option<TcpDecision> {
+///
+/// Port 53 is never asked about. Asking is only safe where being unclassifiable is
+/// the whole of what is wrong with a connection, and DNS is the one protocol this
+/// crate filters in its own right: [`crate::dns`] gates every lookup against the
+/// same allowlist, because a QNAME carries data out whether or not a connection to
+/// that name is permitted. The stub is UDP-only and relies on this branch dropping
+/// DNS over TCP (see its module docs). A card offering to splice port 53 would
+/// offer to reopen the covert channel the stub exists to close, and nothing on the
+/// card could convey that.
+fn unclassified_splice_decision(
+    state: &Arc<ProxyState>,
+    orig_dst: SocketAddr,
+) -> Option<TcpDecision> {
+    if orig_dst.port() == DNS_PORT {
+        return None;
+    }
     let policy = state.policy.read().unwrap();
     if policy.default_verdict == Verdict::Deny {
         return None;
@@ -4640,7 +4660,7 @@ pub(crate) mod tests {
         // destination it was shown — which a raw rule needs a port for.
         let (state, mut rx) = test_state();
         let dst: SocketAddr = "203.0.113.7:4444".parse().unwrap();
-        let decision = unclassified_splice_decision(&state).expect("the default asks");
+        let decision = unclassified_splice_decision(&state, dst).expect("the default asks");
         assert_eq!(decision.verdict, Verdict::Ask);
 
         let (_client, server) = socket_pair().await;
@@ -4661,13 +4681,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn dns_over_tcp_is_dropped_rather_than_offered_as_a_splice() {
+        // The stub filters every lookup because a QNAME carries data out whether
+        // or not a connection to that name is permitted — and it is UDP-only, so
+        // DNS over TCP is blocked by this branch dropping it. A card here would
+        // offer to reopen that channel, and no wording on it could convey what
+        // approving means.
+        let (state, _rx) = test_state();
+        for dst in ["192.168.64.1:53", "1.1.1.1:53", "[2001:db8::1]:53"] {
+            assert!(
+                unclassified_splice_decision(&state, dst.parse().unwrap()).is_none(),
+                "{dst} must be dropped, not asked about"
+            );
+        }
+        // The neighbouring port is ordinary traffic and still asks.
+        assert!(unclassified_splice_decision(&state, "192.168.64.1:54".parse().unwrap()).is_some());
+    }
+
+    #[test]
     fn a_deny_default_drops_an_unclassified_connection_rather_than_asking() {
         // `defaultVerdict: deny` is an answer already given — block what no rule
         // names, and do not ask. Raising a card would overrule it and prompt the
         // one operator who said they never wanted prompting.
         let (state, _rx) = test_state();
         state.policy.write().unwrap().default_verdict = Verdict::Deny;
-        assert!(unclassified_splice_decision(&state).is_none());
+        assert!(
+            unclassified_splice_decision(&state, "203.0.113.7:4444".parse().unwrap()).is_none()
+        );
     }
 
     #[test]
@@ -4678,8 +4718,9 @@ pub(crate) mod tests {
         for default in [Verdict::Ask, Verdict::Allow] {
             let (state, _rx) = test_state();
             state.policy.write().unwrap().default_verdict = default;
-            let decision = unclassified_splice_decision(&state)
-                .unwrap_or_else(|| panic!("{default:?} must raise a question"));
+            let decision =
+                unclassified_splice_decision(&state, "203.0.113.7:4444".parse().unwrap())
+                    .unwrap_or_else(|| panic!("{default:?} must raise a question"));
             assert_eq!(decision.verdict, Verdict::Ask);
         }
     }
@@ -4691,7 +4732,7 @@ pub(crate) mod tests {
         // past the cage, so it must never be offered to a human to approve.
         let (state, mut rx) = test_state();
         let dst: SocketAddr = "169.254.169.254:80".parse().unwrap();
-        let decision = unclassified_splice_decision(&state).expect("the default asks");
+        let decision = unclassified_splice_decision(&state, dst).expect("the default asks");
 
         let (_client, server) = socket_pair().await;
         handle_raw_passthrough(server, dst, &decision, &state, &test_actor())
