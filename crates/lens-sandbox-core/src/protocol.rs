@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 
 /// The protocol date this sandbox binary was built against (YYYY-MM-DD, zero-padded).
 /// Must be >= SANDBOX_MIN_PROTOCOL_DATE in packages/lens-sandbox/src/infra/sandbox-provisioner/types.ts.
-/// Bump to today's date when making breaking changes to the sandbox WebSocket protocol.
-pub const SANDBOX_PROTOCOL_DATE: &str = "2026-05-26";
+/// Bump to today's date in the same commit as any change to `policy_schema.rs`
+/// or the wire types in this file — an older sandbox must not accept a policy it
+/// cannot enforce.
+pub const SANDBOX_PROTOCOL_DATE: &str = "2026-08-07";
 
 /// A temporary file to write before executing a command.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

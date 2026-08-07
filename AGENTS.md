@@ -32,3 +32,7 @@ The canonical policy schema is defined in `policy_schema.rs` and exported as JSO
 ```bash
 cargo run --bin generate-policy-schema > schemas/policy.schema.json
 ```
+
+## Protocol Date
+
+When to bump `SANDBOX_PROTOCOL_DATE` is defined by its doc comment in `crates/lens-sandbox-core/src/protocol.rs` — that comment is the rule; follow it.
