@@ -124,8 +124,9 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
 }
 
 /// Parse a `match` pattern into a [`RouteMatcher`]. Shared by application-layer
-/// (`allowedRoutes` / `egress.http`) and raw-TCP (`egress.tcp`) parsing so the
-/// two never diverge on how a pattern is interpreted. Accepts a bare IP/CIDR,
+/// (`allowedRoutes` / `egress.http`) and raw (`egress.tcp`, `egress.udp`)
+/// parsing so the tables never diverge on how a pattern is interpreted. Accepts
+/// a bare IP/CIDR,
 /// `ip:port`/`host:port`, `cidr:port` (`10.0.0.0/24:5432`), bracketed IPv6
 /// (`[::1]:6443`, `[2001:db8::/32]:5432`), or a domain / wildcard.
 pub fn parse_matcher(pattern: &str) -> Result<RouteMatcher, String> {
@@ -227,7 +228,7 @@ pub(crate) fn overlapping_http_rules<'a>(
 }
 
 /// Parse the `egress.tcp` list into ONE ordered `Vec<RouteRule>`, preserving the
-/// original rule order. Connect resolution ([`find_matching_tcp_egress`]) walks
+/// original rule order. Connect resolution ([`find_matching_raw_egress`]) walks
 /// this single list in policy order so a static IP rule and a hostname (pinned)
 /// rule compete by their real position — an earlier rule always wins, whichever
 /// kind it is. The matcher kind is the connect-vs-pin discriminator:
@@ -349,7 +350,7 @@ fn parse_port_scoped_egress(
 }
 
 /// Fold an IP-literal `HostPort` into the equivalent single-address `CidrPort`
-/// so the raw-TCP layer treats it as a direct IP match. A hostname `HostPort`
+/// so the raw match layer treats it as a direct IP match. A hostname `HostPort`
 /// (and every other matcher) is returned unchanged. This also gives IPv6
 /// literals canonical numeric matching instead of string comparison.
 ///
@@ -616,19 +617,20 @@ pub fn find_matching_route<'a>(
     RouteOutcome::NoMatch { binary_filtered }
 }
 
-/// A raw-TCP destination as one egress door knows it. The doors differ only in
-/// what they can supply: the transparent listener has the destination IP but
-/// lost the name to `SO_ORIGINAL_DST`, while the explicit proxy is handed a name
-/// that may or may not be an IP literal. Live DNS pins supply the names neither
-/// door was given, so a hostname rule binds the same way on both.
+/// A destination bound for a raw table, as one egress door knows it. The doors
+/// differ only in what they can supply: the transparent listener has the
+/// destination IP but lost the name to `SO_ORIGINAL_DST`, the datagram relay
+/// only ever has an address, and the explicit proxy is handed a name that may or
+/// may not be an IP literal. Live DNS pins supply the names the others were
+/// never given, so a hostname rule binds the same way on every door.
 #[derive(Debug, Clone, Copy)]
-pub struct TcpTarget<'t> {
+pub struct RawTarget<'t> {
     ip: Option<std::net::IpAddr>,
     host: Option<&'t str>,
     pinned_qnames: &'t [&'t str],
 }
 
-impl<'t> TcpTarget<'t> {
+impl<'t> RawTarget<'t> {
     /// A destination in whichever form the door had it: an IP literal (the
     /// transparent door's `SO_ORIGINAL_DST`, or a client that dialed an address)
     /// or a hostname (a `CONNECT` target, an absolute-form URL).
@@ -660,7 +662,7 @@ impl<'t> TcpTarget<'t> {
     }
 }
 
-/// What the `egress.tcp` table said, and the name it said it about.
+/// What a raw table said, and the name it said it about.
 ///
 /// `matched_name` is the name the matching rule bound through — the door's own
 /// target, or the DNS pin the transparent door had to reach the rule through —
@@ -669,28 +671,30 @@ impl<'t> TcpTarget<'t> {
 /// transparent door holds only an address, and asking a developer about a bare
 /// IP for a rule they wrote as a hostname is unanswerable.
 #[derive(Debug)]
-pub struct TcpMatch<'a> {
+pub struct RawMatch<'a> {
     pub outcome: RouteOutcome<'a>,
     pub matched_name: Option<&'a str>,
 }
 
-/// Match a raw-TCP destination against the ordered `egress.tcp` rules in one
-/// pass, so IP rules and hostname rules compete by their real policy position.
+/// Match a destination against one raw table's ordered rules in a single pass,
+/// so IP rules and hostname rules compete by their real policy position. Serves
+/// `egress.tcp` and `egress.udp` alike: the caller supplies the table, and the
+/// rules mean the same thing in both.
 ///
 /// Only the port-scoped matchers occur here — [`parse_tcp_egress`] rejects the
 /// portless ones, so an any-port raw grant cannot exist. `CidrPort` matches the
 /// destination IP, canonicalized so an IPv4-mapped IPv6 literal cannot slip past
-/// a v4 CIDR; `HostPort` matches any name the destination is known by.
-/// `egress.tcp` rules carry no scheme, so there is no scheme filter here. Binary
+/// a v4 CIDR; `HostPort` matches any name the destination is known by. Raw rules
+/// carry no scheme, so there is no scheme filter here. Binary
 /// scoping and the no-reopen guard run through the same [`caller_admits_rule`]
 /// helper as [`find_matching_route`], so first-match / deny / binary semantics
 /// are identical across every door.
-pub fn find_matching_tcp_egress<'a>(
+pub fn find_matching_raw_egress<'a>(
     rules: &'a [RouteRule],
-    target: TcpTarget<'a>,
+    target: RawTarget<'a>,
     port: u16,
     caller: Option<&crate::peer_process::PeerProcess>,
-) -> TcpMatch<'a> {
+) -> RawMatch<'a> {
     let mut binary_filtered = false;
     for rule in rules {
         let mut matched_name = None;
@@ -715,7 +719,7 @@ pub fn find_matching_tcp_egress<'a>(
             continue;
         }
         if caller_admits_rule(rule, caller, binary_filtered) {
-            return TcpMatch {
+            return RawMatch {
                 outcome: RouteOutcome::Matched(rule),
                 matched_name,
             };
@@ -725,7 +729,7 @@ pub fn find_matching_tcp_egress<'a>(
         // the exclusion so the proxy fails closed rather than falling through.
         binary_filtered = true;
     }
-    TcpMatch {
+    RawMatch {
         outcome: RouteOutcome::NoMatch { binary_filtered },
         matched_name: None,
     }
@@ -1448,7 +1452,7 @@ mod tests {
             &serde_json::from_str(r#"[{"match": "10.0.0.0/8:5432", "verdict": "deny"}]"#).unwrap(),
         )
         .unwrap();
-        match find_matching_tcp_egress(&rules, TcpTarget::at("::ffff:10.0.0.5", &[]), 5432, None)
+        match find_matching_raw_egress(&rules, RawTarget::at("::ffff:10.0.0.5", &[]), 5432, None)
             .outcome
         {
             RouteOutcome::Matched(rule) => assert_eq!(rule.verdict, Verdict::Deny),
