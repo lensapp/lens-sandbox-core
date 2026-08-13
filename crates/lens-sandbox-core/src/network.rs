@@ -150,7 +150,12 @@ fn render_install_script() -> String {
          \t\tmeta mark != {mark} ip daddr 127.0.0.0/8 accept\n\
          \t\tmeta mark != {mark} ip6 daddr ::1 accept\n\
          \t\tmeta mark != {mark} oifname \"lo\" accept\n\
-         \t\tmeta mark != {mark} ct state established,related accept\n\
+         \t\t# Conntrack never answers for UDP: an entry names a flow, and a\n\
+         \t\t# flow is five numbers a later program can rebind — see the\n\
+         \t\t# `udp_egress` module docs. Every datagram reaches the queue below\n\
+         \t\t# instead. Non-UDP keeps the fast path, where a connection is a\n\
+         \t\t# socket and `related` is an ICMP error for a flow already accepted.\n\
+         \t\tmeta mark != {mark} meta l4proto != udp ct state established,related accept\n\
          \n\
          \t\t# UDP is judged in userspace: the relay reads each datagram off\n\
          \t\t# queue {queue} and answers accept, drop, or — by stamping\n\
@@ -396,19 +401,21 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_rule_follows_the_established_accept() {
-        // A flow that has seen a reply is judged once, not per packet. The
-        // ordering is what buys that, and it is also what puts a live flow
-        // beyond the reach of a policy reload — see `udp_egress`.
-        let s = render_install_script();
-        let chain = output_filter_chain(&s);
-        let established = chain
-            .find("ct state established,related accept")
-            .expect("established accept");
-        let queue = chain
-            .find(&format!("queue num {DEFAULT_UDP_QUEUE_NUM}"))
-            .expect("udp queue rule");
-        assert!(established < queue);
+    fn conntrack_never_answers_for_a_datagram() {
+        // A conntrack entry names a flow, not a program, so it cannot carry a
+        // verdict about one — see the `udp_egress` module docs.
+        let rules = output_filter_rules(&render_install_script());
+        let tracked: Vec<&str> = rules
+            .lines()
+            .filter(|rule| rule.contains("ct state"))
+            .collect();
+        assert!(!tracked.is_empty(), "expected a conntrack accept");
+        for rule in tracked {
+            assert!(
+                rule.contains("meta l4proto != udp"),
+                "a conntrack accept must not cover udp: {rule}"
+            );
+        }
     }
 
     #[test]
