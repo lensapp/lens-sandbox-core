@@ -23,6 +23,19 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 /// other mark consumers are vanishingly unlikely.
 pub const MARK_VALUE: u32 = 0x4E_58_55_53; // "NXUS" in ASCII
 
+/// Mark the UDP relay stamps on a datagram it refuses, so the nftables chain
+/// answers the sender with ICMP port-unreachable (see [`crate::udp_egress`]).
+///
+/// A verdict from userspace cannot send ICMP. It can set this mark and ask for
+/// the packet to be judged again, which is what turns a refusal into the same
+/// immediate error the cage gave before any of this existed.
+///
+/// The workload cannot forge it: `SO_MARK` needs `CAP_NET_ADMIN`, dropped before
+/// the agent execs, and a forged mark would only reject the forger's own packet.
+/// It is deliberately not [`MARK_VALUE`] — that one means "this is ours, let it
+/// out", which is the opposite instruction.
+pub const REJECT_MARK: u32 = 0x4E_58_55_44; // "NXUD" in ASCII
+
 /// Apply `SO_MARK = MARK_VALUE` to a socket. Linux-only — requires
 /// `CAP_NET_ADMIN`. On other platforms this is a no-op so the rest of the
 /// crate continues to compile (nftables enforcement is Linux-only anyway).
