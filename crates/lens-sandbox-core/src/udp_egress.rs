@@ -367,7 +367,7 @@ fn ask(
 /// with no reader the queue fills and the kernel discards, so UDP simply stays
 /// denied. It is logged at error level because that is a real loss of function.
 #[cfg(target_os = "linux")]
-pub(crate) fn spawn(state: Arc<ProxyState>) {
+pub fn spawn(state: Arc<ProxyState>) {
     let runtime = tokio::runtime::Handle::current();
     let thread = std::thread::Builder::new()
         .name("udp-egress".to_string())
@@ -421,7 +421,7 @@ fn run(state: &Arc<ProxyState>, runtime: &tokio::runtime::Handle) -> std::io::Re
 /// crate still builds and the rest of the proxy still runs; UDP is simply not
 /// policed, because on those platforms nothing is confining it either.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn spawn(_state: Arc<ProxyState>) {
+pub fn spawn(_state: Arc<ProxyState>) {
     tracing::info!("udp egress relay not started: NFQUEUE requires Linux");
 }
 
