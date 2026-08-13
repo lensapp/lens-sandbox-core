@@ -76,6 +76,7 @@ pub struct NetworkPolicy {
 ///   payload (HTTP rules, TLS termination, credential injection).
 /// - [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the
 ///   payload — an opaque byte splice for non-HTTP services.
+/// - [`udp`](Self::udp) governs datagrams, which the other two never see.
 ///
 /// `tcp` is a pre-filter: whatever it claims, it governs, and its verdict is
 /// final. Only a destination no `tcp` rule matches falls through to `http`.
@@ -111,6 +112,21 @@ pub struct Egress {
     /// it needs no paired [`http`](Self::http) rule (see [`TcpEgressRule`]).
     #[serde(default)]
     pub tcp: Vec<TcpEgressRule>,
+
+    /// Raw UDP rules, first match wins. Matched exactly as [`tcp`](Self::tcp)
+    /// is — by IP/CIDR or hostname, always scoped to a port — and never
+    /// inspected. UDP is a different protocol from the other two tables, so
+    /// this list cannot collide with them: it alone decides what leaves the
+    /// sandbox as a datagram.
+    ///
+    /// UDP is denied unless a rule here allows it. [`default_verdict`] does not
+    /// reach this table: it governs destinations the *connection* tables did
+    /// not name, and reading it as a datagram grant would open every UDP port
+    /// of every policy that allows by default.
+    ///
+    /// [`default_verdict`]: NetworkPolicy::default_verdict
+    #[serde(default)]
+    pub udp: Vec<UdpEgressRule>,
 }
 
 /// A single first-match-wins raw-TCP egress rule.
@@ -145,6 +161,48 @@ pub struct TcpEgressRule {
     pub description: Option<String>,
 }
 
+/// A single first-match-wins raw-UDP egress rule.
+///
+/// The fields are [`TcpEgressRule`]'s, and a destination is matched the same
+/// way, including DNS forward-pinning for a hostname pattern. What differs is
+/// what a rule can promise, because UDP carries no connection:
+///
+/// - There is nothing to hold open, so an `ask` verdict cannot suspend the
+///   datagram that raised it — see [`Verdict::Ask`].
+/// - A verdict is decided once per flow, keyed by address and port. A flow is
+///   not a kernel object the way a connection is, so a source port freed by one
+///   process and taken by another inherits the decision until the flow expires.
+/// - [`binaries`](Self::binaries) needs the sending socket to still be open when
+///   the datagram is judged. A program that sends and exits at once (statsd,
+///   syslog) cannot be identified, and fails closed.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UdpEgressRule {
+    /// Destination as `ip:port`, `cidr:port`, or `hostname:port`. A port is
+    /// **required**, exactly as in [`TcpEgressRule::match_pattern`], and for the
+    /// same reason: a datagram is forwarded uninspected, so a portless grant
+    /// would be too broad.
+    ///
+    /// Port `53` is refused. Every unmarked DNS datagram is claimed by the
+    /// sandbox's own DNS stub before any rule here can see it, so such a rule
+    /// could never take effect — and a rule that cannot match is worse than no
+    /// rule, because a dead `deny` fails open.
+    #[serde(rename = "match")]
+    pub match_pattern: String,
+
+    /// Policy verdict: allow, deny, or ask.
+    pub verdict: Verdict,
+
+    /// Restrict this rule to datagrams sent by specific binaries. Same
+    /// semantics as [`RouteRule::binaries`], with the caveat above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binaries: Option<Vec<String>>,
+
+    /// Human-readable description of this rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// Verdict for a matched route or as default: should the connection be allowed,
 /// blocked, or held for developer approval?
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -158,6 +216,11 @@ pub enum Verdict {
     /// `transport`. Only meaningful in interactive environments (local CLI
     /// relay); remote/unattended consumers should keep using `Deny` so
     /// requests fail closed without waiting for a human.
+    ///
+    /// On a [`UdpEgressRule`] there is no request to suspend, so the datagram
+    /// that raised the dialog is dropped and the answer governs the ones that
+    /// follow. A client that retries — which is every client that expects a
+    /// reply — gets through on the retry.
     Ask,
 }
 

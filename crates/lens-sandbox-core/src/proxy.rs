@@ -100,6 +100,11 @@ pub struct NetworkPolicy {
     /// and the DNS stub gates lookups against the hostname entries of this same
     /// list via `hostname_match_for_caller`.
     pub tcp_egress: Vec<RouteRule>,
+    /// The `egress.udp` rules as ONE ordered list, matched exactly as
+    /// `tcp_egress` is — the same matchers, the same pins, the same ordered
+    /// pass. What it governs, and what the default verdict has to do with it,
+    /// is [`crate::policy_schema::Egress::udp`].
+    pub udp_egress: Vec<RouteRule>,
     /// IPs pinned from DNS answers of hostname `tcp_egress` names, each carrying
     /// the originating `qname` and a TTL-bounded expiry. Consulted by
     /// [`tcp_egress_verdict`] to match hostname rules against a raw connection.
@@ -122,6 +127,7 @@ impl NetworkPolicy {
             default_verdict,
             default_transport,
             tcp_egress,
+            udp_egress,
             pins: _,       // runtime state owned by apply_network_policy
             generation: _, // ditto
         } = self;
@@ -129,6 +135,7 @@ impl NetworkPolicy {
             && *default_verdict == other.default_verdict
             && *default_transport == other.default_transport
             && *tcp_egress == other.tcp_egress
+            && *udp_egress == other.udp_egress
     }
 }
 
@@ -142,6 +149,7 @@ impl Default for NetworkPolicy {
             default_verdict: Verdict::Allow,
             default_transport: Transport::Upstream,
             tcp_egress: Vec::new(),
+            udp_egress: Vec::new(),
             pins: HashMap::new(),
             generation: 0,
         }
@@ -1683,12 +1691,24 @@ pub(crate) fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
     if policy.egress_eq(&next) {
         return;
     }
-    for (tcp, http) in crate::routing::shadowed_http_rules(&next.tcp_egress, &next.routes) {
+    for (tcp, http) in crate::routing::overlapping_http_rules(&next.tcp_egress, &next.routes) {
         tracing::warn!(
             ?tcp,
             ?http,
             "egress.tcp claims this port, so the egress.http rule for the same host is not applied: \
              traffic is spliced raw, with no HTTP rules, credential injection, or inspection"
+        );
+    }
+    // A UDP rule shadows nothing — it opens a second door. The http rule still
+    // governs TCP, but an HTTP/3 client offered a datagram path to the same host
+    // takes it, and everything that door applies is skipped.
+    for (udp, http) in crate::routing::overlapping_http_rules(&next.udp_egress, &next.routes) {
+        tracing::warn!(
+            ?udp,
+            ?http,
+            "egress.udp opens a datagram path to a host the egress.http table governs: an HTTP/3 \
+             client can take it and skip the HTTP rules, credential injection, and inspection that \
+             apply over TCP"
         );
     }
     *policy = NetworkPolicy {
