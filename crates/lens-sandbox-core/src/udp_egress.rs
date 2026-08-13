@@ -82,10 +82,11 @@ const FLOW_VERDICT_TTL: Duration = Duration::from_secs(10);
 /// its own policy.
 const GRANT_TTL: Duration = Duration::from_secs(30);
 
-/// Cap on remembered flows, and on standing answers. Both are keyed by something
-/// a workload can mint at will — a source port, a destination — so both are
-/// pruned and then refused rather than grown without bound. Refusing to grow
-/// costs a `/proc` walk per datagram, never a permission.
+/// Cap on remembered flows, on standing answers, and on open dialogs. All three
+/// are keyed by something a workload can mint at will — a source port, a
+/// destination — so all three are pruned and then refused rather than grown
+/// without bound. Refusing to grow costs a `/proc` walk per datagram or an
+/// unasked question, never a permission.
 const MAX_REMEMBERED: usize = 4096;
 
 /// Bytes of each packet copied to userspace. An IPv4 header is at most 60 and an
@@ -98,6 +99,16 @@ const COPY_RANGE: u16 = 68;
 /// Paired with fail-open turned off, so a flood is dropped rather than let
 /// through — see [`run`].
 const MAX_QUEUED_PACKETS: u32 = 1024;
+
+/// How long a claimed dialog stands without an answer. Twice the gate's own
+/// timeout, so it can only ever free a claim whose task did not live to release
+/// it — a dialog that is merely slow is never taken away from the developer.
+const CLAIM_TTL: Duration = crate::gate::DECISION_TIMEOUT.saturating_mul(2);
+
+/// Recoverable errors the queue socket may report in a row before the relay
+/// treats them as its end rather than as lost datagrams. A bound, not a budget:
+/// it stops a socket that fails every call from spinning a core forever.
+const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 64;
 
 /// A datagram's two endpoints, read from the packet itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -211,49 +222,92 @@ impl FlowCache {
 
 /// Answers to datagram dialogs, waiting for the retry they were given for.
 ///
-/// Keyed by destination, which is what the card named. Keying by flow would miss
-/// the common retry, because a client that gave up and tried again usually does
-/// so from a fresh source port.
+/// Keyed by the target the card named — the hostname when a pin let a hostname
+/// rule bind, else the address. A developer answers for what they were shown, so
+/// a name whose next A record differs still lands on the answer they gave.
+/// Keying by flow would miss the common retry, because a client that gave up and
+/// tried again usually does so from a fresh source port.
+///
+/// A grant carries no generation. It is consulted from one place only — the arm
+/// where the *current* table has just said `ask` about this destination — so the
+/// question the developer answered is still the question being asked. A reload
+/// that deleted the rule, narrowed it, or turned it into a deny never reaches
+/// that arm, and a reload that changed nothing relevant must not throw the
+/// answer away: an unrelated policy frame arriving while a card is open is
+/// routine, and a generation check would turn a click into silence.
 #[derive(Clone, Default)]
-struct Grants(Arc<Mutex<HashMap<SocketAddr, Granted>>>);
-
-/// An answer, and the policy it was given under. Consent belongs to the policy
-/// that raised the question: a reload may have deleted the rule, narrowed it, or
-/// turned it into a deny.
-struct Granted {
-    generation: u64,
-    expiry: Instant,
-}
+struct Grants(Arc<Mutex<HashMap<String, Instant>>>);
 
 impl Grants {
-    /// Whether an answer given under `generation` still stands for `dst`.
-    fn admits(&self, dst: SocketAddr, generation: u64) -> bool {
+    /// Whether an answer still stands for the target the card named.
+    fn admits(&self, shown: &str) -> bool {
         let grants = self.0.lock().unwrap();
         grants
-            .get(&dst)
-            .is_some_and(|g| g.generation == generation && g.expiry > Instant::now())
+            .get(shown)
+            .is_some_and(|expiry| *expiry > Instant::now())
     }
 
-    fn record(&self, dst: SocketAddr, generation: u64) {
+    fn record(&self, shown: String) {
         let mut grants = self.0.lock().unwrap();
         if grants.len() >= MAX_REMEMBERED {
             let now = Instant::now();
-            grants.retain(|_, g| g.expiry > now);
+            grants.retain(|_, expiry| *expiry > now);
             if grants.len() >= MAX_REMEMBERED {
                 // Failing closed here means a developer clicked allow and
                 // nothing happened. Say so: silence after a click is the one
                 // outcome nobody can diagnose.
-                tracing::warn!(%dst, "grant table full; a developer's approval was not recorded");
+                tracing::warn!(
+                    target = %shown,
+                    "grant table full; a developer's approval was not recorded"
+                );
                 return;
             }
         }
-        grants.insert(
-            dst,
-            Granted {
-                generation,
-                expiry: Instant::now() + GRANT_TTL,
-            },
-        );
+        grants.insert(shown, Instant::now() + GRANT_TTL);
+    }
+}
+
+/// Dialogs already open, so a client retrying into a dropped `ask` joins the
+/// card it already raised instead of spawning a task per datagram.
+///
+/// The gate deduplicates the *card*, not the waiting: without this, a client
+/// retrying at any rate would pile up one task per datagram, each holding a
+/// subscription for up to the gate's decision timeout, and a denial would then
+/// emit one audit event per task — a refusal event is not pooled, by design.
+///
+/// A claim carries an expiry only as a backstop. It is released when the dialog
+/// answers; the expiry is what frees a destination whose task never got that
+/// far, because a claim nothing releases would drop every later datagram to it
+/// in silence — with no card, and nothing in the log to say why.
+#[derive(Clone, Default)]
+struct Pending(Arc<Mutex<HashMap<String, Instant>>>);
+
+impl Pending {
+    /// Claim the dialog for `shown`, or `false` if one is already open. Bounded
+    /// like every other table here: at the cap nothing is claimed, so no card is
+    /// raised and the datagram is dropped — the answer a card would have needed.
+    fn claim(&self, shown: &str) -> bool {
+        let mut pending = self.0.lock().unwrap();
+        let now = Instant::now();
+        if pending.len() >= MAX_REMEMBERED {
+            pending.retain(|_, expiry| *expiry > now);
+            if pending.len() >= MAX_REMEMBERED {
+                tracing::warn!(
+                    target = %shown,
+                    "too many open udp dialogs; not asking about this one"
+                );
+                return false;
+            }
+        }
+        if pending.get(shown).is_some_and(|expiry| *expiry > now) {
+            return false;
+        }
+        pending.insert(shown.to_string(), now + CLAIM_TTL);
+        true
+    }
+
+    fn release(&self, shown: &str) {
+        self.0.lock().unwrap().remove(shown);
     }
 }
 
@@ -268,8 +322,17 @@ fn decide(
     datagram: Datagram,
     cache: &mut FlowCache,
     grants: &Grants,
+    pending: &Pending,
     runtime: &tokio::runtime::Handle,
 ) -> Disposition {
+    // The cache comes first, ahead of the floor below and the table alike: every
+    // answer this function can reach costs a `/proc` walk, and a flow that is
+    // still sending is asking a question already answered.
+    let generation = state.policy.read().unwrap().generation;
+    if let Some(remembered) = cache.get(&datagram, generation) {
+        return remembered;
+    }
+
     let target = datagram.dst.to_string();
 
     // The floor every egress path shares, and not a policy question: an
@@ -278,12 +341,8 @@ fn decide(
     if sock_mark::is_disallowed_egress_ip(datagram.dst.ip()) {
         let actor = ActorContext::resolve_udp(datagram.src);
         crate::proxy::emit_policy_deny_connect(state, &target, "blocked-destination", &actor);
+        cache.insert(datagram, Disposition::Reject, generation);
         return Disposition::Reject;
-    }
-
-    let generation = state.policy.read().unwrap().generation;
-    if let Some(remembered) = cache.get(&datagram, generation) {
-        return remembered;
     }
 
     let actor = ActorContext::resolve_udp(datagram.src);
@@ -302,13 +361,22 @@ fn decide(
             cache.insert(datagram, Disposition::Reject, decision.generation);
             Disposition::Reject
         }
-        Verdict::Ask if grants.admits(datagram.dst, decision.generation) => {
-            crate::proxy::emit_audit(state, &target, "success", 200, &actor);
-            Disposition::Accept
-        }
         Verdict::Ask => {
-            ask(state, &decision, datagram.dst, grants, runtime);
-            crate::proxy::emit_audit(state, &target, "failure", 403, &actor);
+            // Named the way the policy author wrote it, when a pin let a
+            // hostname rule bind — a developer cannot answer for an address they
+            // never typed, so that name is also what the answer is filed under.
+            let shown = decision.matched_target.clone().unwrap_or(target);
+            if grants.admits(&shown) {
+                crate::proxy::emit_audit(state, &shown, "success", 200, &actor);
+                // Remembered like any other accept. The flow is admitted for its
+                // own, shorter life, so a flow still sending when the grant
+                // lapses finishes on the answer it was given rather than being
+                // cut off mid-burst.
+                cache.insert(datagram, Disposition::Accept, decision.generation);
+                return Disposition::Accept;
+            }
+            crate::proxy::emit_audit(state, &shown, "failure", 403, &actor);
+            ask(state, &decision, shown, grants, pending, runtime);
             Disposition::Drop
         }
     }
@@ -316,26 +384,21 @@ fn decide(
 
 /// Put a destination to the developer, and record the answer for the datagrams
 /// that follow. Returns at once: the card outlives this datagram by design.
-///
-/// The gate deduplicates on the action, so a client retrying into a refusal
-/// joins the open dialog instead of raising a second card.
 fn ask(
     state: &Arc<ProxyState>,
     decision: &RawDecision,
-    dst: SocketAddr,
+    shown: String,
     grants: &Grants,
+    pending: &Pending,
     runtime: &tokio::runtime::Handle,
 ) {
-    // Named the way the policy author wrote it, when a pin let a hostname rule
-    // bind — a developer cannot answer for an address they never typed.
-    let shown = decision
-        .matched_target
-        .clone()
-        .unwrap_or_else(|| dst.to_string());
-    let generation = decision.generation;
+    if !pending.claim(&shown) {
+        return;
+    }
     let reason = decision.reason;
     let state = state.clone();
     let grants = grants.clone();
+    let pending = pending.clone();
     runtime.spawn(async move {
         let action = format!("UDP {shown}");
         let answer = crate::gate::gate_or_deny(
@@ -346,17 +409,16 @@ fn ask(
             Treatment::Datagram,
         )
         .await;
-        if !answer.is_allow() {
+        if answer.is_allow() {
+            crate::proxy::emit_gate_resolved(&state, &action, answer);
+            grants.record(shown.clone());
+            tracing::info!(target = %shown, reason = answer.audit_reason(), "udp egress ALLOWED (gated)");
+        } else {
             crate::proxy::emit_gate_denied(&state, &action, answer);
-            return;
         }
-        // The answer belongs to the policy that raised the question. A reload
-        // while the card was open may have deleted the rule, narrowed it, or
-        // turned it into a deny, and the generation carried here is what stops
-        // consent surviving that.
-        crate::proxy::emit_gate_resolved(&state, &action, answer);
-        grants.record(dst, generation);
-        tracing::info!(target = %shown, reason = answer.audit_reason(), "udp egress ALLOWED (gated)");
+        // Released last, and on both answers: until it is, the destination
+        // raises no second card, which is the whole point of claiming it.
+        pending.release(&shown);
     });
 }
 
@@ -396,11 +458,43 @@ fn run(state: &Arc<ProxyState>, runtime: &tokio::runtime::Handle) -> std::io::Re
 
     let mut cache = FlowCache::default();
     let grants = Grants::default();
+    let pending = Pending::default();
+    let mut failures = 0u32;
     loop {
-        let mut msg = queue.recv()?;
+        let mut msg = match queue.recv() {
+            Ok(msg) => {
+                failures = 0;
+                msg
+            }
+            // A signal or a socket that momentarily could not keep up is not a
+            // reason to stop policing UDP for the life of the process. Giving up
+            // here would leave the cage dropping every datagram in silence — no
+            // ICMP, because the rule that sends it is only reached by a verdict.
+            Err(e) if is_transient(&e) => {
+                failures += 1;
+                if failures >= MAX_CONSECUTIVE_RECV_ERRORS {
+                    return Err(e);
+                }
+                // Debug, not warn: `ENOBUFS` is the kernel reporting a flood it
+                // could not hold, so this arrives at whatever rate the flood
+                // does. The bound above is what makes a real fault loud.
+                tracing::debug!("udp egress relay retrying after a queue error: {e}");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let disposition = match parse_datagram(msg.get_payload()) {
-            Some(datagram) => decide(state, datagram, &mut cache, &grants, runtime),
-            None => Disposition::Drop,
+            Some(datagram) => decide(state, datagram, &mut cache, &grants, &pending, runtime),
+            // A shape this layer will not read: a fragment, an IPv6 extension
+            // header, a truncated header. Logged at debug and not above, because
+            // whatever is producing them is producing them at line rate.
+            None => {
+                tracing::debug!(
+                    bytes = msg.get_payload().len(),
+                    "udp egress relay dropped a datagram it could not read"
+                );
+                Disposition::Drop
+            }
         };
         match disposition {
             Disposition::Accept => msg.set_verdict(nfq::Verdict::Accept),
@@ -413,8 +507,23 @@ fn run(state: &Arc<ProxyState>, runtime: &tokio::runtime::Handle) -> std::io::Re
                 msg.set_verdict(nfq::Verdict::Repeat);
             }
         }
-        queue.verdict(msg)?;
+        // One unanswered packet, which the kernel discards when the queue
+        // overflows. The loop outlives it.
+        if let Err(e) = queue.verdict(msg) {
+            tracing::warn!("udp egress relay could not answer for a datagram: {e}");
+        }
     }
+}
+
+/// Whether an error on the queue socket is one more datagram lost rather than
+/// the relay's end. `ENOBUFS` is the kernel saying it discarded some; `nfq`
+/// reports an interrupted dump as `EINTR`.
+#[cfg(target_os = "linux")]
+fn is_transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+    ) || e.raw_os_error() == Some(libc::ENOBUFS)
 }
 
 /// NFQUEUE is a Linux facility, and so is the cage it belongs to. Elsewhere the
@@ -557,6 +666,7 @@ mod tests {
             datagram,
             &mut FlowCache::default(),
             &Grants::default(),
+            &Pending::default(),
             &tokio::runtime::Handle::current(),
         )
     }
@@ -623,16 +733,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_answered_ask_admits_the_retry_until_the_policy_moves() {
-        let state = state_with_udp_rules(r#"[{"match": "10.20.0.0/24:123", "verdict": "ask"}]"#);
-        let dst: SocketAddr = "10.20.0.9:123".parse().unwrap();
+    async fn an_answer_stands_while_the_table_still_asks_the_same_question() {
+        let ask_rule = r#"[{"match": "10.20.0.0/24:123", "verdict": "ask"}]"#;
+        let state = state_with_udp_rules(ask_rule);
         let datagram = Datagram {
             src: "10.0.0.5:41234".parse().unwrap(),
-            dst,
+            dst: "10.20.0.9:123".parse().unwrap(),
         };
         let grants = Grants::default();
-        let generation = state.policy.read().unwrap().generation;
-        grants.record(dst, generation);
+        grants.record("10.20.0.9:123".to_string());
 
         let judge = |grants: &Grants| {
             decide(
@@ -640,26 +749,95 @@ mod tests {
                 datagram,
                 &mut FlowCache::default(),
                 grants,
+                &Pending::default(),
                 &tokio::runtime::Handle::current(),
             )
         };
         assert_eq!(judge(&grants), Disposition::Accept);
 
-        // A reload is a new question. Consent belongs to the policy that asked
-        // it, so the answer must not carry over.
+        // An unrelated reload. A policy frame arrives whenever a credential is
+        // refreshed, and a developer who has just clicked allow must not have
+        // the click quietly discarded by one.
         apply_network_policy(
             &state,
             NetworkPolicy {
-                udp_egress: parse_udp_egress(
-                    &serde_json::from_str(r#"[{"match": "10.20.0.0/24:123", "verdict": "ask"}]"#)
-                        .unwrap(),
-                )
-                .unwrap(),
+                udp_egress: parse_udp_egress(&serde_json::from_str(ask_rule).unwrap()).unwrap(),
                 default_verdict: Verdict::Deny,
                 ..Default::default()
             },
         );
-        assert_eq!(judge(&grants), Disposition::Drop);
+        assert_eq!(judge(&grants), Disposition::Accept);
+
+        // The rule itself is gone, so nothing asks about this destination any
+        // more, and the answer to a question no longer put cannot admit it.
+        apply_network_policy(&state, NetworkPolicy::default());
+        assert_eq!(judge(&grants), Disposition::Reject);
+    }
+
+    #[tokio::test]
+    async fn an_admitted_flow_is_remembered_like_any_other_accept() {
+        // Otherwise every datagram of an approved flow re-walks `/proc` and
+        // raises its own audit event, for as long as the answer stands.
+        let state = state_with_udp_rules(r#"[{"match": "10.20.0.0/24:123", "verdict": "ask"}]"#);
+        let datagram = Datagram {
+            src: "10.0.0.5:41234".parse().unwrap(),
+            dst: "10.20.0.9:123".parse().unwrap(),
+        };
+        let mut cache = FlowCache::default();
+        let grants = Grants::default();
+        grants.record("10.20.0.9:123".to_string());
+        let runtime = tokio::runtime::Handle::current();
+        assert_eq!(
+            decide(
+                &state,
+                datagram,
+                &mut cache,
+                &grants,
+                &Pending::default(),
+                &runtime
+            ),
+            Disposition::Accept
+        );
+
+        // The same flow, judged with no grant at all. Only the cache can answer.
+        assert_eq!(
+            decide(
+                &state,
+                datagram,
+                &mut cache,
+                &Grants::default(),
+                &Pending::default(),
+                &runtime
+            ),
+            Disposition::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn one_open_dialog_per_destination() {
+        let state = state_with_udp_rules(r#"[{"match": "10.20.0.0/24:123", "verdict": "ask"}]"#);
+        let pending = Pending::default();
+        let judge = |src_port: u16| {
+            decide(
+                &state,
+                Datagram {
+                    src: SocketAddr::new("10.0.0.5".parse().unwrap(), src_port),
+                    dst: "10.20.0.9:123".parse().unwrap(),
+                },
+                &mut FlowCache::default(),
+                &Grants::default(),
+                &pending,
+                &tokio::runtime::Handle::current(),
+            )
+        };
+        // A client retrying from a fresh source port each time, which is what a
+        // client that gave up on a dropped datagram does.
+        assert_eq!(judge(41234), Disposition::Drop);
+        assert_eq!(judge(41235), Disposition::Drop);
+        assert!(
+            !pending.claim("10.20.0.9:123"),
+            "the retries must join the open card, not raise one each"
+        );
     }
 
     #[tokio::test]
@@ -672,8 +850,9 @@ mod tests {
         let mut cache = FlowCache::default();
         let runtime = tokio::runtime::Handle::current();
         let grants = Grants::default();
+        let pending = Pending::default();
         assert_eq!(
-            decide(&state, datagram, &mut cache, &grants, &runtime),
+            decide(&state, datagram, &mut cache, &grants, &pending, &runtime),
             Disposition::Accept
         );
 
@@ -686,7 +865,7 @@ mod tests {
             },
         );
         assert_eq!(
-            decide(&state, datagram, &mut cache, &grants, &runtime),
+            decide(&state, datagram, &mut cache, &grants, &pending, &runtime),
             Disposition::Reject
         );
     }
@@ -704,12 +883,11 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_stands_only_for_its_own_destination_and_generation() {
+    fn a_grant_stands_only_for_the_target_the_card_named() {
         let grants = Grants::default();
-        let dst: SocketAddr = "10.20.0.9:123".parse().unwrap();
-        grants.record(dst, 3);
-        assert!(grants.admits(dst, 3));
-        assert!(!grants.admits(dst, 4));
-        assert!(!grants.admits("10.20.0.9:124".parse().unwrap(), 3));
+        grants.record("ntp.internal:123".to_string());
+        assert!(grants.admits("ntp.internal:123"));
+        assert!(!grants.admits("ntp.internal:124"));
+        assert!(!grants.admits("10.20.0.9:123"));
     }
 }
