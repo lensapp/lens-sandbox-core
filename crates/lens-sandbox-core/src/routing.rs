@@ -428,11 +428,13 @@ pub(crate) enum HostnameMatch {
 }
 
 impl HostnameMatch {
-    /// Combine the `egress.tcp` and `egress.http` answers for one name: it
-    /// resolves iff some table holds a live allow for it. DNS carries no port
-    /// and the tables govern different ports of the same host, so a deny in one
-    /// cannot speak for the other's. Port- and caller-aware enforcement still
-    /// runs at connect, which is where the tables are actually separated.
+    /// Combine two tables' answers for one name: it resolves iff some table
+    /// holds a live allow for it. DNS carries no port and no protocol, while the
+    /// tables govern different ports — and, for `egress.udp`, a different
+    /// protocol — of the same host, so a deny in one cannot speak for another's.
+    /// Port-, protocol-, and caller-aware enforcement still runs when the
+    /// connection or the datagram is judged, which is where the tables are
+    /// actually separated.
     ///
     /// With no allow anywhere the name is refused either way; `self` only picks
     /// which reason is reported, following connect-time order.
@@ -446,19 +448,20 @@ impl HostnameMatch {
 }
 
 /// How the DNS gate treats a *port-scoped* deny. DNS carries no destination
-/// port, so the two rule sets need different answers.
+/// port, so the http table and the raw tables need different answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PortScope {
     /// `egress.http` routes: ordered first-match, exactly like
     /// [`find_matching_route`]. Any matched deny denies the name for this table;
-    /// whether it still resolves depends on the other one — see
+    /// whether it still resolves depends on the other tables — see
     /// [`HostnameMatch::union`].
     FirstMatch,
-    /// `egress.tcp` rules: *port-existential*. One answer serves every port, so
-    /// the name resolves when some port survives to an allow. A deny rules out
-    /// only its own port (and kills a later allow on it). Safe because the
-    /// per-port decision is re-made at connect against the real `host:port`,
-    /// and a name left with only denies still reports `Denied`.
+    /// Raw-table (`egress.tcp`, `egress.udp`) rules: *port-existential*. One
+    /// answer serves every port, so the name resolves when some port survives to
+    /// an allow. A deny rules out only its own port (and kills a later allow on
+    /// it). Safe because the per-port decision is re-made against the real
+    /// `host:port` when the connection or the datagram is judged, and a name
+    /// left with only denies still reports `Denied`.
     PerPort,
 }
 
