@@ -25,19 +25,20 @@
 //!   outlives the datagram, and an ICMP refusal usually surfaces as a hard error
 //!   that stops the client retrying into the answer.
 //!
-//! # What a datagram cannot promise
+//! # What this costs, and what a datagram cannot promise
 //!
-//! **A live flow outlives a policy.** The queue rule sits after the chain's
-//! `ct state established` accept, so once a reply is seen the flow stops coming
-//! here and a reload cannot reach it. A live raw TCP splice behaves the same:
-//! the generation stamped on a decision voids *pending consent*, never traffic
-//! already flowing. A flow that never gets a reply — statsd, syslog — stays new
-//! and is judged for every datagram.
+//! **Every datagram comes here.** The chain's conntrack accept excludes UDP, so
+//! an established flow is not waved through: a flow is five numbers, and the
+//! kernel hands a source port back out once it is free, so the kernel cannot
+//! tell one program's flow from its successor's. The price is a round trip to
+//! userspace per packet — nothing at a media stream's rate, and a ceiling worth
+//! knowing about for bulk UDP. [`FlowCache`] is what keeps the decision itself a
+//! hash lookup rather than a `/proc` walk.
 //!
-//! **A flow is not a kernel object.** Its name is five numbers, and the kernel
-//! hands a source port out again once it is free, so a decision remembered
-//! against one is only as trustworthy as it is short-lived. See
-//! [`FLOW_VERDICT_TTL`].
+//! **A flow is not a kernel object.** For the same reason, a decision remembered
+//! against one is only as trustworthy as it is short-lived, and one a `binaries`
+//! rule reached is not remembered at all. See [`FLOW_VERDICT_TTL`] and
+//! [`FlowCache`].
 //!
 //! **A sender that does not wait cannot be identified.** Caller identity comes
 //! from the socket, and a program that sends one datagram and exits may leave
@@ -175,9 +176,15 @@ pub(crate) fn parse_datagram(packet: &[u8]) -> Option<Datagram> {
 /// Verdicts already reached, so a flow's second datagram costs no `/proc` walk
 /// and raises no second audit event. Owned by the relay thread alone.
 ///
-/// An `ask` is never remembered here. Its answer arrives later and lands in
-/// [`Grants`]; a cached refusal would hide that answer for as long as it lived,
-/// which is precisely the retry the dialog exists to serve.
+/// Two verdicts are never remembered here.
+///
+/// A dropped `ask`, because its answer arrives later and lands in [`Grants`]: a
+/// cached refusal would hide that answer for as long as it lived, which is
+/// precisely the retry the dialog exists to serve.
+///
+/// A verdict a `binaries` rule decided, because the key is a flow and a flow is
+/// not a program — the reason this module's docs open with. See
+/// `RawDecision::caller_scoped`.
 #[derive(Default)]
 struct FlowCache {
     entries: HashMap<Datagram, Remembered>,
@@ -347,10 +354,9 @@ fn decide(
 
     let actor = ActorContext::resolve_udp(datagram.src);
     let decision = crate::proxy::udp_egress_verdict(state, datagram.dst, actor.process());
-    match decision.verdict {
+    let disposition = match decision.verdict {
         Verdict::Allow => {
             crate::proxy::emit_audit(state, &target, "success", 200, &actor);
-            cache.insert(datagram, Disposition::Accept, decision.generation);
             Disposition::Accept
         }
         Verdict::Deny => {
@@ -358,7 +364,6 @@ fn decide(
             // nothing: both are the policy refusing, and the relay surfaces a
             // failure to the developer by matching on this exact value.
             crate::proxy::emit_policy_deny_connect(state, &target, "policy-deny", &actor);
-            cache.insert(datagram, Disposition::Reject, decision.generation);
             Disposition::Reject
         }
         Verdict::Ask => {
@@ -368,18 +373,24 @@ fn decide(
             let shown = decision.matched_target.clone().unwrap_or(target);
             if grants.admits(&shown) {
                 crate::proxy::emit_audit(state, &shown, "success", 200, &actor);
-                // Remembered like any other accept. The flow is admitted for its
-                // own, shorter life, so a flow still sending when the grant
-                // lapses finishes on the answer it was given rather than being
-                // cut off mid-burst.
-                cache.insert(datagram, Disposition::Accept, decision.generation);
-                return Disposition::Accept;
+                // Remembered like any other accept, if the rule allows it to
+                // be. The flow is then admitted for its own, shorter life, so
+                // one still sending when the grant lapses finishes on the answer
+                // it was given rather than being cut off mid-burst.
+                Disposition::Accept
+            } else {
+                crate::proxy::emit_audit(state, &shown, "failure", 403, &actor);
+                ask(state, &decision, shown, grants, pending, runtime);
+                // Returned rather than remembered: the answer the dialog is
+                // about to produce must reach the retry. See [`FlowCache`].
+                return Disposition::Drop;
             }
-            crate::proxy::emit_audit(state, &shown, "failure", 403, &actor);
-            ask(state, &decision, shown, grants, pending, runtime);
-            Disposition::Drop
         }
+    };
+    if !decision.caller_scoped {
+        cache.insert(datagram, disposition, decision.generation);
     }
+    disposition
 }
 
 /// Put a destination to the developer, and record the answer for the datagrams
@@ -811,6 +822,48 @@ mod tests {
             ),
             Disposition::Accept
         );
+    }
+
+    #[tokio::test]
+    async fn a_verdict_a_binaries_rule_decided_is_not_remembered() {
+        // The cache key is the flow, and a flow is not a process: the kernel
+        // reissues a source port as soon as it is free. Remembering this would
+        // answer for whichever program binds that port next.
+        let allow_ntpd =
+            r#"{"match": "10.20.0.0/24:123", "verdict": "allow", "binaries": ["/usr/bin/ntpd"]}"#;
+        let deny_all = r#"{"match": "10.20.0.0/24:123", "verdict": "deny"}"#;
+        // Both shapes an excluded caller can end on: the rule that named it, and
+        // an unrestricted rule further down that it falls through to.
+        for table in [
+            format!("[{allow_ntpd}]"),
+            format!("[{allow_ntpd},{deny_all}]"),
+        ] {
+            let state = state_with_udp_rules(&table);
+            let datagram = Datagram {
+                src: "10.0.0.5:41234".parse().unwrap(),
+                dst: "10.20.0.9:123".parse().unwrap(),
+            };
+            let mut cache = FlowCache::default();
+            let generation = state.policy.read().unwrap().generation;
+            // No process owns this socket here, so the filter fails closed —
+            // which is a refusal about a caller, not about a destination.
+            assert_eq!(
+                decide(
+                    &state,
+                    datagram,
+                    &mut cache,
+                    &Grants::default(),
+                    &Pending::default(),
+                    &tokio::runtime::Handle::current()
+                ),
+                Disposition::Reject
+            );
+            assert_eq!(
+                cache.get(&datagram, generation),
+                None,
+                "a caller's verdict must not be left for the next caller to find: {table}"
+            );
+        }
     }
 
     #[tokio::test]

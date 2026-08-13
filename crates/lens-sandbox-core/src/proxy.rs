@@ -1521,6 +1521,11 @@ pub(crate) struct RawDecision {
     /// Why a dialog is being raised, for the card to explain itself with: a rule
     /// asked, or the protocol could not be classified.
     pub(crate) reason: &'static str,
+    /// Whether the caller decided this, rather than the destination alone. Such
+    /// a verdict is the asking process's and no other's, so nothing may reuse it
+    /// for a second caller — see [`crate::udp_egress`], the only place that
+    /// would want to. Carried from [`crate::routing::RawMatch::caller_scoped`].
+    pub(crate) caller_scoped: bool,
 }
 
 /// The `egress.tcp` table's decision for one destination, or `None` when no
@@ -1574,6 +1579,8 @@ pub(crate) fn udp_egress_verdict(
             matched_target: None,
             generation: policy.generation,
             reason: "no-udp-rule",
+            // An empty table refuses every caller alike.
+            caller_scoped: false,
         },
     )
 }
@@ -1600,6 +1607,7 @@ fn raw_egress_verdict(
             matched_target,
             generation,
             reason: "policy-ambiguous",
+            caller_scoped: found.caller_scoped,
         }),
         RouteOutcome::NoMatch {
             binary_filtered: true,
@@ -1608,6 +1616,7 @@ fn raw_egress_verdict(
             matched_target,
             generation,
             reason: "policy-ambiguous",
+            caller_scoped: found.caller_scoped,
         }),
         RouteOutcome::NoMatch { .. } => None,
     }
@@ -2055,6 +2064,7 @@ fn unclassified_splice_decision(
         matched_target: None,
         generation: policy.generation,
         reason: "unknown-protocol",
+        caller_scoped: false,
     })
 }
 
@@ -5463,6 +5473,7 @@ pub(crate) mod tests {
             matched_target: None,
             generation: state.policy.read().unwrap().generation,
             reason: "policy-ambiguous",
+            caller_scoped: false,
         };
         let actor = test_actor();
         assert_eq!(

@@ -674,6 +674,11 @@ impl<'t> RawTarget<'t> {
 pub struct RawMatch<'a> {
     pub outcome: RouteOutcome<'a>,
     pub matched_name: Option<&'a str>,
+    /// Whether the caller decided this outcome, rather than the destination
+    /// alone: the rule that matched carries `binaries`, or an earlier rule
+    /// matched the destination and excluded the caller. Such an outcome belongs
+    /// to one process and is not another's to inherit.
+    pub caller_scoped: bool,
 }
 
 /// Match a destination against one raw table's ordered rules in a single pass,
@@ -722,6 +727,7 @@ pub fn find_matching_raw_egress<'a>(
             return RawMatch {
                 outcome: RouteOutcome::Matched(rule),
                 matched_name,
+                caller_scoped: binary_filtered || rule.binaries.is_some(),
             };
         }
         // Matched the target but the binary filter excluded the caller (or a
@@ -732,6 +738,7 @@ pub fn find_matching_raw_egress<'a>(
     RawMatch {
         outcome: RouteOutcome::NoMatch { binary_filtered },
         matched_name: None,
+        caller_scoped: binary_filtered,
     }
 }
 
