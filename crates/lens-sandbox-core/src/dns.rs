@@ -7,11 +7,13 @@
 //! `routing::hostname_match_for_caller` (Domain and HostPort matchers;
 //! wildcards supported; CIDR matchers are intentionally excluded — a bare IP
 //! literal is not a legitimate QNAME and allowing it would leak CIDR policy to
-//! the upstream resolver. IP-based access is still enforced at the TCP layer).
+//! the upstream resolver. IP-based access is still enforced when the connection
+//! or the datagram is judged).
 //! Explicit `Deny` rules take first-match precedence within a table, same as
-//! `find_matching_route`; across the two tables a name resolves iff either
-//! holds a live allow (`HostnameMatch::union`), since a query names no port and
-//! the tables govern different ones. When a route carries a `binaries` filter we resolve
+//! `find_matching_route`; across the tables a name resolves iff one of them
+//! holds a live allow (`HostnameMatch::union`), since a query names neither a
+//! port nor a protocol and the tables govern different ones. When a route
+//! carries a `binaries` filter we resolve
 //! the querying process (best-effort, via `/proc`) so a name reachable only by
 //! other binaries fails closed here, exactly as it would at the TCP layer. The
 //! stub then either forwards allowed queries upstream or responds with
@@ -184,9 +186,10 @@ async fn handle_query(
 }
 
 enum Decision {
-    /// Resolve the name. `should_pin` is set when a hostname `tcp_egress` rule matched the
-    /// name, so its A answers should be recorded against `qname` (the connect
-    /// path re-evaluates the ordered rules against the connecting caller).
+    /// Resolve the name. `should_pin` is set when a hostname rule in either raw
+    /// table matched the name, so its A answers should be recorded against
+    /// `qname` (the raw path re-evaluates the ordered rules against the caller
+    /// that actually shows up).
     /// `generation` is the policy generation this decision was made under, so a
     /// pin from an answer that lands after a policy change can be dropped.
     Allow {
@@ -228,11 +231,10 @@ async fn resolve_decision(packet: &[u8], peer: SocketAddr, state: &ProxyState) -
     // Scoped so the policy read guard drops before the `.await` below — a
     // std RwLock guard must never be held across an await point.
     let has_binary_rule = {
-        let policy = state.policy.read().unwrap();
-        policy.routes.iter().any(|r| r.binaries.is_some())
-            // Only hostname `tcp_egress` rules gate DNS, so a binary-scoped
-            // pure-IP rule shouldn't force a /proc walk on every lookup.
-            || policy.tcp_egress.iter().any(|r| {
+        // Only hostname rules from a raw table gate DNS, so a binary-scoped
+        // pure-IP rule shouldn't force a /proc walk on every lookup.
+        let gates_dns_by_binary = |rules: &[crate::routing::RouteRule]| {
+            rules.iter().any(|r| {
                 r.binaries.is_some()
                     && matches!(
                         r.matcher,
@@ -240,6 +242,11 @@ async fn resolve_decision(packet: &[u8], peer: SocketAddr, state: &ProxyState) -
                             | crate::routing::RouteMatcher::HostPort(..)
                     )
             })
+        };
+        let policy = state.policy.read().unwrap();
+        policy.routes.iter().any(|r| r.binaries.is_some())
+            || gates_dns_by_binary(&policy.tcp_egress)
+            || gates_dns_by_binary(&policy.udp_egress)
     };
     let caller = if has_binary_rule {
         resolve_udp_offloaded(peer).await
@@ -293,18 +300,24 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         query.query_type(),
         RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB | RecordType::ANY
     );
-    // Both tables and the generation come from one snapshot (see `NetworkPolicy`),
+    // Every table and the generation come from one snapshot (see `NetworkPolicy`),
     // so the verdict, the pin it implies, and the generation stamped on that pin
-    // all belong to the same policy. The same `tcp_egress` evaluation decides
+    // all belong to the same policy. The same raw-table evaluation decides
     // whether the name resolves and whether to pin, so those two cannot disagree.
     let policy = state.policy.read().unwrap();
     let generation = policy.generation;
     let tcp_match =
         hostname_match_for_caller(&policy.tcp_egress, &normalized, caller, PortScope::PerPort);
-    // Pin on any hostname tcp match, deny included: the raw path can only bind
-    // hostname rules through pins, and a pin carries no verdict — connect
-    // re-evaluates.
-    let should_pin = tcp_match != HostnameMatch::Unmatched;
+    // The udp table is read the same way and for the same reason: its hostname
+    // rules also bind only through a pin. One pin serves both — it records the
+    // name, not the rule that wanted it, so each table still answers for its own
+    // traffic at the point the datagram or connection is judged.
+    let udp_match =
+        hostname_match_for_caller(&policy.udp_egress, &normalized, caller, PortScope::PerPort);
+    // Pin on any hostname match from either raw table, deny included: the raw
+    // paths can only bind hostname rules through pins, and a pin carries no
+    // verdict — the connect or the datagram re-evaluates.
+    let should_pin = tcp_match != HostnameMatch::Unmatched || udp_match != HostnameMatch::Unmatched;
 
     let allow = |qname| {
         if should_suppress {
@@ -332,12 +345,12 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
     // DNS matches on hostname only (no scheme/port); port- and scheme-aware
     // enforcement still applies at the subsequent TCP step. `caller` applies
     // any `binaries` filter, so a name reachable only by other binaries fails
-    // closed here just as it would at the TCP layer. The two tables union —
+    // closed here just as it would at the TCP layer. The tables union —
     // see `HostnameMatch::union`.
     let http_match =
         hostname_match_for_caller(&policy.routes, &normalized, caller, PortScope::FirstMatch);
     drop(policy);
-    match tcp_match.union(http_match) {
+    match tcp_match.union(udp_match).union(http_match) {
         HostnameMatch::Allowed => return allow(normalized),
         HostnameMatch::Denied => {
             return Decision::Deny {
@@ -786,6 +799,97 @@ mod tests {
                 "a routes-allow must not carry an fqdn pin from another snapshot"
             ),
             other => panic!("policy B must allow H at DNS, got: {}", describe(&other)),
+        }
+    }
+
+    /// A port-scoped `egress.udp` rule. Same shape as `tcp_rule` — one parser
+    /// builds both — so the gate is exercised with what a policy can carry.
+    fn udp_rule(host: &str, port: u16, verdict: Verdict) -> RouteRule {
+        tcp_rule(host, port, verdict)
+    }
+
+    #[test]
+    fn a_udp_hostname_rule_resolves_and_pins_on_its_own() {
+        // A udp rule is self-sufficient at DNS, exactly as a tcp one is: the
+        // relay binds a hostname rule only through a pin, so a name that does
+        // not resolve leaves the rule permanently dead.
+        let state = state_with_routes(Vec::new());
+        state.policy.write().unwrap().udp_egress =
+            vec![udp_rule("ntp.internal", 123, Verdict::Allow)];
+
+        let packet = make_query("ntp.internal", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Allow { should_pin, .. } => {
+                assert!(should_pin, "the udp allow needs its pin")
+            }
+            other => panic!(
+                "the udp allow must resolve the name, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn a_udp_deny_does_not_deny_a_name_the_tcp_table_allows() {
+        // The tables govern different protocols of the same host. A datagram
+        // refusal cannot speak for the connection the tcp table admits, and
+        // NXDOMAIN would kill both.
+        let state = state_with_routes(Vec::new());
+        {
+            let mut policy = state.policy.write().unwrap();
+            policy.udp_egress = vec![udp_rule("db.internal", 443, Verdict::Deny)];
+            policy.tcp_egress = vec![tcp_rule("db.internal", 5432, Verdict::Allow)];
+        }
+
+        let packet = make_query("db.internal", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Allow { should_pin, .. } => assert!(should_pin),
+            other => panic!(
+                "the tcp allow must still resolve the name, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn a_udp_only_deny_refuses_the_name() {
+        // With nothing else claiming it, a udp deny is the whole answer — and
+        // it must read as a denial, not as an unmatched name that the gate set
+        // could later re-open.
+        let state = state_with_routes(Vec::new());
+        state.policy.write().unwrap().udp_egress =
+            vec![udp_rule("ntp.internal", 123, Verdict::Deny)];
+
+        let packet = make_query("ntp.internal", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Deny { reason, .. } => assert_eq!(reason, DENY_REASON),
+            other => panic!(
+                "the udp deny must refuse the name, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn a_binary_scoped_udp_rule_fails_a_foreign_caller_closed() {
+        // The binaries filter reaches DNS for the udp table too: a name only
+        // one binary may send to must not resolve for another, or the excluded
+        // caller learns the address and the filter is the only thing left
+        // between it and the destination.
+        let state = state_with_routes(Vec::new());
+        state.policy.write().unwrap().udp_egress = vec![RouteRule {
+            binaries: Some(vec![std::path::PathBuf::from("/usr/sbin/ntpd")]),
+            ..udp_rule("ntp.internal", 123, Verdict::Allow)
+        }];
+
+        let packet = make_query("ntp.internal", RecordType::A);
+        let curl = caller("/usr/bin/curl");
+        match classify_query(&packet, &state, Some(&curl)) {
+            Decision::Deny { reason, .. } => assert_eq!(reason, BINARY_DENY_REASON),
+            other => panic!(
+                "a foreign caller must fail closed, got: {}",
+                describe(&other)
+            ),
         }
     }
 
