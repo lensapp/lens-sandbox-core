@@ -12,6 +12,11 @@ pub const DEFAULT_TRANSPARENT_PORT: u16 = 3129;
 /// sandbox-user UDP/53 to this port so queries can be allowlist-gated
 /// (see `dns.rs`).
 pub const DEFAULT_DNS_STUB_PORT: u16 = 5355;
+/// NFQUEUE number the filter chain hands sandbox datagrams to, and the one the
+/// UDP relay binds. Not a port — a queue index — but the same single-source-of-
+/// truth rule applies: `network.rs` renders this value into the nftables script
+/// and `udp_egress.rs` binds it (see `udp_egress.rs`).
+pub const DEFAULT_UDP_QUEUE_NUM: u16 = 0;
 
 #[derive(Debug, Clone)]
 pub enum SandboxMode {

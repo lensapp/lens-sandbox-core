@@ -2,8 +2,10 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::config::{DEFAULT_DNS_STUB_PORT, DEFAULT_PROXY_PORT, DEFAULT_TRANSPARENT_PORT};
-use crate::sock_mark::MARK_VALUE;
+use crate::config::{
+    DEFAULT_DNS_STUB_PORT, DEFAULT_PROXY_PORT, DEFAULT_TRANSPARENT_PORT, DEFAULT_UDP_QUEUE_NUM,
+};
+use crate::sock_mark::{MARK_VALUE, REJECT_MARK};
 
 const TABLE_NAME: &str = "lens_sandbox";
 const LOG_PREFIX: &str = "lens:bypass:";
@@ -102,6 +104,8 @@ fn render_install_script() -> String {
     let prefix = LOG_PREFIX;
     // Decimal — `nft` accepts plain integers for meta mark, no 0x prefix needed.
     let mark = MARK_VALUE;
+    let reject_mark = REJECT_MARK;
+    let queue = DEFAULT_UDP_QUEUE_NUM;
 
     // Pure create transaction. Any prior copy of the table was removed
     // by `delete_table_best_effort` before this script runs, so the
@@ -148,14 +152,37 @@ fn render_install_script() -> String {
          \t\tmeta mark != {mark} oifname \"lo\" accept\n\
          \t\tmeta mark != {mark} ct state established,related accept\n\
          \n\
-         \t\t# Rate-limited LOG of bypass attempts. Unlike iptables' `--log-uid`,\n\
-         \t\t# nftables `log` doesn't emit the originating UID into the kernel\n\
-         \t\t# log — operators correlating `lens:bypass:` entries to a specific\n\
-         \t\t# process must use `meta skuid` matches or audit subsystem hooks\n\
-         \t\t# instead. Mark-based gating made UID attribution moot for the\n\
-         \t\t# cage itself, but the diagnostic loss is worth a note.\n\
+         \t\t# UDP is judged in userspace: the relay reads each datagram off\n\
+         \t\t# queue {queue} and answers accept, drop, or — by stamping\n\
+         \t\t# {reject_mark} and asking for another pass — the reject below.\n\
+         \t\t# Both mark rules MUST precede the queue rule: a repeated packet\n\
+         \t\t# re-enters this chain at the top, and would be queued again.\n\
+         \t\t#\n\
+         \t\t# DNS needs no exclusion here. The nat chain runs first (priority\n\
+         \t\t# -100 against this chain's 0), so an unmarked UDP/53 datagram\n\
+         \t\t# arrives already rewritten to the stub and is taken by the\n\
+         \t\t# loopback accept above. A `udp dport 53` rule in this chain could\n\
+         \t\t# only ever match one the nat chain did NOT redirect — which is the\n\
+         \t\t# covert channel the stub exists to close.\n\
+         \t\t#\n\
+         \t\t# The queue carries no `bypass` flag, so a full queue drops rather\n\
+         \t\t# than admits. With no relay attached, all UDP stops here.\n\
+         \t\tmeta mark {reject_mark} limit rate 5/second burst 10 packets log prefix \"{prefix}\" level info\n\
+         \t\tmeta mark {reject_mark} reject with icmpx type port-unreachable\n\
+         \t\tmeta mark != {mark} meta l4proto udp queue num {queue}\n\
+         \n\
+         \t\t# Rate-limited LOG of TCP bypass attempts. UDP has no rule here:\n\
+         \t\t# the queue above is terminal for every datagram — a verdict ends\n\
+         \t\t# the packet, and an unread queue drops it — so nothing UDP can\n\
+         \t\t# reach this far. Refused datagrams are logged at the reject rule.\n\
+         \t\t#\n\
+         \t\t# Unlike iptables' `--log-uid`, nftables `log` doesn't emit the\n\
+         \t\t# originating UID into the kernel log — operators correlating\n\
+         \t\t# `lens:bypass:` entries to a specific process must use `meta skuid`\n\
+         \t\t# matches or audit subsystem hooks instead. Mark-based gating made\n\
+         \t\t# UID attribution moot for the cage itself, but the diagnostic loss\n\
+         \t\t# is worth a note.\n\
          \t\tmeta mark != {mark} tcp flags syn limit rate 5/second burst 10 packets log prefix \"{prefix}\" level info\n\
-         \t\tmeta mark != {mark} meta l4proto udp limit rate 5/second burst 10 packets log prefix \"{prefix}\" level info\n\
          \n\
          \t\tmeta mark != {mark} reject with icmpx type port-unreachable\n\
          \t}}\n\
@@ -216,6 +243,19 @@ mod tests {
     /// exemption). Shared so the rule text and its test guards can't drift.
     fn marked_accept_rule() -> String {
         format!("meta mark {MARK_VALUE} accept")
+    }
+
+    /// The `output_filter` rules with the commentary stripped. A test asking
+    /// whether the chain *does* something must not be answered by prose that
+    /// merely says so — several of these comments quote the very rule shapes
+    /// the chain is asserted not to contain.
+    fn output_filter_rules(script: &str) -> String {
+        output_filter_chain(script)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -288,8 +328,17 @@ mod tests {
         let s = render_install_script();
         let needle = format!("meta mark != {MARK_VALUE} ");
         let marked_accept = marked_accept_rule();
+        // The relay's own refusal rules match `REJECT_MARK` instead. They are
+        // consistent with the guard rather than an exception to it: the mark is
+        // not MARK_VALUE, so only unmarked traffic the relay has judged can
+        // carry it, and the workload cannot set either mark without
+        // CAP_NET_ADMIN.
+        let reject_marked = format!("meta mark {REJECT_MARK} ");
         for line in s.lines() {
             let t = line.trim();
+            if t.starts_with(&reject_marked) {
+                continue;
+            }
             // Header / scaffolding lines that are allowed to lack the mark match:
             // - empty
             // - comments (`#`)
@@ -319,7 +368,76 @@ mod tests {
         assert_eq!(
             s.matches("log prefix \"lens:bypass:\" level info").count(),
             2,
-            "expected two LOG rules (TCP SYN + UDP) with the lens:bypass: prefix"
+            "expected two LOG rules (TCP SYN + refused datagram) with the lens:bypass: prefix"
+        );
+    }
+
+    #[test]
+    fn the_relays_mark_rules_precede_the_queue() {
+        // A rejected datagram is stamped and re-judged, so it re-enters this
+        // chain at the top. If the queue rule came first it would be queued
+        // again, and the relay would answer the same packet forever.
+        let s = render_install_script();
+        let chain = output_filter_chain(&s);
+        let log = chain
+            .find(&format!("meta mark {REJECT_MARK} limit rate"))
+            .expect("refused datagrams must be logged");
+        let reject = chain
+            .find(&format!("meta mark {REJECT_MARK} reject"))
+            .expect("refused datagrams must be rejected");
+        let queue = chain
+            .find(&format!("queue num {DEFAULT_UDP_QUEUE_NUM}"))
+            .expect("udp must be queued to the relay");
+        assert!(log < reject, "log the refusal before answering it");
+        assert!(
+            reject < queue,
+            "reject ({reject}) must precede queue ({queue})"
+        );
+    }
+
+    #[test]
+    fn the_queue_rule_follows_the_established_accept() {
+        // A flow that has seen a reply is judged once, not per packet. The
+        // ordering is what buys that, and it is also what puts a live flow
+        // beyond the reach of a policy reload — see `udp_egress`.
+        let s = render_install_script();
+        let chain = output_filter_chain(&s);
+        let established = chain
+            .find("ct state established,related accept")
+            .expect("established accept");
+        let queue = chain
+            .find(&format!("queue num {DEFAULT_UDP_QUEUE_NUM}"))
+            .expect("udp queue rule");
+        assert!(established < queue);
+    }
+
+    #[test]
+    fn the_filter_chain_never_accepts_dns_by_port() {
+        // The nat chain runs first (priority -100 against this chain's 0), so a
+        // DNS datagram arrives here already rewritten to the stub and the
+        // loopback accept takes it. A `udp dport 53` rule in this chain could
+        // therefore only ever match one the nat chain did NOT redirect — and
+        // accepting that is the covert channel the stub exists to close.
+        let rules = output_filter_rules(&render_install_script());
+        assert!(
+            !rules.contains("dport 53"),
+            "output_filter must not name the DNS port"
+        );
+    }
+
+    #[test]
+    fn the_udp_queue_does_not_fail_open() {
+        // `bypass` tells the kernel to accept what it cannot queue. On this
+        // chain that would let every datagram past the cap leave unjudged,
+        // exactly when something is flooding.
+        let rules = output_filter_rules(&render_install_script());
+        let queue_rule = rules
+            .lines()
+            .find(|line| line.contains("queue num"))
+            .expect("udp must be queued to the relay");
+        assert!(
+            !queue_rule.contains("bypass"),
+            "the queue rule must not carry the bypass flag: {queue_rule}"
         );
     }
 

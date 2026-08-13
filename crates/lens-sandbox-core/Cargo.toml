@@ -32,9 +32,12 @@ hex = "0.4"
 hickory-proto = "0.26"
 apollo-parser = "0.8.6"
 
-# AF_VSOCK is Linux-only
+# AF_VSOCK and NFQUEUE are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.7"
+# Pure Rust over netlink: no libnetfilter_queue, so nothing to link and no
+# GPL-2.0 C library beside an Apache-2.0 crate.
+nfq = "0.2"
 
 [[bin]]
 name = "generate-policy-schema"

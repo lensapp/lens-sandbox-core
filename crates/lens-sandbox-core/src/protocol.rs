@@ -118,6 +118,11 @@ pub enum Treatment {
     Raw,
     /// The proxy terminates and inspects — an `egress.http` route governs it.
     Inspected,
+    /// A datagram an `egress.udp` rule claimed. Opaque like `Raw`, and one
+    /// thing more: nothing is being held. The datagram that raised the dialog
+    /// is already gone, so an approval governs what the workload sends next,
+    /// not what it sent. A card for this must not promise to release anything.
+    Datagram,
 }
 
 /// Inbound frame carrying the developer's answer to a pending request.

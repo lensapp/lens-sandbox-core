@@ -63,6 +63,22 @@ impl ActorContext {
         }
     }
 
+    /// Resolve the process behind a UDP source endpoint, by walking `/proc`
+    /// exactly as [`ActorContext::resolve`] does — the socket table read is the
+    /// only difference.
+    ///
+    /// The datagram relay calls this on its own thread, which is not a tokio
+    /// worker, so there is nothing to offload it from. Timing is what differs
+    /// from the TCP path: a connection is open for as long as it is judged,
+    /// while a socket that sent one datagram and closed leaves nothing to find.
+    /// That resolves to `None`, and a `binaries` rule then fails closed.
+    pub fn resolve_udp(peer: SocketAddr) -> Self {
+        Self {
+            peer,
+            process: resolve_udp(peer),
+        }
+    }
+
     /// Resolve on a blocking thread. The `/proc` walk (`read_dir` over every
     /// pid plus a `read_link` per fd) is synchronous filesystem I/O, so we
     /// offload it via `spawn_blocking` to keep the connection handler's tokio

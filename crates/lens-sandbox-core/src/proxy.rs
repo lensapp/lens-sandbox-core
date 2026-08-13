@@ -499,6 +499,12 @@ impl ProxyServer {
             }
         });
 
+        // The UDP relay runs on its own thread, not a task: it judges each
+        // datagram synchronously against the kernel queue. Failing to start is
+        // not fatal and not a way through — with nothing reading the queue, the
+        // filter chain keeps dropping UDP.
+        crate::udp_egress::spawn(dns_state.clone());
+
         let dns_task = tokio::spawn(async move {
             // The stub is best-effort: a bind failure or missing
             // /etc/resolv.conf shouldn't take the whole proxy down, but we
@@ -1534,10 +1540,52 @@ fn tcp_egress_verdict(
     // Rules and pins come from one snapshot (see `NetworkPolicy`), so a
     // connection never pairs new rules with a superseded policy's pins.
     let policy = state.policy.read().unwrap();
+    raw_egress_verdict(&policy, &policy.tcp_egress, hostname, port, caller)
+}
 
-    let pinned_qnames = live_pinned_qnames(&policy, hostname);
+/// The `egress.udp` table's decision for one datagram's destination.
+///
+/// Unlike [`tcp_egress_verdict`] this always answers. A connection the tcp table
+/// does not claim falls through to the `egress.http` routes; a datagram has
+/// nowhere to fall to, so the table is the whole of the policy and silence from
+/// it is a refusal. That is what makes UDP deny-by-default without the default
+/// verdict — which governs the connection tables — having to say anything.
+///
+/// The relay holds an address, never a name, so a hostname rule binds here only
+/// through a live DNS pin, exactly as it does on the transparent door.
+// Its only caller is the relay, which runs on Linux alone — see `udp_egress`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn udp_egress_verdict(
+    state: &Arc<ProxyState>,
+    dst: SocketAddr,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> RawDecision {
+    let policy = state.policy.read().unwrap();
+    let hostname = dst.ip().to_string();
+    raw_egress_verdict(&policy, &policy.udp_egress, &hostname, dst.port(), caller).unwrap_or(
+        RawDecision {
+            verdict: Verdict::Deny,
+            matched_target: None,
+            generation: policy.generation,
+            reason: "no-udp-rule",
+        },
+    )
+}
+
+/// One ordered pass over one raw table, against the pins and generation of the
+/// snapshot the caller already holds. `None` means no rule claimed the
+/// destination; what that silence means belongs to the table, so the two
+/// callers above answer it themselves.
+fn raw_egress_verdict(
+    policy: &NetworkPolicy,
+    rules: &[RouteRule],
+    hostname: &str,
+    port: u16,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> Option<RawDecision> {
+    let pinned_qnames = live_pinned_qnames(policy, hostname);
     let target = RawTarget::at(hostname, &pinned_qnames);
-    let found = find_matching_raw_egress(&policy.tcp_egress, target, port, caller);
+    let found = find_matching_raw_egress(rules, target, port, caller);
     let matched_target = found.matched_name.map(|n| format!("{n}:{port}"));
     let generation = policy.generation;
     match found.outcome {
@@ -2496,7 +2544,7 @@ struct RequestFacts<'a> {
 }
 
 /// Emit an audit event for a CONNECT tunnel request.
-fn emit_audit(
+pub(crate) fn emit_audit(
     state: &Arc<ProxyState>,
     target_host: &str,
     result: &str,
@@ -2609,7 +2657,7 @@ fn emit_audit_action_with_metadata(
 /// deny, `binary-not-allowed` for a `binaries`-filter miss) rides in
 /// `metadata.reason` so the relay daemon can surface it to the developer as an
 /// Allow/Skip notification rather than letting it disappear into the audit log.
-fn emit_policy_deny_connect(
+pub(crate) fn emit_policy_deny_connect(
     state: &Arc<ProxyState>,
     target_host: &str,
     reason: &str,
@@ -2733,7 +2781,11 @@ pub(crate) fn emit_gate_resolved(
 /// Bypasses the failure-event dedup pool: a second user click on the
 /// same host inside `AUDIT_DEDUP_SECS` is a fresh decision, not a retry
 /// storm.
-fn emit_gate_denied(state: &Arc<ProxyState>, action: &str, decision: crate::protocol::Decision) {
+pub(crate) fn emit_gate_denied(
+    state: &Arc<ProxyState>,
+    action: &str,
+    decision: crate::protocol::Decision,
+) {
     let tx = state.audit_tx.lock().unwrap().clone();
     if let Some(tx) = tx {
         let event = serde_json::json!({
