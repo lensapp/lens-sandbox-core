@@ -39,4 +39,4 @@ pub mod routing;
 pub mod sock_mark;
 pub mod temp_files;
 pub mod transparent;
-pub(crate) mod udp_egress;
+pub mod udp_egress;

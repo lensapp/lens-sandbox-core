@@ -56,6 +56,12 @@ const PIN_TTL_CAP_SECS: u64 = 3600;
 /// many IPs, or from many distinct names all resolving to one IP (a wildcard
 /// rule). Counting total entries rather than distinct IP keys is what bounds
 /// both the store and the per-connect linear scan of a single IP's list.
+///
+/// One cap serves both raw tables, because one pin does: it records the name a
+/// lookup was allowed for, not the rule that wanted it. So a workload resolving
+/// many `egress.udp` names can crowd out `egress.tcp` pins, and the other way
+/// round. What that costs is a raw splice or a datagram for a *hostname* rule,
+/// never a permission — an unpinned name simply matches nothing.
 const MAX_PINNED_ENTRIES: usize = 4096;
 
 /// An IP pinned from a DNS answer for a hostname `egress.tcp` rule, plus its
@@ -1734,7 +1740,7 @@ fn tcp_egress_admits(
 ///
 /// Re-applying an unchanged egress policy is a no-op — policy frames also carry
 /// periodic credential refreshes, so this runs routinely with identical rules.
-pub(crate) fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
+pub fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
     let mut policy = state.policy.write().unwrap();
     if policy.egress_eq(&next) {
         return;
