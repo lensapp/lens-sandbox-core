@@ -8,8 +8,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use crate::routing::{
-    HttpRule, RouteOutcome, RouteRule, Scheme, TcpTarget, Transport, Verdict, find_matching_route,
-    find_matching_tcp_egress,
+    HttpRule, RawTarget, RouteOutcome, RouteRule, Scheme, Transport, Verdict,
+    find_matching_raw_egress, find_matching_route,
 };
 use crate::sock_mark;
 use crate::transparent::{self, Protocol};
@@ -96,7 +96,7 @@ pub struct NetworkPolicy {
     /// directly; `Domain`/`HostPort` matchers match only a dst IP that a live
     /// DNS pin bound to a name the rule covers (the raw path never sees a name,
     /// so hostname rules drive DNS-answer pinning). Both kinds are evaluated in
-    /// one ordered pass by [`tcp_egress_verdict`] / `find_matching_tcp_egress`,
+    /// one ordered pass by [`tcp_egress_verdict`] / `find_matching_raw_egress`,
     /// and the DNS stub gates lookups against the hostname entries of this same
     /// list via `hostname_match_for_caller`.
     pub tcp_egress: Vec<RouteRule>,
@@ -1492,9 +1492,9 @@ async fn handle_transparent_connection(
     }
 }
 
-/// An `egress.tcp` verdict and the destination as the policy author wrote it.
+/// A raw table's verdict and the destination as the policy author wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TcpDecision {
+pub(crate) struct RawDecision {
     pub(crate) verdict: Verdict,
     /// `name:port` when the rule bound through a name, `None` when it matched
     /// by address. Feeds the ask dialog and, via `gate_key`, the QNAME-keyed
@@ -1530,18 +1530,18 @@ fn tcp_egress_verdict(
     hostname: &str,
     port: u16,
     caller: Option<&crate::peer_process::PeerProcess>,
-) -> Option<TcpDecision> {
+) -> Option<RawDecision> {
     // Rules and pins come from one snapshot (see `NetworkPolicy`), so a
     // connection never pairs new rules with a superseded policy's pins.
     let policy = state.policy.read().unwrap();
 
     let pinned_qnames = live_pinned_qnames(&policy, hostname);
-    let target = TcpTarget::at(hostname, &pinned_qnames);
-    let found = find_matching_tcp_egress(&policy.tcp_egress, target, port, caller);
+    let target = RawTarget::at(hostname, &pinned_qnames);
+    let found = find_matching_raw_egress(&policy.tcp_egress, target, port, caller);
     let matched_target = found.matched_name.map(|n| format!("{n}:{port}"));
     let generation = policy.generation;
     match found.outcome {
-        RouteOutcome::Matched(rule) => Some(TcpDecision {
+        RouteOutcome::Matched(rule) => Some(RawDecision {
             verdict: rule.verdict,
             matched_target,
             generation,
@@ -1549,7 +1549,7 @@ fn tcp_egress_verdict(
         }),
         RouteOutcome::NoMatch {
             binary_filtered: true,
-        } => Some(TcpDecision {
+        } => Some(RawDecision {
             verdict: Verdict::Deny,
             matched_target,
             generation,
@@ -1593,7 +1593,7 @@ fn tcp_egress_verdict_for_hostport(
     target_host: &str,
     default_port: u16,
     caller: Option<&crate::peer_process::PeerProcess>,
-) -> Option<TcpDecision> {
+) -> Option<RawDecision> {
     let hostname = extract_hostname(target_host);
     let port = extract_port(target_host, default_port);
     tcp_egress_verdict(state, &hostname, port, caller)
@@ -1850,7 +1850,7 @@ async fn open_upstream_tunnel(
 async fn handle_raw_passthrough(
     mut stream: TcpStream,
     orig_dst: SocketAddr,
-    decision: &TcpDecision,
+    decision: &RawDecision,
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1901,7 +1901,7 @@ async fn handle_raw_passthrough(
 async fn raw_verdict_admits(
     state: &Arc<ProxyState>,
     target: &str,
-    decision: &TcpDecision,
+    decision: &RawDecision,
     actor: &crate::peer_process::ActorContext,
 ) -> Option<Gated> {
     match decision.verdict {
@@ -1986,7 +1986,7 @@ async fn raw_verdict_admits(
 fn unclassified_splice_decision(
     state: &Arc<ProxyState>,
     orig_dst: SocketAddr,
-) -> Option<TcpDecision> {
+) -> Option<RawDecision> {
     if orig_dst.port() == DNS_PORT {
         return None;
     }
@@ -1994,7 +1994,7 @@ fn unclassified_splice_decision(
     if policy.default_verdict == Verdict::Deny {
         return None;
     }
-    Some(TcpDecision {
+    Some(RawDecision {
         verdict: Verdict::Ask,
         // The table named nothing here, so the address is all the card can show —
         // and a raw rule must carry a port, which the door's target has.
@@ -2010,7 +2010,7 @@ fn unclassified_splice_decision(
 /// reload cleared — else the address itself.
 fn reallows_after_reload(
     state: &Arc<ProxyState>,
-    decision: &TcpDecision,
+    decision: &RawDecision,
     target: &str,
     actor: &crate::peer_process::ActorContext,
 ) -> bool {
@@ -2035,7 +2035,7 @@ fn reallows_after_reload(
 async fn connect_raw_passthrough(
     mut client: TcpStream,
     target_host: &str,
-    decision: &TcpDecision,
+    decision: &RawDecision,
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2082,7 +2082,7 @@ async fn http_forward_raw_passthrough(
     mut client: TcpStream,
     target_host: &str,
     request_head: &str,
-    decision: &TcpDecision,
+    decision: &RawDecision,
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -3671,7 +3671,7 @@ pub(crate) mod tests {
     #[test]
     fn a_wildcard_hostname_rule_does_not_reach_an_unpinned_ip_literal() {
         // An IP literal is not a name, on any door: hostname rules reach it only
-        // through a DNS pin. See `TcpTarget::at`.
+        // through a DNS pin. See `RawTarget::at`.
         let (state, _rx) = test_state();
         install_tcp_rules(&state, r#"[{"match": "*:443", "verdict": "deny"}]"#);
         assert_eq!(tcp_verdict(&state, "203.0.113.7:443", None), None);
@@ -5400,7 +5400,7 @@ pub(crate) mod tests {
         // `an_approved_ask_still_splices_on_the_proxy_door`, which needs a
         // live gate.
         let (state, _rx) = test_state();
-        let at = |verdict| TcpDecision {
+        let at = |verdict| RawDecision {
             verdict,
             matched_target: None,
             generation: state.policy.read().unwrap().generation,
