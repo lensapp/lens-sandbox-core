@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Bump to today's date in the same commit as any change to `policy_schema.rs`
 /// or the wire types in this file — an older sandbox must not accept a policy it
 /// cannot enforce.
-pub const SANDBOX_PROTOCOL_DATE: &str = "2026-08-07";
+pub const SANDBOX_PROTOCOL_DATE: &str = "2026-08-13";
 
 /// A temporary file to write before executing a command.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

@@ -190,7 +190,7 @@
       ]
     },
     "Egress": {
-      "description": "Egress rules split by the protocol at which the destination is filtered.\n\n- [`http`](Self::http) filters by hostname and can see and rewrite the\n  payload (HTTP rules, TLS termination, credential injection).\n- [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the\n  payload — an opaque byte splice for non-HTTP services.\n\n`tcp` is a pre-filter: whatever it claims, it governs, and its verdict is\nfinal. Only a destination no `tcp` rule matches falls through to `http`.\n\nHostname `tcp` rules apply however the traffic reaches the proxy. An IP/CIDR\nrule can only match an address, so when the workload connects by name it\nbinds after resolution — in time to deny the connection, but not to grant a\nraw splice, and only where the sandbox resolves the name itself. A route the\n`http` table sends over `upstream` transport is tunnelled to Lens Sandbox\nunresolved, so no IP/CIDR rule sees it. Write a hostname rule whenever you\nwant a `tcp` rule to bind by name.\n\nSo a `tcp` allow turns off HTTP rules, credential injection, and inspection\nfor the port it names — that is what asking for a raw splice means. Because\nevery `tcp` rule carries a port, the two lists can describe the same host\nwithout colliding: `db.internal:5432` in `tcp` leaves `db.internal:443` to\n`http`. An overlap on the same port is allowed, and logged at load.",
+      "description": "Egress rules split by the protocol at which the destination is filtered.\n\n- [`http`](Self::http) filters by hostname and can see and rewrite the\n  payload (HTTP rules, TLS termination, credential injection).\n- [`tcp`](Self::tcp) filters by IP/CIDR and port and never inspects the\n  payload — an opaque byte splice for non-HTTP services.\n- [`udp`](Self::udp) governs datagrams, which the other two never see.\n\n`tcp` is a pre-filter: whatever it claims, it governs, and its verdict is\nfinal. Only a destination no `tcp` rule matches falls through to `http`.\n\nHostname `tcp` rules apply however the traffic reaches the proxy. An IP/CIDR\nrule can only match an address, so when the workload connects by name it\nbinds after resolution — in time to deny the connection, but not to grant a\nraw splice, and only where the sandbox resolves the name itself. A route the\n`http` table sends over `upstream` transport is tunnelled to Lens Sandbox\nunresolved, so no IP/CIDR rule sees it. Write a hostname rule whenever you\nwant a `tcp` rule to bind by name.\n\nSo a `tcp` allow turns off HTTP rules, credential injection, and inspection\nfor the port it names — that is what asking for a raw splice means. Because\nevery `tcp` rule carries a port, the two lists can describe the same host\nwithout colliding: `db.internal:5432` in `tcp` leaves `db.internal:443` to\n`http`. An overlap on the same port is allowed, and logged at load.",
       "type": "object",
       "properties": {
         "http": {
@@ -207,6 +207,14 @@
           "default": [],
           "items": {
             "$ref": "#/$defs/TcpEgressRule"
+          }
+        },
+        "udp": {
+          "description": "Raw UDP rules, first match wins. Matched exactly as [`tcp`](Self::tcp)\nis — by IP/CIDR or hostname, always scoped to a port — and never\ninspected. UDP is a different protocol from the other two tables, so\nthis list cannot collide with them: it alone decides what leaves the\nsandbox as a datagram.\n\nUDP is denied unless a rule here allows it. [`default_verdict`] does not\nreach this table: it governs destinations the *connection* tables did\nnot name, and reading it as a datagram grant would open every UDP port\nof every policy that allows by default.\n\n[`default_verdict`]: NetworkPolicy::default_verdict",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/UdpEgressRule"
           }
         }
       }
@@ -558,6 +566,41 @@
         }
       ]
     },
+    "UdpEgressRule": {
+      "description": "A single first-match-wins raw-UDP egress rule.\n\nThe fields are [`TcpEgressRule`]'s, and a destination is matched the same\nway, including DNS forward-pinning for a hostname pattern. What differs is\nwhat a rule can promise, because UDP carries no connection:\n\n- There is nothing to hold open, so an `ask` verdict cannot suspend the\n  datagram that raised it — see [`Verdict::Ask`].\n- A verdict is decided once per flow, keyed by address and port. A flow is\n  not a kernel object the way a connection is, so a source port freed by one\n  process and taken by another inherits the decision until the flow expires.\n- [`binaries`](Self::binaries) needs the sending socket to still be open when\n  the datagram is judged. A program that sends and exits at once (statsd,\n  syslog) cannot be identified, and fails closed.",
+      "type": "object",
+      "properties": {
+        "binaries": {
+          "description": "Restrict this rule to datagrams sent by specific binaries. Same\nsemantics as [`RouteRule::binaries`], with the caveat above.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "description": "Human-readable description of this rule.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "match": {
+          "description": "Destination as `ip:port`, `cidr:port`, or `hostname:port`. A port is\n**required**, exactly as in [`TcpEgressRule::match_pattern`], and for the\nsame reason: a datagram is forwarded uninspected, so a portless grant\nwould be too broad.\n\nPort `53` is refused. Every unmarked DNS datagram is claimed by the\nsandbox's own DNS stub before any rule here can see it, so such a rule\ncould never take effect — and a rule that cannot match is worse than no\nrule, because a dead `deny` fails open.",
+          "type": "string"
+        },
+        "verdict": {
+          "description": "Policy verdict: allow, deny, or ask.",
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "match",
+        "verdict"
+      ]
+    },
     "Verdict": {
       "description": "Verdict for a matched route or as default: should the connection be allowed,\nblocked, or held for developer approval?",
       "oneOf": [
@@ -572,7 +615,7 @@
           "const": "deny"
         },
         {
-          "description": "Suspend the request and prompt the developer; on approval, allow using\n`transport`. Only meaningful in interactive environments (local CLI\nrelay); remote/unattended consumers should keep using `Deny` so\nrequests fail closed without waiting for a human.",
+          "description": "Suspend the request and prompt the developer; on approval, allow using\n`transport`. Only meaningful in interactive environments (local CLI\nrelay); remote/unattended consumers should keep using `Deny` so\nrequests fail closed without waiting for a human.\n\nOn a [`UdpEgressRule`] there is no request to suspend, so the datagram\nthat raised the dialog is dropped and the answer governs the ones that\nfollow. A client that retries — which is every client that expects a\nreply — gets through on the retry.",
           "type": "string",
           "const": "ask"
         }

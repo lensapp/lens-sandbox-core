@@ -712,9 +712,11 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         http: serde_json::Value,
         #[serde(default)]
         tcp: serde_json::Value,
+        #[serde(default)]
+        udp: serde_json::Value,
     }
 
-    /// The two egress tables a policy publishes, or `Ok(None)` when it names
+    /// The egress tables a policy publishes, or `Ok(None)` when it names
     /// no policy at all. Every shape that must fail closed comes back as
     /// `Err`, so the caller force-denies from one place and this function is
     /// the single answer to "which policies are we willing to install".
@@ -725,10 +727,13 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     /// list. `allowedRoutes` is read only when there is no `egress` block at
     /// all. Anything else is an operator typo, and silently dropping every
     /// rule is the most permissive reading of one available.
-    type EgressTables = (
-        Vec<crate::routing::ParsedRoute>,
-        Vec<crate::routing::RouteRule>,
-    );
+    /// Named rather than a tuple: `tcp` and `udp` are the same type, and a
+    /// transposed pair would hand each protocol the other's rules silently.
+    struct EgressTables {
+        http: Vec<crate::routing::ParsedRoute>,
+        tcp: Vec<crate::routing::RouteRule>,
+        udp: Vec<crate::routing::RouteRule>,
+    }
     fn parse_egress_tables(network: &NetworkPolicyRaw) -> Result<Option<EgressTables>, String> {
         let egress: EgressRaw = match &network.egress {
             serde_json::Value::Object(_) => serde_json::from_value(network.egress.clone())
@@ -739,7 +744,11 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 }
                 let routes = parse_proxy_routes(&network.allowed_routes)
                     .map_err(|e| format!("allowedRoutes: {e}"))?;
-                return Ok(Some((routes, Vec::new())));
+                return Ok(Some(EgressTables {
+                    http: routes,
+                    tcp: Vec::new(),
+                    udp: Vec::new(),
+                }));
             }
             _ => return Err("network.egress must be an object".to_string()),
         };
@@ -756,7 +765,14 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             v if v.is_null() => Vec::new(),
             _ => return Err("egress.tcp must be an array".to_string()),
         };
-        Ok(Some((http, tcp)))
+        let udp = match &egress.udp {
+            v if v.is_array() => {
+                crate::routing::parse_udp_egress(v).map_err(|e| format!("egress.udp: {e}"))?
+            }
+            v if v.is_null() => Vec::new(),
+            _ => return Err("egress.udp must be an array".to_string()),
+        };
+        Ok(Some(EgressTables { http, tcp, udp }))
     }
 
     // Parsed first, alone — the version gate must fire before the full typed
@@ -867,7 +883,11 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             };
 
             match parse_egress_tables(&network) {
-                Ok(Some((parsed_routes, tcp_egress_rules))) => {
+                Ok(Some(EgressTables {
+                    http: parsed_routes,
+                    tcp: tcp_egress_rules,
+                    udp: udp_egress_rules,
+                })) => {
                     let mut route_rules = Vec::with_capacity(parsed_routes.len());
                     let mut cert_map: HashMap<String, crate::proxy::ClientCertConfig> =
                         HashMap::new();
@@ -921,17 +941,18 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                     tracing::info!(
                         route_count = route_rules.len(),
                         tcp_egress_count = tcp_egress_rules.len(),
+                        udp_egress_count = udp_egress_rules.len(),
                         client_cert_count = cert_map.len(),
                         client_cert_keys = ?cert_map.keys().collect::<Vec<_>>(),
                         verdict = ?default_verdict,
                         transport = ?default_transport,
-                        "proxy routes, tcp egress, defaults, and forward certs updated from policy"
+                        "proxy routes, raw egress, defaults, and forward certs updated from policy"
                     );
                     *state.client_certs.write().unwrap() = cert_map;
-                    // Publish routes, defaults, and the ordered tcp egress
+                    // Publish routes, defaults, and the ordered raw egress
                     // rules, clear the previous policy's pins, and bump the
-                    // generation in one atomic swap, so no connection or DNS
-                    // lookup can combine these with a superseded policy's
+                    // generation in one atomic swap, so no connection, datagram,
+                    // or DNS lookup can combine these with a superseded policy's
                     // fields.
                     crate::proxy::apply_network_policy(
                         state,
@@ -940,6 +961,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                             default_verdict,
                             default_transport,
                             tcp_egress: tcp_egress_rules,
+                            udp_egress: udp_egress_rules,
                             ..Default::default()
                         },
                     );
@@ -2513,6 +2535,79 @@ mod tests {
             &tcp[0].matcher,
             crate::routing::RouteMatcher::CidrPort(net, 5432) if net.to_string() == "10.20.0.0/24"
         ));
+    }
+
+    #[tokio::test]
+    async fn egress_udp_populates_its_own_list_and_leaves_the_others_alone() {
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        // The same host and port in both raw tables: they govern different
+        // protocols, so each keeps its own verdict and neither is consulted for
+        // the other's traffic.
+        let policy_json = serde_json::json!({
+            "network": {
+                "egress": {
+                    "tcp": [{"match": "10.20.0.0/24:443", "verdict": "deny"}],
+                    "udp": [{"match": "10.20.0.0/24:443", "verdict": "allow"}]
+                },
+                "defaultVerdict": "deny",
+                "defaultTransport": "upstream"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        let policy = state.policy.read().unwrap();
+        assert_eq!(policy.tcp_egress.len(), 1);
+        assert_eq!(policy.tcp_egress[0].verdict, crate::routing::Verdict::Deny);
+        assert_eq!(policy.udp_egress.len(), 1);
+        assert_eq!(policy.udp_egress[0].verdict, crate::routing::Verdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn invalid_egress_udp_fails_the_whole_policy_closed() {
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        let proxy_state = Some(state.clone());
+
+        // A dead udp rule takes the working http rule down with it, exactly as a
+        // dead tcp rule does: a policy the sandbox cannot enforce as written is
+        // not partially applied.
+        let policy_json = serde_json::json!({
+            "network": {
+                "egress": {
+                    "http": [
+                        {"match": "api.github.com", "verdict": "allow", "transport": "upstream"}
+                    ],
+                    "udp": [{"match": "8.8.8.8:53", "verdict": "allow"}]
+                },
+                "defaultVerdict": "allow",
+                "defaultTransport": "upstream"
+            }
+        });
+
+        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+
+        let policy = state.policy.read().unwrap();
+        assert!(policy.routes.is_empty());
+        assert!(policy.udp_egress.is_empty());
+        assert_eq!(
+            policy.default_verdict,
+            crate::routing::Verdict::Deny,
+            "an unenforceable egress.udp must force the default verdict to deny"
+        );
     }
 
     #[tokio::test]

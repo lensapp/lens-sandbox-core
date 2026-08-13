@@ -196,21 +196,20 @@ fn patterns_overlap(a: &str, b: &str) -> bool {
     domain_matches(a, b) || domain_matches(b, a)
 }
 
-/// Every `(tcp rule, http rule)` pair where a non-deny `egress.tcp` rule claims
-/// a port an `egress.http` rule also covers for the same host. Both rules are
-/// valid and the policy still loads — the tcp table is the pre-filter, so it
-/// wins and the http rule is simply not applied on that port. Callers report
-/// these; silence is the failure mode.
+/// Every `(raw rule, http rule)` pair where a non-deny rule from a raw table
+/// covers a host and port an `egress.http` rule also covers. Both rules are
+/// valid and the policy still loads; what the overlap *means* differs by table,
+/// so the caller says it. Silence is the failure mode either way.
 ///
-/// Only hostname (`HostPort`) tcp rules are comparable; whether a CIDR covers a
+/// Only hostname (`HostPort`) raw rules are comparable; whether a CIDR covers a
 /// name is knowable only after resolving.
-pub(crate) fn shadowed_http_rules<'a>(
-    tcp_egress: &'a [RouteRule],
+pub(crate) fn overlapping_http_rules<'a>(
+    raw_egress: &'a [RouteRule],
     routes: &'a [RouteRule],
 ) -> Vec<(&'a RouteMatcher, &'a RouteMatcher)> {
-    let mut shadowed = Vec::new();
-    for tcp in tcp_egress.iter().filter(|r| r.verdict != Verdict::Deny) {
-        let RouteMatcher::HostPort(host, port) = &tcp.matcher else {
+    let mut overlaps = Vec::new();
+    for raw in raw_egress.iter().filter(|r| r.verdict != Verdict::Deny) {
+        let RouteMatcher::HostPort(host, port) = &raw.matcher else {
             continue;
         };
         for route in routes {
@@ -220,11 +219,11 @@ pub(crate) fn shadowed_http_rules<'a>(
                 RouteMatcher::Cidr(_) | RouteMatcher::CidrPort(_, _) => false,
             };
             if covers {
-                shadowed.push((&tcp.matcher, &route.matcher));
+                overlaps.push((&raw.matcher, &route.matcher));
             }
         }
     }
-    shadowed
+    overlaps
 }
 
 /// Parse the `egress.tcp` list into ONE ordered `Vec<RouteRule>`, preserving the
@@ -246,38 +245,98 @@ pub(crate) fn shadowed_http_rules<'a>(
 /// stays a direct IP match rather than a hostname rule: the discriminator is
 /// then purely the matcher kind, and the DNS gate (which skips `CidrPort`,
 /// never `HostPort`) can share this list without an IP literal leaking in as a
-/// QNAME. Normalization is scoped to `egress.tcp` — the L7 `parse_matcher` path
-/// keeps its string semantics untouched.
+/// QNAME. Normalization is scoped to the raw tables — the L7 `parse_matcher`
+/// path keeps its string semantics untouched.
 pub fn parse_tcp_egress(json: &serde_json::Value) -> Result<Vec<RouteRule>, String> {
-    let arr = json.as_array().ok_or("egress.tcp must be an array")?;
+    parse_port_scoped_egress(json, PortScopedTable::Tcp)
+}
+
+/// Parse the `egress.udp` list, under the rules [`parse_tcp_egress`] documents —
+/// one ordered list, a mandatory port, IP literals normalized to `CidrPort`. Port
+/// 53 is refused here and accepted there; see
+/// [`UdpEgressRule::match_pattern`](crate::policy_schema::UdpEgressRule::match_pattern).
+pub fn parse_udp_egress(json: &serde_json::Value) -> Result<Vec<RouteRule>, String> {
+    parse_port_scoped_egress(json, PortScopedTable::Udp)
+}
+
+/// The two raw egress tables. Both are parsed by the same code so they can never
+/// drift on how a pattern is read; this names what still differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortScopedTable {
+    Tcp,
+    Udp,
+}
+
+impl PortScopedTable {
+    fn label(self) -> &'static str {
+        match self {
+            PortScopedTable::Tcp => "egress.tcp",
+            PortScopedTable::Udp => "egress.udp",
+        }
+    }
+}
+
+/// The fields both tables carry, and the one shape the parser reads.
+/// [`TcpEgressRule`](crate::policy_schema::TcpEgressRule) and
+/// [`UdpEgressRule`](crate::policy_schema::UdpEgressRule) stay separate types so
+/// the published JSON Schema can document what each table promises.
+#[derive(serde::Deserialize)]
+struct PortScopedRule {
+    #[serde(rename = "match")]
+    match_pattern: String,
+    verdict: Verdict,
+    #[serde(default)]
+    binaries: Option<Vec<String>>,
+}
+
+/// Well-known DNS port.
+const DNS_PORT: u16 = 53;
+
+fn parse_port_scoped_egress(
+    json: &serde_json::Value,
+    table: PortScopedTable,
+) -> Result<Vec<RouteRule>, String> {
+    let arr = json
+        .as_array()
+        .ok_or_else(|| format!("{} must be an array", table.label()))?;
     let mut out = Vec::with_capacity(arr.len());
     for v in arr {
-        let raw: crate::policy_schema::TcpEgressRule =
-            serde_json::from_value(v.clone()).map_err(|e| format!("invalid tcp rule: {e}"))?;
+        let raw: PortScopedRule = serde_json::from_value(v.clone())
+            .map_err(|e| format!("invalid {} rule: {e}", table.label()))?;
         let matcher = normalize_ip_literal(parse_matcher(&raw.match_pattern)?);
         // Port 0 joins the portless patterns in being rejected: no connection
         // can target it, so the rule would resolve and pin at DNS yet never
         // match a real connect.
-        match matcher {
+        let port = match matcher {
             RouteMatcher::CidrPort(_, 0) | RouteMatcher::HostPort(_, 0) => {
                 return Err(format!(
-                    "egress.tcp rule \"{}\": port 0 is not a valid destination port",
+                    "{} rule \"{}\": port 0 is not a valid destination port",
+                    table.label(),
                     raw.match_pattern
                 ));
             }
-            RouteMatcher::CidrPort(..) | RouteMatcher::HostPort(..) => {}
+            RouteMatcher::CidrPort(_, port) | RouteMatcher::HostPort(_, port) => port,
             RouteMatcher::Cidr(_) | RouteMatcher::Domain(_) => {
                 return Err(format!(
-                    "egress.tcp rule \"{}\" must specify a port, e.g. \"host:443\" or \"10.0.0.0/24:443\"",
+                    "{} rule \"{}\" must specify a port, e.g. \"host:443\" or \"10.0.0.0/24:443\"",
+                    table.label(),
                     raw.match_pattern
                 ));
             }
+        };
+        if table == PortScopedTable::Udp && port == DNS_PORT {
+            return Err(format!(
+                "{} rule \"{}\": port {port} is served by the sandbox DNS stub, so this rule \
+                 could never match",
+                table.label(),
+                raw.match_pattern
+            ));
         }
         let binaries = raw.binaries.map(parse_binaries).transpose()?;
         out.push(RouteRule {
             matcher,
             verdict: raw.verdict,
-            // Raw TCP always egresses directly; the shared `RouteRule` still
+            // Raw egress always leaves directly; the shared `RouteRule` still
             // carries a transport, so pin it to `Direct` for the raw path.
             transport: Transport::Direct,
             tls_terminate: false,
@@ -1547,7 +1606,7 @@ mod tests {
         let tcp = parse_tcp(r#"[{"match": "db.internal:5432", "verdict": "allow"}]"#).unwrap();
         let http =
             routes_from(r#"[{"match": "db.internal", "verdict": "allow", "transport": "direct"}]"#);
-        assert_eq!(shadowed_http_rules(&tcp, &http).len(), 1);
+        assert_eq!(overlapping_http_rules(&tcp, &http).len(), 1);
     }
 
     #[test]
@@ -1558,7 +1617,7 @@ mod tests {
         let http = routes_from(
             r#"[{"match": "db.internal:443", "verdict": "allow", "transport": "direct"}]"#,
         );
-        assert!(shadowed_http_rules(&tcp, &http).is_empty());
+        assert!(overlapping_http_rules(&tcp, &http).is_empty());
     }
 
     #[test]
@@ -1567,7 +1626,7 @@ mod tests {
         let tcp = parse_tcp(r#"[{"match": "db.internal:5432", "verdict": "deny"}]"#).unwrap();
         let http =
             routes_from(r#"[{"match": "db.internal", "verdict": "allow", "transport": "direct"}]"#);
-        assert!(shadowed_http_rules(&tcp, &http).is_empty());
+        assert!(overlapping_http_rules(&tcp, &http).is_empty());
     }
 
     #[test]
@@ -1578,7 +1637,7 @@ mod tests {
         let http = routes_from(
             r#"[{"match": "db.rds.amazonaws.com", "verdict": "allow", "transport": "direct"}]"#,
         );
-        assert_eq!(shadowed_http_rules(&tcp, &http).len(), 1);
+        assert_eq!(overlapping_http_rules(&tcp, &http).len(), 1);
     }
 
     #[test]
@@ -1587,7 +1646,7 @@ mod tests {
         let tcp = parse_tcp(r#"[{"match": "10.0.0.0/8:5432", "verdict": "allow"}]"#).unwrap();
         let http =
             routes_from(r#"[{"match": "db.internal", "verdict": "allow", "transport": "direct"}]"#);
-        assert!(shadowed_http_rules(&tcp, &http).is_empty());
+        assert!(overlapping_http_rules(&tcp, &http).is_empty());
     }
 
     #[test]
@@ -1603,7 +1662,7 @@ mod tests {
             !http[0].http_rules.is_empty(),
             "the route must carry the rules the splice will skip"
         );
-        assert_eq!(shadowed_http_rules(&tcp, &http).len(), 1);
+        assert_eq!(overlapping_http_rules(&tcp, &http).len(), 1);
     }
 
     /// The `egress.http` DNS gate with no caller: ordered first-match.
@@ -1716,6 +1775,88 @@ mod tests {
                 "unexpected error for {pattern:?}: {err}"
             );
         }
+    }
+
+    fn parse_udp(json: &str) -> Result<Vec<RouteRule>, String> {
+        let val: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        parse_udp_egress(&val)
+    }
+
+    #[test]
+    fn parse_udp_egress_reads_every_shape_the_tcp_table_does() {
+        // One parser serves both tables, so a pattern means the same thing in
+        // each: the IP literal folds to `CidrPort`, the hostname stays
+        // `HostPort` to drive DNS pinning, and order is the policy's order.
+        let rules = parse_udp(
+            r#"[
+                {"match": "10.0.0.5:123", "verdict": "allow"},
+                {"match": "10.0.0.0/8:161", "verdict": "deny"},
+                {"match": "ntp.internal:123", "verdict": "ask"}
+            ]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &rules[0].matcher,
+            RouteMatcher::CidrPort(net, 123) if net.to_string() == "10.0.0.5/32"
+        ));
+        assert!(matches!(&rules[1].matcher, RouteMatcher::CidrPort(_, 161)));
+        assert!(matches!(
+            &rules[2].matcher,
+            RouteMatcher::HostPort(h, 123) if h == "ntp.internal"
+        ));
+        assert_eq!(rules[2].verdict, Verdict::Ask);
+        assert_eq!(rules[0].transport, Transport::Direct);
+    }
+
+    #[test]
+    fn parse_udp_egress_rejects_the_shapes_the_tcp_table_rejects() {
+        for (pattern, expected) in [
+            ("ntp.internal", "must specify a port"),
+            ("10.20.0.0/16", "must specify a port"),
+            ("ntp.internal:0", "port 0 is not a valid"),
+        ] {
+            let json = format!(r#"[{{"match": "{pattern}", "verdict": "allow"}}]"#);
+            let err = parse_udp(&json).expect_err("dead pattern must be rejected");
+            assert!(
+                err.contains(expected),
+                "unexpected error for {pattern:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_udp_egress_rejects_port_53() {
+        // The DNS stub claims every unmarked UDP/53 datagram, so such a rule is
+        // dead, and a dead `deny` reads as protection that isn't there.
+        for pattern in ["8.8.8.8:53", "10.0.0.0/8:53", "resolver.internal:53"] {
+            let json = format!(r#"[{{"match": "{pattern}", "verdict": "deny"}}]"#);
+            let err = parse_udp(&json).expect_err("port 53 must be rejected");
+            assert!(
+                err.contains("served by the sandbox DNS stub"),
+                "unexpected error for {pattern:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tcp_egress_still_accepts_port_53() {
+        // Only the UDP table loses port 53. Over TCP the transparent door drops
+        // DNS rather than claiming it, so a rule naming that port still says
+        // something true and must keep parsing.
+        let rules = parse_tcp(r#"[{"match": "10.0.0.0/8:53", "verdict": "deny"}]"#).unwrap();
+        assert!(matches!(&rules[0].matcher, RouteMatcher::CidrPort(_, 53)));
+    }
+
+    #[test]
+    fn parse_udp_egress_names_its_own_table_in_an_error() {
+        // The operator has two tables to look in; the message must say which.
+        let err = parse_udp(r#"[{"match": "ntp.internal", "verdict": "allow"}]"#).unwrap_err();
+        assert!(
+            err.starts_with("egress.udp rule"),
+            "unexpected error: {err}"
+        );
+        let err = parse_udp(r#"{"match": "ntp.internal:123"}"#).unwrap_err();
+        assert_eq!(err, "egress.udp must be an array");
     }
 
     #[test]
