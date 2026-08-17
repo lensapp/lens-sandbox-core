@@ -27,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 
 use apollo_parser::{Parser, cst};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::http_body::BodyFraming;
 use crate::policy_schema::{GraphqlMatcher, GraphqlOperationType, GraphqlOperationTypeMatcher};
@@ -625,26 +625,11 @@ where
     // A client that was told to wait is waiting on us, and we hold the body it
     // has not sent yet. Answer so it sends. Clients must accept more than one
     // 1xx, so a later `100 Continue` from upstream is forwarded harmlessly.
-    if expects_continue(header_str) {
-        tls_client
-            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-            .await
-            .map_err(|err| format!("could not answer Expect: 100-continue: {err}"))?;
-    }
+    crate::http_body::answer_continue_if_expected(tls_client, header_str).await?;
 
     crate::http_body::read_body(tls_client, framing, crate::http_body::MAX_INSPECT_BYTES)
         .await
         .map_err(|err| err.to_string())
-}
-
-/// Whether the request head asks the proxy to confirm before the body is sent.
-fn expects_continue(header_block: &str) -> bool {
-    header_block.split("\r\n").skip(1).any(|line| {
-        let lower = line.to_ascii_lowercase();
-        lower
-            .strip_prefix("expect:")
-            .is_some_and(|value| value.trim() == "100-continue")
-    })
 }
 
 /// Confirm that a request head does not hide its body from inspection.

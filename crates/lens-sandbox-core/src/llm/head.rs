@@ -74,16 +74,32 @@ pub fn rewrite_for_backend(head: &str, redirect: &Redirect) -> String {
     let request_line = lines.next().unwrap_or_default();
     let translating = !translate::is_passthrough(redirect.translation);
 
+    let mut dropping = false;
     let mut out = String::with_capacity(head.len() + 64);
     out.push_str(&rewrite_request_line(request_line, &redirect.path));
     for line in lines {
+        // An obs-fold continuation belongs to the header above it and shares
+        // its fate. Kept on its own it would fold onto whichever header now
+        // precedes it, which for a dropped credential means part of the key
+        // crossing under another name.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if !dropping {
+                // RFC 9112 §5.2: a fold that goes on goes on as spaces. The
+                // CRLF form is deprecated, and the next hop may read it as
+                // something else or refuse the message for carrying it.
+                out.push(' ');
+                out.push_str(line.trim_start());
+            }
+            continue;
+        }
         // A line with no colon names nothing, matches no list, and survives.
         let name = line
             .split_once(':')
             .map(|(name, _)| name.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        if DROPPED.contains(&name.as_str()) || (translating && API_HEADERS.contains(&name.as_str()))
-        {
+        dropping = DROPPED.contains(&name.as_str())
+            || (translating && API_HEADERS.contains(&name.as_str()));
+        if dropping {
             continue;
         }
         out.push_str("\r\n");
@@ -287,6 +303,30 @@ mod tests {
             !dropped.to_ascii_lowercase().contains("openai-beta"),
             "{dropped}"
         );
+    }
+
+    #[test]
+    fn a_folded_credential_leaves_no_line_behind() {
+        // An obs-fold splits one header over two lines. Dropping only the first
+        // would leave the rest to fold onto `User-Agent`, and part of the key
+        // would reach the backend under that name.
+        let head = "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n\
+                    User-Agent: agent/1\r\nX-Api-Key: sk-\r\n\tant-real\r\nAccept: */*";
+        let out = rewrite_for_backend(head, &redirect("vllm.internal", 443, "/v1/chat"));
+        assert!(
+            !out.to_ascii_lowercase().contains("ant-real"),
+            "no part of the key may cross: {out}"
+        );
+        assert!(out.contains("User-Agent: agent/1"), "{out}");
+        assert!(out.contains("Accept: */*"), "{out}");
+    }
+
+    #[test]
+    fn a_folded_header_that_stays_goes_on_as_one_line() {
+        let head = "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n\
+                    User-Agent: agent/1\r\n (linux)";
+        let out = rewrite_for_backend(head, &redirect("vllm.internal", 443, "/v1/chat"));
+        assert!(out.contains("User-Agent: agent/1 (linux)"), "{out}");
     }
 
     #[test]

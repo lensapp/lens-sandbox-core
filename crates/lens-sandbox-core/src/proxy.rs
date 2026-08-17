@@ -1262,6 +1262,27 @@ async fn handle_connect(
 
     match effective_transport {
         Transport::Direct => {
+            // The re-sign path owns whatever it matches: it knows nothing of
+            // `llm` and delivers to the host the sandbox named. Going on would
+            // send the request to the API the redirect exists to keep it away
+            // from, signed. Said before the tunnel is established, so the client
+            // is refused rather than left holding an open connection. A claim
+            // this door cannot honour must never become one it ignores.
+            if state.intercept_for_llm(target_host) && state.aws_resign.matches(target_host) {
+                client
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    .await?;
+                // `error`, not `failure`: this is a misconfiguration and every
+                // occurrence of it should be visible. A `failure` is deduped per
+                // host, so the second attempt would leave no trace at all.
+                emit_audit(state, target_host, "error", 502, actor);
+                return Err(format!(
+                    "an llm route covers {target_host}, which the aws re-sign path also owns; \
+                     one connection cannot be both"
+                )
+                .into());
+            }
+
             client
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await?;
@@ -1367,6 +1388,17 @@ async fn handle_connect(
             }
         }
         Transport::Upstream => {
+            // Every branch below terminates the connection only where a CA
+            // already exists and splices it otherwise, and a redirect cannot
+            // survive a splice: it reaches the API the route exists to keep it
+            // away from. So the CA is made here if it has to be, exactly as the
+            // direct door makes it. In a sandbox it is there already — the
+            // policy message that carries the `llm` block installs one with it —
+            // and this only repairs a proxy that was given a route before one.
+            if state.intercept_for_llm(target_host) {
+                get_or_init_ca(state)?;
+            }
+
             let upstream_opt = state.upstream.lock().await.clone();
             let upstream = match upstream_opt {
                 Some(n) => n,
@@ -4633,6 +4665,96 @@ pub(crate) mod tests {
                 scheme: None,
                 binaries: None,
             });
+    }
+
+    /// Install one allow rule with `transport` for `domain`, and an `llm` route
+    /// that claims every request to it.
+    fn install_llm_route(state: &Arc<ProxyState>, domain: &str, transport: Transport) {
+        let llm = crate::llm::LlmRouting::from_policy(
+            &serde_json::from_str(&format!(
+                r#"{{
+                    "backends": [{{ "id": "b", "url": "https://vllm.internal/v1/chat/completions" }}],
+                    "routes": [{{ "match": {{ "domain": "{domain}", "path": "/v1/**" }},
+                        "translate": {{ "from": "anthropicMessages", "to": "openaiChat" }},
+                        "backend": "b" }}]
+                }}"#,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        apply_network_policy(
+            state,
+            NetworkPolicy {
+                default_verdict: Verdict::Allow,
+                default_transport: transport,
+                llm: Arc::new(llm),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Drive the CONNECT door and read what it answered the client.
+    async fn connect_answer(state: &Arc<ProxyState>, target: &'static str) -> (String, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_connect(server, target, &test_actor(), &state_for_handler).await
+        });
+
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the door answers rather than dialling")
+            .unwrap();
+        let reason = handler
+            .await
+            .unwrap()
+            .expect_err("the connection is refused")
+            .to_string();
+        (String::from_utf8_lossy(&buf[..n]).to_string(), reason)
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_an_llm_claim_the_aws_resign_path_would_swallow() {
+        // The re-sign path delivers to the host the sandbox named and knows
+        // nothing of `llm`. Letting it have the connection would send the
+        // request — signed — to the API the redirect exists to withhold it from.
+        let (state, mut rx) = test_state();
+        install_llm_route(&state, "bedrock.example.com", Transport::Direct);
+        state
+            .aws_resign
+            .update(Default::default(), vec!["bedrock.example.com".to_string()]);
+
+        let (answer, reason) = connect_answer(&state, "bedrock.example.com:443").await;
+        assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+        assert!(reason.contains("aws re-sign"), "{reason}");
+        let events = drain_audit_lines(&mut rx);
+        assert!(
+            events.iter().any(|ev| ev["result"] == "error"),
+            "every occurrence of a misconfiguration is recorded: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tunnelled_llm_claim_is_given_the_ca_it_needs() {
+        // Without one this branch splices the connection, and a spliced
+        // connection carries the request to the API the route claims it from.
+        let (state, _rx) = test_state();
+        install_llm_route(&state, "api.anthropic.com", Transport::Upstream);
+        assert!(
+            state.ephemeral_ca.get().is_none(),
+            "the fixture must start without one"
+        );
+
+        // No upstream is configured, so the connection ends there — after the
+        // door has decided what this route needs.
+        let _ = connect_answer(&state, "api.anthropic.com:443").await;
+        assert!(state.ephemeral_ca.get().is_some());
     }
 
     /// Drain everything currently on `rx` and decode as JSON, ignoring any

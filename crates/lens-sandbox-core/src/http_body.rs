@@ -15,7 +15,7 @@
 //! pipelined behind the request stay on the socket rather than being swallowed
 //! into a buffer this module would later drop.
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Largest request body buffered for policy inspection.
 ///
@@ -393,6 +393,41 @@ where
             return Err(BodyReadError::TooLarge);
         }
     }
+}
+
+/// Tell a client that said `Expect: 100-continue` to send its body.
+///
+/// Every door that reads a request body itself has to do this, and only those
+/// do. A door that forwards the body leaves the answer to the origin server; a
+/// door that reads the body has taken the origin's place, and until it replies
+/// the client holds the body back while the door waits for one that never comes.
+///
+/// Clients must accept more than one 1xx, so a later `100 Continue` forwarded
+/// from upstream does no harm.
+pub async fn answer_continue_if_expected<W>(
+    client: &mut W,
+    header_block: &str,
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    if !expects_continue(header_block) {
+        return Ok(());
+    }
+    client
+        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+        .await
+        .map_err(|err| format!("could not answer Expect: 100-continue: {err}"))
+}
+
+/// Whether a request head asks the proxy to confirm before the body is sent.
+fn expects_continue(header_block: &str) -> bool {
+    header_block.split("\r\n").skip(1).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("expect:")
+            .is_some_and(|value| value.trim() == "100-continue")
+    })
 }
 
 /// Read a message head, up to and including the blank line that ends it.

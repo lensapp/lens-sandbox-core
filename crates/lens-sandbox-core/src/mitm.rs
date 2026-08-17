@@ -654,6 +654,9 @@ struct RequestFacts<'a, 'c> {
     target_host: &'a str,
     method: &'a str,
     path: &'a str,
+    /// The whole request head, CRLF-joined. Read by the steps that have to
+    /// answer the client themselves rather than forward what it sent.
+    head: &'a str,
     is_tunnel: bool,
 }
 
@@ -761,6 +764,11 @@ where
     let body = match buffered_body.take() {
         Some(body) => body,
         None => {
+            if let Err(reason) =
+                crate::http_body::answer_continue_if_expected(tls_client, facts.head).await
+            {
+                return Err(facts.deny(tls_client, "llm_denied", &reason).await);
+            }
             match crate::http_body::read_body(tls_client, body_mode, crate::llm::MAX_LLM_BODY_BYTES)
                 .await
             {
@@ -891,6 +899,7 @@ async fn mitm_inject_after_accept(
         target_host,
         method,
         path,
+        head: &header_str,
         is_tunnel,
     };
 

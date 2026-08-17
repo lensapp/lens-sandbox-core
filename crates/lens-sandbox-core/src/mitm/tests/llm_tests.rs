@@ -89,6 +89,25 @@ const ANTHROPIC_BODY: &str =
 /// What an OpenAI-compatible backend answers with.
 const OPENAI_BODY: &str = r#"{"id":"chatcmpl-1","model":"qwen3-coder-30b","choices":[{"finish_reason":"stop","message":{"content":"hello"}}]}"#;
 
+/// The interim answer a client waiting on `Expect: 100-continue` reads.
+const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// Split a request that expects to be answered before it sends its body.
+///
+/// `None` when the head asks for no such answer, in which case the request goes
+/// out in one piece as any other does.
+fn split_at_continue(request: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?
+        + 4;
+    let (head, body) = request.split_at(end);
+    String::from_utf8_lossy(head)
+        .to_ascii_lowercase()
+        .contains("expect: 100-continue")
+        .then_some((head, body))
+}
+
 /// An Anthropic request carrying `body`, framed by its real length. Written
 /// here rather than spelled out so a fixture can never claim a length it does
 /// not have — a reader would wait for the rest of it forever.
@@ -104,6 +123,17 @@ fn anthropic_request(body: &str) -> Vec<u8> {
         body.len()
     )
     .into_bytes()
+}
+
+/// The same request, from a client that waits to be told to send its body.
+///
+/// `curl` writes this header on every POST body over a kilobyte, and an LLM
+/// request body is always over a kilobyte.
+fn anthropic_request_expecting_continue(body: &str) -> Vec<u8> {
+    let request = String::from_utf8(anthropic_request(body)).expect("the head is text");
+    request
+        .replacen("Host:", "Expect: 100-continue\r\nHost:", 1)
+        .into_bytes()
 }
 
 /// A backend answer carrying `body`, framed by its real length.
@@ -202,7 +232,25 @@ async fn run(
         let connector = TlsConnector::from(Arc::new(client_config));
         let server_name = ServerName::try_from(FRONT_HOST.to_string()).unwrap();
         let mut tls = connector.connect(server_name, stream).await.unwrap();
-        tls.write_all(&request).await.unwrap();
+        // A client that says `Expect: 100-continue` holds its body back until it
+        // is answered, which is the whole point of the header. Nothing else in
+        // the request tells the proxy to reply first, so nothing else here does.
+        match split_at_continue(&request) {
+            Some((head, body)) => {
+                tls.write_all(head).await.unwrap();
+                let mut interim = vec![0u8; CONTINUE.len()];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    tls.read_exact(&mut interim),
+                )
+                .await
+                .expect("the proxy holds the body it never asked for")
+                .unwrap();
+                assert_eq!(interim, CONTINUE, "{}", String::from_utf8_lossy(&interim));
+                tls.write_all(body).await.unwrap();
+            }
+            None => tls.write_all(&request).await.unwrap(),
+        }
         let mut response = Vec::new();
         let _ = tls.read_to_end(&mut response).await;
         String::from_utf8(response).unwrap()
@@ -313,6 +361,28 @@ async fn the_backend_receives_the_request_addressed_to_itself() {
         "{upstream}"
     );
     assert!(upstream.contains("Host: vllm.internal\r\n"), "{upstream}");
+}
+
+#[tokio::test]
+async fn a_client_that_waits_to_be_asked_for_its_body_is_asked() {
+    // The origin would have answered this. Reading the body here takes the
+    // origin's place, so the answer has to come from here too, or the client
+    // holds the body until it gives up and the request never happens.
+    let (upstream, _, _) = run(
+        ROUTES,
+        LLM,
+        anthropic_request_expecting_continue(ANTHROPIC_BODY),
+        openai_answer(OPENAI_BODY),
+        false,
+    )
+    .await
+    .served();
+    assert_eq!(body_of(&upstream)["messages"][0]["content"], "hi");
+    // The backend reads a body of its own length; it was never told to wait.
+    assert!(
+        !upstream.to_ascii_lowercase().contains("expect:"),
+        "{upstream}"
+    );
 }
 
 #[tokio::test]
