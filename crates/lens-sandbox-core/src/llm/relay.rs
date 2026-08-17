@@ -73,8 +73,9 @@ where
         raw.extend_from_slice(&part);
     }
 
-    // An empty or unreadable body still has to reach the sandbox as an answer it
-    // can parse, so the status alone becomes the error.
+    // An empty or unreadable body is null, and [`translate::response`] decides
+    // what to make of it: a refusal the status alone writes, or — where the
+    // status promised a completion — no answer at all.
     let parsed = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
     let translated = translate::response(redirect.translation, &parsed, status)?;
     let payload = serde_json::to_vec(&translated)?;
@@ -181,7 +182,7 @@ fn reason_phrase(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy_schema::LlmTranslation;
+    use crate::policy_schema::{LlmFormat, LlmTranslation};
 
     fn redirect(streaming: bool) -> Redirect {
         Redirect {
@@ -190,7 +191,10 @@ mod tests {
             path: "/v1/chat/completions".to_string(),
             body: Vec::new(),
             streaming,
-            translation: LlmTranslation::AnthropicMessagesToOpenaiChat,
+            translation: LlmTranslation {
+                from: LlmFormat::AnthropicMessages,
+                to: LlmFormat::OpenaiChat,
+            },
             model: "qwen3".to_string(),
         }
     }

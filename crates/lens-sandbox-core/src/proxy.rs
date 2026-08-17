@@ -4441,7 +4441,7 @@ pub(crate) mod tests {
                 r#"{
                     "backends": [{ "id": "b", "url": "https://vllm.internal/v1/chat/completions" }],
                     "routes": [{ "match": { "domain": "10.0.0.5", "path": "/v1/messages" },
-                        "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                        "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "b" }]
                 }"#,
             )
             .unwrap(),

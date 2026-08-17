@@ -2,34 +2,36 @@
 //!
 //! The formats themselves are `switchyard-translation`'s work: it decodes a
 //! provider's JSON into a neutral conversation, then encodes that conversation
-//! for the provider on the other side. This file owns the four things that crate
-//! leaves to its caller.
+//! for the provider on the other side. This file owns what that crate leaves to
+//! its caller.
 //!
-//! - Which pair of formats a route's [`LlmTranslation`] names, and which way
-//!   round each direction runs. A request goes sandbox → backend; the answer
-//!   comes back backend → sandbox.
+//! - Which way round each direction runs. A request goes sandbox → backend; the
+//!   answer comes back backend → sandbox.
 //! - The [`policy`] every translation runs under.
 //! - The model. The sandbox asked for one name and the backend serves another,
 //!   so the name the table resolved replaces whatever came out of the encoder.
-//! - A refusal. `switchyard-translation` translates answers, not error bodies,
-//!   so a backend that says no is dressed here in the error shape the sandbox
-//!   knows how to read.
+//! - A route that names one format twice, which translates nothing at all: no
+//!   field is added, dropped or renamed, and apart from the model the body says
+//!   what the sandbox wrote it to say.
+//!
+//! A refusal is written by [`super::refusal`], because the crate translates
+//! answers and not error bodies.
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use switchyard_translation::{
     DeterministicIdPolicy, LossyConversionPolicy, PreservationPolicy, TargetCapabilities,
     TranslationDiagnostic, TranslationEngine, TranslationPolicy, UnknownFieldPolicy, WireFormat,
 };
 
-use crate::policy_schema::LlmTranslation;
+use super::refusal;
+use crate::policy_schema::{LlmFormat, LlmTranslation};
 
-/// The formats a route joins: what the sandbox speaks, and what the backend
-/// speaks.
-fn formats(translation: LlmTranslation) -> (WireFormat, WireFormat) {
-    match translation {
-        LlmTranslation::AnthropicMessagesToOpenaiChat => {
-            (WireFormat::AnthropicMessages, WireFormat::OpenAiChat)
-        }
+/// The name `switchyard-translation` knows a format by.
+pub fn wire(format: LlmFormat) -> WireFormat {
+    match format {
+        LlmFormat::AnthropicMessages => WireFormat::AnthropicMessages,
+        LlmFormat::OpenaiChat => WireFormat::OpenAiChat,
+        LlmFormat::OpenaiResponses => WireFormat::OpenAiResponses,
     }
 }
 
@@ -74,34 +76,42 @@ fn report(diagnostics: &[TranslationDiagnostic]) {
     }
 }
 
-/// The formats one streamed answer is translated between: backend first, because
-/// that is the direction an answer travels.
-pub fn answer_formats(translation: LlmTranslation) -> (WireFormat, WireFormat) {
-    let (sandbox, backend) = formats(translation);
-    (backend, sandbox)
+/// Whether a route changes the wire format at all.
+pub fn is_passthrough(translation: LlmTranslation) -> bool {
+    translation.from == translation.to
 }
 
 /// Translate the sandbox's request into the one the backend is sent, asking it
 /// for `model`.
 pub fn request(translation: LlmTranslation, request: &Value, model: &str) -> Result<Value, String> {
-    let (sandbox, backend) = formats(translation);
-    let translated = TranslationEngine::default()
-        .translate_request(sandbox, backend, request, &policy())
-        .map_err(|e| format!("this request does not translate to the backend's format: {e}"))?;
-    report(&translated.diagnostics);
-    let mut body = translated.body;
+    let mut body = if is_passthrough(translation) {
+        request.clone()
+    } else {
+        let translated = TranslationEngine::default()
+            .translate_request(
+                wire(translation.from),
+                wire(translation.to),
+                request,
+                &policy(),
+            )
+            .map_err(|e| format!("this request does not translate to the backend's format: {e}"))?;
+        report(&translated.diagnostics);
+        translated.body
+    };
     let object = body
         .as_object_mut()
         .ok_or("the translated request is not a JSON object")?;
 
     // Whatever the sandbox asked for, the backend serves the model the table
-    // resolved for it.
+    // resolved for it. This is the one edit a passthrough route also makes.
     object.insert("model".to_string(), json!(model));
 
-    // The sandbox asked Anthropic, which reports usage on every stream. OpenAI
-    // reports it only when asked, and the answer has to carry what the sandbox
-    // is waiting for.
-    if backend == WireFormat::OpenAiChat
+    // Anthropic and Responses report usage on every stream; Chat reports it only
+    // when asked, and the answer has to carry what the sandbox is waiting for. A
+    // sandbox already speaking Chat asked for what it wanted, so this adds
+    // nothing to a request it wrote itself.
+    if translation.to == LlmFormat::OpenaiChat
+        && !is_passthrough(translation)
         && object.get("stream").and_then(Value::as_bool) == Some(true)
     {
         object.insert(
@@ -123,60 +133,48 @@ pub fn response(
     response: &Value,
     status: u16,
 ) -> Result<Value, String> {
-    if !(200..300).contains(&status) {
-        return Ok(match translation {
-            LlmTranslation::AnthropicMessagesToOpenaiChat => anthropic_refusal(response, status),
-        });
+    // A body that could not be read is [`Value::Null`] by the time it gets here.
+    // On a status that promised no completion it is the refusal that matters, so
+    // the status alone writes it. On a status that promised one, there is no
+    // answer to hand back and saying so is the only honest reading.
+    if response.is_null() {
+        if (200..300).contains(&status) {
+            return Err(format!(
+                "the backend answered {status} with a body that is not an answer"
+            ));
+        }
+        return Ok(refusal::write(translation.from, response, status));
     }
-    let (backend, sandbox) = answer_formats(translation);
+    if is_passthrough(translation) {
+        // The answer is already in the format the sandbox reads, a refusal as
+        // much as a completion, so it is handed back as it came. Rewriting it
+        // would drop what only the backend knows — an OpenAI `code` that clients
+        // branch on, a `param`, a request id.
+        return Ok(response.clone());
+    }
+    if !(200..300).contains(&status) {
+        return Ok(refusal::write(translation.from, response, status));
+    }
     let translated = TranslationEngine::default()
-        .translate_response(backend, sandbox, response, &policy())
+        .translate_response(
+            wire(translation.to),
+            wire(translation.from),
+            response,
+            &policy(),
+        )
         .map_err(|e| format!("the backend's answer does not translate: {e}"))?;
     report(&translated.diagnostics);
     Ok(translated.body)
-}
-
-/// A backend's refusal as the Anthropic error the sandbox knows how to read.
-///
-/// An OpenAI error body reaching a sandbox that speaks Anthropic reads as a
-/// malformed answer, which is the one thing a failing request should never look
-/// like.
-fn anthropic_refusal(response: &Value, status: u16) -> Value {
-    let message = response
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("llm backend returned status {status}"));
-
-    let mut body = Map::new();
-    body.insert("type".to_string(), json!("error"));
-    body.insert(
-        "error".to_string(),
-        json!({ "type": anthropic_error_type(status), "message": message }),
-    );
-    Value::Object(body)
-}
-
-/// The Anthropic error type for an HTTP status.
-fn anthropic_error_type(status: u16) -> &'static str {
-    match status {
-        400 => "invalid_request_error",
-        401 => "authentication_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        529 => "overloaded_error",
-        _ => "api_error",
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ANTHROPIC_TO_OPENAI: LlmTranslation = LlmTranslation::AnthropicMessagesToOpenaiChat;
+    const ANTHROPIC_TO_OPENAI: LlmTranslation = LlmTranslation {
+        from: LlmFormat::AnthropicMessages,
+        to: LlmFormat::OpenaiChat,
+    };
 
     fn parse(json: &str) -> Value {
         serde_json::from_str(json).expect("fixture parses")
@@ -381,6 +379,234 @@ mod tests {
             !wire.contains("EroBCkYIAxgCKkBmw"),
             "the redacted record must not become part of the prompt: {wire}"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // Every pair a policy can name
+    // ----------------------------------------------------------------------
+
+    const FORMATS: [LlmFormat; 3] = [
+        LlmFormat::AnthropicMessages,
+        LlmFormat::OpenaiChat,
+        LlmFormat::OpenaiResponses,
+    ];
+
+    /// The same one-turn conversation, written the way each format writes it.
+    fn one_turn(format: LlmFormat) -> Value {
+        match format {
+            LlmFormat::AnthropicMessages => parse(
+                r#"{ "model": "m", "max_tokens": 64,
+                     "messages": [{ "role": "user", "content": "weather?" }] }"#,
+            ),
+            LlmFormat::OpenaiChat => parse(
+                r#"{ "model": "m", "max_completion_tokens": 64,
+                     "messages": [{ "role": "user", "content": "weather?" }] }"#,
+            ),
+            LlmFormat::OpenaiResponses => {
+                parse(r#"{ "model": "m", "max_output_tokens": 64, "input": "weather?" }"#)
+            }
+        }
+    }
+
+    #[test]
+    fn every_pair_of_formats_carries_one_turn() {
+        for from in FORMATS {
+            for to in FORMATS {
+                let translation = LlmTranslation { from, to };
+                let out = request(translation, &one_turn(from), "served-by")
+                    .unwrap_or_else(|e| panic!("{from:?} -> {to:?}: {e}"));
+                assert_eq!(out["model"], "served-by", "{from:?} -> {to:?}");
+                assert!(
+                    serde_json::to_string(&out)
+                        .expect("request serializes")
+                        .contains("weather?"),
+                    "{from:?} -> {to:?} lost the turn: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_openai_sandbox_reaches_an_anthropic_backend() {
+        let out = request(
+            LlmTranslation {
+                from: LlmFormat::OpenaiChat,
+                to: LlmFormat::AnthropicMessages,
+            },
+            &parse(
+                r#"{ "model": "gpt-4o", "max_completion_tokens": 64,
+                     "messages": [
+                        { "role": "system", "content": "be brief" },
+                        { "role": "user", "content": "weather?" }] }"#,
+            ),
+            "claude-opus-5",
+        )
+        .expect("request translates");
+
+        assert_eq!(out["model"], "claude-opus-5");
+        // Anthropic lifts the system turn out of the conversation.
+        assert_eq!(out["system"], "be brief");
+        assert_eq!(out["max_tokens"], 64);
+        assert_eq!(out["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn a_route_that_names_one_format_twice_changes_only_the_model() {
+        let sent = parse(
+            r#"{ "model": "claude-opus-5", "max_tokens": 64, "metadata": { "user_id": "u1" },
+                 "messages": [{ "role": "user", "content": "hi" }] }"#,
+        );
+        let out = request(
+            LlmTranslation {
+                from: LlmFormat::AnthropicMessages,
+                to: LlmFormat::AnthropicMessages,
+            },
+            &sent,
+            "claude-opus-5-eu",
+        )
+        .expect("request crosses");
+
+        let mut expected = sent.clone();
+        expected["model"] = json!("claude-opus-5-eu");
+        assert_eq!(out, expected, "a passthrough route rewrites nothing else");
+    }
+
+    #[test]
+    fn only_a_translated_chat_request_is_asked_for_usage() {
+        // A sandbox already speaking Chat asked for what it wanted.
+        let streamed = parse(r#"{ "model": "m", "stream": true, "messages": [] }"#);
+        let passthrough = request(
+            LlmTranslation {
+                from: LlmFormat::OpenaiChat,
+                to: LlmFormat::OpenaiChat,
+            },
+            &streamed,
+            "m",
+        )
+        .expect("request crosses");
+        assert!(passthrough.get("stream_options").is_none(), "{passthrough}");
+    }
+
+    #[test]
+    fn a_passthrough_answer_crosses_untouched() {
+        let answered = parse(r#"{ "id": "msg_1", "type": "message", "vendor_extra": true }"#);
+        let out = response(
+            LlmTranslation {
+                from: LlmFormat::AnthropicMessages,
+                to: LlmFormat::AnthropicMessages,
+            },
+            &answered,
+            200,
+        )
+        .expect("answer crosses");
+        assert_eq!(out, answered);
+    }
+
+    #[test]
+    fn a_passthrough_refusal_keeps_what_only_the_backend_knows() {
+        // An OpenAI client branches on `code`, and the translated shape has none
+        // to give it.
+        let refused = parse(
+            r#"{ "error": { "message": "you ran out", "type": "insufficient_quota",
+                 "code": "insufficient_quota", "param": null } }"#,
+        );
+        let out = response(
+            LlmTranslation {
+                from: LlmFormat::OpenaiChat,
+                to: LlmFormat::OpenaiChat,
+            },
+            &refused,
+            429,
+        )
+        .expect("refusal crosses");
+        assert_eq!(out, refused);
+    }
+
+    #[test]
+    fn a_passthrough_backend_that_said_nothing_readable_still_says_something() {
+        let out = response(
+            LlmTranslation {
+                from: LlmFormat::OpenaiChat,
+                to: LlmFormat::OpenaiChat,
+            },
+            &Value::Null,
+            502,
+        )
+        .expect("refusal is written");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("502"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_success_carrying_no_answer_is_not_reported_as_one() {
+        // Handing back an error body under a 200 would tell the sandbox the call
+        // succeeded and the model refused, and neither happened.
+        for translation in [
+            ANTHROPIC_TO_OPENAI,
+            LlmTranslation {
+                from: LlmFormat::OpenaiChat,
+                to: LlmFormat::OpenaiChat,
+            },
+        ] {
+            let out = response(translation, &Value::Null, 200);
+            assert!(out.is_err(), "{translation:?}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn an_anthropic_answer_reaches_an_openai_sandbox() {
+        let out = response(
+            LlmTranslation {
+                from: LlmFormat::OpenaiChat,
+                to: LlmFormat::AnthropicMessages,
+            },
+            &parse(
+                r#"{ "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5",
+                     "content": [{ "type": "text", "text": "5 degrees" }],
+                     "stop_reason": "end_turn",
+                     "usage": { "input_tokens": 9, "output_tokens": 3 } }"#,
+            ),
+            200,
+        )
+        .expect("answer translates");
+
+        assert_eq!(out["object"], "chat.completion");
+        assert_eq!(out["choices"][0]["message"]["content"], "5 degrees");
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+        assert_eq!(out["usage"]["prompt_tokens"], 9);
+        assert_eq!(out["usage"]["completion_tokens"], 3);
+    }
+
+    #[test]
+    fn a_refusal_is_written_in_the_format_the_sandbox_reads() {
+        let body = parse(r#"{ "error": { "message": "no such model" } }"#);
+        let anthropic = response(
+            LlmTranslation {
+                from: LlmFormat::AnthropicMessages,
+                to: LlmFormat::OpenaiChat,
+            },
+            &body,
+            400,
+        )
+        .expect("error translates");
+        assert_eq!(anthropic["type"], "error");
+
+        let openai = response(
+            LlmTranslation {
+                from: LlmFormat::OpenaiChat,
+                to: LlmFormat::AnthropicMessages,
+            },
+            &body,
+            400,
+        )
+        .expect("error translates");
+        assert!(openai.get("type").is_none());
+        assert_eq!(openai["error"]["message"], "no such model");
     }
 
     // ----------------------------------------------------------------------

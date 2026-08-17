@@ -50,19 +50,25 @@ pub fn decide(routing: &LlmRouting, host: &str, path: &str, body: &[u8]) -> Outc
         return Outcome::Untouched;
     };
 
-    if let Some(missing) = missing_capability(&request, &backend.capabilities) {
+    let reader = inspect::reader(route.translation.from);
+    if let Some(missing) = missing_capability(reader, &request, &backend.capabilities) {
         return Outcome::Refused(format!(
             "llm backend {:?} does not support {missing}, and the request needs it",
             backend.id
         ));
     }
-    if let Some(block) = inspect::unsupported_block(&request) {
+    // Only a route that rewrites the body can misrepresent it. A route that
+    // names one format twice carries every part the sandbox wrote, whether this
+    // proxy understands it or not, so there is nothing here to refuse.
+    if !translate::is_passthrough(route.translation)
+        && let Some(part) = reader.unsupported_part(&request)
+    {
         // The name is quoted back from the request, so it is capped for the same
         // reason the model name above is.
-        let block: String = block.chars().take(64).collect();
+        let part: String = part.chars().take(64).collect();
         return Outcome::Refused(format!(
-            "anthropic content block {block:?} has no translation, and dropping it would send \
-             the backend a different request from the one the sandbox wrote"
+            "this request carries {part:?}, which has no translation, and dropping it would \
+             send the backend a different request from the one the sandbox wrote"
         ));
     }
 
@@ -73,8 +79,12 @@ pub fn decide(routing: &LlmRouting, host: &str, path: &str, body: &[u8]) -> Outc
 }
 
 /// The first capability the request needs and the backend does not declare.
-fn missing_capability(request: &Value, capabilities: &LlmCapabilities) -> Option<&'static str> {
-    let needs = inspect::requirements(request);
+fn missing_capability(
+    reader: &dyn inspect::Reader,
+    request: &Value,
+    capabilities: &LlmCapabilities,
+) -> Option<&'static str> {
+    let needs = reader.requirements(request);
     if needs.tools && !capabilities.tools {
         return Some("tools");
     }
@@ -122,7 +132,7 @@ mod tests {
         }],
         "routes": [{
             "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-            "translate": "anthropicMessagesToOpenaiChat",
+            "translate": { "from": "anthropicMessages", "to": "openaiChat" },
             "backend": "local"
         }]
     }"#;
@@ -181,7 +191,7 @@ mod tests {
             "backends": [{ "id": "b", "url": "https://x.internal/v1/chat/completions" }],
             "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/messages",
                 "model": "claude-haiku-*" },
-                "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "b" }]
         }"#;
         let outcome = decide_body(
             policy,
@@ -222,7 +232,7 @@ mod tests {
             "backends": [{ "id": "b", "url": "https://x.internal/v1/chat/completions",
                 "capabilities": { "tools": false } }],
             "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-                "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "b" }]
         }"#;
         let outcome = decide_body(
             policy,
@@ -242,7 +252,7 @@ mod tests {
             "backends": [{ "id": "b", "url": "https://x.internal/v1/chat/completions",
                 "capabilities": { "images": false } }],
             "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-                "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "b" }]
         }"#;
         let outcome = decide_body(
             policy,
@@ -268,6 +278,30 @@ mod tests {
                 "tools":[{"name":"w","input_schema":{}}]}"#,
         );
         assert!(matches!(outcome, Outcome::Redirect(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_route_that_translates_nothing_carries_what_a_translation_could_not() {
+        // The same `document` block the route below refuses. Nothing rewrites it
+        // here, so there is nothing to misrepresent and nothing to refuse.
+        let policy = r#"{
+            "backends": [{ "id": "b", "url": "https://x.internal/v1/messages" }],
+            "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
+                "translate": { "from": "anthropicMessages", "to": "anthropicMessages" },
+                "backend": "b" }]
+        }"#;
+        let outcome = decide_body(
+            policy,
+            "api.anthropic.com",
+            "/v1/messages",
+            r#"{"model":"claude-opus-5","messages":[{"role":"user","content":[
+                {"type":"document","source":{}}]}]}"#,
+        );
+        let Outcome::Redirect(redirect) = outcome else {
+            panic!("expected a redirect, got {outcome:?}");
+        };
+        let body: Value = serde_json::from_slice(&redirect.body).expect("body is JSON");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "document");
     }
 
     #[test]

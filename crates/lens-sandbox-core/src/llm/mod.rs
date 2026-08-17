@@ -14,10 +14,13 @@
 //! - [`table`] holds the policy: which requests are claimed, which backend
 //!   serves them, and which model name it is asked for.
 //! - [`inspect`] reads the request the sandbox sent, which is what decides the
-//!   route and what the backend has to be able to do.
+//!   route and what the backend has to be able to do. It has one reader per
+//!   format a sandbox may speak.
 //! - [`translate`] and [`stream`] change the wire format, one for a whole body
-//!   and one for an event stream. Both delegate the formats themselves to
-//!   `switchyard-translation`.
+//!   and one for an event stream, and [`refusal`] writes the error body a
+//!   failing backend earns. The formats themselves are delegated to
+//!   `switchyard-translation`; every pair it knows is a route a policy can name,
+//!   including a pair that names one format twice and so translates nothing.
 //! - [`head`] rewrites the request head for the backend, and [`relay`] carries
 //!   the answer back.
 //!
@@ -29,6 +32,7 @@
 pub mod decide;
 pub mod head;
 pub mod inspect;
+pub mod refusal;
 pub mod relay;
 pub mod stream;
 pub mod table;

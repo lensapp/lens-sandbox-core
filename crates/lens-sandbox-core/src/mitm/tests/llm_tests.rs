@@ -77,7 +77,7 @@ const LLM: &str = r#"{
     }],
     "routes": [{
         "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-        "translate": "anthropicMessagesToOpenaiChat",
+        "translate": { "from": "anthropicMessages", "to": "openaiChat" },
         "backend": "local"
     }]
 }"#;
@@ -451,7 +451,7 @@ async fn a_request_the_backend_cannot_serve_is_refused() {
         }],
         "routes": [{
             "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-            "translate": "anthropicMessagesToOpenaiChat",
+            "translate": { "from": "anthropicMessages", "to": "openaiChat" },
             "backend": "local"
         }]
     }"#;
@@ -502,4 +502,65 @@ async fn a_streamed_request_comes_back_as_anthropic_events() {
     assert!(client.contains(r#""text":"hel""#), "{client}");
     assert!(client.contains(r#""text":"lo""#), "{client}");
     assert!(client.contains("event: message_stop"), "{client}");
+}
+
+#[tokio::test]
+async fn a_route_that_translates_nothing_still_swaps_the_backend_and_the_key() {
+    // The most ordinary use of the block: keep the protocol, change who serves
+    // it. Nothing about the body may move.
+    const PASSTHROUGH_ROUTES: &str = r#"[
+        { "match": "api.anthropic.com", "verdict": "allow", "transport": "direct",
+          "tlsTerminate": true, "rules": [{ "method": "POST", "path": "/v1/messages" }] },
+        { "match": "vllm.internal", "verdict": "allow", "transport": "direct",
+          "tlsTerminate": true, "rules": [{ "method": "POST", "path": "/v1/messages" }] }
+    ]"#;
+    const PASSTHROUGH_LLM: &str = r#"{
+        "backends": [{ "id": "mirror", "url": "https://vllm.internal/v1/messages" }],
+        "routes": [{
+            "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
+            "translate": { "from": "anthropicMessages", "to": "anthropicMessages" },
+            "backend": "mirror"
+        }]
+    }"#;
+    const ANSWER: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+
+    let (upstream, client, _) = run(
+        PASSTHROUGH_ROUTES,
+        PASSTHROUGH_LLM,
+        anthropic_request(ANTHROPIC_BODY),
+        openai_answer(ANSWER),
+        false,
+    )
+    .await
+    .served();
+
+    // The request reached the backend, addressed to it and holding its key.
+    assert!(
+        upstream.starts_with("POST /v1/messages HTTP/1.1\r\n"),
+        "{upstream}"
+    );
+    assert!(upstream.contains("Host: vllm.internal\r\n"), "{upstream}");
+    assert!(
+        upstream.contains("Authorization: Bearer real-vllm-key"),
+        "{upstream}"
+    );
+    assert!(!upstream.contains("sk-ant-sandbox-key"), "{upstream}");
+    // This backend serves the very API the sandbox addressed, so the version it
+    // named describes the backend just as well and travels with the request.
+    assert!(
+        upstream.contains("anthropic-version: 2023-06-01"),
+        "{upstream}"
+    );
+
+    // And it reached it word for word, because no model map renamed anything.
+    assert_eq!(
+        body_of(&upstream),
+        serde_json::from_str::<serde_json::Value>(ANTHROPIC_BODY).expect("body is JSON")
+    );
+
+    // The answer came back the same way.
+    assert_eq!(
+        body_of(&client),
+        serde_json::from_str::<serde_json::Value>(ANSWER).expect("answer is JSON")
+    );
 }
