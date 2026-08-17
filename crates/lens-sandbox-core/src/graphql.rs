@@ -31,6 +31,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::http_body::BodyFraming;
 use crate::policy_schema::{GraphqlMatcher, GraphqlOperationType, GraphqlOperationTypeMatcher};
+use crate::routing::glob_matches;
 
 /// Recursion depth the document parser accepts. A document nested deeper than
 /// this is refused rather than parsed, so a deeply nested selection cannot cost
@@ -655,38 +656,6 @@ pub fn ensure_body_is_readable(header_block: &str) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Match `text` against a pattern in which `*` stands for any run of
-/// characters, including none. Every other character matches itself.
-///
-/// Field and operation names have no separator to respect, so `*` spans the
-/// whole name — unlike a path glob, where a wildcard stops at `/`.
-pub(crate) fn glob_matches(pattern: &str, text: &str) -> bool {
-    // `split` always yields at least one part, so `first` is the literal head
-    // the text must open with.
-    let mut parts = pattern.split('*');
-    let first = parts.next().unwrap_or(pattern);
-    let Some(mut rest) = text.strip_prefix(first) else {
-        return false;
-    };
-
-    // Every part but the last may sit anywhere after the one before it; the
-    // last must land at the end.
-    let mut pending: Option<&str> = None;
-    for part in parts {
-        if let Some(previous) = pending.replace(part) {
-            match rest.find(previous) {
-                Some(at) => rest = &rest[at + previous.len()..],
-                None => return false,
-            }
-        }
-    }
-    match pending {
-        // No `*` at all: the whole pattern had to match exactly.
-        None => rest.is_empty(),
-        Some(last) => rest.ends_with(last),
-    }
 }
 
 #[cfg(test)]

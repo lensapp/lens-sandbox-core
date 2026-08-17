@@ -983,6 +983,45 @@ pub fn normalize_path(path: &str) -> String {
     format!("/{}", segments.join("/"))
 }
 
+/// Match a name against a pattern in which `*` stands for any run of
+/// characters, including none. Every other character matches itself.
+///
+/// The plainest of the three matchers here, for names with no structure to
+/// respect: a GraphQL field, an LLM model. `*` spans the whole name, unlike
+/// [`path_glob_matches`], where a wildcard stops at a `/`, and unlike
+/// [`domain_matches`], which reads a leading `*.` as a label.
+///
+/// Each literal between two stars is taken at the first place it appears, which
+/// is both correct and cheap. Trying every split point instead would be correct
+/// too, and would cost a power of the name's length in the number of stars — on
+/// names that arrive in a request body.
+pub fn glob_matches(pattern: &str, name: &str) -> bool {
+    // `split` always yields at least one part, so this is the literal head the
+    // name must open with.
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+
+    // Every part but the last may sit anywhere after the one before it; the
+    // last must land at the end.
+    let mut pending: Option<&str> = None;
+    for part in parts {
+        if let Some(previous) = pending.replace(part) {
+            match rest.find(previous) {
+                Some(at) => rest = &rest[at + previous.len()..],
+                None => return false,
+            }
+        }
+    }
+    match pending {
+        // No `*` at all: the whole pattern had to match exactly.
+        None => rest.is_empty(),
+        Some(last) => rest.ends_with(last),
+    }
+}
+
 /// Match a URL path against a glob pattern.
 /// Supports: exact match, `*` (single segment or empty with trailing slash), and `**` (any depth).
 /// Examples:

@@ -124,6 +124,30 @@ impl LlmDestination {
     }
 }
 
+/// What the credential gate shows a developer, and what a denial of it is
+/// recorded under.
+///
+/// It names where the credential is going, which on a redirected request is not
+/// where the sandbox addressed it. The credentials the gate is asking about were
+/// collected for the backend, so a prompt naming the API the sandbox asked for
+/// would show a developer one host and have them approve a key for another. The
+/// success record is free to keep naming the sandbox's own destination — it says
+/// where the request went in its metadata, and nobody decides anything from it.
+fn gate_action(
+    method: &str,
+    target_host: &str,
+    path: &str,
+    destination: Option<&LlmDestination>,
+) -> String {
+    match destination {
+        Some(destination) => format!(
+            "{method} {}{}",
+            destination.authority, destination.redirect.path
+        ),
+        None => format!("{method} {target_host}{path}"),
+    }
+}
+
 /// Handle a MITM connection: terminate TLS from the client,
 /// inject credential headers into the first HTTP request,
 /// and forward to the upstream using the specified `UpstreamMode`.
@@ -1043,7 +1067,7 @@ async fn mitm_inject_after_accept(
     let matches = scan_for_unarmed_placeholders(ctx.state, &scan_target);
     if !matches.is_empty() {
         let state = ctx.state;
-        let action = format!("{method} {target_host}{path}");
+        let action = gate_action(method, target_host, path, destination.as_ref());
 
         let mut deny_record: Option<(String, &'static str)> = None;
         for m in &matches {
@@ -1088,6 +1112,21 @@ async fn mitm_inject_after_accept(
                 "credential gate denied — failing held request closed"
             );
             if let Some(tx) = ctx.audit_tx {
+                let mut metadata = serde_json::json!({
+                    "host": target_host,
+                    "mitm": true,
+                    "tunnel": is_tunnel,
+                    "credential_gate_denied": true,
+                    "credential_id": credential_id,
+                    "reason": reason,
+                });
+                // The action names the backend, and every other field here names
+                // the host the sandbox asked for. Say which is which, as the
+                // success record does, or a denial cannot be found by either.
+                if let (Some(destination), Some(object)) = (&destination, metadata.as_object_mut())
+                {
+                    object.insert("llm_backend".into(), destination.authority.clone().into());
+                }
                 let event = serde_json::json!({
                     "type": "audit_event",
                     "source": "sandbox-proxy",
@@ -1097,14 +1136,7 @@ async fn mitm_inject_after_accept(
                     "path": path,
                     "result": "failure",
                     "status_code": 403,
-                    "metadata": {
-                        "host": target_host,
-                        "mitm": true,
-                        "tunnel": is_tunnel,
-                        "credential_gate_denied": true,
-                        "credential_id": credential_id,
-                        "reason": reason,
-                    }
+                    "metadata": metadata,
                 });
                 send_audit(tx, event, ctx.actor);
             }
@@ -1678,6 +1710,57 @@ mod tests {
             .unwrap()
             .insert(placeholder.to_string(), credential_id.to_string());
         state
+    }
+
+    /// A redirect to `host:port`, built the way `apply_llm_route` builds one so
+    /// a test can never assert a string production does not produce.
+    fn llm_destination(host: &str, port: u16, path: &str) -> LlmDestination {
+        let redirect = crate::llm::Redirect {
+            host: host.to_string(),
+            port,
+            path: path.to_string(),
+            body: Vec::new(),
+            streaming: false,
+            translation: crate::policy_schema::LlmTranslation {
+                from: crate::policy_schema::LlmFormat::AnthropicMessages,
+                to: crate::policy_schema::LlmFormat::OpenaiChat,
+            },
+            model: "qwen3".to_string(),
+        };
+        LlmDestination {
+            authority: redirect.authority(),
+            redirect: Box::new(redirect),
+            injections: Vec::new(),
+            placeholders: Vec::new(),
+            http_rules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_credential_gate_names_the_host_the_credential_is_for() {
+        // A developer reads this string and approves a key from it. On a
+        // redirected request the key is the backend's, so naming the API the
+        // sandbox asked for would put the wrong host in front of the decision.
+        // The port is part of the name, and on a non-default one it is the
+        // difference between two hosts.
+        let redirected = llm_destination("vllm.internal", 443, "/v1/chat/completions");
+        assert_eq!(
+            gate_action(
+                "POST",
+                "api.anthropic.com",
+                "/v1/messages",
+                Some(&redirected)
+            ),
+            "POST vllm.internal:443/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn an_unredirected_gate_names_where_the_sandbox_asked() {
+        assert_eq!(
+            gate_action("GET", "api.github.com", "/issues", None),
+            "GET api.github.com/issues"
+        );
     }
 
     #[test]
