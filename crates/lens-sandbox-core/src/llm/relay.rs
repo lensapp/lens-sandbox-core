@@ -17,7 +17,7 @@
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use super::{MAX_LLM_BODY_BYTES, Redirect, stream::StreamTranslator, translate};
+use super::{MAX_LLM_BODY_BYTES, Redirect, refusal, stream::StreamTranslator, translate};
 use crate::http_body::{ResponseBody, determine_response_framing, read_head};
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -29,6 +29,22 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 /// sandbox a successful call that never happened.
 const STREAMING_STATUS: u16 = 200;
 
+/// The media type an event stream is written in. A backend may answer a
+/// streamed request with a whole completion — some ignore `stream` entirely —
+/// and reading that as a stream would find no events in it and hand the sandbox
+/// a successful, empty answer.
+const STREAMING_TYPE: &str = "text/event-stream";
+
+/// The status a failure of this proxy's own is reported under. The backend
+/// answered; what it said could not be carried across, and a gateway that
+/// cannot carry an answer it did receive is a bad gateway.
+const UNCARRIED_STATUS: u16 = 502;
+
+/// More interim answers than a server has any reason to send. Each one is
+/// bounded in size but not in number, and a backend that sends them without end
+/// would otherwise hold this task for as long as it cared to.
+const MAX_INTERIM_HEADS: usize = 16;
+
 /// Read the backend's answer, translate it, and write it to the sandbox.
 pub async fn forward_translated<C, U>(
     client: &mut C,
@@ -39,18 +55,47 @@ where
     C: AsyncWrite + Unpin,
     U: AsyncRead + Unpin,
 {
-    let head_bytes = read_head(upstream).await?;
-    let head = String::from_utf8_lossy(&head_bytes).into_owned();
-    let status = parse_status(&head).ok_or("llm backend sent a malformed status line")?;
+    let (head, status) = final_head(upstream).await?;
     let mut body = ResponseBody::new(determine_response_framing(&head));
 
-    if redirect.streaming && status == STREAMING_STATUS {
+    if redirect.streaming && status == STREAMING_STATUS && is_event_stream(&head) {
         stream_answer(client, upstream, &mut body, redirect).await?;
     } else {
         whole_answer(client, upstream, &mut body, status, redirect).await?;
     }
     client.shutdown().await.ok();
     Ok(())
+}
+
+/// Read heads until one of them is the answer.
+///
+/// A server may send any number of 1xx heads before the one that answers
+/// (RFC 9110 §15.2), and `103 Early Hints` in front of a completion is now
+/// ordinary. Each carries no body, so reading one as the answer would leave the
+/// true answer on the socket to be read as that answer's body.
+async fn final_head<U>(upstream: &mut U) -> Result<(String, u16), Failure>
+where
+    U: AsyncRead + Unpin,
+{
+    for _ in 0..MAX_INTERIM_HEADS {
+        let head_bytes = read_head(upstream).await?;
+        let head = String::from_utf8_lossy(&head_bytes).into_owned();
+        let status = parse_status(&head).ok_or("llm backend sent a malformed status line")?;
+        if !(100..200).contains(&status) {
+            return Ok((head, status));
+        }
+    }
+    Err("llm backend sent nothing but interim answers".into())
+}
+
+/// Whether a response head says its body is an event stream.
+fn is_event_stream(head: &str) -> bool {
+    head.split("\r\n").skip(1).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("content-type:")
+            .is_some_and(|value| value.trim_start().starts_with(STREAMING_TYPE))
+    })
 }
 
 /// Translate a whole answer and send it with its length.
@@ -66,9 +111,11 @@ where
     U: AsyncRead + Unpin,
 {
     let mut raw = Vec::new();
+    let mut answer = Ok(());
     while let Some(part) = body.next(upstream).await? {
         if raw.len() + part.len() > MAX_LLM_BODY_BYTES {
-            return Err("llm backend answer exceeds the translation limit".into());
+            answer = Err("llm backend answer exceeds the translation limit".to_string());
+            break;
         }
         raw.extend_from_slice(&part);
     }
@@ -76,9 +123,30 @@ where
     // An empty or unreadable body is null, and [`translate::response`] decides
     // what to make of it: a refusal the status alone writes, or — where the
     // status promised a completion — no answer at all.
-    let parsed = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
-    let translated = translate::response(redirect.translation, &parsed, status)?;
-    let payload = serde_json::to_vec(&translated)?;
+    let answer = answer.and_then(|()| {
+        let parsed = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+        translate::response(redirect.translation, &parsed, status)
+    });
+
+    // Nothing has been written yet, so a failure here is still answerable — and
+    // it has to be answered. The sandbox would otherwise read a closed socket,
+    // which says a network fault where what happened is that this proxy could
+    // not carry what the backend said.
+    let (status, answer) = match answer {
+        Ok(answer) => (status, answer),
+        Err(reason) => {
+            tracing::warn!(%reason, "llm backend answer could not be carried to the sandbox");
+            (
+                UNCARRIED_STATUS,
+                refusal::write(
+                    redirect.translation.from,
+                    &serde_json::json!({ "error": { "message": reason } }),
+                    UNCARRIED_STATUS,
+                ),
+            )
+        }
+    };
+    let payload = serde_json::to_vec(&answer)?;
 
     client
         .write_all(
@@ -321,6 +389,66 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_with_an_unreadable_body_still_answers() {
         let answer = fixed_answer("HTTP/1.1 502 Bad Gateway", "text/html", "<html>nope</html>");
+        let out = relayed(&answer, false).await;
+        let (head, body) = split(&out);
+        assert!(head.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{head}");
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "api_error");
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_did_not_stream_is_not_read_as_a_stream() {
+        // Some servers ignore `stream` and answer with a whole completion. Read
+        // as a stream it holds no events, and the sandbox would be handed a
+        // successful answer with nothing in it.
+        let answer = fixed_answer(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"hello"}}]}"#,
+        );
+        let out = relayed(&answer, true).await;
+        let (head, body) = split(&out);
+        assert!(!head.contains("text/event-stream"), "{head}");
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+        assert_eq!(parsed["content"][0]["text"], "hello");
+    }
+
+    #[tokio::test]
+    async fn an_early_hint_is_not_mistaken_for_the_answer() {
+        // A 103 carries no body, so reading it as the answer would leave the
+        // true answer on the socket to be read as that answer's body.
+        let answer = format!(
+            "HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n{}",
+            fixed_answer(
+                "HTTP/1.1 200 OK",
+                "application/json",
+                r#"{"choices":[{"finish_reason":"stop","message":{"content":"hello"}}]}"#,
+            )
+        );
+        let out = relayed(&answer, false).await;
+        let (head, body) = split(&out);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+        assert_eq!(parsed["content"][0]["text"], "hello");
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_only_ever_hints_is_given_up_on() {
+        let answer = "HTTP/1.1 103 Early Hints\r\n\r\n".repeat(MAX_INTERIM_HEADS + 1);
+        let mut upstream = std::io::Cursor::new(answer.into_bytes());
+        let mut client = Vec::new();
+        let failure = forward_translated(&mut client, &mut upstream, &redirect(false))
+            .await
+            .expect_err("the relay gives up");
+        assert!(failure.to_string().contains("interim"), "{failure}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_this_proxy_cannot_carry_is_still_an_answer() {
+        // A 200 whose body is not one. Closing the connection here would tell
+        // the sandbox a network fault, which is not what happened.
+        let answer = fixed_answer("HTTP/1.1 200 OK", "text/html", "<html>nope</html>");
         let out = relayed(&answer, false).await;
         let (head, body) = split(&out);
         assert!(head.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{head}");

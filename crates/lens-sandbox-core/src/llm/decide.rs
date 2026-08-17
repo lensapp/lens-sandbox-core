@@ -29,6 +29,13 @@ pub fn decide(routing: &LlmRouting, host: &str, path: &str, body: &[u8]) -> Outc
     if !routing.claims(host, path) {
         return Outcome::Untouched;
     }
+    // A request with no body is no request this table can translate. One route
+    // may cover a whole API — `GET /v1/models` sits under the same `/v1/**` a
+    // route claims — and the HTTP rules on this host have judged it already.
+    // They are where a policy says which paths may be reached at all.
+    if body.is_empty() {
+        return Outcome::Untouched;
+    }
     let Ok(request) = serde_json::from_slice::<Value>(body) else {
         return Outcome::Refused(
             "an llm route covers this request, but its body is not JSON and cannot be translated"
@@ -213,6 +220,21 @@ mod tests {
             panic!("expected a refusal, got {outcome:?}");
         };
         assert!(reason.contains("model name"), "{reason}");
+    }
+
+    #[test]
+    fn a_request_with_no_body_is_left_alone() {
+        // `GET /v1/models` under a route that claims the whole of `/v1`. There
+        // is nothing here to translate, and the route rules on this host have
+        // already said whether it may be asked at all.
+        let policy = r#"{
+            "backends": [{ "id": "b", "url": "https://x.internal/v1/chat/completions" }],
+            "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/**" },
+                "translate": { "from": "anthropicMessages", "to": "openaiChat" },
+                "backend": "b" }]
+        }"#;
+        let outcome = decide_body(policy, "api.anthropic.com", "/v1/models", "");
+        assert!(matches!(outcome, Outcome::Untouched), "{outcome:?}");
     }
 
     #[test]
