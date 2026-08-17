@@ -1,5 +1,7 @@
-//! HTTP/1.1 request body framing: how much of the stream belongs to this
-//! request, and how to buffer and re-frame it.
+//! HTTP/1.1 body framing: how much of the stream belongs to this message, and
+//! how to buffer and re-frame it. Requests are the main subject; a response is
+//! framed by [`determine_response_framing`] and read by [`ResponseBody`], for
+//! the caller that has to see an answer rather than splice it.
 //!
 //! Both proxy doors read a request head one byte at a time up to the
 //! terminating `\r\n\r\n`, so when policy runs the body is always still on the
@@ -23,6 +25,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 /// fail open.
 pub const MAX_INSPECT_BYTES: usize = 64 * 1024;
 
+/// Largest message head [`read_head`] will read. A head is metadata; one that
+/// keeps growing is a stream that will never reach its blank line.
+pub const MAX_HEAD_BYTES: usize = 64 * 1024;
+
 /// Cap on a single chunked framing line (chunk size, or one trailer field).
 /// Framing lines are short by construction; the cap stops a stream that never
 /// sends its CRLF from growing the buffer without bound.
@@ -43,6 +49,137 @@ pub enum BodyFraming {
     Fixed(u64),
     /// Body is HTTP/1.1 chunked transfer encoding.
     Chunked,
+}
+
+/// HTTP/1.1 *response* body framing. Same three shapes a request has, plus the
+/// one only a response can take: a body whose end is the end of the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFraming {
+    /// Body is exactly N bytes (`Content-Length`).
+    Fixed(u64),
+    /// Body is HTTP/1.1 chunked transfer encoding.
+    Chunked,
+    /// Body runs until the connection closes.
+    UntilClose,
+}
+
+/// Reads a response body a piece at a time, whatever its framing.
+///
+/// Exists for the caller that has to *see* a body rather than splice it, and
+/// cannot wait for the end of it to start: a streamed answer is read, rewritten,
+/// and passed on while the origin is still sending. Each [`next`](Self::next)
+/// call returns the next run of decoded body bytes, and `None` once the body is
+/// over. Chunk framing is consumed, never returned.
+pub struct ResponseBody {
+    framing: ResponseFraming,
+    /// Bytes of a `Fixed` body still to come.
+    remaining: u64,
+    done: bool,
+}
+
+/// How much of an unframed or fixed-length body one read asks for.
+const READ_CHUNK_BYTES: usize = 16 * 1024;
+
+impl ResponseBody {
+    pub fn new(framing: ResponseFraming) -> Self {
+        Self {
+            framing,
+            remaining: match framing {
+                ResponseFraming::Fixed(n) => n,
+                _ => 0,
+            },
+            done: false,
+        }
+    }
+
+    /// The next run of body bytes, or `None` at the end of the body.
+    pub async fn next<R>(&mut self, reader: &mut R) -> Result<Option<Vec<u8>>, BodyReadError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        if self.done {
+            return Ok(None);
+        }
+        match self.framing {
+            ResponseFraming::Fixed(_) => self.next_fixed(reader).await,
+            ResponseFraming::Chunked => self.next_chunk(reader).await,
+            ResponseFraming::UntilClose => self.next_until_close(reader).await,
+        }
+    }
+
+    async fn next_fixed<R>(&mut self, reader: &mut R) -> Result<Option<Vec<u8>>, BodyReadError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        if self.remaining == 0 {
+            self.done = true;
+            return Ok(None);
+        }
+        let want = self.remaining.min(READ_CHUNK_BYTES as u64) as usize;
+        let mut buf = vec![0u8; want];
+        let read = reader
+            .read(&mut buf)
+            .await
+            .map_err(|_| BodyReadError::Malformed("body ended before Content-Length"))?;
+        if read == 0 {
+            return Err(BodyReadError::Malformed("body ended before Content-Length"));
+        }
+        buf.truncate(read);
+        self.remaining -= read as u64;
+        Ok(Some(buf))
+    }
+
+    async fn next_chunk<R>(&mut self, reader: &mut R) -> Result<Option<Vec<u8>>, BodyReadError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let size_line = read_framing_line(reader).await?;
+        let size_token = size_line.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_token, 16)
+            .map_err(|_| BodyReadError::Malformed("invalid chunked body chunk size"))?;
+
+        if size == 0 {
+            for _ in 0..MAX_TRAILER_LINES {
+                if read_framing_line(reader).await?.is_empty() {
+                    self.done = true;
+                    return Ok(None);
+                }
+            }
+            return Err(BodyReadError::Malformed("too many chunked body trailers"));
+        }
+
+        let mut buf = vec![0u8; size];
+        reader
+            .read_exact(&mut buf)
+            .await
+            .map_err(|_| BodyReadError::Malformed("chunked body ended mid-chunk"))?;
+        if !read_framing_line(reader).await?.is_empty() {
+            return Err(BodyReadError::Malformed(
+                "chunked body chunk missing terminating CRLF",
+            ));
+        }
+        Ok(Some(buf))
+    }
+
+    async fn next_until_close<R>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<Vec<u8>>, BodyReadError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut buf = vec![0u8; READ_CHUNK_BYTES];
+        let read = reader
+            .read(&mut buf)
+            .await
+            .map_err(|_| BodyReadError::Malformed("body ended before the connection did"))?;
+        if read == 0 {
+            self.done = true;
+            return Ok(None);
+        }
+        buf.truncate(read);
+        Ok(Some(buf))
+    }
 }
 
 /// Why a request body could not be buffered for inspection.
@@ -83,11 +220,41 @@ impl std::error::Error for BodyReadError {}
 /// HTTP/1.1 framing rules (RFC 9112 §6.3):
 /// 1. If `Transfer-Encoding` is present and ends with `chunked` → chunked.
 /// 2. Else if `Content-Length` is a non-negative integer → fixed length.
-/// 3. Else, request method conventions: HEAD/GET/DELETE/OPTIONS/TRACE have no
-///    body; POST/PUT/PATCH/etc. without explicit framing default to no body
-///    too (a server is allowed to reject those, but we shouldn't pump bytes
-///    of unknown length to upstream where they'd outlive our session).
-pub fn determine_body_framing(header_block: &str, method: &str) -> BodyFraming {
+/// 3. Else there is no body, whatever the method. A server is allowed to reject
+///    a `POST` sent that way, but we must not pump bytes of unknown length to
+///    upstream where they would outlive our session — so the method is not
+///    consulted, and this function does not take one.
+pub fn determine_body_framing(header_block: &str) -> BodyFraming {
+    match declared_framing(header_block) {
+        DeclaredFraming::Chunked => BodyFraming::Chunked,
+        DeclaredFraming::Fixed(n) => BodyFraming::Fixed(n),
+        DeclaredFraming::Absent => BodyFraming::None,
+    }
+}
+
+/// Determine HTTP/1.1 *response* body framing from a response head.
+///
+/// Reads the same two headers as [`determine_body_framing`] and differs in one
+/// thing, which is the whole difference between the two directions: a response
+/// that declares no framing does not have an empty body, it has a body that
+/// ends when the connection does (RFC 9112 §6.3, item 8).
+pub fn determine_response_framing(header_block: &str) -> ResponseFraming {
+    match declared_framing(header_block) {
+        DeclaredFraming::Chunked => ResponseFraming::Chunked,
+        DeclaredFraming::Fixed(n) => ResponseFraming::Fixed(n),
+        DeclaredFraming::Absent => ResponseFraming::UntilClose,
+    }
+}
+
+/// What a head's framing headers declare, before either direction's
+/// no-framing convention is applied.
+enum DeclaredFraming {
+    Chunked,
+    Fixed(u64),
+    Absent,
+}
+
+fn declared_framing(header_block: &str) -> DeclaredFraming {
     let mut content_length: Option<u64> = None;
     for line in header_block.split("\r\n").skip(1) {
         if line.is_empty() {
@@ -97,10 +264,10 @@ pub fn determine_body_framing(header_block: &str, method: &str) -> BodyFraming {
         if let Some(rest) = lower.strip_prefix("transfer-encoding:") {
             // Per RFC, the last coding listed is the outer one. If chunked is
             // present anywhere we treat it as chunked — a chunked-with-extras
-            // request is rare and the safest thing is to switch to chunk
-            // parsing rather than blindly forwarding bytes by length.
+            // message is rare and the safest thing is to switch to chunk
+            // parsing rather than blindly moving bytes by length.
             if rest.contains("chunked") {
-                return BodyFraming::Chunked;
+                return DeclaredFraming::Chunked;
             }
         } else if let Some(rest) = lower.strip_prefix("content-length:")
             && let Ok(n) = rest.trim().parse::<u64>()
@@ -108,15 +275,7 @@ pub fn determine_body_framing(header_block: &str, method: &str) -> BodyFraming {
             content_length = Some(n);
         }
     }
-    if let Some(n) = content_length {
-        return BodyFraming::Fixed(n);
-    }
-    match method.to_ascii_uppercase().as_str() {
-        "GET" | "HEAD" | "DELETE" | "OPTIONS" | "TRACE" | "CONNECT" => BodyFraming::None,
-        // Methods that conventionally carry a body but were sent without
-        // framing — treat as empty rather than forwarding indefinite bytes.
-        _ => BodyFraming::None,
-    }
+    content_length.map_or(DeclaredFraming::Absent, DeclaredFraming::Fixed)
 }
 
 /// Read this request's body in full so a policy rule can match on it.
@@ -195,10 +354,22 @@ where
 }
 
 /// Read one CRLF-terminated framing line, returning it without the CRLF.
-///
-/// Reads a byte at a time so that neither chunk payload nor a pipelined second
-/// request is consumed along with the line.
 async fn read_framing_line<R>(reader: &mut R) -> Result<String, BodyReadError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut line = read_crlf_line(reader).await?;
+    line.truncate(line.len() - 2);
+    String::from_utf8(line)
+        .map_err(|_| BodyReadError::Malformed("invalid UTF-8 in chunked body framing"))
+}
+
+/// Read one CRLF-terminated line, returning it *with* the terminator, so a
+/// caller relaying framing verbatim can write back exactly what it read.
+///
+/// Reads a byte at a time so that neither a payload nor a pipelined second
+/// request is consumed along with the line.
+pub async fn read_crlf_line<R>(reader: &mut R) -> Result<Vec<u8>, BodyReadError>
 where
     R: AsyncRead + Unpin,
 {
@@ -208,19 +379,47 @@ where
         let read = reader
             .read(&mut byte)
             .await
-            .map_err(|_| BodyReadError::Malformed("chunked body ended before its terminator"))?;
+            .map_err(|_| BodyReadError::Malformed("stream ended before the end of a line"))?;
         if read == 0 {
             return Err(BodyReadError::Malformed(
-                "chunked body ended before its terminator",
+                "stream ended before the end of a line",
             ));
         }
         line.push(byte[0]);
         if line.ends_with(b"\r\n") {
-            line.truncate(line.len() - 2);
-            return String::from_utf8(line)
-                .map_err(|_| BodyReadError::Malformed("invalid UTF-8 in chunked body framing"));
+            return Ok(line);
         }
         if line.len() > MAX_FRAMING_LINE_BYTES {
+            return Err(BodyReadError::TooLarge);
+        }
+    }
+}
+
+/// Read a message head, up to and including the blank line that ends it.
+///
+/// Reads a byte at a time for the same reason every other reader here does: the
+/// body must still be on the socket when policy runs.
+pub async fn read_head<R>(reader: &mut R) -> Result<Vec<u8>, BodyReadError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut head = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    loop {
+        let read = reader
+            .read(&mut byte)
+            .await
+            .map_err(|_| BodyReadError::Malformed("stream ended before the end of the head"))?;
+        if read == 0 {
+            return Err(BodyReadError::Malformed(
+                "stream ended before the end of the head",
+            ));
+        }
+        head.push(byte[0]);
+        if head.len() >= 4 && head[head.len() - 4..] == *b"\r\n\r\n" {
+            return Ok(head);
+        }
+        if head.len() > MAX_HEAD_BYTES {
             return Err(BodyReadError::TooLarge);
         }
     }
@@ -270,32 +469,32 @@ mod tests {
     #[test]
     fn get_with_no_framing_has_no_body() {
         let req = "GET / HTTP/1.1\r\nHost: x\r\n";
-        assert_eq!(determine_body_framing(req, "GET"), BodyFraming::None);
+        assert_eq!(determine_body_framing(req), BodyFraming::None);
     }
 
     #[test]
     fn content_length_gives_fixed_framing() {
         let req = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\n";
-        assert_eq!(determine_body_framing(req, "POST"), BodyFraming::Fixed(42));
+        assert_eq!(determine_body_framing(req), BodyFraming::Fixed(42));
     }
 
     #[test]
     fn chunked_takes_precedence_over_content_length() {
         let req =
             "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 42\r\nTransfer-Encoding: chunked\r\n";
-        assert_eq!(determine_body_framing(req, "POST"), BodyFraming::Chunked);
+        assert_eq!(determine_body_framing(req), BodyFraming::Chunked);
     }
 
     #[test]
     fn chunked_detection_is_case_insensitive() {
         let req = "POST / HTTP/1.1\r\nHost: x\r\nTRANSFER-ENCODING: Chunked\r\n";
-        assert_eq!(determine_body_framing(req, "POST"), BodyFraming::Chunked);
+        assert_eq!(determine_body_framing(req), BodyFraming::Chunked);
     }
 
     #[test]
     fn post_without_framing_is_treated_as_no_body() {
         let req = "POST / HTTP/1.1\r\nHost: x\r\n";
-        assert_eq!(determine_body_framing(req, "POST"), BodyFraming::None);
+        assert_eq!(determine_body_framing(req), BodyFraming::None);
     }
 
     #[tokio::test]
@@ -407,6 +606,43 @@ mod tests {
             .await
             .expect_err("non-hex chunk size should fail");
         assert!(matches!(err, BodyReadError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn a_head_is_read_up_to_its_blank_line_and_no_further() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nbody-after";
+        let mut stream = std::io::Cursor::new(&raw[..]);
+        let head = read_head(&mut stream).await.expect("head reads");
+        assert_eq!(head, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        // The body stays on the stream for whoever frames it.
+        assert_eq!(&raw[stream.position() as usize..], b"body-after");
+    }
+
+    #[tokio::test]
+    async fn a_head_that_never_ends_is_malformed() {
+        let mut stream = std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec());
+        let err = read_head(&mut stream)
+            .await
+            .expect_err("an unterminated head should fail");
+        assert!(matches!(err, BodyReadError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn a_head_over_the_cap_is_refused() {
+        let mut oversized = vec![b'x'; MAX_HEAD_BYTES + 1];
+        oversized.extend_from_slice(b"\r\n\r\n");
+        let mut stream = std::io::Cursor::new(oversized);
+        let err = read_head(&mut stream).await.expect_err("cap should refuse");
+        assert_eq!(err, BodyReadError::TooLarge);
+    }
+
+    #[tokio::test]
+    async fn a_line_is_returned_with_its_terminator() {
+        let raw = b"1a;ext=1\r\npayload";
+        let mut stream = std::io::Cursor::new(&raw[..]);
+        let line = read_crlf_line(&mut stream).await.expect("line reads");
+        assert_eq!(line, b"1a;ext=1\r\n");
+        assert_eq!(&raw[stream.position() as usize..], b"payload");
     }
 
     #[test]

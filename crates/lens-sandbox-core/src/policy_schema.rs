@@ -44,6 +44,147 @@ pub struct PolicyDocument {
     /// Files written into the sandbox before execution.
     #[serde(default)]
     pub files: Option<Vec<TempFile>>,
+
+    /// Optional LLM routing: send a request the sandbox addressed to one LLM
+    /// API to a different backend, and translate the wire format on the way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmPolicy>,
+}
+
+/// Where LLM requests go, and what they are translated into.
+///
+/// This block **redirects, it does not grant**. The backend host is an ordinary
+/// destination: it still needs its own [`Egress::http`] rule, and the request
+/// still passes every rule on that route. It also names no credential — the
+/// [`credentials`](PolicyDocument::credentials) list stays the one place that
+/// decides what a host is sent. A redirect drops the credential the sandbox
+/// wrote and injects the backend's own, so the key for the API the agent
+/// thought it called never reaches the backend.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmPolicy {
+    /// The backends routes can name. Every [`LlmRoute::backend`] must name one
+    /// of these; an unknown id fails the policy.
+    #[serde(default)]
+    pub backends: Vec<LlmBackend>,
+
+    /// Ordered routes, first match wins.
+    #[serde(default)]
+    pub routes: Vec<LlmRoute>,
+}
+
+/// One LLM backend: where the request goes, and what model it asks for there.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmBackend {
+    /// Identifier a route points at.
+    pub id: String,
+
+    /// Full `https://host[:port]/path` URL of the backend endpoint. The scheme
+    /// must be `https`: the proxy re-encrypts to the backend, and a plain-HTTP
+    /// backend would carry the injected credential in the clear.
+    pub url: String,
+
+    /// Ordered model-name rules, first match wins. Each entry maps the model the
+    /// sandbox asked for to the model this backend serves. A name no entry
+    /// covers is sent unchanged — many OpenAI-compatible servers serve one model
+    /// and ignore the field.
+    #[serde(default)]
+    pub model_map: Vec<LlmModelMapping>,
+
+    /// What this backend accepts. A request that needs more than it declares is
+    /// denied, not quietly cut down: an agent that asked for tools and got prose
+    /// cannot tell the difference between a backend that has none and a model
+    /// that chose not to use them.
+    #[serde(default)]
+    pub capabilities: LlmCapabilities,
+}
+
+/// One first-match-wins model-name rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LlmModelMapping {
+    /// Glob over the model name the sandbox asked for (`claude-haiku-*`, `*`).
+    #[serde(rename = "match")]
+    pub match_pattern: String,
+
+    /// Model name to ask the backend for.
+    pub model: String,
+}
+
+/// The parts of a request a backend can serve. Every field defaults to true, so
+/// an omitted `capabilities` block promises a backend that accepts everything —
+/// which is what an OpenAI-compatible frontier model does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmCapabilities {
+    /// The backend can be given tools and can call them.
+    #[serde(default = "enabled")]
+    pub tools: bool,
+
+    /// The backend accepts images in a message.
+    #[serde(default = "enabled")]
+    pub images: bool,
+}
+
+fn enabled() -> bool {
+    true
+}
+
+impl Default for LlmCapabilities {
+    fn default() -> Self {
+        Self {
+            tools: true,
+            images: true,
+        }
+    }
+}
+
+/// A single first-match-wins LLM route.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmRoute {
+    /// The requests this route claims.
+    #[serde(rename = "match")]
+    pub match_request: LlmRouteMatch,
+
+    /// The translation applied to the request and to the answer.
+    pub translate: LlmTranslation,
+
+    /// [`LlmBackend::id`] of the backend that serves these requests.
+    pub backend: String,
+
+    /// Human-readable description of this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The requests one [`LlmRoute`] claims. Every field that is set must match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LlmRouteMatch {
+    /// Host the sandbox addressed, as a domain pattern (`api.anthropic.com`,
+    /// `*.anthropic.com`).
+    pub domain: String,
+
+    /// URL path glob, matched exactly as [`HttpRule::path`] is.
+    pub path: String,
+
+    /// Glob over the model name in the request body. Omit to claim every model
+    /// the domain and path cover — which is how one route sends a whole API to
+    /// one backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// The wire translations the proxy can perform. Each names the format the
+/// sandbox speaks and the format the backend speaks, in that order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum LlmTranslation {
+    /// Anthropic Messages (`POST /v1/messages`) into OpenAI Chat Completions
+    /// (`POST /v1/chat/completions`), and the answer back again.
+    AnthropicMessagesToOpenaiChat,
 }
 
 /// Network policy controlling what the sandbox can reach.
