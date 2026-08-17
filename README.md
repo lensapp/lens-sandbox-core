@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lensapp/lens-sandbox-core/actions/workflows/ci.yml/badge.svg)](https://github.com/lensapp/lens-sandbox-core/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](crates/lens-sandbox-core/Cargo.toml)
+[![Rust 1.96.1+](https://img.shields.io/badge/rust-1.96.1%2B-orange.svg)](crates/lens-sandbox-core/Cargo.toml)
 
 `lens-sandbox-core` is the Rust library used by Lens Sandbox and Lens Agents to enforce governed network, DNS, proxy, credential, and policy behavior inside sandboxed execution environments.
 

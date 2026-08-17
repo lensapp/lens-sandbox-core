@@ -320,7 +320,7 @@ async fn the_backend_receives_the_request_in_its_own_format() {
     let (upstream, _, _) = redirected().await.served();
     let body = body_of(&upstream);
     assert_eq!(body["model"], "qwen3-coder-30b");
-    assert_eq!(body["max_tokens"], 64);
+    assert_eq!(body["max_completion_tokens"], 64);
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(body["messages"][0]["content"], "hi");
 }

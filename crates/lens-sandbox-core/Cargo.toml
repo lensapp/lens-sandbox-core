@@ -2,7 +2,7 @@
 name = "lens-sandbox-core"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96.1"
 license = "Apache-2.0"
 description = "Core library for Lens sandbox runtime — proxy, MITM, nftables lockdown, policy handling"
 repository = "https://github.com/lensapp/lens-sandbox-core"
@@ -31,6 +31,7 @@ sha2 = "0.10"
 hex = "0.4"
 hickory-proto = "0.26"
 apollo-parser = "0.8.6"
+switchyard-translation = "0.2"
 
 # AF_VSOCK and NFQUEUE are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]

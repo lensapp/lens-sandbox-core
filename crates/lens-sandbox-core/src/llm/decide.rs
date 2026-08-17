@@ -7,12 +7,14 @@
 //! 1. The model name is read first, because a route may be scoped to one.
 //! 2. Capabilities are checked before anything is translated, so a request the
 //!    backend cannot serve is refused rather than half-rewritten.
-//! 3. Only then is the body translated.
+//! 3. So is every content block, because a translation drops what it cannot
+//!    carry and this proxy refuses it instead.
+//! 4. Only then is the body translated.
 
 use serde_json::Value;
 
 use super::table::{Backend, LlmRouting};
-use super::{Outcome, Redirect, anthropic_request};
+use super::{Outcome, Redirect, inspect, translate};
 use crate::policy_schema::{LlmCapabilities, LlmTranslation};
 
 /// Longest model name the table will match a glob against. Real names are a few
@@ -34,7 +36,7 @@ pub fn decide(routing: &LlmRouting, host: &str, path: &str, body: &[u8]) -> Outc
         );
     };
 
-    let requested_model = anthropic_request::model_of(&request);
+    let requested_model = inspect::model_of(&request);
     // A model name is a name. Every glob in the table is matched against this
     // string, so an arbitrarily long one turns a 4 MB body into proxy time.
     if requested_model.len() > MAX_MODEL_NAME_BYTES {
@@ -54,8 +56,17 @@ pub fn decide(routing: &LlmRouting, host: &str, path: &str, body: &[u8]) -> Outc
             backend.id
         ));
     }
+    if let Some(block) = inspect::unsupported_block(&request) {
+        // The name is quoted back from the request, so it is capped for the same
+        // reason the model name above is.
+        let block: String = block.chars().take(64).collect();
+        return Outcome::Refused(format!(
+            "anthropic content block {block:?} has no translation, and dropping it would send \
+             the backend a different request from the one the sandbox wrote"
+        ));
+    }
 
-    match translate(route.translation, &request, backend) {
+    match redirect(route.translation, &request, backend) {
         Ok(redirect) => Outcome::Redirect(Box::new(redirect)),
         Err(reason) => Outcome::Refused(reason),
     }
@@ -63,7 +74,7 @@ pub fn decide(routing: &LlmRouting, host: &str, path: &str, body: &[u8]) -> Outc
 
 /// The first capability the request needs and the backend does not declare.
 fn missing_capability(request: &Value, capabilities: &LlmCapabilities) -> Option<&'static str> {
-    let needs = anthropic_request::requirements(request);
+    let needs = inspect::requirements(request);
     if needs.tools && !capabilities.tools {
         return Some("tools");
     }
@@ -74,27 +85,23 @@ fn missing_capability(request: &Value, capabilities: &LlmCapabilities) -> Option
 }
 
 /// Apply a route's translation, producing the request that goes to the backend.
-fn translate(
+fn redirect(
     translation: LlmTranslation,
     request: &Value,
     backend: &Backend,
 ) -> Result<Redirect, String> {
-    match translation {
-        LlmTranslation::AnthropicMessagesToOpenaiChat => {
-            let model = backend.model_for(anthropic_request::model_of(request));
-            let translated = anthropic_request::translate(request, &model)?;
-            Ok(Redirect {
-                host: backend.host.clone(),
-                port: backend.port,
-                path: backend.path.clone(),
-                body: serde_json::to_vec(&translated)
-                    .map_err(|e| format!("translated llm request is not serializable: {e}"))?,
-                streaming: anthropic_request::is_streaming(request),
-                translation,
-                model,
-            })
-        }
-    }
+    let model = backend.model_for(inspect::model_of(request));
+    let translated = translate::request(translation, request, &model)?;
+    Ok(Redirect {
+        host: backend.host.clone(),
+        port: backend.port,
+        path: backend.path.clone(),
+        body: serde_json::to_vec(&translated)
+            .map_err(|e| format!("translated llm request is not serializable: {e}"))?,
+        streaming: inspect::is_streaming(request),
+        translation,
+        model,
+    })
 }
 
 #[cfg(test)]

@@ -13,9 +13,11 @@
 //!   order they are correct in.
 //! - [`table`] holds the policy: which requests are claimed, which backend
 //!   serves them, and which model name it is asked for.
-//! - [`anthropic_request`] and [`openai_response`] / [`openai_stream`] are the
-//!   wire translations, one per direction. They are pure functions over JSON,
-//!   and every one of them is tested against a recorded payload.
+//! - [`inspect`] reads the request the sandbox sent, which is what decides the
+//!   route and what the backend has to be able to do.
+//! - [`translate`] and [`stream`] change the wire format, one for a whole body
+//!   and one for an event stream. Both delegate the formats themselves to
+//!   `switchyard-translation`.
 //! - [`head`] rewrites the request head for the backend, and [`relay`] carries
 //!   the answer back.
 //!
@@ -24,13 +26,13 @@
 //! through the same policy-aware egress path as any other destination, and sent
 //! only the credentials the policy binds to *it*.
 
-pub mod anthropic_request;
 pub mod decide;
 pub mod head;
-pub mod openai_response;
-pub mod openai_stream;
+pub mod inspect;
 pub mod relay;
+pub mod stream;
 pub mod table;
+pub mod translate;
 
 pub use decide::decide;
 pub use table::LlmRouting;
