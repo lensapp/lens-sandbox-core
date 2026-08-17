@@ -7,7 +7,7 @@
 //! failure rather than a request-time surprise.
 
 use crate::policy_schema::{LlmBackend, LlmCapabilities, LlmPolicy, LlmRoute, LlmTranslation};
-use crate::routing::{domain_matches, path_glob_matches};
+use crate::routing::{domain_matches, glob_matches, path_glob_matches};
 
 /// The LLM policy, resolved and ready to match requests against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -241,29 +241,6 @@ fn hostname_of(host: &str) -> &str {
     }
 }
 
-/// Whether a `*`-glob covers a value.
-///
-/// Model names are not hostnames and not paths, so neither of the crate's other
-/// two matchers fits: `claude-*` must cover `claude-opus-5` without the dot
-/// rules `domain_matches` applies, and without the `/` segments
-/// `path_glob_matches` counts. `*` stands for any run of characters, anywhere,
-/// as many times as the pattern uses it.
-pub(crate) fn glob_matches(pattern: &str, value: &str) -> bool {
-    match pattern.split_once('*') {
-        None => pattern == value,
-        Some((prefix, rest)) => {
-            let Some(tail) = value.strip_prefix(prefix) else {
-                return false;
-            };
-            // The `*` can stand for any run, so every split point is a candidate.
-            tail.char_indices()
-                .map(|(idx, _)| &tail[idx..])
-                .chain(std::iter::once(""))
-                .any(|suffix| glob_matches(rest, suffix))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +304,17 @@ mod tests {
         // pattern demands the name *end* there.
         assert!(!glob_matches("a*b", "abc"));
         assert!(glob_matches("a*b", "axxb"));
+    }
+
+    #[test]
+    fn a_pattern_of_many_stars_costs_no_more_than_one() {
+        // The model name is written by the sandbox, capped by `decide` at 256
+        // bytes, and rewritten as often as it likes. Trying every split point
+        // for every star would take longer than the rest of the request by
+        // orders of magnitude.
+        let name = "a".repeat(256);
+        assert!(!glob_matches("*a*a*a*a*a*a*a*b", &name));
+        assert!(glob_matches("*a*a*a*a*a*a*a*a", &name));
     }
 
     // ----------------------------------------------------------------------
