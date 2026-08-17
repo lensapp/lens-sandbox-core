@@ -656,6 +656,19 @@ fn resolve_default_verdict_transport(
     (effective_verdict, transport)
 }
 
+/// Read the policy's `llm` block into the table the proxy enforces.
+///
+/// An absent block is the ordinary case and yields an empty table. Every other
+/// failure is the caller's cue to fail the policy closed.
+fn parse_llm_routing(value: &serde_json::Value) -> Result<crate::llm::LlmRouting, String> {
+    if value.is_null() {
+        return Ok(crate::llm::LlmRouting::default());
+    }
+    let policy: crate::policy_schema::LlmPolicy =
+        serde_json::from_value(value.clone()).map_err(|e| format!("llm: {e}"))?;
+    crate::llm::LlmRouting::from_policy(&policy)
+}
+
 /// Parse and apply a policy message. Returns the env vars for the session handler,
 /// or a version mismatch if the sandbox protocol date is too old.
 async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> PolicyResult {
@@ -675,6 +688,11 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         env: Option<HashMap<String, String>>,
         #[serde(default)]
         credentials: Option<Vec<crate::policy_schema::Credential>>,
+        /// Kept loose for the reason `network.egress` is: a malformed block must
+        /// fail closed, not abort the typed parse and leave the previous policy
+        /// installed.
+        #[serde(default)]
+        llm: serde_json::Value,
         #[serde(default)]
         files: Option<Vec<crate::protocol::TempFile>>,
     }
@@ -866,22 +884,34 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     // network policy. Routes with a `forward` field carry mTLS config inline —
     // we parse PEM from the forward config and populate state.client_certs. If
     // PEM parsing fails, the route verdict is overridden to Deny (fail-closed).
-    match msg.network {
-        Some(network) => {
-            // Clear all network policy and fail closed (deny via upstream).
-            // Shared by every invalid-policy branch so they can't drift.
-            let force_deny = || {
-                crate::proxy::apply_network_policy(
-                    state,
-                    crate::proxy::NetworkPolicy {
-                        default_verdict: crate::routing::Verdict::Deny,
-                        default_transport: crate::routing::Transport::Upstream,
-                        ..Default::default()
-                    },
-                );
-                state.client_certs.write().unwrap().clear();
-            };
+    // Clear all network policy and fail closed (deny via upstream). Shared by
+    // every invalid-policy branch so they can't drift.
+    let force_deny = || {
+        crate::proxy::apply_network_policy(
+            state,
+            crate::proxy::NetworkPolicy {
+                default_verdict: crate::routing::Verdict::Deny,
+                default_transport: crate::routing::Transport::Upstream,
+                ..Default::default()
+            },
+        );
+        state.client_certs.write().unwrap().clear();
+    };
 
+    // An llm block the proxy cannot enforce fails the whole policy closed. A
+    // route it ignored instead would let the sandbox reach the API the policy
+    // meant to redirect, carrying the credential the policy meant to withhold.
+    let llm = match parse_llm_routing(&msg.llm) {
+        Ok(llm) => Some(Arc::new(llm)),
+        Err(e) => {
+            tracing::error!("invalid llm policy: {e}; clearing routes and forcing deny");
+            None
+        }
+    };
+
+    match (llm, msg.network) {
+        (None, _) => force_deny(),
+        (Some(llm), Some(network)) => {
             match parse_egress_tables(&network) {
                 Ok(Some(EgressTables {
                     http: parsed_routes,
@@ -962,6 +992,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                             default_transport,
                             tcp_egress: tcp_egress_rules,
                             udp_egress: udp_egress_rules,
+                            llm,
                             ..Default::default()
                         },
                     );
@@ -980,7 +1011,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 }
             }
         }
-        None => {
+        (Some(llm), None) => {
             // No network field means no domain restrictions — reset to allow-all via Lens Sandbox.
             tracing::info!("network policy absent; resetting to allow-all via lens");
             crate::proxy::apply_network_policy(
@@ -988,6 +1019,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 crate::proxy::NetworkPolicy {
                     default_verdict: crate::routing::Verdict::Allow,
                     default_transport: crate::routing::Transport::Upstream,
+                    llm,
                     ..Default::default()
                 },
             );

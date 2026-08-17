@@ -37,6 +37,17 @@
         "$ref": "#/$defs/TempFile"
       }
     },
+    "llm": {
+      "description": "Optional LLM routing: send a request the sandbox addressed to one LLM\nAPI to a different backend, and translate the wire format on the way.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LlmPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "network": {
       "description": "Network routing rules and default verdict + transport.",
       "anyOf": [
@@ -366,6 +377,167 @@
         }
       },
       "additionalProperties": false
+    },
+    "LlmBackend": {
+      "description": "One LLM backend: where the request goes, and what model it asks for there.",
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "description": "What this backend accepts. A request that needs more than it declares is\ndenied, not quietly cut down: an agent that asked for tools and got prose\ncannot tell the difference between a backend that has none and a model\nthat chose not to use them.",
+          "$ref": "#/$defs/LlmCapabilities",
+          "default": {
+            "images": true,
+            "tools": true
+          }
+        },
+        "id": {
+          "description": "Identifier a route points at.",
+          "type": "string"
+        },
+        "modelMap": {
+          "description": "Ordered model-name rules, first match wins. Each entry maps the model the\nsandbox asked for to the model this backend serves. A name no entry\ncovers is sent unchanged — many OpenAI-compatible servers serve one model\nand ignore the field.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/LlmModelMapping"
+          }
+        },
+        "url": {
+          "description": "Full `https://host[:port]/path` URL of the backend endpoint. The scheme\nmust be `https`: the proxy re-encrypts to the backend, and a plain-HTTP\nbackend would carry the injected credential in the clear.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "url"
+      ]
+    },
+    "LlmCapabilities": {
+      "description": "The parts of a request a backend can serve. Every field defaults to true, so\nan omitted `capabilities` block promises a backend that accepts everything —\nwhich is what an OpenAI-compatible frontier model does.",
+      "type": "object",
+      "properties": {
+        "images": {
+          "description": "The backend accepts images in a message.",
+          "type": "boolean",
+          "default": true
+        },
+        "tools": {
+          "description": "The backend can be given tools and can call them.",
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "LlmModelMapping": {
+      "description": "One first-match-wins model-name rule.",
+      "type": "object",
+      "properties": {
+        "match": {
+          "description": "Glob over the model name the sandbox asked for (`claude-haiku-*`, `*`).",
+          "type": "string"
+        },
+        "model": {
+          "description": "Model name to ask the backend for.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "match",
+        "model"
+      ]
+    },
+    "LlmPolicy": {
+      "description": "Where LLM requests go, and what they are translated into.\n\nThis block **redirects, it does not grant**. The backend host is an ordinary\ndestination: it still needs its own [`Egress::http`] rule, and the request\nstill passes every rule on that route. It also names no credential — the\n[`credentials`](PolicyDocument::credentials) list stays the one place that\ndecides what a host is sent. A redirect drops the credential the sandbox\nwrote and injects the backend's own, so the key for the API the agent\nthought it called never reaches the backend.",
+      "type": "object",
+      "properties": {
+        "backends": {
+          "description": "The backends routes can name. Every [`LlmRoute::backend`] must name one\nof these; an unknown id fails the policy.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/LlmBackend"
+          }
+        },
+        "routes": {
+          "description": "Ordered routes, first match wins.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/LlmRoute"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "LlmRoute": {
+      "description": "A single first-match-wins LLM route.",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "description": "[`LlmBackend::id`] of the backend that serves these requests.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Human-readable description of this route.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "match": {
+          "description": "The requests this route claims.",
+          "$ref": "#/$defs/LlmRouteMatch"
+        },
+        "translate": {
+          "description": "The translation applied to the request and to the answer.",
+          "$ref": "#/$defs/LlmTranslation"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "match",
+        "translate",
+        "backend"
+      ]
+    },
+    "LlmRouteMatch": {
+      "description": "The requests one [`LlmRoute`] claims. Every field that is set must match.",
+      "type": "object",
+      "properties": {
+        "domain": {
+          "description": "Host the sandbox addressed, as a domain pattern (`api.anthropic.com`,\n`*.anthropic.com`).",
+          "type": "string"
+        },
+        "model": {
+          "description": "Glob over the model name in the request body. Omit to claim every model\nthe domain and path cover — which is how one route sends a whole API to\none backend.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "URL path glob, matched exactly as [`HttpRule::path`] is.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "domain",
+        "path"
+      ]
+    },
+    "LlmTranslation": {
+      "description": "The wire translations the proxy can perform. Each names the format the\nsandbox speaks and the format the backend speaks, in that order.",
+      "oneOf": [
+        {
+          "description": "Anthropic Messages (`POST /v1/messages`) into OpenAI Chat Completions\n(`POST /v1/chat/completions`), and the answer back again.",
+          "type": "string",
+          "const": "anthropicMessagesToOpenaiChat"
+        }
+      ]
     },
     "NetworkPolicy": {
       "description": "Network policy controlling what the sandbox can reach.",

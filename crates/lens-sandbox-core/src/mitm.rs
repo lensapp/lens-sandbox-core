@@ -71,6 +71,57 @@ struct RequestMeta {
     /// gone: a frame is refused long after the request that opened the socket.
     method: String,
     path: String,
+    /// Where an `llm` route sent this request, when one claimed it. It decides
+    /// the host that is dialled and the shape the answer comes back in.
+    redirect: Option<Box<crate::llm::Redirect>>,
+}
+
+/// Who a request is being sent to, once policy has had its say.
+///
+/// Ordinarily this is the host the sandbox named. An `llm` route replaces every
+/// field at once, because a redirect changes all of them together: the
+/// credentials, the placeholder map, and the rules that judge the request all
+/// belong to the backend now. Keeping them in one value is what stops a
+/// half-redirected request — the backend's path judged by the sandbox's rules,
+/// or the sandbox's key sent to the backend.
+struct RequestTarget<'a> {
+    match_host: &'a str,
+    injections: &'a [CredentialInjection],
+    placeholders: &'a [(String, String)],
+    http_rules: &'a [HttpRule],
+}
+
+impl<'a> RequestTarget<'a> {
+    /// The host the sandbox named, as the proxy door resolved it.
+    fn from_context(ctx: &MitmContext<'a>) -> Self {
+        Self {
+            match_host: ctx.match_host,
+            injections: ctx.injections,
+            placeholders: ctx.placeholder_map,
+            http_rules: ctx.http_rules,
+        }
+    }
+}
+
+/// A backend an `llm` route redirected to, with everything that host answers
+/// for: its own credentials and its own HTTP rules.
+struct LlmDestination {
+    redirect: Box<crate::llm::Redirect>,
+    authority: String,
+    injections: Vec<CredentialInjection>,
+    placeholders: Vec<(String, String)>,
+    http_rules: Vec<HttpRule>,
+}
+
+impl LlmDestination {
+    fn target(&self) -> RequestTarget<'_> {
+        RequestTarget {
+            match_host: &self.authority,
+            injections: &self.injections,
+            placeholders: &self.placeholders,
+            http_rules: &self.http_rules,
+        }
+    }
 }
 
 /// Handle a MITM connection: terminate TLS from the client,
@@ -101,11 +152,18 @@ pub async fn handle_mitm_pre_accepted(
 
     // Read/inject headers BEFORE connecting upstream, so a stalling client
     // doesn't hold open upstream connections.
-    let (tls_client, modified, meta) =
+    let (mut tls_client, modified, meta) =
         mitm_inject_after_accept(tls_client, target_host, ctx, is_tunnel).await?;
 
     match upstream_mode {
         UpstreamMode::DirectTls { host, port } => {
+            // An `llm` route sends this request to a host the sandbox never
+            // named. Everything below treats that host as the destination, so
+            // the dial, the SNI, and the certificate check are the backend's.
+            let (host, port) = match &meta.redirect {
+                Some(redirect) => (redirect.host.clone(), redirect.port),
+                None => (host, port),
+            };
             // Through the policy-aware dial, not a bare one: an `egress.tcp`
             // CIDR rule binds by address, so this is the first point at which it
             // can be applied to a target the client named. Skipping it would let
@@ -121,8 +179,22 @@ pub async fn handle_mitm_pre_accepted(
             let mut tls_upstream =
                 connect_upstream_tls(target_stream, &host, None, None, ctx.extra_ca_certs).await?;
             write_request_head_and_body(&mut tls_upstream, &modified, &meta).await?;
-            let denial = forward_or_bridge(tls_client, tls_upstream, &meta).await?;
-            audit_frame_denial(ctx, target_host, is_tunnel, &meta, denial);
+            match &meta.redirect {
+                // The answer is in the backend's format and the sandbox is
+                // waiting for its own, so it is translated rather than spliced.
+                Some(redirect) => {
+                    crate::llm::relay::forward_translated(
+                        &mut tls_client,
+                        &mut tls_upstream,
+                        redirect,
+                    )
+                    .await?;
+                }
+                None => {
+                    let denial = forward_or_bridge(tls_client, tls_upstream, &meta).await?;
+                    audit_frame_denial(ctx, target_host, is_tunnel, &meta, denial);
+                }
+            }
         }
         UpstreamMode::TunnelTls(upstream) => {
             let mut tls_upstream =
@@ -382,7 +454,7 @@ where
         // each have their own header block but no body. Forward them
         // verbatim — they're not the response we want to rewrite.
         loop {
-            let header_bytes = read_until_double_crlf(&mut upstream_read).await?;
+            let header_bytes = crate::http_body::read_head(&mut upstream_read).await?;
             match parse_status_code(&header_bytes) {
                 Some(101) if meta.is_upgrade => {
                     // The offer of an extension was stripped from the request, so
@@ -454,7 +526,7 @@ where
 {
     use tokio::io::AsyncReadExt;
     loop {
-        let size_line = read_line_with_crlf(reader).await?;
+        let size_line = crate::http_body::read_crlf_line(reader).await?;
         writer.write_all(&size_line).await?;
 
         // Parse hex chunk size, ignoring any chunk extensions after `;`.
@@ -474,7 +546,7 @@ where
             // Final chunk. Trailers (or just the empty line) follow until a
             // bare CRLF closes the body.
             loop {
-                let line = read_line_with_crlf(reader).await?;
+                let line = crate::http_body::read_crlf_line(reader).await?;
                 writer.write_all(&line).await?;
                 if line.as_slice() == b"\r\n" {
                     return Ok(());
@@ -491,54 +563,6 @@ where
             return Err("chunk body missing trailing CRLF".into());
         }
         writer.write_all(&crlf).await?;
-    }
-}
-
-/// Read up to and including the next `\r\n` (or EOF). Returns the bytes
-/// including the terminator.
-async fn read_line_with_crlf<R>(
-    stream: &mut R,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = Vec::with_capacity(64);
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte).await?;
-        if n == 0 {
-            return Err("stream closed before end of line".into());
-        }
-        buf.push(byte[0]);
-        if buf.len() >= 2 && buf.ends_with(b"\r\n") {
-            return Ok(buf);
-        }
-        if buf.len() > 8192 {
-            return Err("chunk header line too large".into());
-        }
-    }
-}
-
-async fn read_until_double_crlf<R>(
-    stream: &mut R,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte).await?;
-        if n == 0 {
-            return Err("upstream closed before end of response headers".into());
-        }
-        buf.push(byte[0]);
-        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
-            return Ok(buf);
-        }
-        if buf.len() > 65536 {
-            return Err("response headers too large".into());
-        }
     }
 }
 
@@ -685,6 +709,131 @@ impl RequestFacts<'_, '_> {
     }
 }
 
+/// Send this request to the backend an `llm` route names, if one claims it.
+///
+/// Returns the destination when the request was redirected, `None` when no route
+/// claimed it, and `Err` when a route claimed it and it cannot be served — by
+/// then the client has been answered and the session is over.
+///
+/// Reading the body is the price of the decision: the model name lives there,
+/// and so does everything that has to be translated. A body read here is left in
+/// `buffered_body` even when no route claims the request, because it is no
+/// longer on the socket for the relay to find.
+async fn apply_llm_route<C>(
+    tls_client: &mut C,
+    facts: &RequestFacts<'_, '_>,
+    body_mode: BodyFraming,
+    buffered_body: &mut Option<Vec<u8>>,
+    is_upgrade: bool,
+) -> Result<Option<LlmDestination>, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let ctx = facts.ctx;
+    let llm = ctx.state.policy.read().unwrap().llm.clone();
+    if !llm.claims(facts.target_host, facts.path) {
+        return Ok(None);
+    }
+    // A tunnelled session is already connected to the host the sandbox named,
+    // so there is no dial left to point somewhere else.
+    if facts.is_tunnel {
+        return Err(facts
+            .deny(
+                tls_client,
+                "llm_denied",
+                "an llm route cannot redirect a connection that is already tunnelled; \
+                 give the route direct transport",
+            )
+            .await);
+    }
+    // An upgrade replaces the request with a socket, and there is no body to
+    // translate — nor any way to go on translating what crosses it.
+    if is_upgrade {
+        return Err(facts
+            .deny(
+                tls_client,
+                "llm_denied",
+                "an llm route cannot translate a connection upgrade",
+            )
+            .await);
+    }
+
+    let body = match buffered_body.take() {
+        Some(body) => body,
+        None => {
+            match crate::http_body::read_body(tls_client, body_mode, crate::llm::MAX_LLM_BODY_BYTES)
+                .await
+            {
+                Ok(body) => body,
+                Err(e) => {
+                    return Err(facts
+                        .deny(
+                            tls_client,
+                            "llm_denied",
+                            &format!("an llm route covers this request, but its body {e}"),
+                        )
+                        .await);
+                }
+            }
+        }
+    };
+
+    match crate::llm::decide(&llm, facts.target_host, facts.path, &body) {
+        crate::llm::Outcome::Untouched => {
+            *buffered_body = Some(body);
+            Ok(None)
+        }
+        crate::llm::Outcome::Refused(reason) => {
+            Err(facts.deny(tls_client, "llm_denied", &reason).await)
+        }
+        crate::llm::Outcome::Redirect(mut redirect) => {
+            let authority = redirect.authority();
+            // The backend answers for itself. This is what makes an `llm` block
+            // a redirect and not a grant.
+            let http_rules = match crate::proxy::destination_http_rules(
+                ctx.state,
+                &authority,
+                ctx.actor.process(),
+            ) {
+                Ok(rules) => rules,
+                Err(reason) => {
+                    return Err(facts
+                        .deny(
+                            tls_client,
+                            "llm_denied",
+                            &format!("an llm route redirects to {authority}, but {reason}"),
+                        )
+                        .await);
+                }
+            };
+            if !matches!(
+                crate::routing::classify_http_request(&http_rules, facts.method, &redirect.path),
+                crate::routing::HttpRuleOutcome::Allow
+            ) {
+                return Err(facts
+                    .deny(
+                        tls_client,
+                        "llm_denied",
+                        &format!(
+                            "no HTTP rule on the {authority} route permits the translated request"
+                        ),
+                    )
+                    .await);
+            }
+            // The translated body replaces the one the sandbox wrote; the head
+            // is restated to describe it further down.
+            *buffered_body = Some(std::mem::take(&mut redirect.body));
+            Ok(Some(LlmDestination {
+                injections: crate::proxy::collect_header_injections(ctx.state, &authority),
+                placeholders: crate::proxy::collect_uri_placeholders(ctx.state, &authority),
+                http_rules,
+                authority,
+                redirect,
+            }))
+        }
+    }
+}
+
 /// enforce HTTP rules, inject credentials, rewrite URI placeholders, emit
 /// audit event. Returns the TLS client stream and the modified header
 /// block (ready to send upstream).
@@ -730,7 +879,7 @@ async fn mitm_inject_after_accept(
     let request_line = header_str.lines().next().unwrap_or("UNKNOWN");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     let method = parts.first().unwrap_or(&"UNKNOWN");
-    let body_mode = determine_body_framing(&header_str, method);
+    let body_mode = determine_body_framing(&header_str);
     let raw_path = parts.get(1).unwrap_or(&"/");
     // Strip query string and normalize path (collapse //, resolve ..)
     let raw_no_query = raw_path.split('?').next().unwrap_or(raw_path);
@@ -824,10 +973,33 @@ async fn mitm_inject_after_accept(
         }
     }
 
+    // The route's own rules have now judged this request. An `llm` route may
+    // send it somewhere else entirely, so everything below — the head, the
+    // credentials, the gate, and the dial — works from `target` rather than from
+    // the host the sandbox named.
+    let destination = apply_llm_route(
+        &mut tls_client,
+        &facts,
+        body_mode,
+        &mut buffered_body,
+        is_upgrade,
+    )
+    .await?;
+
+    let target = destination
+        .as_ref()
+        .map_or_else(|| RequestTarget::from_context(ctx), LlmDestination::target);
+    let head = match &destination {
+        Some(destination) => {
+            crate::llm::head::rewrite_for_backend(&header_str, &destination.redirect)
+        }
+        None => header_str.to_string(),
+    };
+
     // Two request-head mutations from policy, applied in order:
     //   1. inject_headers     — type=header credential injections
     //   2. rewrite_uri_placeholders — type=uriPlaceholder credential injections
-    let mut header_injected = inject_headers(&header_str, ctx.injections);
+    let mut header_injected = inject_headers(&head, target.injections);
 
     // After a credential_gate Allow we may need a fresher URI placeholder
     // map than the one captured in `ctx.placeholder_map`. None = use ctx
@@ -858,7 +1030,7 @@ async fn mitm_inject_after_accept(
     // re-trips the gate on every call. `ctx.placeholder_map` carries only
     // armed placeholders (`collect_uri_placeholders` skips unarmed ones), so a
     // first, unarmed use still survives and trips the gate.
-    let scan_target = rewrite_uri_placeholders(&header_injected, ctx.placeholder_map);
+    let scan_target = rewrite_uri_placeholders(&header_injected, target.placeholders);
     let matches = scan_for_unarmed_placeholders(ctx.state, &scan_target);
     if !matches.is_empty() {
         let state = ctx.state;
@@ -875,9 +1047,9 @@ async fn mitm_inject_after_accept(
         }
 
         if deny_record.is_none() {
-            let fresh_headers = crate::proxy::collect_header_injections(state, ctx.match_host);
-            let rebuilt = inject_headers(&header_str, &fresh_headers);
-            let fresh_uri = crate::proxy::collect_uri_placeholders(state, ctx.match_host);
+            let fresh_headers = crate::proxy::collect_header_injections(state, target.match_host);
+            let rebuilt = inject_headers(&head, &fresh_headers);
+            let fresh_uri = crate::proxy::collect_uri_placeholders(state, target.match_host);
             // rewrite_uri_placeholders only touches the request line; the
             // scan runs over the whole rebuilt head, so a header-resident
             // placeholder that inject_headers failed to replace is still
@@ -938,7 +1110,7 @@ async fn mitm_inject_after_accept(
     }
     let effective_uri_placeholders: &[(String, String)] = refreshed_uri_placeholders
         .as_deref()
-        .unwrap_or(ctx.placeholder_map);
+        .unwrap_or(target.placeholders);
     let modified = rewrite_uri_placeholders(&header_injected, effective_uri_placeholders);
     if modified != header_injected {
         tracing::debug!(
@@ -949,14 +1121,18 @@ async fn mitm_inject_after_accept(
         // still satisfy HTTP rules. A credential containing `/`, `?`, or `..`
         // could produce a different normalized path than the placeholder version
         // that was checked above, bypassing policy.
-        if !ctx.http_rules.is_empty() {
+        if !target.http_rules.is_empty() {
             let rw_line = modified.split("\r\n").next().unwrap_or(&modified);
             let rw_parts: Vec<&str> = rw_line.split_whitespace().collect();
             let rw_method = rw_parts.first().unwrap_or(&"UNKNOWN");
             let rw_raw_path = rw_parts.get(1).unwrap_or(&"/");
             let rw_no_query = rw_raw_path.split('?').next().unwrap_or(rw_raw_path);
             let rw_normalized = crate::routing::normalize_path(rw_no_query);
-            match crate::routing::classify_http_request(ctx.http_rules, rw_method, &rw_normalized) {
+            match crate::routing::classify_http_request(
+                target.http_rules,
+                rw_method,
+                &rw_normalized,
+            ) {
                 crate::routing::HttpRuleOutcome::Allow => {
                     if is_upgrade {
                         return Err(facts
@@ -1032,6 +1208,18 @@ async fn mitm_inject_after_accept(
     };
 
     if let Some(tx) = ctx.audit_tx {
+        let mut metadata = serde_json::json!({
+            "host": target_host, "mitm": true, "tunnel": is_tunnel
+        });
+        // A redirected request never reaches the host the action names, so the
+        // record has to say where it went instead.
+        if let (Some(destination), Some(object)) = (&destination, metadata.as_object_mut()) {
+            object.insert("llm_backend".into(), destination.authority.clone().into());
+            object.insert(
+                "llm_model".into(),
+                destination.redirect.model.clone().into(),
+            );
+        }
         let event = serde_json::json!({
             "type": "audit_event",
             "source": "sandbox-proxy",
@@ -1040,7 +1228,7 @@ async fn mitm_inject_after_accept(
             "host": target_host,
             "path": path,
             "result": "success",
-            "metadata": { "host": target_host, "mitm": true, "tunnel": is_tunnel }
+            "metadata": metadata,
         });
         send_audit(tx, event, ctx.actor);
     }
@@ -1063,6 +1251,7 @@ async fn mitm_inject_after_accept(
             graphql_frames,
             method: (*method).to_string(),
             path: path.to_string(),
+            redirect: destination.map(|destination| destination.redirect),
         },
     ))
 }
@@ -1971,6 +2160,10 @@ mod tests {
         store
     }
 
+    /// The `llm` redirect, end to end. Its own file: this one is long enough.
+    #[path = "llm_tests.rs"]
+    mod llm;
+
     /// Shared harness for MITM integration tests.
     /// Spins up: TLS upstream server ← upstream TLS ← MITM ← client TLS.
     /// Returns (upstream_headers, client_response, audit_events).
@@ -2603,22 +2796,6 @@ mod tests {
         assert!(!is_upgrade_request(req));
     }
 
-    #[tokio::test]
-    async fn read_until_double_crlf_returns_full_header_block() {
-        let bytes = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nbody-after";
-        let mut cursor = std::io::Cursor::new(&bytes[..]);
-        let result = read_until_double_crlf(&mut cursor).await.unwrap();
-        assert_eq!(result, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-    }
-
-    #[tokio::test]
-    async fn read_until_double_crlf_errors_on_eof_before_terminator() {
-        let bytes = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n";
-        let mut cursor = std::io::Cursor::new(&bytes[..]);
-        let err = read_until_double_crlf(&mut cursor).await.unwrap_err();
-        assert!(err.to_string().contains("upstream closed"), "{err}");
-    }
-
     #[test]
     fn parse_status_code_extracts_code() {
         assert_eq!(parse_status_code(b"HTTP/1.1 200 OK\r\n\r\n"), Some(200));
@@ -3145,6 +3322,7 @@ mod tests {
             graphql_frames,
             method: "GET".to_string(),
             path: "/graphql".to_string(),
+            redirect: None,
         };
         let task = tokio::spawn(async move {
             let _ = forward_or_bridge(client_near, upstream_near, &meta).await;
@@ -3161,6 +3339,7 @@ mod tests {
             graphql_frames: vec![],
             method: "GET".to_string(),
             path: "/".to_string(),
+            redirect: None,
         }
     }
 

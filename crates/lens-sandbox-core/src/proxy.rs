@@ -115,6 +115,13 @@ pub struct NetworkPolicy {
     /// the originating `qname` and a TTL-bounded expiry. Consulted by
     /// [`tcp_egress_verdict`] to match hostname rules against a raw connection.
     pub pins: HashMap<IpAddr, Vec<PinnedIp>>,
+    /// Optional LLM routing — where a request the sandbox addressed to one LLM
+    /// API actually goes, and what it is translated into. Lives here because a
+    /// redirect is an egress decision: the backend it names is judged by the
+    /// same `routes` this snapshot carries, and a reload must not leave a route
+    /// pointing into a superseded policy's table. `Arc` because every
+    /// intercepted request reads it and none of them modifies it.
+    pub llm: Arc<crate::llm::LlmRouting>,
     /// Bumped every time the policy is (re)applied. The DNS stub captures it
     /// when it authorizes a lookup and hands it back at pin-insertion time; an
     /// in-flight answer whose generation no longer matches is dropped, so a
@@ -134,6 +141,7 @@ impl NetworkPolicy {
             default_transport,
             tcp_egress,
             udp_egress,
+            llm,
             pins: _,       // runtime state owned by apply_network_policy
             generation: _, // ditto
         } = self;
@@ -142,6 +150,7 @@ impl NetworkPolicy {
             && *default_transport == other.default_transport
             && *tcp_egress == other.tcp_egress
             && *udp_egress == other.udp_egress
+            && *llm == other.llm
     }
 }
 
@@ -156,6 +165,7 @@ impl Default for NetworkPolicy {
             default_transport: Transport::Upstream,
             tcp_egress: Vec::new(),
             udp_egress: Vec::new(),
+            llm: Arc::new(crate::llm::LlmRouting::default()),
             pins: HashMap::new(),
             generation: 0,
         }
@@ -301,6 +311,16 @@ impl ProxyState {
             .any(|pattern| crate::routing::injection_matches(pattern, target_host))
     }
 
+    /// Whether an `llm` route could claim a request to this host, so the
+    /// connection has to be intercepted for one to be able to.
+    ///
+    /// A route this misses is a route that never fires — the request is spliced
+    /// through to the API the sandbox named, carrying the key the redirect
+    /// exists to withhold.
+    pub(crate) fn intercept_for_llm(&self, target_host: &str) -> bool {
+        self.policy.read().unwrap().llm.claims_host(target_host)
+    }
+
     /// Override the gate timeout. Test-only seam; production keeps the
     /// `gate::DECISION_TIMEOUT` default set at construction.
     #[cfg(test)]
@@ -343,6 +363,42 @@ pub(crate) fn collect_header_injections(
         }
     }
     matched
+}
+
+/// The HTTP rules that govern a destination the proxy is about to dial on its
+/// own initiative, or the reason that destination is not reachable at all.
+///
+/// An LLM redirect names a host the sandbox never asked for, so nothing has
+/// judged it yet: the CONNECT that opened this session was judged against the
+/// host the sandbox *did* name. This is where the backend answers for itself.
+/// That is what makes an `llm` block a redirect and not a grant — the backend
+/// still needs its own `egress.http` allow rule, and the translated request
+/// still has to satisfy that route's HTTP rules.
+///
+/// Only an explicit `allow` counts. An `ask` would need a developer's answer,
+/// and there is no request left to suspend: the sandbox is already mid-session
+/// with a route that was approved for a different host.
+pub(crate) fn destination_http_rules(
+    state: &ProxyState,
+    authority: &str,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> Result<Vec<crate::routing::HttpRule>, String> {
+    let policy = state.policy.read().unwrap();
+    match crate::routing::find_matching_route(&policy.routes, authority, Scheme::Https, caller) {
+        crate::routing::RouteOutcome::Matched(rule) if rule.verdict == Verdict::Allow => {
+            Ok(rule.http_rules.clone())
+        }
+        crate::routing::RouteOutcome::Matched(rule) => Err(format!(
+            "the egress.http rule covering {authority} says {:?}, not allow",
+            rule.verdict
+        )),
+        crate::routing::RouteOutcome::NoMatch {
+            binary_filtered: false,
+        } if policy.default_verdict == Verdict::Allow => Ok(Vec::new()),
+        crate::routing::RouteOutcome::NoMatch { .. } => {
+            Err(format!("no egress.http rule allows {authority}"))
+        }
+    }
 }
 
 /// Get or initialize the ephemeral CA for MITM TLS interception.
@@ -706,6 +762,29 @@ async fn handle_http_forward(
         actor,
     };
 
+    // An `llm` route claims this request and this door cannot honour it: there is
+    // no TLS session to redirect, and cleartext is no place to put a backend
+    // credential anyway. Refusing is the whole point — passing it on would send
+    // the request, with the key the proxy injects, to the very API the redirect
+    // exists to withhold it from. Checked before the raw `egress.tcp`
+    // passthrough below, which is otherwise final on every door: a claim the
+    // proxy cannot honour must never become one it ignores.
+    if state
+        .policy
+        .read()
+        .unwrap()
+        .llm
+        .claims(target_host, &normalized_path)
+    {
+        return refusal
+            .deny(
+                &mut client,
+                "an llm route claims this request, and it cannot be redirected over cleartext \
+                 http; address the api over https so the proxy can intercept it",
+            )
+            .await;
+    }
+
     // `egress.tcp` claims are final on every door — see `tcp_egress_verdict`.
     // Absolute-form `http://` is port 80, not 443.
     if let Some(decision) = tcp_egress_verdict_for_hostport(state, target_host, 80, actor.process())
@@ -780,7 +859,7 @@ async fn handle_http_forward(
                 .await;
         }
         crate::routing::HttpRuleOutcome::Graphql(matchers) => {
-            let framing = crate::http_body::determine_body_framing(&header_str, method);
+            let framing = crate::http_body::determine_body_framing(&header_str);
             let body = match crate::graphql::read_body_for_inspection(
                 &mut client,
                 &header_str,
@@ -1202,7 +1281,8 @@ async fn handle_connect(
             let needs_mitm = injections.is_some()
                 || !domain_http_rules.is_empty()
                 || !uri_placeholders.is_empty()
-                || state.intercept_for_unarmed(target_host);
+                || state.intercept_for_unarmed(target_host)
+                || state.intercept_for_llm(target_host);
             if needs_aws_resign {
                 // AWS-resign path owns the MITM for this connection; any
                 // other injections configured for the same host would be
@@ -1396,6 +1476,7 @@ async fn handle_connect(
                 || !domain_http_rules.is_empty()
                 || !placeholders.is_empty()
                 || state.intercept_for_unarmed(target_host)
+                || state.intercept_for_llm(target_host)
             {
                 if let Some(ca) = state.ephemeral_ca.get() {
                     // HTTPS upstream via Lens Sandbox tunnel — MITM to inject credentials,
@@ -4347,6 +4428,52 @@ pub(crate) mod tests {
         });
         client.write_all(body.as_bytes()).await.unwrap();
         read_response(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn http_forward_refuses_a_request_an_llm_route_claims() {
+        // The redirect needs a TLS session it can point elsewhere. This door has
+        // none, so passing the request on would send it — with the key the proxy
+        // injects — to the very API the redirect exists to withhold it from.
+        let (state, _rx) = test_state();
+        let llm = crate::llm::LlmRouting::from_policy(
+            &serde_json::from_str(
+                r#"{
+                    "backends": [{ "id": "b", "url": "https://vllm.internal/v1/chat/completions" }],
+                    "routes": [{ "match": { "domain": "10.0.0.5", "path": "/v1/messages" },
+                        "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                }"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                default_verdict: Verdict::Allow,
+                default_transport: Transport::Direct,
+                llm: Arc::new(llm),
+                ..Default::default()
+            },
+        );
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            handle_http_forward(
+                server,
+                "10.0.0.5:80",
+                b"POST http://10.0.0.5/v1/messages HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n".to_vec(),
+                &state_for_handler,
+                &test_actor(),
+            )
+            .await
+        });
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a claimed request must not leave over cleartext; got {response:?}"
+        );
     }
 
     #[tokio::test]
