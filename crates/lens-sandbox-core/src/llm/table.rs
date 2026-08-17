@@ -287,7 +287,7 @@ mod tests {
         }],
         "routes": [{
             "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-            "translate": "anthropicMessagesToOpenaiChat",
+            "translate": { "from": "anthropicMessages", "to": "openaiChat" },
             "backend": "local"
         }]
     }"#;
@@ -350,7 +350,7 @@ mod tests {
                 "backends": [{ "id": "b", "url": "https://x.internal/v1/chat/completions",
                     "modelMap": [{ "match": "claude-opus-*", "model": "big" }] }],
                 "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-                    "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                    "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "b" }]
             }"#,
         );
         let (_, backend) = routing
@@ -392,9 +392,9 @@ mod tests {
                 "routes": [
                     { "match": { "domain": "api.anthropic.com", "path": "/v1/messages",
                         "model": "claude-haiku-*" },
-                      "translate": "anthropicMessagesToOpenaiChat", "backend": "small" },
+                      "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "small" },
                     { "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-                      "translate": "anthropicMessagesToOpenaiChat", "backend": "large" }
+                      "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "large" }
                 ]
             }"#,
         );
@@ -417,7 +417,7 @@ mod tests {
                 "backends": [{ "id": "b", "url": "https://x.internal/v1/chat/completions" }],
                 "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/messages",
                     "model": "claude-haiku-*" },
-                    "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                    "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "b" }]
             }"#,
         );
         assert!(routing.claims("api.anthropic.com", "/v1/messages"));
@@ -434,7 +434,7 @@ mod tests {
             r#"{
                 "backends": [{ "id": "b", "url": "https://x.internal/v1/chat/completions" }],
                 "routes": [{ "match": { "domain": "*.anthropic.com", "path": "/v1/**" },
-                    "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                    "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "b" }]
             }"#,
         );
         assert!(routing.claims("api.anthropic.com", "/v1/messages"));
@@ -451,7 +451,7 @@ mod tests {
             r#"{
                 "backends": [{ "id": "b", "url": "https://VLLM.internal:8443/v1/chat/completions" }],
                 "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-                    "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                    "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "b" }]
             }"#,
         );
         let (_, backend) = routing
@@ -489,7 +489,7 @@ mod tests {
             r#"{
                 "backends": [{ "id": "b", "url": "https://x.internal/v1/chat/completions" }],
                 "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-                    "translate": "anthropicMessagesToOpenaiChat", "backend": "typo" }]
+                    "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "typo" }]
             }"#,
         ))
         .expect_err("a route that cannot be honoured must not become a route we ignore");
@@ -542,7 +542,7 @@ mod tests {
                 "backends": [{ "id": "b", "url": "https://x.internal/v1/chat/completions",
                     "capabilities": { "images": false } }],
                 "routes": [{ "match": { "domain": "api.anthropic.com", "path": "/v1/messages" },
-                    "translate": "anthropicMessagesToOpenaiChat", "backend": "b" }]
+                    "translate": { "from": "anthropicMessages", "to": "openaiChat" }, "backend": "b" }]
             }"#,
         );
         let (_, backend) = routing

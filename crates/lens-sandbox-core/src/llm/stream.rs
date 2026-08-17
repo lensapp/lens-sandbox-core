@@ -7,20 +7,24 @@
 //! because an SSE frame split across two TCP reads is ordinary, and it never
 //! holds a completed event.
 //!
-//! Every event is framed with the `type` the target format gave it, which is
-//! where an Anthropic client reads the event name from. That is the only wire
-//! format a route can address a sandbox in today; a route that answers a sandbox
-//! speaking something else needs its own framing beside this one.
+//! Reading a stream needs no format knowledge. All three formats put one JSON
+//! object on a `data:` line, and only Chat marks the end with a sentinel, so a
+//! parser that reads `data:` lines and stops at `[DONE]` reads all three.
+//! Writing one does need it, and [`frame`] is where that lives.
 
 use serde_json::Value;
-use switchyard_translation::{StreamTranslationState, TranslationEngine, WireFormat};
+use switchyard_translation::{StreamTranslationState, TranslationEngine};
 
-use crate::policy_schema::LlmTranslation;
+use super::translate::{is_passthrough, wire};
+use crate::policy_schema::{LlmFormat, LlmTranslation};
 
 /// Cap on one SSE line held while waiting for its newline. Frames are one JSON
 /// object each; the cap stops a backend that never sends a newline from growing
 /// the buffer without bound.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// What a Chat stream sends instead of an end-of-message event.
+const DONE: &[u8] = b"data: [DONE]\n\n";
 
 /// Turns the backend's event stream into the one the sandbox is waiting for.
 pub struct StreamTranslator {
@@ -28,10 +32,11 @@ pub struct StreamTranslator {
     line: Vec<u8>,
     engine: TranslationEngine,
     state: StreamTranslationState,
-    /// The format the backend streams in.
-    backend: WireFormat,
-    /// The format the sandbox reads.
-    sandbox: WireFormat,
+    translation: LlmTranslation,
+    /// Whether any event has gone out, so an answer that never began is not
+    /// given an ending. Counted here rather than read off the translation state,
+    /// because only some of the encoders record having started.
+    started: bool,
     /// Whether the message has been closed, so a second end is not written.
     ended: bool,
 }
@@ -39,13 +44,12 @@ pub struct StreamTranslator {
 impl StreamTranslator {
     /// A translator for the answer to a request `translation` sent out.
     pub fn new(translation: LlmTranslation) -> Self {
-        let (backend, sandbox) = super::translate::answer_formats(translation);
         Self {
             line: Vec::new(),
             engine: TranslationEngine::default(),
-            state: StreamTranslationState::new(backend, sandbox),
-            backend,
-            sandbox,
+            state: StreamTranslationState::new(wire(translation.to), wire(translation.from)),
+            translation,
+            started: false,
             ended: false,
         }
     }
@@ -53,8 +57,13 @@ impl StreamTranslator {
     /// Translate the bytes the backend just sent.
     ///
     /// A partial trailing line is kept for the next call, so the caller can pass
-    /// on whatever a socket read happened to give it.
+    /// on whatever a socket read happened to give it. A route that translates
+    /// nothing hands the bytes straight back, which is both cheaper and exact:
+    /// no event is reframed, so none can be lost on the way.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        if is_passthrough(self.translation) {
+            return Ok(bytes.to_vec());
+        }
         let mut out = Vec::new();
         for &byte in bytes {
             if byte != b'\n' {
@@ -83,8 +92,9 @@ impl StreamTranslator {
 
     /// Translate one SSE line.
     fn translate_line(&mut self, line: &str, out: &mut Vec<u8>) -> Result<(), String> {
-        // Blank lines separate frames, and a line starting with `:` is a comment
-        // (heartbeats are sent as one). Neither carries an event.
+        // Blank lines separate frames, a line starting with `:` is a comment
+        // (heartbeats are sent as one), and an `event:` line only repeats the
+        // `type` the data carries. None of them holds an event.
         let Some(data) = line.strip_prefix("data:") else {
             return Ok(());
         };
@@ -97,9 +107,17 @@ impl StreamTranslator {
             .map_err(|e| format!("llm backend sent an SSE frame that is not JSON: {e}"))?;
         let events = self
             .engine
-            .translate_event(&mut self.state, self.backend, self.sandbox, &chunk)
+            .translate_event(
+                &mut self.state,
+                wire(self.translation.to),
+                wire(self.translation.from),
+                &chunk,
+            )
             .map_err(|e| format!("llm backend sent a frame that does not translate: {e}"))?;
-        push_events(out, &events);
+        self.started |= !events.is_empty();
+        for event in &events {
+            frame(self.translation.from, event, out);
+        }
         Ok(())
     }
 
@@ -114,24 +132,41 @@ impl StreamTranslator {
     /// with a truncated message — the same thing it sees when a backend dies
     /// mid-answer, and the caller terminates the body either way.
     fn end(&mut self, out: &mut Vec<u8>) {
-        if self.ended || !self.state.emitted_message_start {
+        if self.ended || is_passthrough(self.translation) || !self.started {
             return;
         }
         self.ended = true;
-        if let Ok(events) = self.engine.finish_stream(&mut self.state, self.sandbox) {
-            push_events(out, &events);
+        let sandbox = self.translation.from;
+        if let Ok(events) = self.engine.finish_stream(&mut self.state, wire(sandbox)) {
+            for event in &events {
+                frame(sandbox, event, out);
+            }
+            // Inside the branch: the sentinel says the answer completed, and an
+            // answer whose ending could not be written did not.
+            if sandbox == LlmFormat::OpenaiChat {
+                out.extend_from_slice(DONE);
+            }
         }
     }
 }
 
-/// Frame translated events as SSE, naming each by its `type`.
-fn push_events(out: &mut Vec<u8>, events: &[Value]) {
-    for event in events {
-        let name = event
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("message");
-        out.extend_from_slice(format!("event: {name}\ndata: {event}\n\n").as_bytes());
+/// Write one translated event as the sandbox's format frames it.
+///
+/// Anthropic and Responses both name every event, and both name it with the
+/// `type` the event already carries. A Chat stream names nothing, and marks its
+/// end with [`DONE`] instead of with a final event.
+fn frame(sandbox: LlmFormat, event: &Value, out: &mut Vec<u8>) {
+    match sandbox {
+        LlmFormat::AnthropicMessages | LlmFormat::OpenaiResponses => {
+            let name = event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("message");
+            out.extend_from_slice(format!("event: {name}\ndata: {event}\n\n").as_bytes());
+        }
+        LlmFormat::OpenaiChat => {
+            out.extend_from_slice(format!("data: {event}\n\n").as_bytes());
+        }
     }
 }
 
@@ -140,16 +175,24 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const ANTHROPIC_TO_OPENAI: LlmTranslation = LlmTranslation::AnthropicMessagesToOpenaiChat;
+    const ANTHROPIC_TO_OPENAI: LlmTranslation = LlmTranslation {
+        from: LlmFormat::AnthropicMessages,
+        to: LlmFormat::OpenaiChat,
+    };
 
     /// Feed a whole OpenAI stream and read back the Anthropic events.
     fn stream(input: &str) -> Vec<(String, Value)> {
-        let mut translator = StreamTranslator::new(ANTHROPIC_TO_OPENAI);
+        parse_events(&bytes_out(ANTHROPIC_TO_OPENAI, input))
+    }
+
+    /// Feed a whole backend stream through `translation` and keep the raw bytes.
+    fn bytes_out(translation: LlmTranslation, input: &str) -> Vec<u8> {
+        let mut translator = StreamTranslator::new(translation);
         let mut out = translator
             .push(input.as_bytes())
             .expect("stream translates");
         out.extend(translator.finish());
-        parse_events(&out)
+        out
     }
 
     fn parse_events(bytes: &[u8]) -> Vec<(String, Value)> {
@@ -412,6 +455,80 @@ mod tests {
             .push(&vec![b'x'; MAX_LINE_BYTES + 1])
             .expect_err("a line with no end must not grow the buffer without bound");
         assert!(err.contains("no end"), "{err}");
+    }
+
+    /// One Anthropic backend stream, for the sandboxes that do not speak it.
+    const ANTHROPIC_STREAM: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+        "\n\n",
+    );
+
+    #[test]
+    fn a_chat_sandbox_reads_unnamed_frames_and_a_done_sentinel() {
+        let out = bytes_out(
+            LlmTranslation {
+                from: LlmFormat::OpenaiChat,
+                to: LlmFormat::AnthropicMessages,
+            },
+            ANTHROPIC_STREAM,
+        );
+        let text = String::from_utf8(out).expect("events are UTF-8");
+        assert!(
+            !text.contains("event: "),
+            "a Chat stream names no event: {text}"
+        );
+        assert!(text.contains(r#""content":"Hi""#), "{text}");
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "a Chat stream ends with the sentinel: {text}"
+        );
+    }
+
+    #[test]
+    fn a_responses_sandbox_reads_named_frames_and_no_sentinel() {
+        let out = bytes_out(
+            LlmTranslation {
+                from: LlmFormat::OpenaiResponses,
+                to: LlmFormat::AnthropicMessages,
+            },
+            ANTHROPIC_STREAM,
+        );
+        let text = String::from_utf8(out).expect("events are UTF-8");
+        assert!(text.contains("event: response.created"), "{text}");
+        assert!(text.contains("event: response.output_text.delta"), "{text}");
+        assert!(text.contains("event: response.completed"), "{text}");
+        assert!(
+            !text.contains("[DONE]"),
+            "only a Chat stream carries the sentinel: {text}"
+        );
+    }
+
+    #[test]
+    fn a_route_that_translates_nothing_hands_the_bytes_straight_back() {
+        // Byte for byte, `event:` lines and all. Reframing could only lose
+        // something the sandbox already knows how to read.
+        for format in [
+            LlmFormat::AnthropicMessages,
+            LlmFormat::OpenaiChat,
+            LlmFormat::OpenaiResponses,
+        ] {
+            let out = bytes_out(
+                LlmTranslation {
+                    from: format,
+                    to: format,
+                },
+                ANTHROPIC_STREAM,
+            );
+            assert_eq!(
+                String::from_utf8(out).expect("events are UTF-8"),
+                ANTHROPIC_STREAM,
+                "{format:?}"
+            );
+        }
     }
 
     #[test]

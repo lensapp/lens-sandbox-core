@@ -430,6 +430,26 @@
       },
       "additionalProperties": false
     },
+    "LlmFormat": {
+      "description": "A wire format the proxy can read and write.",
+      "oneOf": [
+        {
+          "description": "Anthropic Messages, `POST /v1/messages`.",
+          "type": "string",
+          "const": "anthropicMessages"
+        },
+        {
+          "description": "OpenAI Chat Completions, `POST /v1/chat/completions`.",
+          "type": "string",
+          "const": "openaiChat"
+        },
+        {
+          "description": "OpenAI Responses, `POST /v1/responses`.",
+          "type": "string",
+          "const": "openaiResponses"
+        }
+      ]
+    },
     "LlmModelMapping": {
       "description": "One first-match-wins model-name rule.",
       "type": "object",
@@ -530,13 +550,22 @@
       ]
     },
     "LlmTranslation": {
-      "description": "The wire translations the proxy can perform. Each names the format the\nsandbox speaks and the format the backend speaks, in that order.",
-      "oneOf": [
-        {
-          "description": "Anthropic Messages (`POST /v1/messages`) into OpenAI Chat Completions\n(`POST /v1/chat/completions`), and the answer back again.",
-          "type": "string",
-          "const": "anthropicMessagesToOpenaiChat"
+      "description": "The wire formats a route translates between.\n\nAny pair is allowed, including a pair that names the same format twice. That\nis a route which changes only where the request goes: nothing in the body is\nrewritten but the model it names, and the backend is reached with its own\ncredential.",
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "The format the sandbox speaks, and the format its answer is written in.",
+          "$ref": "#/$defs/LlmFormat"
+        },
+        "to": {
+          "description": "The format the backend speaks.",
+          "$ref": "#/$defs/LlmFormat"
         }
+      },
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to"
       ]
     },
     "NetworkPolicy": {

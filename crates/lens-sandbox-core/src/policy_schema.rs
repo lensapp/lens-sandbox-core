@@ -177,14 +177,32 @@ pub struct LlmRouteMatch {
     pub model: Option<String>,
 }
 
-/// The wire translations the proxy can perform. Each names the format the
-/// sandbox speaks and the format the backend speaks, in that order.
+/// The wire formats a route translates between.
+///
+/// Any pair is allowed, including a pair that names the same format twice. That
+/// is a route which changes only where the request goes: nothing in the body is
+/// rewritten but the model it names, and the backend is reached with its own
+/// credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmTranslation {
+    /// The format the sandbox speaks, and the format its answer is written in.
+    pub from: LlmFormat,
+
+    /// The format the backend speaks.
+    pub to: LlmFormat,
+}
+
+/// A wire format the proxy can read and write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub enum LlmTranslation {
-    /// Anthropic Messages (`POST /v1/messages`) into OpenAI Chat Completions
-    /// (`POST /v1/chat/completions`), and the answer back again.
-    AnthropicMessagesToOpenaiChat,
+pub enum LlmFormat {
+    /// Anthropic Messages, `POST /v1/messages`.
+    AnthropicMessages,
+    /// OpenAI Chat Completions, `POST /v1/chat/completions`.
+    OpenaiChat,
+    /// OpenAI Responses, `POST /v1/responses`.
+    OpenaiResponses,
 }
 
 /// Network policy controlling what the sandbox can reach.
