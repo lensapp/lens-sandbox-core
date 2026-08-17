@@ -20,6 +20,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,6 +1002,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "switchyard-translation",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -1677,6 +1700,34 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "switchyard-protocol"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c8be18d2d2c600ba679651f9e31ec9eb9dff96060a078c39e50e42ccd4e2318"
+dependencies = [
+ "async-trait",
+ "futures",
+ "http 1.4.1",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "switchyard-translation"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e40cc4f9517e2fa6ecf11c5ffaace82d04689d088ed3095631609e46d2a3f940"
+dependencies = [
+ "async-stream",
+ "futures",
+ "serde",
+ "serde_json",
+ "switchyard-protocol",
+ "thiserror",
+]
 
 [[package]]
 name = "syn"

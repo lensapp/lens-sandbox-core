@@ -17,7 +17,7 @@
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use super::{MAX_LLM_BODY_BYTES, Redirect, openai_response, openai_stream::StreamTranslator};
+use super::{MAX_LLM_BODY_BYTES, Redirect, stream::StreamTranslator, translate};
 use crate::http_body::{ResponseBody, determine_response_framing, read_head};
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -45,9 +45,9 @@ where
     let mut body = ResponseBody::new(determine_response_framing(&head));
 
     if redirect.streaming && status == STREAMING_STATUS {
-        stream_answer(client, upstream, &mut body).await?;
+        stream_answer(client, upstream, &mut body, redirect).await?;
     } else {
-        whole_answer(client, upstream, &mut body, status).await?;
+        whole_answer(client, upstream, &mut body, status, redirect).await?;
     }
     client.shutdown().await.ok();
     Ok(())
@@ -59,6 +59,7 @@ async fn whole_answer<C, U>(
     upstream: &mut U,
     body: &mut ResponseBody,
     status: u16,
+    redirect: &Redirect,
 ) -> Result<(), Failure>
 where
     C: AsyncWrite + Unpin,
@@ -75,7 +76,7 @@ where
     // An empty or unreadable body still has to reach the sandbox as an answer it
     // can parse, so the status alone becomes the error.
     let parsed = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
-    let translated = openai_response::translate(&parsed, status)?;
+    let translated = translate::response(redirect.translation, &parsed, status)?;
     let payload = serde_json::to_vec(&translated)?;
 
     client
@@ -98,6 +99,7 @@ async fn stream_answer<C, U>(
     client: &mut C,
     upstream: &mut U,
     body: &mut ResponseBody,
+    redirect: &Redirect,
 ) -> Result<(), Failure>
 where
     C: AsyncWrite + Unpin,
@@ -114,7 +116,7 @@ where
     // the end of one. So neither a backend that dies mid-stream nor a frame this
     // proxy cannot read aborts here: both stop the loop, and the message is
     // closed and the body terminated on the way out.
-    let mut translator = StreamTranslator::new();
+    let mut translator = StreamTranslator::new(redirect.translation);
     loop {
         let Ok(Some(part)) = body.next(upstream).await else {
             break;

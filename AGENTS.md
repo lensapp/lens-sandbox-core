@@ -21,7 +21,7 @@ cargo test -p lens-sandbox-core -- --ignored
 ## Conventions
 
 - **Git**: Conventional commits (`feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `ci:`)
-- **Rust edition**: 2024, MSRV 1.85
+- **Rust edition**: 2024, MSRV 1.96.1 (pinned in `rust-toolchain.toml`)
 - **No `any`-style shortcuts**: avoid `unsafe` unless strictly necessary, no `unwrap()` in library code outside tests
 - **Tests**: new features and bug fixes should include tests
 

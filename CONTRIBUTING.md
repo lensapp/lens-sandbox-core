@@ -6,12 +6,15 @@ This repository contains the shared Rust library used by Lens Sandbox and Lens A
 
 ## Development Setup
 
-Install a Rust toolchain compatible with the repository MSRV:
+`rust-toolchain.toml` names the compiler this repository builds with, and rustup
+reads it automatically. Install that version once:
 
 ```bash
-rustup toolchain install 1.85
-rustup override set 1.85
+rustup toolchain install $(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)
 ```
+
+Do not set a `rustup override`, and unset `RUSTUP_TOOLCHAIN` if your shell
+exports one: either overrides the file.
 
 Set up the repository hooks:
 

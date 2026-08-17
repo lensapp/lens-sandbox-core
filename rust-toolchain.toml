@@ -1,0 +1,9 @@
+[toolchain]
+# One known compiler for every developer. The floor is set by
+# switchyard-translation, which declares 1.96.1; this crate itself needs nothing
+# newer than the 2024 edition.
+#
+# CI names the same version in its own `RUST_TOOLCHAIN`, because the action that
+# installs it exports `RUSTUP_TOOLCHAIN` and that overrides this file.
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
