@@ -620,7 +620,11 @@ pub struct McpMatcher {
     /// The `resources/*` methods carry it.
     ///
     /// `*` spans a `/` here, unlike a `path` glob, so `file:///projects/*` also
-    /// covers `file:///projects/a/b/anything`.
+    /// covers `file:///projects/a/b/anything`. Because of that reach, a rule that
+    /// sets this refuses a URI holding a `.` or `..` segment, or any percent
+    /// escape: the server resolves those and this door cannot, so the URI could
+    /// land outside the tree the glob bounds. A resource whose URI must carry an
+    /// escape needs a rule that names the method and puts no condition here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
 

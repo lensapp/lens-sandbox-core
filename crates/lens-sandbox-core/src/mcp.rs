@@ -85,6 +85,25 @@ impl Subject {
     }
 }
 
+/// Whether a URI may resolve somewhere other than where it reads.
+///
+/// A `.` or `..` segment lets a server reach outside the tree a `uri` glob
+/// bounds, because `*` spans a separator here. A backslash counts as a separator,
+/// and any percent-escape counts as a dodge: which characters divide a path, and
+/// how an escape decodes, are the server's answers, not this door's. Naming the
+/// escapes that can become a dot would be a list to get around — an overlong
+/// `%c0%ae` is not on it — so every escape is refused, the way a body this door
+/// cannot read is refused. [`crate::routing::normalize_path`] resolves an HTTP
+/// path instead, because there the grammar is the door's to enforce.
+///
+/// The whole URI is read, not the path alone, because where the path stops is
+/// also the server's business.
+fn may_resolve_elsewhere(uri: &str) -> bool {
+    uri.split(['/', '\\'])
+        .any(|segment| segment == "." || segment == "..")
+        || uri.contains('%')
+}
+
 /// Whether a method carries `params.arguments`, which a condition can point into.
 fn carries_arguments(method: &str) -> bool {
     matches!(method, "tools/call" | "prompts/get")
@@ -192,6 +211,18 @@ pub fn check_operation(info: &RequestInfo, matchers: &[&McpMatcher]) -> Result<(
     if matchers.iter().any(|matcher| covers(info, matcher)) {
         return Ok(());
     }
+    if let Some(uri) = info.uri.as_deref()
+        && may_resolve_elsewhere(uri)
+        && Subject::of(&info.method) == Subject::Uri
+        && matchers
+            .iter()
+            .any(|matcher| matcher.uri.is_some() && glob_matches(&matcher.method, &info.method))
+    {
+        return Err(format!(
+            "MCP request \"{}\" names uri \"{uri}\", which may resolve outside what a rule bounds",
+            info.method
+        ));
+    }
     Err(match info.mirrored_name() {
         Some(name) => format!(
             "no MCP rule permits method \"{}\" naming \"{name}\"",
@@ -214,7 +245,10 @@ fn covers(info: &RequestInfo, matcher: &McpMatcher) -> bool {
         return false;
     }
     if let Some(uri) = &matcher.uri
-        && (subject != Subject::Uri || !info.uri.as_deref().is_some_and(|u| glob_matches(uri, u)))
+        && (subject != Subject::Uri
+            || !info.uri.as_deref().is_some_and(|requested| {
+                !may_resolve_elsewhere(requested) && glob_matches(uri, requested)
+            }))
     {
         return false;
     }
@@ -439,6 +473,17 @@ mod tests {
         format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}"}}}}"#)
     }
 
+    fn uri_rule(uri: &str) -> McpMatcher {
+        McpMatcher {
+            uri: Some(uri.to_string()),
+            ..matcher("resources/read")
+        }
+    }
+
+    fn read(uri: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","method":"resources/read","params":{{"uri":"{uri}"}}}}"#)
+    }
+
     fn judge(body: &str, matchers: &[&McpMatcher]) -> Result<(), String> {
         super::judge(&head(""), body.as_bytes(), matchers).map(|_| ())
     }
@@ -603,6 +648,94 @@ mod tests {
         let decoy = r#"{"jsonrpc":"2.0","method":"tools/call",
             "params":{"name":"delete_everything"}}"#;
         assert!(judge(decoy, &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_uri_rule_covers_a_resource_below_the_tree_it_bounds() {
+        // `*` spans a `/` here, which is what makes the refusals below necessary.
+        let rule = uri_rule("file:///projects/*");
+        assert!(judge(&read("file:///projects/a/b/notes.txt"), &[&rule]).is_ok());
+    }
+
+    #[test]
+    fn a_uri_holding_a_dot_segment_is_refused() {
+        let rule = uri_rule("file:///projects/*");
+        let err = judge(&read("file:///projects/../../etc/passwd"), &[&rule])
+            .expect_err("the server would read outside the tree the rule bounds");
+        assert!(err.contains("may resolve outside"), "{err}");
+    }
+
+    #[test]
+    fn a_uri_holding_any_percent_escape_is_refused() {
+        // What an escape decodes to is the server's answer. Listing the escapes
+        // that become a dot would be a list to get around, so none pass: the
+        // encoded dot, the double-encoded one, the encoded separator, the
+        // overlong dot no list would name, and the innocent space alike.
+        let rule = uri_rule("file:///projects/*");
+        for uri in [
+            "file:///projects/%2e%2e/secret",
+            "file:///projects/%252e%252e/secret",
+            "file:///projects/a%2f..%2fsecret",
+            "file:///projects/%c0%ae%c0%ae/secret",
+            "file:///projects/report%20final.txt",
+        ] {
+            assert!(judge(&read(uri), &[&rule]).is_err(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn a_uri_holding_a_backslash_segment_is_refused() {
+        // Which characters divide a path is the server's answer, not this door's.
+        let rule = uri_rule("file:///projects/*");
+        assert!(judge(&read(r"file:///projects/..\\secret"), &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_rule_putting_no_condition_on_the_uri_still_covers_one() {
+        // The operator bounded the method, not the tree, so there is no tree to
+        // resolve outside of.
+        assert!(
+            judge(
+                &read("file:///projects/../secret"),
+                &[&matcher("resources/read")]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_method_reading_no_uri_does_not_own_the_reason() {
+        // `tools/call` reads `params.name`, so a stray uri beside it bounds
+        // nothing and cannot be why the request lost.
+        let stray = r#"{"jsonrpc":"2.0","method":"tools/call",
+            "params":{"uri":"file:///x/../y"}}"#;
+        let rule = McpMatcher {
+            uri: Some("file:///x/*".to_string()),
+            ..matcher("*")
+        };
+        let err = judge(stray, &[&rule]).expect_err("no rule permits it");
+        assert!(err.contains("no MCP rule permits"), "{err}");
+    }
+
+    #[test]
+    fn a_uri_rule_for_another_method_does_not_own_the_reason() {
+        // A clean URI would have lost the same way, so the dot segment is not why.
+        let subscribe = r#"{"jsonrpc":"2.0","method":"resources/subscribe",
+            "params":{"uri":"file:///x/../y"}}"#;
+        let err =
+            judge(subscribe, &[&uri_rule("file:///x/*")]).expect_err("no rule permits the method");
+        assert!(err.contains("no MCP rule permits"), "{err}");
+    }
+
+    #[test]
+    fn the_reason_names_the_denial_that_happened() {
+        // Where no rule bounds a tree, a dot segment is not why the request lost.
+        let err = judge(
+            &read("file:///projects/../secret"),
+            &[&tool_rule("tools/call", "*")],
+        )
+        .expect_err("no rule permits the method");
+        assert!(err.contains("no MCP rule permits"), "{err}");
     }
 
     #[test]
