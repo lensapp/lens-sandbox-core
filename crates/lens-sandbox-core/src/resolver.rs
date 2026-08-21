@@ -145,15 +145,19 @@ pub async fn resolve_first(host: &str, port: u16) -> io::Result<SocketAddr> {
 /// cache and reads the system configuration once; a per-dial resolver would
 /// re-parse `/etc/resolv.conf` and throw the cache away.
 ///
-/// A failure to build is cached like a success: the configuration a container
-/// starts with is the configuration it keeps, so a retry would read the same
-/// unreadable file and every lookup would pay for it.
+/// Only a working resolver is kept. A first dial can arrive before the file it
+/// reads is finished — Docker and kubelet both write `resolv.conf` after the
+/// root filesystem exists — and a remembered failure would then outlive the
+/// thing that caused it and refuse every name for as long as the sandbox runs.
+/// The next dial reads the file again instead, which costs one read beside a
+/// lookup that was going to wait for the network anyway.
 fn resolver() -> io::Result<&'static Resolver<MarkedRuntime>> {
-    static RESOLVER: OnceLock<Result<Resolver<MarkedRuntime>, String>> = OnceLock::new();
-    RESOLVER
-        .get_or_init(build_resolver)
-        .as_ref()
-        .map_err(|e| io::Error::other(e.clone()))
+    static RESOLVER: OnceLock<Resolver<MarkedRuntime>> = OnceLock::new();
+    if let Some(resolver) = RESOLVER.get() {
+        return Ok(resolver);
+    }
+    let built = build_resolver().map_err(io::Error::other)?;
+    Ok(RESOLVER.get_or_init(|| built))
 }
 
 fn build_resolver() -> Result<Resolver<MarkedRuntime>, String> {
