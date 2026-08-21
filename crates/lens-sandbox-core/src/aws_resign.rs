@@ -663,6 +663,9 @@ fn check_http_rules(
         crate::routing::HttpRuleOutcome::NoMatch => {
             Err("no HTTP rule permits this method and path".to_string())
         }
+        crate::routing::HttpRuleOutcome::Conflict => {
+            Err(crate::routing::CONFLICT_REASON.to_string())
+        }
         crate::routing::HttpRuleOutcome::Graphql(matchers) => match &prepared.outgoing_body {
             OutgoingBody::Buffered { bytes, .. } => {
                 crate::graphql::check_request(&prepared.method, &prepared.uri, bytes, &matchers)
@@ -1621,15 +1624,19 @@ mod tests {
         }
     }
 
-    const TOOL_CALL: &str = r#"{"method":"tools/call","params":{"name":"read_file"}}"#;
+    /// A head naming a revision the MCP rules enforce.
+    const COMPLIANT_HEAD: &str = "POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: 2026-07-28";
+
+    const TOOL_CALL: &str =
+        r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"read_file"}}"#;
 
     #[test]
     fn an_mcp_rule_judges_the_re_signed_request() {
         let rules = mcp_read_rule();
-        assert!(check_http_rules(&rules, &prepared_mcp("", TOOL_CALL)).is_ok());
+        assert!(check_http_rules(&rules, &prepared_mcp(COMPLIANT_HEAD, TOOL_CALL)).is_ok());
 
-        let denied = r#"{"method":"tools/call","params":{"name":"write_file"}}"#;
-        let detail = check_http_rules(&rules, &prepared_mcp("", denied))
+        let denied = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"write_file"}}"#;
+        let detail = check_http_rules(&rules, &prepared_mcp(COMPLIANT_HEAD, denied))
             .expect_err("a tool no rule names must not pass");
         assert!(detail.contains("write_file"), "unexpected detail: {detail}");
     }
@@ -1638,7 +1645,7 @@ mod tests {
     fn an_mcp_rule_reads_the_outgoing_head_for_the_mirrored_headers() {
         // Re-signing rewrites the head, and upstream acts on what it receives.
         let rules = mcp_read_rule();
-        let head = "POST /mcp HTTP/1.1\r\nMcp-Name: write_file";
+        let head = "POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Name: write_file";
         let detail = check_http_rules(&rules, &prepared_mcp(head, TOOL_CALL))
             .expect_err("a header disagreeing with the body must not pass");
         assert!(detail.contains("Mcp-Name"), "unexpected detail: {detail}");
@@ -1649,7 +1656,7 @@ mod tests {
         let rules = mcp_read_rule();
         let prepared = PreparedResign {
             outgoing_body: OutgoingBody::Stream,
-            ..prepared_mcp("", TOOL_CALL)
+            ..prepared_mcp(COMPLIANT_HEAD, TOOL_CALL)
         };
         let detail =
             check_http_rules(&rules, &prepared).expect_err("an unread payload must not pass");

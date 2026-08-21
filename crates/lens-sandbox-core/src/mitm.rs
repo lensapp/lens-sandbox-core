@@ -14,7 +14,7 @@ use crate::ca::EphemeralCa;
 use crate::http_body::{BodyFraming, determine_body_framing};
 use crate::policy_schema::GraphqlMatcher;
 use crate::proxy::CredentialInjection;
-use crate::routing::HttpRule;
+use crate::routing::{CONFLICT_REASON, HttpRule};
 use crate::sock_mark;
 
 /// How to reach the upstream server after terminating client TLS.
@@ -958,6 +958,11 @@ async fn mitm_inject_after_accept(
                 )
                 .await);
         }
+        crate::routing::HttpRuleOutcome::Conflict => {
+            return Err(facts
+                .deny(&mut tls_client, "http_rule_denied", CONFLICT_REASON)
+                .await);
+        }
         // The handshake of an upgrade carries no operation — the frames do. The
         // rules that cover this head go on to judge each one of them.
         crate::routing::HttpRuleOutcome::Graphql(matchers) if is_upgrade => {
@@ -1227,6 +1232,11 @@ async fn mitm_inject_after_accept(
                             "rewritten_path_denied",
                             "rewritten URI does not match policy rules",
                         )
+                        .await);
+                }
+                crate::routing::HttpRuleOutcome::Conflict => {
+                    return Err(facts
+                        .deny(&mut tls_client, "rewritten_path_denied", CONFLICT_REASON)
                         .await);
                 }
                 // The rewrite may have moved the connection onto other GraphQL
@@ -3224,7 +3234,7 @@ mod tests {
 
     fn mcp_request(body: &str, extra_headers: &str) -> Vec<u8> {
         format!(
-            "POST /mcp HTTP/1.1\r\nHost: test.example.com\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
+            "POST /mcp HTTP/1.1\r\nHost: test.example.com\r\nMCP-Protocol-Version: 2026-07-28\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .into_bytes()
@@ -3339,10 +3349,11 @@ mod tests {
                 }),
             },
         ];
-        let body = r#"{"method":"tools/call","params":{"name":"write_file"}}"#;
+        let body = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"write_file"}}"#;
         let request: &[u8] = Box::leak(
             format!(
                 "POST /mcp/{placeholder} HTTP/1.1\r\nHost: test.example.com\r\n\
+                 MCP-Protocol-Version: 2026-07-28\r\n\
                  Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
@@ -3394,10 +3405,11 @@ mod tests {
             rule(format!("/mcp/{placeholder}"), "*"),
             rule("/mcp/real-token".to_string(), "read_*"),
         ];
-        let body = r#"{"method":"tools/call","params":{"name":"read_file"}}"#;
+        let body = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"read_file"}}"#;
         let request: &[u8] = Box::leak(
             format!(
                 "POST /mcp/{placeholder} HTTP/1.1\r\nHost: test.example.com\r\n\
+                 MCP-Protocol-Version: 2026-07-28\r\n\
                  Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
@@ -3446,10 +3458,11 @@ mod tests {
                 }),
             },
         ];
-        let body = r#"{"method":"tools/call","params":{"name":"read_file"}}"#;
+        let body = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"read_file"}}"#;
         let request: &[u8] = Box::leak(
             format!(
                 "POST /mcp/{placeholder} HTTP/1.1\r\nHost: test.example.com\r\n\
+                 MCP-Protocol-Version: 2026-07-28\r\n\
                  Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             )
@@ -3490,7 +3503,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_compressed_mcp_body_is_denied_rather_than_relayed_unread() {
-        let body = r#"{"method":"tools/call","params":{"name":"read_file"}}"#;
+        let body = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"read_file"}}"#;
         let request: &'static [u8] =
             Box::leak(mcp_request(body, "Content-Encoding: gzip\r\n").into_boxed_slice());
         let (_err, response, _audits) =

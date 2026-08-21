@@ -107,15 +107,6 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             }
         }
 
-        if http_rules.iter().any(|r| r.graphql.is_some())
-            && http_rules.iter().any(|r| r.mcp.is_some())
-        {
-            return Err(format!(
-                "route {} mixes graphql and mcp rules; one endpoint speaks one of them",
-                raw.match_pattern
-            ));
-        }
-
         // A body-reading rule governs the requests its head covers, so a bodiless
         // rule beside it does not admit them. That is worth saying out loud at
         // load: the operator sees which shape wins before a request is denied
@@ -1176,15 +1167,23 @@ pub enum HttpRuleOutcome<'a> {
     /// MCP rules cover it, and they decide it once the body is read. Each matcher
     /// listed is a candidate; one of them must cover the request whole.
     Mcp(Vec<&'a McpMatcher>),
+    /// Rules of both body grammars cover it, so which one judges the request is
+    /// undefined. The caller denies rather than picking one.
+    Conflict,
 }
+
+/// The reason a door records when it denies on [`HttpRuleOutcome::Conflict`].
+pub const CONFLICT_REASON: &str =
+    "rules of both body grammars cover this request, so no rule decides it";
 
 /// Decide what a route's HTTP rules make of a request head.
 ///
 /// An empty rule list puts no restriction on the route, which is the
 /// deny-by-default contract on [`crate::policy_schema::RouteRule::rules`].
 ///
-/// Where both kinds of rule cover the same head, the body-reading rules win and
-/// the body decides. [`crate::policy_schema::HttpRule::graphql`] says why.
+/// Where a rule reading the body and a rule reading the head alone cover the same
+/// head, the body-reading one wins and the body decides.
+/// [`crate::policy_schema::HttpRule::graphql`] says why.
 pub fn classify_http_request<'a>(
     rules: &'a [HttpRule],
     method: &str,
@@ -1208,8 +1207,13 @@ pub fn classify_http_request<'a>(
         }
     }
 
-    // A route carrying both grammars is refused at load, so at most one of these
-    // is non-empty for any head.
+    // Both non-empty means one request is claimed by two grammars, which has no
+    // defined winner. Refused here rather than at load: a route may serve both on
+    // disjoint paths, and whether two globs overlap is its own problem, while
+    // whether they both cover *this* head is a fact.
+    if !graphql.is_empty() && !mcp.is_empty() {
+        return HttpRuleOutcome::Conflict;
+    }
     if !graphql.is_empty() {
         HttpRuleOutcome::Graphql(graphql)
     } else if !mcp.is_empty() {
@@ -1489,15 +1493,41 @@ mod tests {
     }
 
     #[test]
-    fn a_route_mixing_graphql_and_mcp_rules_is_refused() {
-        let err = route(
+    fn a_route_may_serve_both_grammars_on_disjoint_paths() {
+        // Route selection is first-match-wins, so an operator cannot split one
+        // host in two to escape a refusal here. Disjoint paths do not conflict.
+        let routes = route(
             r#"[
                 { "path": "/graphql", "graphql": { "operationType": "query" } },
                 { "path": "/mcp", "mcp": { "method": "*" } }
             ]"#,
         )
-        .expect_err("one endpoint speaks one of them");
-        assert!(err.contains("mixes graphql and mcp"), "{err}");
+        .expect("disjoint endpoints on one host are not a conflict");
+        let rules = &routes[0].http_rules;
+        assert!(matches!(
+            classify_http_request(rules, "POST", "/graphql"),
+            HttpRuleOutcome::Graphql(_)
+        ));
+        assert!(matches!(
+            classify_http_request(rules, "POST", "/mcp"),
+            HttpRuleOutcome::Mcp(_)
+        ));
+    }
+
+    #[test]
+    fn one_head_covered_by_both_grammars_is_refused() {
+        // Which grammar judges the request would be undefined, so neither does.
+        let routes = route(
+            r#"[
+                { "path": "/**", "graphql": { "operationType": "query" } },
+                { "path": "/mcp", "mcp": { "method": "*" } }
+            ]"#,
+        )
+        .expect("the overlap is a runtime fact, not a load error");
+        assert!(matches!(
+            classify_http_request(&routes[0].http_rules, "POST", "/mcp"),
+            HttpRuleOutcome::Conflict
+        ));
     }
 
     #[test]

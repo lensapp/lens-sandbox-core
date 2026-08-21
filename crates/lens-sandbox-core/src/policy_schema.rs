@@ -593,10 +593,12 @@ pub enum GraphqlOperationTypeMatcher {
 ///
 /// This reads MCP revision `2026-07-28`: one JSON-RPC request or notification per
 /// `POST`, never a batch, and the sandbox is the only side that sends a request.
-/// An earlier revision let a server drive the client over a stream this door
-/// relays unread. Those revisions are refused as a consequence rather than by a
-/// version test — no rule here names `initialize`, so their handshake matches
-/// nothing.
+/// A request that names any other revision in its `MCP-Protocol-Version` header
+/// is refused, and so is one that names none.
+///
+/// Each field bounds only the methods that read it: `tool` the ones that name at
+/// `params.name`, `uri` the ones that name at `params.uri`, `arguments` the ones
+/// that carry them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpMatcher {
@@ -615,14 +617,15 @@ pub struct McpMatcher {
     pub tool: Option<String>,
 
     /// The resource the request must name, as a glob, read from `params.uri`.
-    /// Only `resources/read` carries it.
+    /// The `resources/*` methods carry it.
     ///
     /// `*` spans a `/` here, unlike a `path` glob, so `file:///projects/*` also
     /// covers `file:///projects/a/b/anything`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
 
-    /// Conditions on the tool arguments. Every entry must match.
+    /// Conditions on the arguments, which `tools/call` and `prompts/get` carry.
+    /// Every entry must match.
     ///
     /// Each entry bounds the argument it names and says nothing about the rest.
     /// This is unlike [`GraphqlMatcher::fields`], which every root field must

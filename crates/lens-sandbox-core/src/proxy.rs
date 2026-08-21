@@ -859,6 +859,11 @@ async fn handle_http_forward(
                 .deny(&mut client, "no HTTP rule permits this method and path")
                 .await;
         }
+        crate::routing::HttpRuleOutcome::Conflict => {
+            return refusal
+                .deny(&mut client, crate::routing::CONFLICT_REASON)
+                .await;
+        }
         crate::routing::HttpRuleOutcome::Graphql(matchers) => {
             let framing = crate::http_body::determine_body_framing(&header_str);
             let body = match crate::graphql::read_body_for_inspection(
@@ -935,6 +940,9 @@ async fn handle_http_forward(
                 crate::routing::HttpRuleOutcome::Allow => None,
                 crate::routing::HttpRuleOutcome::NoMatch => {
                     Some("rewritten URI does not match policy rules".to_string())
+                }
+                crate::routing::HttpRuleOutcome::Conflict => {
+                    Some(crate::routing::CONFLICT_REASON.to_string())
                 }
                 // The credential value moved the request onto a GraphQL rule. The
                 // rewrite does not touch the body, so the one already read answers
@@ -4512,7 +4520,7 @@ pub(crate) mod tests {
     /// governed only HTTPS would leave `http://` unjudged.
     async fn forward_mcp(state: &Arc<ProxyState>, body: &'static str) -> String {
         let head = format!(
-            "POST http://10.0.0.5/mcp HTTP/1.1\r\nHost: 10.0.0.5\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            "POST http://10.0.0.5/mcp HTTP/1.1\r\nHost: 10.0.0.5\r\nMCP-Protocol-Version: 2026-07-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         )
         .into_bytes();
@@ -4569,7 +4577,7 @@ pub(crate) mod tests {
     /// Drive the forward-proxy door with a placeholder in the path.
     async fn forward_mcp_with_placeholder(state: &Arc<ProxyState>, body: &'static str) -> String {
         let head = format!(
-            "POST http://10.0.0.5/mcp/__lens_cred:tok__ HTTP/1.1\r\nHost: 10.0.0.5\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            "POST http://10.0.0.5/mcp/__lens_cred:tok__ HTTP/1.1\r\nHost: 10.0.0.5\r\nMCP-Protocol-Version: 2026-07-28\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         )
         .into_bytes();
@@ -4593,7 +4601,7 @@ pub(crate) mod tests {
 
         let response = forward_mcp_with_placeholder(
             &state,
-            r#"{"method":"tools/call","params":{"name":"write_file"}}"#,
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"write_file"}}"#,
         )
         .await;
         assert!(
@@ -4609,7 +4617,7 @@ pub(crate) mod tests {
 
         let response = forward_mcp(
             &state,
-            r#"{"method":"tools/call","params":{"name":"write_file"}}"#,
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"write_file"}}"#,
         )
         .await;
         assert!(
