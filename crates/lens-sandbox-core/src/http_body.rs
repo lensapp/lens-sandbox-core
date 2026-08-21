@@ -15,6 +15,8 @@
 //! pipelined behind the request stay on the socket rather than being swallowed
 //! into a buffer this module would later drop.
 
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Largest request body buffered for policy inspection.
@@ -217,7 +219,7 @@ impl std::fmt::Display for BodyReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooLarge { limit } => {
-                write!(f, "request body exceeds the {limit}-byte inspection limit")
+                write!(f, "payload exceeds the {limit}-byte read limit")
             }
             Self::Malformed(detail) => write!(f, "{detail}"),
         }
@@ -536,6 +538,105 @@ pub fn ensure_body_is_readable(header_block: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Parse a JSON body, refusing a duplicate object key at any depth.
+///
+/// `serde_json` keeps the last of two same-named keys without complaint, and a
+/// server may keep the first. That difference is the proxy-reads-one,
+/// server-runs-the-other gap that every body rule exists to close, so a repeated
+/// key fails the request instead. Trailing content after the value is refused
+/// for the same reason: two documents in one body are two accounts of the
+/// request.
+pub fn parse_json_strict(body: &[u8]) -> Result<serde_json::Value, String> {
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let value = StrictValue::deserialize_from(&mut de).map_err(|err| err.to_string())?;
+    de.end().map_err(|err| err.to_string())?;
+    Ok(value)
+}
+
+/// A [`Value`] parsed with duplicate object keys refused at every depth.
+///
+/// `serde_json` keeps the last of two same-named keys without complaint, and a
+/// server may keep the first. That difference is exactly the proxy-reads-one,
+/// server-runs-the-other gap these rules exist to close, so a repeated key fails
+/// the request instead.
+struct StrictValue;
+
+impl StrictValue {
+    fn deserialize_from<'de, D: Deserializer<'de>>(de: D) -> Result<Value, D::Error> {
+        de.deserialize_any(StrictValue)
+    }
+}
+
+impl<'de> Visitor<'de> for StrictValue {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value with no repeated object key")
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, de: D) -> Result<Value, D::Error> {
+        Self::deserialize_from(de)
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_string()))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(StrictSeed)? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut object = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value_seed(StrictSeed)?;
+            if object.insert(key.clone(), value).is_some() {
+                return Err(de::Error::custom(format!("duplicate key \"{key}\"")));
+            }
+        }
+        Ok(Value::Object(object))
+    }
+}
+
+/// Carries the duplicate-key refusal into every nested value.
+struct StrictSeed;
+
+impl<'de> de::DeserializeSeed<'de> for StrictSeed {
+    type Value = Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, de: D) -> Result<Value, D::Error> {
+        StrictValue::deserialize_from(de)
+    }
 }
 
 #[cfg(test)]

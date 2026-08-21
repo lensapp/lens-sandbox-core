@@ -883,8 +883,13 @@ async fn handle_http_forward(
         }
         crate::routing::HttpRuleOutcome::Mcp(matchers) => {
             let framing = crate::http_body::determine_body_framing(&header_str);
-            let body = match crate::mcp::read_body_for_inspection(&mut client, &header_str, framing)
-                .await
+            let body = match crate::mcp::read_body_for_inspection(
+                &mut client,
+                &header_str,
+                method,
+                framing,
+            )
+            .await
             {
                 Ok(body) => body,
                 Err(detail) => {
@@ -4519,6 +4524,82 @@ pub(crate) mod tests {
         });
         client.write_all(body.as_bytes()).await.unwrap();
         read_response(&mut client).await
+    }
+
+    /// Two MCP rules, one for the path carrying the placeholder and one for the
+    /// path the credential produces, plus the placeholder that moves between them.
+    fn install_mcp_rewrite_allow(state: &Arc<ProxyState>, permit_after_rewrite: &str) {
+        {
+            let mut map = state.uri_placeholder_injections.write().unwrap();
+            map.insert(
+                "10.0.0.5".into(),
+                vec![("__lens_cred:tok__".into(), "real-token".into())],
+            );
+        }
+        let rule = |path: &str, tool: &str| crate::policy_schema::HttpRule {
+            method: Some("POST".to_string()),
+            path: Some(path.to_string()),
+            graphql: None,
+            mcp: Some(crate::policy_schema::McpMatcher {
+                method: "tools/call".to_string(),
+                tool: Some(tool.to_string()),
+                uri: None,
+                arguments: Vec::new(),
+            }),
+        };
+        state
+            .policy
+            .write()
+            .unwrap()
+            .routes
+            .push(crate::routing::RouteRule {
+                matcher: crate::routing::RouteMatcher::Domain("*".to_string()),
+                verdict: Verdict::Allow,
+                transport: Transport::Direct,
+                tls_terminate: false,
+                http_rules: vec![
+                    rule("/mcp/__lens_cred:tok__", "*"),
+                    rule("/mcp/real-token", permit_after_rewrite),
+                ],
+                scheme: None,
+                binaries: None,
+            });
+    }
+
+    /// Drive the forward-proxy door with a placeholder in the path.
+    async fn forward_mcp_with_placeholder(state: &Arc<ProxyState>, body: &'static str) -> String {
+        let head = format!(
+            "POST http://10.0.0.5/mcp/__lens_cred:tok__ HTTP/1.1\r\nHost: 10.0.0.5\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            handle_http_forward(server, "10.0.0.5:80", head, &state_for_handler, &actor).await
+        });
+        client.write_all(body.as_bytes()).await.unwrap();
+        read_response(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn http_forward_re_judges_a_rewritten_path_against_the_mcp_rules_it_reaches() {
+        // The rule for the placeholder path permits any tool; the one the
+        // credential produces permits only `read_*`. The body must answer to the
+        // rules the rewritten path actually reaches.
+        let (state, _rx) = test_state();
+        install_mcp_rewrite_allow(&state, "read_*");
+
+        let response = forward_mcp_with_placeholder(
+            &state,
+            r#"{"method":"tools/call","params":{"name":"write_file"}}"#,
+        )
+        .await;
+        assert!(
+            response.contains("403"),
+            "the post-rewrite rule must decide; got {response:?}"
+        );
     }
 
     #[tokio::test]

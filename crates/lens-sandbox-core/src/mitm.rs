@@ -1017,15 +1017,19 @@ async fn mitm_inject_after_accept(
                 .await);
         }
         crate::routing::HttpRuleOutcome::Mcp(matchers) => {
-            let body =
-                match crate::mcp::read_body_for_inspection(&mut tls_client, &header_str, body_mode)
-                    .await
-                {
-                    Ok(body) => body,
-                    Err(reason) => {
-                        return Err(facts.deny(&mut tls_client, "mcp_denied", &reason).await);
-                    }
-                };
+            let body = match crate::mcp::read_body_for_inspection(
+                &mut tls_client,
+                &header_str,
+                method,
+                body_mode,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(reason) => {
+                    return Err(facts.deny(&mut tls_client, "mcp_denied", &reason).await);
+                }
+            };
             let info = match crate::mcp::judge(&header_str, &body, &matchers) {
                 Ok(info) => info,
                 Err(reason) => {
@@ -3368,6 +3372,54 @@ mod tests {
                 .any(|event| event["metadata"]["rewritten_path_denied"] == true),
             "the rewritten path is what must refuse it: {audits:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_path_the_mcp_rules_still_cover_reaches_the_origin() {
+        // The mirror of the denial above. Without this, an arm that refused every
+        // rewritten request would look correct.
+        let placeholder = "__lens_cred:tok__";
+        let rule = |path: String, tool: &str| HttpRule {
+            method: Some("POST".to_string()),
+            path: Some(path),
+            graphql: None,
+            mcp: Some(crate::policy_schema::McpMatcher {
+                method: "tools/call".to_string(),
+                tool: Some(tool.to_string()),
+                uri: None,
+                arguments: Vec::new(),
+            }),
+        };
+        let rules = vec![
+            rule(format!("/mcp/{placeholder}"), "*"),
+            rule("/mcp/real-token".to_string(), "read_*"),
+        ];
+        let body = r#"{"method":"tools/call","params":{"name":"read_file"}}"#;
+        let request: &[u8] = Box::leak(
+            format!(
+                "POST /mcp/{placeholder} HTTP/1.1\r\nHost: test.example.com\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        );
+        let (upstream_saw, response, audits) = run_mitm_harness_full(
+            vec![],
+            rules,
+            vec![(placeholder.to_string(), "real-token".to_string())],
+            request,
+            true,
+        )
+        .await;
+
+        assert!(response.contains("200 OK"), "expected 200, got: {response}");
+        assert_eq!(audits[0]["result"], "success");
+        assert!(
+            upstream_saw.contains("POST /mcp/real-token"),
+            "the rewrite must reach the origin: {upstream_saw}"
+        );
+        assert!(upstream_saw.ends_with(body), "{upstream_saw}");
     }
 
     #[tokio::test]

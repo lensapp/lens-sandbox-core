@@ -11,7 +11,6 @@
 //! the client re-posts the original request carrying its answer — which arrives
 //! here as an ordinary body this door reads.
 
-use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -53,11 +52,8 @@ pub fn classify_request(body: &[u8]) -> Result<RequestInfo, String> {
         return Err("an MCP rule cannot judge a request with no body".to_string());
     }
 
-    let mut de = serde_json::Deserializer::from_slice(body);
-    let value = StrictValue::deserialize_from(&mut de)
+    let value = crate::http_body::parse_json_strict(body)
         .map_err(|err| format!("MCP request body does not parse: {err}"))?;
-    de.end()
-        .map_err(|err| format!("MCP request body has trailing content: {err}"))?;
 
     let Value::Object(envelope) = value else {
         // An array is a JSON-RPC batch, which this revision removed. Reading one
@@ -207,19 +203,26 @@ pub fn check_headers_agree(header_block: &str, info: &RequestInfo) -> Result<(),
 /// rule must never judge the one it did not act on.
 fn sole_header(header_block: &str, name: &str) -> Result<Option<String>, String> {
     let mut found: Option<String> = None;
-    for line in header_block.split("\r\n").skip(1) {
-        let (field, value) = match line.split_once(':') {
-            Some(parts) => parts,
-            None => continue,
+    let lines: Vec<&str> = header_block.split("\r\n").collect();
+    for (index, line) in lines.iter().enumerate().skip(1) {
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
         };
         if !field.trim().eq_ignore_ascii_case(name) {
             continue;
         }
-        let value = value.trim().to_string();
         if found.is_some() {
             return Err(format!("request carries more than one {name} header"));
         }
-        found = Some(value);
+        // An obsolete folded line (RFC 9110 §5.2) continues the value above, so
+        // reading this line alone would compare a prefix of what upstream sees.
+        if lines
+            .get(index + 1)
+            .is_some_and(|next| next.starts_with([' ', '\t']))
+        {
+            return Err(format!("{name} header is folded across lines"));
+        }
+        found = Some(value.trim().to_string());
     }
     Ok(found)
 }
@@ -245,6 +248,21 @@ fn decode_sentinel(value: &str) -> Result<String, String> {
 // Reading the body
 // ---------------------------------------------------------------------------
 
+/// Refuse a method that carries no MCP message.
+///
+/// This revision sends every message as a `POST`. A body on any other method is
+/// one the server ignores, so a rule judged by it has judged nothing — and a
+/// `GET` is how the revisions before `2026-07-28` opened their server-to-client
+/// stream, which is exactly what must not be admitted on a crafted body.
+pub fn ensure_carries_an_mcp_message(method: &str) -> Result<(), String> {
+    if method.eq_ignore_ascii_case("POST") {
+        return Ok(());
+    }
+    Err(format!(
+        "an MCP rule reads a POST body, so a {method} request carries no message it can judge"
+    ))
+}
+
 /// Buffer the request body an MCP rule must read.
 ///
 /// Bounded by [`crate::http_body::MAX_JUDGED_BODY_BYTES`], and a body over that
@@ -252,11 +270,13 @@ fn decode_sentinel(value: &str) -> Result<String, String> {
 pub async fn read_body_for_inspection<C>(
     tls_client: &mut C,
     header_str: &str,
+    method: &str,
     framing: BodyFraming,
 ) -> Result<Vec<u8>, String>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
+    ensure_carries_an_mcp_message(method)?;
     crate::http_body::ensure_body_is_readable(header_str)?;
 
     // A client that was told to wait is waiting on us, and we hold the body it
@@ -266,94 +286,6 @@ where
     crate::http_body::read_body(tls_client, framing, crate::http_body::MAX_JUDGED_BODY_BYTES)
         .await
         .map_err(|err| err.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// A parse that refuses a duplicate key
-// ---------------------------------------------------------------------------
-
-/// A [`Value`] parsed with duplicate object keys refused at every depth.
-///
-/// `serde_json` keeps the last of two same-named keys without complaint, and a
-/// server may keep the first. That difference is exactly the proxy-reads-one,
-/// server-runs-the-other gap these rules exist to close, so a repeated key fails
-/// the request instead.
-struct StrictValue;
-
-impl StrictValue {
-    fn deserialize_from<'de, D: Deserializer<'de>>(de: D) -> Result<Value, D::Error> {
-        de.deserialize_any(StrictValue)
-    }
-}
-
-impl<'de> Visitor<'de> for StrictValue {
-    type Value = Value;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("any JSON value with no repeated object key")
-    }
-
-    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_none<E: de::Error>(self) -> Result<Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_some<D: Deserializer<'de>>(self, de: D) -> Result<Value, D::Error> {
-        Self::deserialize_from(de)
-    }
-
-    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
-        Ok(Value::Bool(value))
-    }
-
-    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
-        Ok(Value::from(value))
-    }
-
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
-        Ok(Value::from(value))
-    }
-
-    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
-        Ok(serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number))
-    }
-
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
-        Ok(Value::String(value.to_string()))
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        let mut items = Vec::new();
-        while let Some(item) = seq.next_element_seed(StrictSeed)? {
-            items.push(item);
-        }
-        Ok(Value::Array(items))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        let mut object = Map::new();
-        while let Some(key) = map.next_key::<String>()? {
-            let value = map.next_value_seed(StrictSeed)?;
-            if object.insert(key.clone(), value).is_some() {
-                return Err(de::Error::custom(format!("duplicate key \"{key}\"")));
-            }
-        }
-        Ok(Value::Object(object))
-    }
-}
-
-/// Carries the duplicate-key refusal into every nested value.
-struct StrictSeed;
-
-impl<'de> de::DeserializeSeed<'de> for StrictSeed {
-    type Value = Value;
-
-    fn deserialize<D: Deserializer<'de>>(self, de: D) -> Result<Value, D::Error> {
-        StrictValue::deserialize_from(de)
-    }
 }
 
 #[cfg(test)]
@@ -679,6 +611,31 @@ mod tests {
         assert!(super::judge(&disagreeing, body.as_bytes(), &[&rule]).is_err());
     }
 
+    #[test]
+    fn only_a_post_carries_a_message_a_rule_can_judge() {
+        // A GET body is one the server ignores, and a GET is how the older
+        // revisions opened their server-to-client stream. Admitting one on a
+        // crafted body would hand that stream back.
+        assert!(ensure_carries_an_mcp_message("POST").is_ok());
+        assert!(ensure_carries_an_mcp_message("post").is_ok());
+        for method in ["GET", "PUT", "DELETE", "HEAD", "PATCH"] {
+            let err = ensure_carries_an_mcp_message(method)
+                .expect_err("only a POST carries an MCP message");
+            assert!(err.contains(method), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_folded_mirrored_header_is_refused() {
+        // An obs-fold continuation belongs to the value above, so comparing this
+        // line alone would check a prefix of what upstream receives.
+        let head = "POST /mcp HTTP/1.1\r\nMcp-Name: read_file\r\n write_file";
+        let rule = tool_rule("tools/call", "*");
+        let err = super::judge(head, call("read_file").as_bytes(), &[&rule])
+            .expect_err("a folded value must not be compared piecemeal");
+        assert!(err.contains("folded"), "{err}");
+    }
+
     #[tokio::test]
     async fn a_body_over_the_inspection_limit_is_refused() {
         // The limit is what makes the rules affordable, so it has to hold: a body
@@ -694,9 +651,14 @@ mod tests {
             let _ = far.write_all(&vec![b'x'; oversized]).await;
         });
 
-        let err = read_body_for_inspection(&mut near, &head, BodyFraming::Fixed(oversized as u64))
-            .await
-            .expect_err("a body over the limit must be refused");
+        let err = read_body_for_inspection(
+            &mut near,
+            &head,
+            "POST",
+            BodyFraming::Fixed(oversized as u64),
+        )
+        .await
+        .expect_err("a body over the limit must be refused");
         assert!(
             err.contains(&crate::http_body::MAX_JUDGED_BODY_BYTES.to_string()),
             "the reason must name the limit so the need is visible: {err}"
