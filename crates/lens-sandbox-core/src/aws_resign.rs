@@ -677,6 +677,7 @@ fn check_http_rules(
             // The outgoing head and the outgoing body, not the ones that arrived:
             // re-signing rewrites the head, and upstream acts on what it receives.
             OutgoingBody::Buffered { bytes, .. } => {
+                crate::mcp::ensure_carries_an_mcp_message(&prepared.method)?;
                 crate::mcp::judge(&prepared.new_head, bytes, &matchers).map(|_| ())
             }
             OutgoingBody::Stream => {

@@ -127,7 +127,7 @@ fn classify_get(raw_target: &str) -> Result<Vec<OperationInfo>, String> {
     let operation_name = unique_param(&params, "operationName")?;
     let extensions = match unique_param(&params, "extensions")? {
         Some(raw) => Some(
-            serde_json::from_str::<serde_json::Value>(&raw)
+            crate::http_body::parse_json_strict(raw.as_bytes())
                 .map_err(|err| format!("GraphQL extensions parameter is not valid JSON: {err}"))?,
         ),
         None => None,
@@ -148,7 +148,7 @@ fn classify_post(body: &[u8]) -> Result<Vec<OperationInfo>, String> {
     if body.is_empty() {
         return Err("GraphQL POST body is empty".to_string());
     }
-    let value: serde_json::Value = serde_json::from_slice(body)
+    let value = crate::http_body::parse_json_strict(body)
         .map_err(|err| format!("GraphQL request body is not valid JSON: {err}"))?;
 
     match value {
@@ -657,6 +657,15 @@ mod tests {
         assert_eq!(op.operation_type, Some(GraphqlOperationType::Query));
         assert_eq!(op.operation_name.as_deref(), Some("Viewer"));
         assert_eq!(op.fields, ["viewer"]);
+    }
+
+    #[test]
+    fn a_duplicate_key_in_the_envelope_is_refused() {
+        // `serde_json` keeps the last `query` and a server may keep the first, so
+        // the proxy would judge a document the origin never runs.
+        let err = post(r#"{"query":"query { viewer }","query":"mutation { deleteRepository }"}"#)
+            .expect_err("a repeated key must be refused");
+        assert!(err.contains("duplicate key"), "{err}");
     }
 
     #[test]
