@@ -209,6 +209,63 @@ pub fn prepare_writable_dir(path: &Path, creds: &SandboxCredentials) -> Result<(
     Ok(())
 }
 
+/// The name-to-id tables an identity resolves against.
+///
+/// A port rather than a direct NSS call, so every branch of
+/// [`SandboxCredentials::resolve_user_spec`] is reachable in a test
+/// without the host's own passwd deciding the outcome.
+pub trait Passwd: Send + Sync {
+    /// The uid a passwd entry gives this name, if it has one.
+    fn uid_of(&self, name: &str) -> Option<u32>;
+    /// The primary gid on this name's passwd line, if it has one.
+    fn primary_gid_of(&self, name: &str) -> Option<u32>;
+    /// The gid the group file gives this group name, if it has one.
+    fn gid_of_group(&self, group: &str) -> Option<u32>;
+}
+
+/// The tables the system itself answers with, over NSS.
+pub struct SystemPasswd;
+
+impl Passwd for SystemPasswd {
+    fn uid_of(&self, name: &str) -> Option<u32> {
+        nix::unistd::User::from_name(name)
+            .ok()
+            .flatten()
+            .map(|user| user.uid.as_raw())
+    }
+
+    fn primary_gid_of(&self, name: &str) -> Option<u32> {
+        nix::unistd::User::from_name(name)
+            .ok()
+            .flatten()
+            .map(|user| user.gid.as_raw())
+    }
+
+    fn gid_of_group(&self, group: &str) -> Option<u32> {
+        nix::unistd::Group::from_name(group)
+            .ok()
+            .flatten()
+            .map(|group| group.gid.as_raw())
+    }
+}
+
+/// Split a `USER[:GROUP]` into its segments, refusing the shapes that
+/// name no identity at all.
+fn split_user_spec(spec: &str) -> Result<(&str, Option<&str>), String> {
+    let mut parts = spec.split(':');
+    let name = parts.next().unwrap_or_default();
+    let group = parts.next();
+    if parts.next().is_some() {
+        return Err(format!(
+            "invalid user {spec:?}: expected USER or USER:GROUP"
+        ));
+    }
+    if name.is_empty() || group.is_some_and(str::is_empty) {
+        return Err(format!("invalid user {spec:?}: no segment may be empty"));
+    }
+    Ok((name, group))
+}
+
 /// Resolved sandbox uid/gid/home, cached at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCredentials {
@@ -224,6 +281,12 @@ impl SandboxCredentials {
     /// Returns `Ok(Some(creds))` when both the user and the matching group
     /// exist, `Ok(None)` when the user is absent from the image, and
     /// `Err` only for unexpected NSS errors.
+    ///
+    /// Note the "matching group" requirement: this needs a group *named*
+    /// like the user, and answers `Ok(None)` for any identity without one
+    /// — including every numeric `USER`, and any user whose primary group
+    /// is named differently. Use [`Self::resolve_user_spec`] to resolve an
+    /// arbitrary `USER[:GROUP]` the way the kernel and the image mean it.
     pub fn resolve(username: &str) -> Result<Option<Self>, String> {
         let group = match nix::unistd::Group::from_name(username)
             .map_err(|e| format!("group lookup: {e}"))?
@@ -265,6 +328,42 @@ impl SandboxCredentials {
             username,
             home_dir,
         })
+    }
+
+    /// Resolve a `USER[:GROUP]` string against the given name tables.
+    ///
+    /// The two segments resolve differently, because that is how the
+    /// kernel and an image's `USER` directive mean them:
+    ///
+    /// - the **user** is looked up by name first, so a name gets whatever
+    ///   uid this image gave it, and falls back to being parsed as a
+    ///   number. This is how the workload's own identity resolves, and a
+    ///   caller asking for a user by name has to land on the same one;
+    /// - the **group** is parsed as a number first, so a group merely
+    ///   *named* for a numeral cannot outrank the id itself.
+    ///
+    /// With no group segment the user's primary gid applies, and failing
+    /// that the uid doubles as the gid — the usual convention for a
+    /// numeric identity with no passwd line.
+    ///
+    /// A name neither table can resolve is an error, never a fallback:
+    /// falling back would run the child as an identity nobody named, and
+    /// root is the likeliest thing it would fall back to.
+    pub fn resolve_user_spec(spec: &str, passwd: &dyn Passwd) -> Result<Self, String> {
+        let (name, group) = split_user_spec(spec)?;
+        let uid = passwd
+            .uid_of(name)
+            .or_else(|| name.parse::<u32>().ok())
+            .ok_or_else(|| format!("no user {name:?} in passwd"))?;
+        let gid = match group {
+            Some(group) => group
+                .parse::<u32>()
+                .ok()
+                .or_else(|| passwd.gid_of_group(group))
+                .ok_or_else(|| format!("no group {group:?} in the group file"))?,
+            None => passwd.primary_gid_of(name).unwrap_or(uid),
+        };
+        Self::resolve_by_uid(uid, gid)
     }
 
     /// The sandbox user's home directory (from passwd).
@@ -591,6 +690,150 @@ mod tests {
 
     fn creds_for(uid: u32, gid: u32) -> SandboxCredentials {
         SandboxCredentials::resolve_by_uid(uid, gid).expect("resolve_by_uid never fails on a host")
+    }
+
+    #[derive(Default)]
+    struct FakePasswd {
+        users: Vec<(&'static str, u32, u32)>,
+        groups: Vec<(&'static str, u32)>,
+    }
+
+    impl Passwd for FakePasswd {
+        fn uid_of(&self, name: &str) -> Option<u32> {
+            self.users
+                .iter()
+                .find(|(n, ..)| *n == name)
+                .map(|(_, uid, _)| *uid)
+        }
+        fn primary_gid_of(&self, name: &str) -> Option<u32> {
+            self.users
+                .iter()
+                .find(|(n, ..)| *n == name)
+                .map(|(.., gid)| *gid)
+        }
+        fn gid_of_group(&self, group: &str) -> Option<u32> {
+            self.groups
+                .iter()
+                .find(|(g, _)| *g == group)
+                .map(|(_, gid)| *gid)
+        }
+    }
+
+    fn image() -> FakePasswd {
+        FakePasswd {
+            users: vec![("node", 1000, 20)],
+            groups: vec![("staff", 50)],
+        }
+    }
+
+    fn ids(spec: &str, passwd: &dyn Passwd) -> (u32, u32) {
+        let creds =
+            SandboxCredentials::resolve_user_spec(spec, passwd).expect("this identity resolves");
+        let (uid, gid) = creds.uid_gid();
+        (uid.as_raw(), gid.as_raw())
+    }
+
+    #[test]
+    fn a_named_user_resolves_against_the_images_own_passwd() {
+        assert_eq!(
+            ids("node", &image()),
+            (1000, 20),
+            "a name means whatever uid this image gave it, so the answer has to come from the image rather than from whoever staged the run"
+        );
+    }
+
+    #[test]
+    fn a_user_named_for_a_numeral_is_the_passwd_entry_rather_than_the_number() {
+        let passwd = FakePasswd {
+            users: vec![("1000", 1500, 30)],
+            groups: Vec::new(),
+        };
+        assert_eq!(
+            ids("1000", &passwd),
+            (1500, 30),
+            "the user segment is name-first because that is how the workload's own identity resolves; reading it as the number instead would land a script on a different uid from the workload on exactly these images"
+        );
+    }
+
+    #[test]
+    fn a_named_user_takes_its_primary_group_when_none_is_declared() {
+        let passwd = FakePasswd {
+            users: vec![("node", 1000, 20)],
+            groups: Vec::new(),
+        };
+        assert_eq!(
+            ids("node", &passwd),
+            (1000, 20),
+            "the primary group is what the passwd line says, not a group that happens to share the user's name — `resolve` would have found nothing here"
+        );
+    }
+
+    #[test]
+    fn a_numeric_user_with_no_passwd_line_still_resolves() {
+        assert_eq!(
+            ids("1500", &FakePasswd::default()),
+            (1500, 1500),
+            "a number is the uid directly, so an image carrying a numeric USER and no matching passwd line must still resolve"
+        );
+    }
+
+    #[test]
+    fn a_declared_group_outranks_the_users_primary_one() {
+        assert_eq!(ids("node:staff", &image()), (1000, 50));
+    }
+
+    #[test]
+    fn a_numeric_group_resolves_without_a_group_file_entry() {
+        assert_eq!(ids("node:77", &image()), (1000, 77));
+    }
+
+    #[test]
+    fn a_numeral_group_is_the_gid_itself_even_when_a_group_is_named_for_it() {
+        let passwd = FakePasswd {
+            users: vec![("node", 1000, 20)],
+            groups: vec![("77", 500)],
+        };
+        assert_eq!(
+            ids("node:77", &passwd),
+            (1000, 77),
+            "a number names the id directly, so an image that names a group for a numeral must not be able to hand out a gid the number would never give"
+        );
+    }
+
+    #[test]
+    fn a_user_the_tables_cannot_resolve_is_an_error_rather_than_a_fallback() {
+        let err = SandboxCredentials::resolve_user_spec("nobody-here", &image())
+            .expect_err("an unknown name has no answer");
+        assert!(
+            err.contains("nobody-here"),
+            "falling back would run as an identity nobody named, and root is the likeliest thing it would fall back to; got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_group_the_tables_cannot_resolve_is_an_error() {
+        let err = SandboxCredentials::resolve_user_spec("node:ghosts", &image())
+            .expect_err("an unknown group has no answer");
+        assert!(err.contains("ghosts"), "got: {err}");
+    }
+
+    #[test]
+    fn a_spec_that_names_no_identity_is_refused() {
+        for spec in ["", "node:staff:extra", ":staff", "node:"] {
+            assert!(
+                SandboxCredentials::resolve_user_spec(spec, &image()).is_err(),
+                "this shape names no identity, so resolving it would invent one: {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_system_tables_answer_for_root() {
+        assert_eq!(
+            SystemPasswd.uid_of("root"),
+            Some(0),
+            "root is the one entry every platform we run on carries, so this pins the NSS wiring without depending on the image"
+        );
     }
 
     #[test]
