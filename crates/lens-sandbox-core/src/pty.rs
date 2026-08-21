@@ -84,7 +84,14 @@ pub fn spawn_pty(
     apply_ca_env(&mut cmd);
 
     // pre_exec: set up PTY as controlling terminal + privilege drop
-    let creds_info = creds.map(|c| c.uid_gid());
+    // Same rule as the piped path, from the same function: root reaches the
+    // capability drop rather than a `setuid(0)` that would keep CAP_NET_ADMIN.
+    let privilege = crate::privilege::privilege_drop_for(creds, is_root);
+    let creds_info = match privilege {
+        crate::privilege::PrivilegeDrop::Setuid(creds) => Some(creds.uid_gid()),
+        _ => None,
+    };
+    let drop_capabilities = privilege == crate::privilege::PrivilegeDrop::Capabilities;
     unsafe {
         cmd.pre_exec(move || {
             // New session so this process becomes session leader
@@ -123,7 +130,7 @@ pub fn spawn_pty(
                     .map_err(|e| std::io::Error::other(format!("setuid: {e}")))?;
                 crate::privilege::lock_down_after_setuid()?;
                 crate::privilege::set_pdeathsig_sigterm()?;
-            } else if is_root {
+            } else if drop_capabilities {
                 // No UID drop — drop caps so the agent can't rewrite iptables
                 // or set SO_MARK to bypass the proxy redirect.
                 crate::privilege::drop_capabilities_in_child()?;
@@ -309,5 +316,51 @@ mod tests {
         let status = proc.child.wait().await.expect("wait");
         assert!(status.success(), "exit: {status:?}");
         assert!(output.contains("NoNewPrivs:\t1"), "got: {output:?}");
+    }
+
+    /// The PTY sibling of `child_spawner`'s gid assertion: root credentials
+    /// must reach the capability drop here too, or a PTY agent resolved to
+    /// uid 0 keeps CAP_NET_ADMIN.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_pty_does_not_setuid_for_root_credentials() {
+        let ours = nix::unistd::getgid().as_raw();
+        let other = if ours == 1 { 2 } else { 1 };
+        let creds = SandboxCredentials::resolve_by_uid(0, other)
+            .expect("resolve_by_uid never fails on a host");
+        let mut proc = spawn_pty(
+            "/bin/sh",
+            &["-c".into(), "id -g".into()],
+            Some("/tmp"),
+            None,
+            Some(&creds),
+            nix::unistd::geteuid().is_root(),
+            Some((80, 24)),
+        )
+        .expect("spawn should succeed");
+
+        let mut output = String::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match proc.reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => output.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        proc.child.wait().await.expect("wait");
+
+        let reported = output
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or_default();
+
+        assert_eq!(
+            reported,
+            ours.to_string(),
+            "root credentials must take the capability path, which does not setgid; a child reporting {other} took the uid drop and kept CAP_NET_ADMIN with it"
+        );
     }
 }
