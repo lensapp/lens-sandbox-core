@@ -555,12 +555,7 @@ pub fn parse_json_strict(body: &[u8]) -> Result<serde_json::Value, String> {
     Ok(value)
 }
 
-/// A [`Value`] parsed with duplicate object keys refused at every depth.
-///
-/// `serde_json` keeps the last of two same-named keys without complaint, and a
-/// server may keep the first. That difference is exactly the proxy-reads-one,
-/// server-runs-the-other gap these rules exist to close, so a repeated key fails
-/// the request instead.
+/// The visitor behind [`parse_json_strict`].
 struct StrictValue;
 
 impl StrictValue {

@@ -172,7 +172,10 @@ where
 /// recognise is refused rather than forwarded, because an unknown type may
 /// carry an operation in a shape the rules cannot read.
 fn judge_message(text: &str, matchers: &[&GraphqlMatcher]) -> Result<(), String> {
-    let value: serde_json::Value = serde_json::from_str(text)
+    // Strict, because the frame is forwarded byte for byte once it passes: a
+    // repeated `type` read one way here and the other way upstream would relay an
+    // operation no rule judged.
+    let value = crate::http_body::parse_json_strict(text.as_bytes())
         .map_err(|err| format!("a client WebSocket message is not valid JSON: {err}"))?;
     let object = value
         .as_object()
@@ -466,6 +469,25 @@ mod tests {
         let reason =
             judge(r#"{"id":"1","type":"subscribe"}"#).expect_err("there is no operation to judge");
         assert!(reason.contains("no operation payload"), "{reason}");
+    }
+
+    #[test]
+    fn a_duplicate_key_in_a_message_is_refused() {
+        // A frame that passes is forwarded byte for byte. `serde_json` keeps the
+        // last `type` and a first-wins server keeps the other, so this reads as a
+        // harmless `ping` here while the origin runs the subscribe.
+        let reason = judge(r#"{"id":"1","type":"subscribe","type":"ping"}"#)
+            .expect_err("a repeated key must be refused");
+        assert!(reason.contains("duplicate key"), "{reason}");
+    }
+
+    #[test]
+    fn a_duplicate_key_inside_the_payload_is_refused() {
+        let reason = judge(
+            r#"{"id":"1","type":"subscribe","payload":{"query":"{ viewer }","query":"mutation { deleteRepository }"}}"#,
+        )
+        .expect_err("a repeated key at any depth must be refused");
+        assert!(reason.contains("duplicate key"), "{reason}");
     }
 
     #[test]
