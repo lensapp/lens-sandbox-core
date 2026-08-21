@@ -33,6 +33,7 @@ pub mod mitm;
 pub mod network;
 pub mod peer_process;
 pub mod policy_schema;
+pub mod prestart;
 pub mod privilege;
 pub mod protocol;
 pub mod proxy;

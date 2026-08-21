@@ -93,6 +93,27 @@ pub async fn wait_with_signal_forwarding(
     child.wait().await
 }
 
+/// The status a caller reports for a child that has been waited on.
+///
+/// A signalled child has no exit code of its own, so it takes the shell's
+/// convention of `128 + signal` — that is what a reader comparing the
+/// number against `kill -l` expects. A child with neither, which the
+/// platform should not produce, reports a plain failure rather than
+/// success.
+#[cfg(unix)]
+pub fn exit_code_of(status: ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
+#[cfg(not(unix))]
+pub fn exit_code_of(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
 /// Send SIGTERM to the child. Safe to call once: `child.id()` only
 /// returns `None` after the child has been reaped via `wait()`, which
 /// hasn't happened yet at this point in the call chain.
@@ -430,5 +451,26 @@ mod tests {
             .expect("wait result");
 
         assert!(status.success(), "expected success, got {status:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_exited_reports_its_own_code() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // The wait status a child that called exit(100) leaves behind.
+        assert_eq!(exit_code_of(ExitStatus::from_raw(100 << 8)), 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signalled_child_reports_the_signal_above_128() {
+        use std::os::unix::process::ExitStatusExt;
+
+        assert_eq!(
+            exit_code_of(ExitStatus::from_raw(nix::libc::SIGKILL)),
+            128 + 9,
+            "a signalled child has no exit code of its own, and 128 + signal is what a reader comparing the number against `kill -l` expects"
+        );
     }
 }
