@@ -51,8 +51,18 @@ jobs:
       - run: cargo test -p lens-sandbox-core --tests --no-run
       # `CAP_NET_ADMIN` for the nftables rules, and one thread because the cage
       # tests share one table and one queue reader (see
-      # `udp_egress_over_nfqueue.rs`).
-      - run: sudo -E env "PATH=$PATH" cargo test -p lens-sandbox-core --tests -- --ignored --test-threads=1
+      # `udp_egress_over_nfqueue.rs`). These probe an address off the box, so
+      # they need the runner's own routes.
+      - run: >
+          sudo -E env "PATH=$PATH" cargo test -p lens-sandbox-core --tests --
+          --ignored --test-threads=1
+          --skip the_supervisors_own_lookup_never_reaches_the_stub
+      # That one test needs a namespace of its own, and `lo` as the only way
+      # out — see its module doc for what a shared namespace hides.
+      - run: >
+          sudo -E env "PATH=$PATH" unshare -n -- sh -c
+          'ip link set lo up && ip route add default dev lo &&
+          cargo test -p lens-sandbox-core --test supervisor_lookup_over_the_cage -- --ignored'
       # A killed test binary never runs its drop guard, and a stranded table
       # confines the runner itself.
       - if: always()
