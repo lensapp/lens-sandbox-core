@@ -1544,6 +1544,7 @@ mod tests {
                 operation_type: GraphqlOperationTypeMatcher::Query,
                 operation_name: None,
                 fields: vec![],
+                arguments: vec![],
             }),
             mcp: None,
         }]

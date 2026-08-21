@@ -4478,6 +4478,7 @@ pub(crate) mod tests {
                         operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
                         operation_name: None,
                         fields: vec!["viewer".to_string()],
+                        arguments: vec![],
                     }),
                     mcp: None,
                 }],

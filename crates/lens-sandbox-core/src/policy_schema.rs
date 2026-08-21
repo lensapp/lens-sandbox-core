@@ -570,6 +570,78 @@ pub struct GraphqlMatcher {
     /// through `__schema`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
+
+    /// Conditions on the arguments a root field carries. Every entry must match.
+    ///
+    /// This is what binds an operation to a subject rather than to a shape:
+    /// `repository(owner: "acme")` and `repository(owner: $o)` with
+    /// `variables: {"o": "acme"}` both resolve to `acme`, and a condition reads
+    /// the resolved value — what the server acts on.
+    ///
+    /// Each entry bounds the argument it names on the field it names, and says
+    /// nothing about other arguments. A field whose arguments decide what it
+    /// reaches needs one entry per argument that matters. Where a field occurs
+    /// more than once — aliases and fragments both allow it — every occurrence
+    /// must satisfy the entry, so `{ a: repository(owner: "acme") b:
+    /// repository(owner: "other") }` cannot pass on the strength of its first
+    /// half.
+    ///
+    /// # An entry needs a `fields` bound beside it
+    ///
+    /// An entry says nothing about an operation that does not select its field,
+    /// so it is [`fields`](Self::fields) that decides what else the rule admits.
+    /// A policy writing entries beside no `fields` is refused, and so is an entry
+    /// naming a field that `fields` denies. Neither check can judge how tightly
+    /// `fields` is written: with `fields: ["*"]`, an entry on `repository` leaves
+    /// every other root field free. Draw that bound as narrowly as the rule needs
+    /// to mean what it says.
+    ///
+    /// # What arguments cannot bound
+    ///
+    /// They bound the operation's entry points, not everything it reaches. A
+    /// selection nested under a permitted field can leave the subject through
+    /// arguments of its own or through no argument at all — a fork's `parent`,
+    /// an `owner { repositories }`. Nor can they bound a mutation, whose subject
+    /// is an opaque node id the caller can build offline. Only the credential's
+    /// own scope bounds those, so a rule that must confine an agent to a subject
+    /// pairs this with a token scoped to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<GraphqlArgumentMatch>,
+}
+
+/// One condition on the arguments of one GraphQL root field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GraphqlArgumentMatch {
+    /// The root field this condition reads, by exact name — never a glob, and
+    /// never an alias. [`GraphqlMatcher::fields`] is what selects which fields a
+    /// rule admits; a glob here would only spread one condition thinner.
+    pub field: String,
+
+    /// RFC 6901 JSON pointer to the argument, rooted at the field's arguments,
+    /// so `/owner` reaches the `owner` argument and `/input/name` reaches inside
+    /// an input object. A `/` inside a key is written `~1`, and a `~` is written
+    /// `~0`. See [`McpArgumentMatch::pointer`] for why a pointer and not a
+    /// dotted path.
+    ///
+    /// An argument given as a variable is resolved from the request's
+    /// `variables` before the pointer reads it. A variable the request does not
+    /// supply resolves to nothing and so does not match.
+    ///
+    /// A pointer into a list addresses one element (`/ids/0`) and says nothing
+    /// about the others.
+    pub pointer: String,
+
+    /// Glob the argument value must match, compared against the value written as
+    /// text: a string bare, a number in the form the document wrote it, an enum
+    /// by its name.
+    ///
+    /// A pointer that reaches nothing, or reaches `null`, a list, or an object,
+    /// does not match. So a mistyped pointer denies the request rather than
+    /// widening the rule. The comparison is case-sensitive, which for a subject
+    /// the server treats case-insensitively — a GitHub owner or repository name
+    /// — denies a spelling the server would have accepted.
+    pub glob: String,
 }
 
 /// The operation types a [`GraphqlMatcher`] can cover.

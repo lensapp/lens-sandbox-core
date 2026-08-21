@@ -4,8 +4,13 @@
 //! to be told apart from its neighbours. GraphQL puts the operation in the
 //! request body instead: every call is the same `POST /graphql`, so method and
 //! path cannot tell a read from a write. This module reads what the request
-//! actually asks for — the operation type, its name, and the root fields it
-//! selects — so a rule can bind to that.
+//! actually asks for — the operation type, its name, the root fields it selects,
+//! and the arguments those fields carry — so a rule can bind to that.
+//!
+//! An argument is read as the server will act on it: a value the document writes
+//! inline and the same value supplied through `variables` read alike. That is what
+//! lets a rule name a subject rather than only a shape — one repository of one
+//! owner, rather than every `repository` there is.
 //!
 //! # Everything here fails closed
 //!
@@ -13,6 +18,16 @@
 //! a batch above the cap, and a persisted query that carries no document are
 //! all errors, never an empty result that a caller might read as "nothing to
 //! object to". The caller denies the request on `Err`.
+//!
+//! # A name declared twice is refused
+//!
+//! The specification forbids a repeated argument, input-object field, variable,
+//! fragment, and operation name, and this parser accepts all five. Which one
+//! binds is then the server's choice, so a reader that took the last where the
+//! server takes the first would judge a value the server discards — and the frame
+//! that passes is forwarded byte for byte. Every one of the five is therefore an
+//! error here, not a value read on a guess. `parse_json_strict` refuses a
+//! repeated key in the envelope for the same reason.
 //!
 //! # What this cannot read
 //!
@@ -24,13 +39,15 @@
 //! frame rather than in a request body. [`crate::graphql_ws`] reads those, and
 //! judges each one with the [`check_envelope`] entry point here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use apollo_parser::{Parser, cst};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::http_body::BodyFraming;
-use crate::policy_schema::{GraphqlMatcher, GraphqlOperationType, GraphqlOperationTypeMatcher};
+use crate::policy_schema::{
+    GraphqlArgumentMatch, GraphqlMatcher, GraphqlOperationType, GraphqlOperationTypeMatcher,
+};
 use crate::routing::glob_matches;
 
 /// Recursion depth the document parser accepts. A document nested deeper than
@@ -65,6 +82,13 @@ pub struct OperationInfo {
     /// it.
     pub fields: Vec<String>,
 
+    /// Every place a root field appears, in selection order and undeduplicated.
+    ///
+    /// [`fields`](Self::fields) is this list's names, deduplicated — all a rule
+    /// bounding the selection needs. A rule bounding an argument needs each
+    /// occurrence apart; see [`GraphqlMatcher::arguments`].
+    pub root_fields: Vec<RootField>,
+
     /// The persisted-query identifier the request carried: the Apollo APQ
     /// sha256 hash when present, otherwise a document id. Set whether or not
     /// the request also carried a document.
@@ -78,6 +102,21 @@ impl OperationInfo {
     pub fn is_opaque(&self) -> bool {
         self.operation_type.is_none()
     }
+}
+
+/// One place a root field appears in an operation, with its arguments read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootField {
+    /// The field name, never its alias.
+    pub name: String,
+
+    /// The arguments this occurrence carries, as a JSON object, with every
+    /// variable reference already replaced by the value the request supplies.
+    ///
+    /// A variable the request does not supply becomes `null`, which no glob
+    /// matches — the same answer as an absent argument, because in both cases the
+    /// rule cannot read what the server will act on.
+    pub arguments: serde_json::Value,
 }
 
 /// Every operation one GraphQL request carries. A batch envelope produces
@@ -132,12 +171,23 @@ fn classify_get(raw_target: &str) -> Result<Vec<OperationInfo>, String> {
         ),
         None => None,
     };
+    // A GET carries its variables as one JSON object in a parameter, where a
+    // POST has them as a member of the envelope. Both doors must read them, or a
+    // rule bounding an argument would hold on one and not the other.
+    let variables = match unique_param(&params, "variables")? {
+        Some(raw) => Some(
+            crate::http_body::parse_json_strict(raw.as_bytes())
+                .map_err(|err| format!("GraphQL variables parameter is not valid JSON: {err}"))?,
+        ),
+        None => None,
+    };
     let persisted_id = unique_persisted_query_id(&params)?;
 
     Ok(vec![classify_envelope(
         query.as_deref(),
         operation_name.as_deref(),
         extensions.as_ref(),
+        variables.as_ref(),
         persisted_id,
     )?])
 }
@@ -189,6 +239,7 @@ fn classify_json_envelope(value: &serde_json::Value) -> Result<OperationInfo, St
         query,
         operation_name,
         object.get("extensions"),
+        object.get("variables"),
         persisted_id,
     )
 }
@@ -203,14 +254,16 @@ fn classify_envelope(
     query: Option<&str>,
     operation_name: Option<&str>,
     extensions: Option<&serde_json::Value>,
+    variables: Option<&serde_json::Value>,
     persisted_id: Option<String>,
 ) -> Result<OperationInfo, String> {
     let persisted_key = persisted_query_hash(extensions).or(persisted_id);
     let query = query.filter(|document| !document.trim().is_empty());
+    let variables = read_variables(variables)?;
 
     match query {
         Some(document) => {
-            let mut operation = classify_document(document, operation_name)?;
+            let mut operation = classify_document(document, operation_name, &variables)?;
             operation.persisted_key = persisted_key;
             Ok(operation)
         }
@@ -223,9 +276,25 @@ fn classify_envelope(
                 operation_type: None,
                 operation_name: operation_name.map(ToString::to_string),
                 fields: Vec::new(),
+                root_fields: Vec::new(),
                 persisted_key: Some(persisted_key),
             })
         }
+    }
+}
+
+/// Read the request's `variables` member, which supplies the values the document
+/// refers to by name.
+///
+/// Absent and `null` both mean a request that supplies none — clients send both.
+/// Anything other than an object is malformed, and refused rather than read as
+/// none: a rule bounding an argument would otherwise be satisfied by a request
+/// the server rejects, teaching the operator that the rule holds.
+fn read_variables(variables: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+    match variables {
+        None | Some(serde_json::Value::Null) => Ok(serde_json::Value::Null),
+        Some(value @ serde_json::Value::Object(_)) => Ok(value.clone()),
+        Some(_) => Err("GraphQL variables must be a JSON object".to_string()),
     }
 }
 
@@ -233,6 +302,7 @@ fn classify_envelope(
 fn classify_document(
     document: &str,
     operation_name: Option<&str>,
+    variables: &serde_json::Value,
 ) -> Result<OperationInfo, String> {
     let parsed = Parser::new(document)
         .recursion_limit(PARSER_RECURSION_LIMIT)
@@ -249,7 +319,12 @@ fn classify_document(
             cst::Definition::OperationDefinition(operation) => operations.push(operation),
             cst::Definition::FragmentDefinition(fragment) => {
                 if let Some(name) = fragment.fragment_name().and_then(|name| name.name()) {
-                    fragments.insert(name.text().to_string(), fragment);
+                    let name = name.text().to_string();
+                    if fragments.insert(name.clone(), fragment).is_some() {
+                        return Err(format!(
+                            "GraphQL document declares the fragment {name} twice"
+                        ));
+                    }
                 }
             }
             // Type-system definitions cannot be executed, so they select
@@ -266,14 +341,22 @@ fn classify_document(
     // Without it a document may hold only one, else the server could not tell
     // either.
     let selected = match operation_name.filter(|name| !name.is_empty()) {
-        Some(wanted) => operations
-            .into_iter()
-            .find(|operation| {
+        Some(wanted) => {
+            let mut named = operations.into_iter().filter(|operation| {
                 operation
                     .name()
                     .is_some_and(|name| name.text().as_ref() == wanted)
-            })
-            .ok_or_else(|| format!("GraphQL document declares no operation named {wanted:?}"))?,
+            });
+            let selected = named.next().ok_or_else(|| {
+                format!("GraphQL document declares no operation named {wanted:?}")
+            })?;
+            if named.next().is_some() {
+                return Err(format!(
+                    "GraphQL document declares the operation {wanted:?} twice"
+                ));
+            }
+            selected
+        }
         None if operations.len() == 1 => operations.remove(0),
         None => {
             return Err(
@@ -282,21 +365,54 @@ fn classify_document(
         }
     };
 
+    check_variable_definitions(&selected)?;
+
     let selection_set = selected
         .selection_set()
         .ok_or_else(|| "GraphQL operation selects no field".to_string())?;
-    let mut fields = HashSet::new();
+    let mut root_fields = Vec::new();
     let mut visited = HashSet::new();
-    collect_root_fields(selection_set, &fragments, &mut visited, &mut fields);
-    let mut fields: Vec<String> = fields.into_iter().collect();
-    fields.sort();
+    collect_root_fields(
+        selection_set,
+        &fragments,
+        variables,
+        &mut visited,
+        &mut root_fields,
+    )?;
+    let fields = root_fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
 
     Ok(OperationInfo {
         operation_type: Some(operation_type(&selected)),
         operation_name: selected.name().map(|name| name.text().to_string()),
         fields,
+        root_fields,
         persisted_key: None,
     })
+}
+
+/// Refuse an operation that declares one variable name twice.
+fn check_variable_definitions(operation: &cst::OperationDefinition) -> Result<(), String> {
+    let Some(definitions) = operation.variable_definitions() else {
+        return Ok(());
+    };
+    let mut seen = HashSet::new();
+    for definition in definitions.variable_definitions() {
+        let Some(name) = definition.variable().and_then(|variable| variable.name()) else {
+            continue;
+        };
+        if !seen.insert(name.text().to_string()) {
+            return Err(format!(
+                "GraphQL operation declares the variable ${} twice",
+                name.text()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Read an operation's type. A document may leave it out, which the
@@ -321,21 +437,25 @@ fn operation_type(operation: &cst::OperationDefinition) -> GraphqlOperationType 
 fn collect_root_fields(
     selection_set: cst::SelectionSet,
     fragments: &HashMap<String, cst::FragmentDefinition>,
+    variables: &serde_json::Value,
     visited: &mut HashSet<String>,
-    fields: &mut HashSet<String>,
-) {
+    fields: &mut Vec<RootField>,
+) -> Result<(), String> {
     for selection in selection_set.selections() {
         match selection {
             // The field name, not its alias: an alias renames the response key
             // and cannot change which field the server runs.
             cst::Selection::Field(field) => {
                 if let Some(name) = field.name() {
-                    fields.insert(name.text().to_string());
+                    fields.push(RootField {
+                        name: name.text().to_string(),
+                        arguments: read_arguments(field.arguments(), variables)?,
+                    });
                 }
             }
             cst::Selection::InlineFragment(fragment) => {
                 if let Some(inner) = fragment.selection_set() {
-                    collect_root_fields(inner, fragments, visited, fields);
+                    collect_root_fields(inner, fragments, variables, visited, fields)?;
                 }
             }
             cst::Selection::FragmentSpread(spread) => {
@@ -349,11 +469,101 @@ fn collect_root_fields(
                 if let Some(fragment) = fragments.get(&name)
                     && let Some(inner) = fragment.selection_set()
                 {
-                    collect_root_fields(inner, fragments, visited, fields);
+                    collect_root_fields(inner, fragments, variables, visited, fields)?;
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// Read one field's argument list into a JSON object, resolving variables.
+fn read_arguments(
+    arguments: Option<cst::Arguments>,
+    variables: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut object = serde_json::Map::new();
+    let Some(arguments) = arguments else {
+        return Ok(serde_json::Value::Object(object));
+    };
+    for argument in arguments.arguments() {
+        let Some(name) = argument.name() else {
+            continue;
+        };
+        let name = name.text().to_string();
+        let value = match argument.value() {
+            Some(value) => read_value(&value, variables)?,
+            None => serde_json::Value::Null,
+        };
+        if object.insert(name.clone(), value).is_some() {
+            return Err(format!("GraphQL field carries the argument {name} twice"));
+        }
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+/// Read one argument value into JSON, replacing a variable reference with the
+/// value the request supplies for it.
+///
+/// A variable the request does not supply becomes `null`. So does a variable that
+/// carries only a default in the document: the server would use that default, but
+/// reading it here and matching on it would let the document choose the value the
+/// rule checks, and `null` matches no glob.
+fn read_value(
+    value: &cst::Value,
+    variables: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    Ok(match value {
+        cst::Value::Variable(variable) => variable
+            .name()
+            .and_then(|name| variables.get(name.text().as_ref()))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        cst::Value::StringValue(text) => serde_json::Value::String(String::from(text)),
+        cst::Value::IntValue(number) => number_value(number.int_token()),
+        cst::Value::FloatValue(number) => number_value(number.float_token()),
+        cst::Value::BooleanValue(flag) => serde_json::Value::Bool(flag.true_token().is_some()),
+        cst::Value::NullValue(_) => serde_json::Value::Null,
+        // An enum reads as its name, which is what a glob can be written against.
+        cst::Value::EnumValue(name) => match name.name() {
+            Some(name) => serde_json::Value::String(name.text().to_string()),
+            None => serde_json::Value::Null,
+        },
+        cst::Value::ListValue(list) => serde_json::Value::Array(
+            list.values()
+                .map(|item| read_value(&item, variables))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        cst::Value::ObjectValue(fields) => {
+            let mut object = serde_json::Map::new();
+            for field in fields.object_fields() {
+                let Some(name) = field.name() else { continue };
+                let name = name.text().to_string();
+                let value = match field.value() {
+                    Some(value) => read_value(&value, variables)?,
+                    None => serde_json::Value::Null,
+                };
+                if object.insert(name.clone(), value).is_some() {
+                    return Err(format!(
+                        "GraphQL input object carries the field {name} twice"
+                    ));
+                }
+            }
+            serde_json::Value::Object(object)
+        }
+    })
+}
+
+/// Read a numeric literal, keeping it a number so that a variable supplying the
+/// same value reads the same way.
+///
+/// A literal no JSON number can hold reads as `null`, which matches nothing. It
+/// cannot read as its own text: the variable form of the same value fails the
+/// JSON parse and is refused, and the two forms must not disagree.
+fn number_value(token: Option<apollo_parser::SyntaxToken>) -> serde_json::Value {
+    token
+        .and_then(|token| token.text().parse::<serde_json::Number>().ok())
+        .map_or(serde_json::Value::Null, serde_json::Value::Number)
 }
 
 /// Read an Apollo automatic-persisted-query hash out of the `extensions` block.
@@ -535,6 +745,7 @@ fn covers_operation(matcher: &GraphqlMatcher, operation: &OperationInfo) -> bool
             operation.operation_name.as_deref(),
         )
         && fields_covered(&matcher.fields, &operation.fields)
+        && arguments_covered(&matcher.arguments, &operation.root_fields)
 }
 
 /// Whether the matcher's operation type covers the operation's own.
@@ -579,20 +790,104 @@ fn fields_covered(permitted: &[String], selected: &[String]) -> bool {
             .all(|field| permitted.iter().any(|pattern| glob_matches(pattern, field)))
 }
 
+/// Whether every argument condition holds on the operation.
+///
+/// A condition bounds the argument it names, on every occurrence of the field it
+/// names, and says nothing about the other arguments. All occurrences must
+/// satisfy it, so one field selected twice cannot pass on the strength of its
+/// permitted half.
+///
+/// A condition whose field the operation does not select holds — there is
+/// nothing to object to. Why that is not a hole, and where its limit lies, is
+/// stated on
+/// [`GraphqlMatcher::arguments`](crate::policy_schema::GraphqlMatcher::arguments);
+/// [`crate::routing`] enforces the loader's half of it.
+fn arguments_covered(conditions: &[GraphqlArgumentMatch], root_fields: &[RootField]) -> bool {
+    conditions.iter().all(|condition| {
+        root_fields
+            .iter()
+            .filter(|field| field.name == condition.field)
+            .all(|field| {
+                field
+                    .arguments
+                    .pointer(&condition.pointer)
+                    .and_then(scalar_text)
+                    .is_some_and(|text| glob_matches(&condition.glob, &text))
+            })
+    })
+}
+
+/// Read an argument value as the text a glob is compared against.
+///
+/// `None` for `null`, a list, and an object: a glob describes one value, and a
+/// rule that cannot read one denies rather than widens. A list is addressed one
+/// element at a time by the pointer, an object one member at a time.
+fn scalar_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            None
+        }
+    }
+}
+
 /// Describe an operation for an audit record.
+///
+/// The selection carries its arguments, because a rule can now deny on one. A
+/// record naming only the field would name a field the rule permits, leaving the
+/// operator to guess which argument was the objection.
 fn describe(operation: &OperationInfo) -> String {
     let kind = match operation.operation_type {
         Some(operation_type) => operation_type.to_string(),
         None => "operation".to_string(),
     };
     let name = operation.operation_name.as_deref().unwrap_or("anonymous");
-    if operation.fields.is_empty() {
+    if operation.root_fields.is_empty() {
         format!("GraphQL {kind} {name}")
     } else {
         format!(
             "GraphQL {kind} {name} selecting {}",
-            operation.fields.join(", ")
+            describe_selection(&operation.root_fields)
         )
+    }
+}
+
+/// Longest argument value an audit record repeats. A document may carry a value
+/// far larger than a log line should hold, so a long one is cut.
+const MAX_DESCRIBED_VALUE: usize = 48;
+
+/// Longest selection an audit record repeats, for the same reason. A batch of
+/// wide selections must not be able to write the record's length.
+const MAX_DESCRIBED_SELECTION: usize = 240;
+
+/// Render a selection, each field with the arguments it carries.
+fn describe_selection(root_fields: &[RootField]) -> String {
+    let described: Vec<String> = root_fields.iter().map(describe_field).collect();
+    truncate(&described.join(", "), MAX_DESCRIBED_SELECTION)
+}
+
+/// Render one field occurrence, naming its arguments when it has any.
+fn describe_field(field: &RootField) -> String {
+    let Some(arguments) = field.arguments.as_object().filter(|map| !map.is_empty()) else {
+        return field.name.clone();
+    };
+    let rendered: Vec<String> = arguments
+        .iter()
+        .map(|(key, value)| {
+            let value = scalar_text(value).unwrap_or_else(|| value.to_string());
+            format!("{key}: {}", truncate(&value, MAX_DESCRIBED_VALUE))
+        })
+        .collect();
+    format!("{}({})", field.name, rendered.join(", "))
+}
+
+/// Cut a rendered value to a length, on a character boundary.
+fn truncate(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
     }
 }
 
@@ -1018,6 +1313,7 @@ mod tests {
             operation_type,
             operation_name: operation_name.map(ToString::to_string),
             fields: fields.iter().map(ToString::to_string).collect(),
+            arguments: vec![],
         }
     }
 
@@ -1156,6 +1452,7 @@ mod tests {
             operation_type: Some(GraphqlOperationType::Query),
             operation_name: None,
             fields: Vec::new(),
+            root_fields: Vec::new(),
             persisted_key: None,
         };
         let rule = matcher(GraphqlOperationTypeMatcher::Query, None, &["viewer"]);
@@ -1218,6 +1515,350 @@ mod tests {
     // ----------------------------------------------------------------------
     // Bodies the proxy cannot read
     // ----------------------------------------------------------------------
+
+    // ----------------------------------------------------------------------
+    // Argument conditions
+    // ----------------------------------------------------------------------
+
+    /// A rule admitting `repository` and bounding one of its arguments.
+    fn argument_rule(pointer: &str, glob: &str) -> GraphqlMatcher {
+        GraphqlMatcher {
+            arguments: vec![GraphqlArgumentMatch {
+                field: "repository".to_string(),
+                pointer: pointer.to_string(),
+                glob: glob.to_string(),
+            }],
+            ..matcher(GraphqlOperationTypeMatcher::Query, None, &["repository"])
+        }
+    }
+
+    fn repository(arguments: &str) -> String {
+        serde_json::json!({ "query": format!("{{ repository{arguments} {{ id }} }}") }).to_string()
+    }
+
+    #[test]
+    fn an_argument_condition_bounds_a_literal() {
+        let rules = [argument_rule("/owner", "acme")];
+        assert!(judge(&repository(r#"(owner: "acme")"#), &rules).is_ok());
+        let err = judge(&repository(r#"(owner: "other")"#), &rules)
+            .expect_err("a rule naming one owner must not permit another");
+        assert!(err.contains("no rule permits"), "{err}");
+    }
+
+    #[test]
+    fn an_argument_condition_reads_through_a_variable() {
+        // The rule must read what the server acts on, so a document may write
+        // the subject either way.
+        let rules = [argument_rule("/owner", "acme")];
+        let body = r#"{"query":"query($o:String!){ repository(owner: $o) { id } }","variables":{"o":"acme"}}"#;
+        assert!(judge(body, &rules).is_ok());
+        let other = r#"{"query":"query($o:String!){ repository(owner: $o) { id } }","variables":{"o":"other"}}"#;
+        assert!(judge(other, &rules).is_err());
+    }
+
+    #[test]
+    fn a_variable_the_request_does_not_supply_does_not_match() {
+        // Fail closed. A document that declares a default carries the same
+        // hole: it would otherwise choose the value the rule checks.
+        let rules = [argument_rule("/owner", "*")];
+        let absent = r#"{"query":"query($o:String){ repository(owner: $o) { id } }"}"#;
+        assert!(judge(absent, &rules).is_err());
+        let defaulted =
+            r#"{"query":"query($o:String = \"acme\"){ repository(owner: $o) { id } }"}"#;
+        assert!(judge(defaulted, &rules).is_err());
+    }
+
+    #[test]
+    fn every_occurrence_of_the_field_must_satisfy_the_condition() {
+        // An alias selects the same field twice. A rule read on the first
+        // occurrence alone would let the second carry any subject at all.
+        let rules = [argument_rule("/owner", "acme")];
+        let body = r#"{"query":"{ a: repository(owner: \"acme\") { id } b: repository(owner: \"other\") { id } }"}"#;
+        let err = judge(body, &rules).expect_err("the second occurrence must be judged too");
+        assert!(err.contains("no rule permits"), "{err}");
+    }
+
+    #[test]
+    fn a_second_occurrence_inside_a_fragment_is_judged_too() {
+        let rules = [argument_rule("/owner", "acme")];
+        let body = r#"{"query":"{ repository(owner: \"acme\") { id } ...More } fragment More on Query { repository(owner: \"other\") { id } }"}"#;
+        assert!(judge(body, &rules).is_err());
+    }
+
+    #[test]
+    fn a_pointer_that_reaches_nothing_does_not_match() {
+        // A mistyped pointer and an absent argument both deny, rather than
+        // widening the rule to everything.
+        assert!(
+            judge(
+                &repository(r#"(owner: "acme")"#),
+                &[argument_rule("/onwer", "*")]
+            )
+            .is_err()
+        );
+        assert!(judge(&repository(""), &[argument_rule("/owner", "*")]).is_err());
+    }
+
+    #[test]
+    fn a_pointer_reaches_inside_an_input_object() {
+        let rules = [argument_rule("/input/owner", "acme")];
+        assert!(judge(&repository(r#"(input: {owner: "acme"})"#), &rules).is_ok());
+        assert!(judge(&repository(r#"(input: {owner: "other"})"#), &rules).is_err());
+    }
+
+    #[test]
+    fn a_pointer_reaches_one_list_element() {
+        let rules = [argument_rule("/ids/0", "acme")];
+        assert!(judge(&repository(r#"(ids: ["acme"])"#), &rules).is_ok());
+        // The condition bounds index 0 and says nothing about what follows it.
+        assert!(judge(&repository(r#"(ids: ["acme", "other"])"#), &rules).is_ok());
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_scalar_matches_no_glob() {
+        // A glob describes one value, so a rule that cannot read one denies.
+        let rules = [argument_rule("/owner", "*")];
+        assert!(judge(&repository("(owner: null)"), &rules).is_err());
+        assert!(judge(&repository(r#"(owner: ["acme"])"#), &rules).is_err());
+        assert!(judge(&repository(r#"(owner: {name: "acme"})"#), &rules).is_err());
+    }
+
+    #[test]
+    fn a_number_an_enum_and_a_boolean_match_as_text() {
+        assert!(
+            judge(
+                &repository("(first: 100)"),
+                &[argument_rule("/first", "100")]
+            )
+            .is_ok()
+        );
+        assert!(
+            judge(
+                &repository("(order: DESC)"),
+                &[argument_rule("/order", "DESC")]
+            )
+            .is_ok()
+        );
+        assert!(
+            judge(
+                &repository("(fork: true)"),
+                &[argument_rule("/fork", "true")]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_variable_supplies_a_number_the_same_way_a_literal_writes_it() {
+        // Otherwise a rule would hold on the literal form and not on the
+        // variable form of the same request.
+        let rules = [argument_rule("/first", "100")];
+        let body =
+            r#"{"query":"query($n:Int!){ repository(first: $n) { id } }","variables":{"n":100}}"#;
+        assert!(judge(body, &rules).is_ok());
+    }
+
+    #[test]
+    fn a_glob_bounds_a_family_of_subjects() {
+        let rules = [argument_rule("/owner", "acme-*")];
+        assert!(judge(&repository(r#"(owner: "acme-web")"#), &rules).is_ok());
+        assert!(judge(&repository(r#"(owner: "other")"#), &rules).is_err());
+    }
+
+    #[test]
+    fn the_comparison_is_case_sensitive() {
+        // The server reads a GitHub owner case-insensitively; this denies a
+        // spelling the server would have accepted, which is the safe direction.
+        let rules = [argument_rule("/owner", "acme")];
+        assert!(judge(&repository(r#"(owner: "ACME")"#), &rules).is_err());
+    }
+
+    #[test]
+    fn a_block_string_argument_reads_as_its_text() {
+        let rules = [argument_rule("/owner", "acme")];
+        let body = r#"{"query":"{ repository(owner: \"\"\"\n    acme\n    \"\"\") { id } }"}"#;
+        assert!(judge(body, &rules).is_ok());
+    }
+
+    #[test]
+    fn a_condition_holds_where_the_operation_does_not_select_the_field() {
+        // Nothing to object to. A rule carrying conditions must also bound its
+        // fields, which the policy loader enforces, so this cannot widen a rule
+        // beyond the fields it names.
+        let rules = [GraphqlMatcher {
+            fields: vec!["viewer".to_string(), "repository".to_string()],
+            ..argument_rule("/owner", "acme")
+        }];
+        assert!(judge(r#"{"query":"{ viewer }"}"#, &rules).is_ok());
+    }
+
+    #[test]
+    fn every_condition_must_hold() {
+        let rules = [GraphqlMatcher {
+            arguments: vec![
+                GraphqlArgumentMatch {
+                    field: "repository".to_string(),
+                    pointer: "/owner".to_string(),
+                    glob: "acme".to_string(),
+                },
+                GraphqlArgumentMatch {
+                    field: "repository".to_string(),
+                    pointer: "/name".to_string(),
+                    glob: "api".to_string(),
+                },
+            ],
+            ..matcher(GraphqlOperationTypeMatcher::Query, None, &["repository"])
+        }];
+        assert!(judge(&repository(r#"(owner: "acme", name: "api")"#), &rules).is_ok());
+        assert!(judge(&repository(r#"(owner: "acme", name: "secret")"#), &rules).is_err());
+    }
+
+    #[test]
+    fn the_denial_names_the_argument_it_objected_to() {
+        // Naming only the field would name a field the rule permits, leaving the
+        // operator to guess which argument was the objection.
+        let rules = [argument_rule("/owner", "acme")];
+        let err = judge(&repository(r#"(owner: "other")"#), &rules).unwrap_err();
+        assert!(err.contains(r#"repository(owner: other)"#), "{err}");
+    }
+
+    #[test]
+    fn the_denial_bounds_how_much_of_the_request_it_repeats() {
+        // The reason reaches a log, so a document must not be able to write its
+        // length.
+        let rules = [argument_rule("/owner", "acme")];
+        let long = "x".repeat(4_000);
+        let err = judge(&repository(&format!(r#"(owner: "{long}")"#)), &rules).unwrap_err();
+        assert!(err.len() < 400, "reason is {} bytes", err.len());
+        assert!(err.contains('…'), "{err}");
+    }
+
+    // ----------------------------------------------------------------------
+    // Duplicates the parser tolerates
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn an_argument_given_twice_is_refused() {
+        // The parser accepts it and the specification forbids it, so which value
+        // binds is the server's choice. A rule that read one could be reading
+        // the value the server discards.
+        let rules = [argument_rule("/owner", "acme")];
+        let err = judge(&repository(r#"(owner: "acme", owner: "other")"#), &rules)
+            .expect_err("a duplicate argument must not be judged");
+        assert!(err.contains("carries the argument owner twice"), "{err}");
+    }
+
+    #[test]
+    fn an_input_object_field_given_twice_is_refused() {
+        let rules = [argument_rule("/input/owner", "acme")];
+        let err = judge(
+            &repository(r#"(input: {owner: "acme", owner: "other"})"#),
+            &rules,
+        )
+        .expect_err("a duplicate input-object field must not be judged");
+        assert!(err.contains("carries the field owner twice"), "{err}");
+    }
+
+    #[test]
+    fn a_variable_declared_twice_is_refused() {
+        let rules = [argument_rule("/owner", "acme")];
+        let body = r#"{"query":"query($o:String = \"acme\", $o:String = \"other\"){ repository(owner: $o) { id } }","variables":{}}"#;
+        let err = judge(body, &rules).expect_err("a duplicate variable must not be judged");
+        assert!(err.contains("declares the variable $o twice"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicate_argument_is_refused_even_where_no_rule_reads_it() {
+        // The refusal belongs to reading the document, not to the rule that
+        // happens to be written: a later rule must not be able to reach a
+        // document this one could not read.
+        let rules = [matcher(
+            GraphqlOperationTypeMatcher::Query,
+            None,
+            &["repository"],
+        )];
+        assert!(judge(&repository(r#"(owner: "acme", owner: "other")"#), &rules).is_err());
+    }
+
+    #[test]
+    fn a_fragment_declared_twice_is_refused() {
+        // The parser accepts it. Reading the last would judge `acme` while a
+        // first-wins server runs `other`, on a frame forwarded byte for byte.
+        let rules = [argument_rule("/owner", "acme")];
+        let body = r#"{"query":"{ ...F } fragment F on Query { repository(owner: \"other\") { id } } fragment F on Query { repository(owner: \"acme\") { id } }"}"#;
+        let err = judge(body, &rules).expect_err("a duplicate fragment must not be judged");
+        assert!(err.contains("declares the fragment F twice"), "{err}");
+    }
+
+    #[test]
+    fn an_operation_name_declared_twice_is_refused() {
+        // The mirror of the fragment case: reading the first would judge `other`
+        // while a last-wins server runs `acme`.
+        let rules = [argument_rule("/owner", "acme")];
+        let body = r#"{"query":"query Q { repository(owner: \"other\") { id } } query Q { repository(owner: \"acme\") { id } }","operationName":"Q"}"#;
+        let err = judge(body, &rules).expect_err("a duplicate operation must not be judged");
+        assert!(err.contains(r#"declares the operation "Q" twice"#), "{err}");
+    }
+
+    #[test]
+    fn a_numeric_literal_too_large_for_json_matches_nothing() {
+        // It cannot read as its own text: the variable form of the same value
+        // fails the JSON parse and is refused, and the two must not disagree.
+        let rules = [argument_rule("/first", "*")];
+        assert!(judge(&repository("(first: 1e999)"), &rules).is_err());
+    }
+
+    // ----------------------------------------------------------------------
+    // Variables on every door
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn variables_that_are_not_an_object_are_refused() {
+        let rules = [argument_rule("/owner", "acme")];
+        let body = r#"{"query":"{ repository(owner: \"acme\") { id } }","variables":5}"#;
+        let err = judge(body, &rules).expect_err("malformed variables must not be read as none");
+        assert!(err.contains("variables must be a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn null_variables_read_as_none() {
+        // Clients send both an absent member and an explicit null.
+        let rules = [argument_rule("/owner", "acme")];
+        let body = r#"{"query":"{ repository(owner: \"acme\") { id } }","variables":null}"#;
+        assert!(judge(body, &rules).is_ok());
+    }
+
+    #[test]
+    fn a_get_reads_its_variables_parameter() {
+        let rule = argument_rule("/owner", "acme");
+        let candidates = [&rule];
+        let target = "/graphql?query=query($o:String!)%7B%20repository(owner:%20$o)%20%7B%20id%20%7D%20%7D&variables=%7B%22o%22:%22acme%22%7D";
+        assert!(check_request("GET", target, b"", &candidates).is_ok());
+        let other = "/graphql?query=query($o:String!)%7B%20repository(owner:%20$o)%20%7B%20id%20%7D%20%7D&variables=%7B%22o%22:%22other%22%7D";
+        assert!(check_request("GET", other, b"", &candidates).is_err());
+    }
+
+    #[test]
+    fn a_get_that_repeats_its_variables_parameter_is_refused() {
+        let rule = argument_rule("/owner", "acme");
+        let candidates = [&rule];
+        let target = "/graphql?query=%7B%20repository(owner:%20%22acme%22)%20%7B%20id%20%7D%20%7D&variables=%7B%7D&variables=%7B%7D";
+        let err = check_request("GET", target, b"", &candidates)
+            .expect_err("two variables parameters leave which one binds undecided");
+        assert!(
+            err.contains(r#"repeats the "variables" parameter"#),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_member_of_a_batch_is_judged_against_its_own_variables() {
+        let rules = [argument_rule("/owner", "acme")];
+        let ok = r#"[{"query":"query($o:String!){ repository(owner: $o) { id } }","variables":{"o":"acme"}}]"#;
+        assert!(judge(ok, &rules).is_ok());
+        let mixed = r#"[{"query":"query($o:String!){ repository(owner: $o) { id } }","variables":{"o":"acme"}},{"query":"query($o:String!){ repository(owner: $o) { id } }","variables":{"o":"other"}}]"#;
+        assert!(judge(mixed, &rules).is_err());
+    }
 
     // ----------------------------------------------------------------------
     // Name globs
