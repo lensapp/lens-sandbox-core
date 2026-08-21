@@ -1500,9 +1500,12 @@ pub async fn handle_tls_bridge(
     };
 
     // Connect TCP to upstream
-    let upstream_stream = sock_mark::connect_tcp_resolve(dial_addr)
-        .await
-        .map_err(|e| format!("TLS bridge: failed to connect to upstream {dial_addr}: {e}"))?;
+    let upstream_stream = sock_mark::connect_tcp_resolve(
+        &crate::proxy::extract_hostname(dial_addr),
+        crate::proxy::extract_port(dial_addr, 443),
+    )
+    .await
+    .map_err(|e| format!("TLS bridge: failed to connect to upstream {dial_addr}: {e}"))?;
 
     // Wrap upstream in TLS with mTLS client cert
     let mut tls_upstream = connect_upstream_tls(

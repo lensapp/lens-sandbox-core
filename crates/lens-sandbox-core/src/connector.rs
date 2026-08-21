@@ -116,7 +116,7 @@ impl Connector for TcpConnector {
             "wss" | "https" => 443,
             _ => 80,
         });
-        let tcp = sock_mark::connect_tcp_resolve(&format!("{host}:{port}")).await?;
+        let tcp = sock_mark::connect_tcp_resolve(host, port).await?;
         Ok(Stream::Tcp(tcp))
     }
 }

@@ -5,6 +5,9 @@
 //! mark via `SO_MARK` so that proxy → upstream connections aren't recursively
 //! caught by the very rule that's supposed to redirect the agent's traffic.
 //!
+//! Name lookups are marked too — see [`crate::resolver`] for why libc's
+//! `getaddrinfo` cannot be.
+//!
 //! This decouples policy from the agent's UID — the nftables rules no longer
 //! need to name a specific `meta skuid` value, so the agent can run as any user
 //! the user-supplied image expects. Bypass via mark-spoofing requires
@@ -45,7 +48,7 @@ pub const REJECT_MARK: u32 = 0x4E_58_55_44; // "NXUD" in ASCII
 /// is nothing to bypass. Returning the error here would make every outbound
 /// connection from an unprivileged Linux process fail.
 #[cfg(target_os = "linux")]
-fn mark<F: AsFd>(fd: &F) -> io::Result<()> {
+pub(crate) fn mark<F: AsFd>(fd: &F) -> io::Result<()> {
     match nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::Mark, &MARK_VALUE) {
         Err(nix::errno::Errno::EPERM) => {
             tracing::debug!("SO_MARK setsockopt: EPERM (CAP_NET_ADMIN unavailable); continuing");
@@ -56,7 +59,7 @@ fn mark<F: AsFd>(fd: &F) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn mark<F: AsFd>(_fd: &F) -> io::Result<()> {
+pub(crate) fn mark<F: AsFd>(_fd: &F) -> io::Result<()> {
     Ok(())
 }
 
@@ -83,17 +86,16 @@ pub fn is_disallowed_egress_ip(ip: IpAddr) -> bool {
     ip.is_loopback() || ip.is_unspecified() || is_link_local(ip)
 }
 
-/// Resolve `addr` (host:port) and connect via a marked TCP socket. Picks
-/// the first DNS result; reconnect loops at the call site cover transient
-/// failures of any single address.
+/// Resolve `host` (see [`crate::resolver`]) and connect to it on `port` via a
+/// marked TCP socket.
 ///
-/// UNCHECKED: connects to whatever `addr` resolves to, including loopback and
+/// UNCHECKED: connects to whatever `host` resolves to, including loopback and
 /// link-local. Use only for trusted infra dials (the Lens upstream relay, the
 /// control-plane socket, a server-injected forward bridge). For sandbox egress
-/// — where `addr` is a policy/SNI/Host hostname whose resolution an attacker
+/// — where `host` is a policy/SNI/Host hostname whose resolution an attacker
 /// may influence — use [`connect_tcp_egress`], which rejects those addresses.
-pub async fn connect_tcp_resolve(addr: &str) -> io::Result<TcpStream> {
-    let resolved = resolve_first(addr).await?;
+pub async fn connect_tcp_resolve(host: &str, port: u16) -> io::Result<TcpStream> {
+    let resolved = crate::resolver::resolve_first(host, port).await?;
     connect_marked(resolved).await
 }
 
@@ -106,8 +108,8 @@ pub async fn connect_tcp_resolve(addr: &str) -> io::Result<TcpStream> {
 /// cloud metadata, since the marked socket bypasses the nftables cage. The IP
 /// is checked *after* resolution, closing the gap that a string-level target
 /// check (which only sees the hostname) leaves open.
-pub async fn connect_tcp_egress(addr: &str) -> io::Result<TcpStream> {
-    connect_tcp_egress_where(addr, |_| true).await
+pub async fn connect_tcp_egress(host: &str, port: u16) -> io::Result<TcpStream> {
+    connect_tcp_egress_where(host, port, |_| true).await
 }
 
 /// [`connect_tcp_egress`] plus a caller-supplied check on the resolved address.
@@ -115,10 +117,11 @@ pub async fn connect_tcp_egress(addr: &str) -> io::Result<TcpStream> {
 /// about to be connected, so a later DNS answer can't change the decision.
 /// The predicate is a parameter so this module stays policy-free.
 pub async fn connect_tcp_egress_where(
-    addr: &str,
+    host: &str,
+    port: u16,
     admits: impl FnOnce(IpAddr) -> bool,
 ) -> io::Result<TcpStream> {
-    let resolved = resolve_first(addr).await?;
+    let resolved = crate::resolver::resolve_first(host, port).await?;
     if is_disallowed_egress_ip(resolved.ip()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -135,13 +138,6 @@ pub async fn connect_tcp_egress_where(
         ));
     }
     connect_marked(resolved).await
-}
-
-async fn resolve_first(addr: &str) -> io::Result<SocketAddr> {
-    tokio::net::lookup_host(addr)
-        .await?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no addrs for {addr}")))
 }
 
 async fn connect_marked(resolved: SocketAddr) -> io::Result<TcpStream> {
@@ -181,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn egress_rejects_loopback_literal() {
-        let err = connect_tcp_egress("127.0.0.1:9").await.unwrap_err();
+        let err = connect_tcp_egress("127.0.0.1", 9).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -190,7 +186,7 @@ mod tests {
         // A private address the SSRF floor deliberately permits, so only the
         // predicate can stop it.
         let mut seen = None;
-        let err = connect_tcp_egress_where("10.0.0.5:22", |ip| {
+        let err = connect_tcp_egress_where("10.0.0.5", 22, |ip| {
             seen = Some(ip);
             false
         })
@@ -202,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn egress_rejects_link_local_literal() {
-        let err = connect_tcp_egress("169.254.169.254:9").await.unwrap_err();
+        let err = connect_tcp_egress("169.254.169.254", 9).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -210,9 +206,7 @@ mod tests {
     async fn egress_rejects_mapped_loopback_literal() {
         // IPv4-mapped IPv6 must be canonicalized before the check — Linux still
         // routes ::ffff:127.0.0.1 to the host.
-        let err = connect_tcp_egress("[::ffff:127.0.0.1]:9")
-            .await
-            .unwrap_err();
+        let err = connect_tcp_egress("::ffff:127.0.0.1", 9).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -220,7 +214,7 @@ mod tests {
     async fn egress_rejects_unspecified_literal() {
         // 0.0.0.0 is a plausible (blackhole-list) A record and connect(2) sends
         // it to a host-local service.
-        let err = connect_tcp_egress("0.0.0.0:9").await.unwrap_err();
+        let err = connect_tcp_egress("0.0.0.0", 9).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -228,7 +222,7 @@ mod tests {
     async fn egress_rejects_hostname_resolving_to_loopback() {
         // The actual attack shape: an allowed hostname whose DNS answer points
         // back at the host. `localhost` resolves to a loopback address.
-        let err = connect_tcp_egress("localhost:9").await.unwrap_err();
+        let err = connect_tcp_egress("localhost", 9).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -241,7 +235,7 @@ mod tests {
         let accept = tokio::spawn(async move {
             let _ = l.accept().await;
         });
-        let stream = connect_tcp_resolve(&addr.to_string()).await;
+        let stream = connect_tcp_resolve(&addr.ip().to_string(), addr.port()).await;
         assert!(
             stream.is_ok(),
             "trusted primitive must still reach loopback"

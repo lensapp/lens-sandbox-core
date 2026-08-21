@@ -30,6 +30,7 @@ aws-credential-types = "1"
 sha2 = "0.10"
 hex = "0.4"
 hickory-proto = "0.26"
+hickory-resolver = "0.26"
 apollo-parser = "0.8.6"
 switchyard-translation = "0.2"
 
