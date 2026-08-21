@@ -6,8 +6,8 @@
 //! the stub at all. Whether one does is a kernel question: an unmarked UDP/53
 //! query is carried into the stub by an nftables redirect, and only a real chain
 //! can say whether a query carried the mark. So this needs Linux and
-//! `CAP_NET_ADMIN`, and it is `#[ignore]`d like the other cage tests. CI runs it
-//! with `cargo test -- --ignored`.
+//! `CAP_NET_ADMIN`, and it is `#[ignore]`d like the other cage tests. Run it
+//! with `cargo test -- --ignored` on a host that has both.
 //!
 //! # Why two names
 //!
