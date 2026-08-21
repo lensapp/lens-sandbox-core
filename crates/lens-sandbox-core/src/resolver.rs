@@ -20,6 +20,12 @@
 //! container's own names (`host.docker.internal`, a bare Kubernetes service)
 //! live in one or the other.
 //!
+//! The `nameserver` lines are read as an ordered list and asked one at a time,
+//! the way libc reads them. A split-DNS deployment writes the internal resolver
+//! first and a public one after it as a fallback. Querying both at once would
+//! put them in a race the fast one wins, and a public `NXDOMAIN` arriving ahead
+//! of the internal answer would deny a name that does resolve.
+//!
 //! Only A records are asked for — every dial, a workload's target and the
 //! supervisor's own infrastructure alike. The sandbox egresses over IPv4: the
 //! transparent interceptor reads no other family, and the stub answers NODATA
@@ -37,7 +43,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use hickory_resolver::Resolver;
-use hickory_resolver::config::{LookupIpStrategy, ResolveHosts};
+use hickory_resolver::config::{LookupIpStrategy, ResolveHosts, ServerOrderingStrategy};
 use hickory_resolver::net::runtime::iocompat::AsyncIoTokioAsStd;
 use hickory_resolver::net::runtime::{
     RuntimeProvider, TokioHandle, TokioRuntimeProvider, TokioTime,
@@ -156,6 +162,8 @@ fn build_resolver() -> Result<Resolver<MarkedRuntime>, String> {
     let options = builder.options_mut();
     options.ip_strategy = LookupIpStrategy::Ipv4Only;
     options.use_hosts_file = ResolveHosts::Always;
+    options.num_concurrent_reqs = 1;
+    options.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
     builder.build().map_err(|e| format!("build resolver: {e}"))
 }
 
