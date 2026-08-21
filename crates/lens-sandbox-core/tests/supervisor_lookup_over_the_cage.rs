@@ -125,9 +125,19 @@ async fn the_supervisors_own_lookup_never_reaches_the_stub() {
 
     // The supervisor's own lookup. It leaves on a marked socket, so the cage
     // sends it to the upstream resolver instead of into the stub. The name does
-    // not exist, so the answer is an error either way — what matters is that no
+    // not exist, so an error is the expected answer — what matters is that no
     // refusal follows, because the stub never judged it.
-    let _ = lens_sandbox_core::resolver::resolve_first(PROBE_NAME, 443).await;
+    //
+    // A resolver that failed to build never opens a socket, and the silence
+    // below would then prove nothing. So the failure has to be the lookup's:
+    // every lookup-side error names the host it was asked for, and the two
+    // configuration failures name no host at all.
+    if let Err(error) = lens_sandbox_core::resolver::resolve_first(PROBE_NAME, 443).await {
+        assert!(
+            error.to_string().contains(PROBE_NAME),
+            "no query was ever sent: {error}"
+        );
+    }
     tokio::time::sleep(SETTLE).await;
     assert!(
         audit.try_recv().is_err(),
