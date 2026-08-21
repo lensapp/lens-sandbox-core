@@ -1848,7 +1848,7 @@ pub(crate) async fn connect_egress_under_policy(
     already_gated: Gated,
 ) -> std::io::Result<TcpStream> {
     let port = extract_port(target_host, default_port);
-    sock_mark::connect_tcp_egress_where(target_host, |ip| {
+    sock_mark::connect_tcp_egress_where(&extract_hostname(target_host), port, |ip| {
         tcp_egress_admits(state, ip, port, caller, already_gated)
     })
     .await
@@ -2106,13 +2106,14 @@ async fn handle_raw_passthrough(
 
     // Raw TCP always egresses directly: SO_MARK bypasses the nftables cage and
     // the bytes are spliced through untouched.
-    let mut upstream = match sock_mark::connect_tcp_egress(&raw_target).await {
-        Ok(s) => s,
-        Err(e) => {
-            emit_audit(state, &raw_target, "error", 502, actor);
-            return Err(format!("passthrough connect to {raw_target}: {e}").into());
-        }
-    };
+    let mut upstream =
+        match sock_mark::connect_tcp_egress(&orig_dst.ip().to_string(), orig_dst.port()).await {
+            Ok(s) => s,
+            Err(e) => {
+                emit_audit(state, &raw_target, "error", 502, actor);
+                return Err(format!("passthrough connect to {raw_target}: {e}").into());
+            }
+        };
     tracing::debug!(target = %raw_target, "transparent passthrough DIRECT");
     emit_audit(state, &raw_target, "success", 200, actor);
     tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
@@ -3225,11 +3226,15 @@ pub async fn connect_sandbox_upstream(
 ) -> Result<BoxedSandboxStream, Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", upstream.host, upstream.port);
     let connect_timeout = *state.upstream_connect_timeout.read().unwrap();
-    let tcp =
-        match tokio::time::timeout(connect_timeout, sock_mark::connect_tcp_resolve(&addr)).await {
-            Ok(result) => result?,
-            Err(_) => return Err(format!("upstream TCP connect to {addr} timed out").into()),
-        };
+    let tcp = match tokio::time::timeout(
+        connect_timeout,
+        sock_mark::connect_tcp_resolve(&upstream.host, upstream.port),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Err(format!("upstream TCP connect to {addr} timed out").into()),
+    };
     if !upstream.tls {
         return Ok(Box::new(tcp));
     }
@@ -3294,7 +3299,7 @@ fn percent_decode(input: &str) -> String {
     result
 }
 
-fn extract_hostname(target: &str) -> String {
+pub(crate) fn extract_hostname(target: &str) -> String {
     if target.starts_with('[') {
         // IPv6 bracket notation
         target
@@ -3308,7 +3313,7 @@ fn extract_hostname(target: &str) -> String {
     }
 }
 
-fn extract_port(target: &str, default: u16) -> u16 {
+pub(crate) fn extract_port(target: &str, default: u16) -> u16 {
     if target.starts_with('[') {
         target
             .rsplit_once("]:")

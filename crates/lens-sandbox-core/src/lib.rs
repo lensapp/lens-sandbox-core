@@ -37,6 +37,7 @@ pub mod privilege;
 pub mod protocol;
 pub mod proxy;
 pub mod pty;
+pub mod resolver;
 pub mod routing;
 pub mod sock_mark;
 pub mod temp_files;
