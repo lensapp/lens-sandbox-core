@@ -28,6 +28,7 @@ pub(crate) mod graphql_ws;
 pub mod http_body;
 pub mod lifecycle;
 pub mod llm;
+pub mod mcp;
 pub mod mitm;
 pub mod network;
 pub mod peer_process;

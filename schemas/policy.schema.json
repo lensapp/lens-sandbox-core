@@ -347,7 +347,7 @@
       "additionalProperties": false
     },
     "HttpRule": {
-      "description": "A request restriction within a route rule: the method and path it covers,\nand for a GraphQL endpoint the operation it covers.\n\nAn unknown key fails the policy. Every field here narrows what the rule\nadmits, so a key serde could not place is a narrowing that would go missing:\na misspelt `graphql` would leave the bare method and path behind as an\nunconditional allow.",
+      "description": "A request restriction within a route rule: the method and path it covers,\nand for a GraphQL endpoint the operation it covers.\n\nAn unknown key fails the policy. Every field here narrows what the rule\nadmits, so a key serde could not place is a narrowing that would go missing:\na misspelt `graphql` or `mcp` would leave the bare method and path behind as\nan unconditional allow.",
       "type": "object",
       "properties": {
         "graphql": {
@@ -355,6 +355,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/GraphqlMatcher"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mcp": {
+          "description": "MCP operation this rule covers. Set it only for an MCP endpoint: the\nproxy then reads the request body, because an MCP request puts its method\nand its tool there and every call looks like the same `POST /mcp`.\n\nThis governs a remote MCP server only. A server the agent launches as a\nchild process speaks over its standard streams and never reaches this\nproxy, so no rule here can bound it.\n\nAn MCP rule is authoritative over the requests its `method` and `path`\ncover, exactly as [`Self::graphql`] is. The two cannot be combined, on one\nrule or on one route: two body grammars over one request have no defined\nwinner.\n\nA request the proxy cannot read is denied, never passed on. This covers a\ncompressed or `multipart/*` body, a body above\n[`crate::http_body::MAX_JUDGED_BODY_BYTES`], a body that is not one\nJSON-RPC object, and a body carrying a duplicate key.\n\nAn MCP rule never grants a `Connection: upgrade`, because MCP has no\nWebSocket. Its streams are ordinary SSE responses to a `POST`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpMatcher"
             },
             {
               "type": "null"
@@ -566,6 +577,60 @@
       "required": [
         "from",
         "to"
+      ]
+    },
+    "McpArgumentMatch": {
+      "description": "One condition on an MCP tool argument.",
+      "type": "object",
+      "properties": {
+        "glob": {
+          "description": "Glob the argument value must match.\n\nA pointer that reaches nothing, or reaches a value that is not a string,\ndoes not match. So a mistyped pointer denies the request rather than\nwidening the rule.",
+          "type": "string"
+        },
+        "pointer": {
+          "description": "RFC 6901 JSON pointer to the argument, rooted at `params.arguments`, so\n`/region` reaches the `region` argument. A `/` inside a key is written\n`~1`, and a `~` is written `~0`.\n\nA pointer is used rather than a dotted path because a `.` is a legal\ncharacter in a JSON key: a dotted path would leave such an argument\nunreachable and read ambiguously for the rest.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pointer",
+        "glob"
+      ]
+    },
+    "McpMatcher": {
+      "description": "The MCP requests one [`HttpRule`] covers. Every field that is set must match.\n\nThis reads MCP revision `2026-07-28`: one JSON-RPC request or notification per\n`POST`, never a batch, and the sandbox is the only side that sends a request.\nAn earlier revision let a server drive the client over a stream this door\nrelays unread. Those revisions are refused as a consequence rather than by a\nversion test — no rule here names `initialize`, so their handshake matches\nnothing.",
+      "type": "object",
+      "properties": {
+        "arguments": {
+          "description": "Conditions on the tool arguments. Every entry must match.\n\nEach entry bounds the argument it names and says nothing about the rest.\nThis is unlike [`GraphqlMatcher::fields`], which every root field must\nsatisfy: a tool whose arguments decide what it reaches needs one entry per\nargument that matters.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpArgumentMatch"
+          }
+        },
+        "method": {
+          "description": "The JSON-RPC method this rule covers, as a glob (`tools/call`, `tools/*`).\nIt is required, with `*` for any: a rule that left the method out would\nread as narrow but would cover every method there is.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "The tool the request must name, as a glob, read from `params.name`.\n\n`prompts/get` carries its name in the same place, so this bounds a prompt\ntoo — the field is named for its common case. Omit to put no condition on\nthe name. Setting this beside `uri` is refused: one request carries one\nname, so a rule asking for both can never match.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "description": "The resource the request must name, as a glob, read from `params.uri`.\nOnly `resources/read` carries it.\n\n`*` spans a `/` here, unlike a `path` glob, so `file:///projects/*` also\ncovers `file:///projects/a/b/anything`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "method"
       ]
     },
     "NetworkPolicy": {

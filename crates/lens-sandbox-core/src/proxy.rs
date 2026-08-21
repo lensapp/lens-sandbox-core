@@ -848,9 +848,10 @@ async fn handle_http_forward(
 
     let relative_request = rewrite_http_forward_request(&header_str, &path, target_host, reuse);
 
-    // Enforce HTTP rules. A GraphQL rule reads the body, which is still on the
-    // socket: the head was read one byte at a time, up to its terminator.
+    // Enforce HTTP rules. A body-reading rule reads the body, which is still on
+    // the socket: the head was read one byte at a time, up to its terminator.
     let mut buffered_body: Option<Vec<u8>> = None;
+    let mut mcp_request: Option<crate::mcp::RequestInfo> = None;
     match crate::routing::classify_http_request(&domain_http_rules, method, &normalized_path) {
         crate::routing::HttpRuleOutcome::Allow => {}
         crate::routing::HttpRuleOutcome::NoMatch => {
@@ -877,6 +878,22 @@ async fn handle_http_forward(
             // and a GraphQL GET puts its document there.
             if let Err(detail) = crate::graphql::check_request(method, &path, &body, &matchers) {
                 return refusal.deny(&mut client, &detail).await;
+            }
+            buffered_body = Some(body);
+        }
+        crate::routing::HttpRuleOutcome::Mcp(matchers) => {
+            let framing = crate::http_body::determine_body_framing(&header_str);
+            let body = match crate::mcp::read_body_for_inspection(&mut client, &header_str, framing)
+                .await
+            {
+                Ok(body) => body,
+                Err(detail) => {
+                    return refusal.deny(&mut client, &detail).await;
+                }
+            };
+            match crate::mcp::judge(&header_str, &body, &matchers) {
+                Ok(info) => mcp_request = Some(info),
+                Err(detail) => return refusal.deny(&mut client, &detail).await,
             }
             buffered_body = Some(body);
         }
@@ -926,10 +943,33 @@ async fn handle_http_forward(
                             .to_string(),
                     ),
                 },
+                // The same for an MCP rule, but the mirrored headers are re-read
+                // from the head that will be sent, not the one that arrived.
+                crate::routing::HttpRuleOutcome::Mcp(matchers) => match &buffered_body {
+                    Some(body) => match crate::mcp::judge(&modified, body, &matchers) {
+                        Ok(info) => {
+                            mcp_request = Some(info);
+                            None
+                        }
+                        Err(detail) => Some(detail),
+                    },
+                    None => Some(
+                        "rewritten URI reaches an MCP rule, but the body was not read".to_string(),
+                    ),
+                },
             };
         if let Some(detail) = denial {
             return refusal.deny(&mut client, &detail).await;
         }
+    }
+
+    // Credential injection runs after the rule judged the head, and an injected
+    // `Mcp-Name` or `Mcp-Method` would otherwise reach upstream unread. Upstream
+    // acts on the head it receives, so that is the one the agreement binds.
+    if let Some(info) = &mcp_request
+        && let Err(detail) = crate::mcp::check_headers_agree(&modified, info)
+    {
+        return refusal.deny(&mut client, &detail).await;
     }
 
     // A body that policy had to read is no longer on the socket to relay, so the
@@ -4426,10 +4466,88 @@ pub(crate) mod tests {
                         operation_name: None,
                         fields: vec!["viewer".to_string()],
                     }),
+                    mcp: None,
                 }],
                 scheme: None,
                 binaries: None,
             });
+    }
+
+    /// A catch-all allow whose HTTP rules permit read-only MCP tools only.
+    fn install_mcp_read_allow(state: &Arc<ProxyState>) {
+        state
+            .policy
+            .write()
+            .unwrap()
+            .routes
+            .push(crate::routing::RouteRule {
+                matcher: crate::routing::RouteMatcher::Domain("*".to_string()),
+                verdict: Verdict::Allow,
+                transport: Transport::Direct,
+                tls_terminate: false,
+                http_rules: vec![crate::policy_schema::HttpRule {
+                    method: Some("POST".to_string()),
+                    path: Some("/mcp".to_string()),
+                    graphql: None,
+                    mcp: Some(crate::policy_schema::McpMatcher {
+                        method: "tools/call".to_string(),
+                        tool: Some("read_*".to_string()),
+                        uri: None,
+                        arguments: Vec::new(),
+                    }),
+                }],
+                scheme: None,
+                binaries: None,
+            });
+    }
+
+    /// Drive the forward-proxy door with an MCP body and return its answer.
+    ///
+    /// The plaintext door enforces the same rules as the MITM one; a rule that
+    /// governed only HTTPS would leave `http://` unjudged.
+    async fn forward_mcp(state: &Arc<ProxyState>, body: &'static str) -> String {
+        let head = format!(
+            "POST http://10.0.0.5/mcp HTTP/1.1\r\nHost: 10.0.0.5\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            handle_http_forward(server, "10.0.0.5:80", head, &state_for_handler, &actor).await
+        });
+        client.write_all(body.as_bytes()).await.unwrap();
+        read_response(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn http_forward_denies_a_tool_no_mcp_rule_names() {
+        let (state, _rx) = test_state();
+        install_mcp_read_allow(&state);
+
+        let response = forward_mcp(
+            &state,
+            r#"{"method":"tools/call","params":{"name":"write_file"}}"#,
+        )
+        .await;
+        assert!(
+            response.contains("403"),
+            "the plaintext door must judge the body too; got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_forward_denies_a_batch_body() {
+        let (state, _rx) = test_state();
+        install_mcp_read_allow(&state);
+
+        let response = forward_mcp(
+            &state,
+            r#"[{"method":"tools/call","params":{"name":"read_file"}}]"#,
+        )
+        .await;
+        assert!(response.contains("403"), "got {response:?}");
     }
 
     /// The head of an absolute-form forward-proxy GraphQL request.

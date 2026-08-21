@@ -268,6 +268,7 @@ async fn run(
         method: Some("POST".to_string()),
         path: Some("/v1/messages".to_string()),
         graphql: None,
+        mcp: None,
     }];
     let ctx = MitmContext {
         injections: &front_injections,

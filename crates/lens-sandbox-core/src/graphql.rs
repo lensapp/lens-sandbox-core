@@ -612,7 +612,7 @@ pub async fn read_body_for_inspection<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    ensure_body_is_readable(header_str)?;
+    crate::http_body::ensure_body_is_readable(header_str)?;
 
     // A GraphQL GET puts its document in the query string. A body on one is a
     // second account of the request that the origin might read instead, and
@@ -631,31 +631,6 @@ where
     crate::http_body::read_body(tls_client, framing, crate::http_body::MAX_INSPECT_BYTES)
         .await
         .map_err(|err| err.to_string())
-}
-
-/// Confirm that a request head does not hide its body from inspection.
-///
-/// A body the proxy cannot read is a body a rule cannot judge, so a coding it
-/// does not undo and a format it does not split are refused rather than passed
-/// on unread.
-pub fn ensure_body_is_readable(header_block: &str) -> Result<(), String> {
-    for line in header_block.split("\r\n").skip(1) {
-        let lower = line.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-encoding:") {
-            let coding = value.trim();
-            if !coding.is_empty() && coding != "identity" {
-                return Err(format!(
-                    "GraphQL request body uses content-encoding {coding}, which the proxy does not decode"
-                ));
-            }
-        }
-        if let Some(value) = lower.strip_prefix("content-type:")
-            && value.trim_start().starts_with("multipart/")
-        {
-            return Err("GraphQL multipart request bodies are not inspected".to_string());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1234,47 +1209,6 @@ mod tests {
     // ----------------------------------------------------------------------
     // Bodies the proxy cannot read
     // ----------------------------------------------------------------------
-
-    #[test]
-    fn a_plain_head_is_readable() {
-        let head = "POST /graphql HTTP/1.1\r\nHost: x\r\nContent-Type: application/json";
-        assert!(ensure_body_is_readable(head).is_ok());
-    }
-
-    #[test]
-    fn an_identity_encoding_is_readable() {
-        let head = "POST /graphql HTTP/1.1\r\nContent-Encoding: identity";
-        assert!(ensure_body_is_readable(head).is_ok());
-    }
-
-    #[test]
-    fn a_compressed_body_is_refused() {
-        for coding in ["gzip", "deflate", "br", "zstd"] {
-            let head = format!("POST /graphql HTTP/1.1\r\nContent-Encoding: {coding}");
-            let err = ensure_body_is_readable(&head)
-                .expect_err("a coding the proxy cannot undo must be refused");
-            assert!(err.contains(coding), "{err}");
-        }
-    }
-
-    #[test]
-    fn a_multipart_body_is_refused() {
-        let head = "POST /graphql HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=xyz";
-        assert!(ensure_body_is_readable(head).is_err());
-    }
-
-    #[test]
-    fn a_header_name_is_read_without_regard_to_case() {
-        let head = "POST /graphql HTTP/1.1\r\nCONTENT-ENCODING: GZIP";
-        assert!(ensure_body_is_readable(head).is_err());
-    }
-
-    #[test]
-    fn a_request_line_that_looks_like_a_header_is_not_read_as_one() {
-        // The first line is the request line, never a field.
-        let head = "POST /content-encoding:gzip HTTP/1.1\r\nHost: x";
-        assert!(ensure_body_is_readable(head).is_ok());
-    }
 
     // ----------------------------------------------------------------------
     // Name globs

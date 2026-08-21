@@ -927,11 +927,12 @@ async fn mitm_inject_after_accept(
         is_tunnel,
     };
 
-    // Enforce HTTP rules. A GraphQL rule needs the body, which is still on the
-    // socket: both doors read the head one byte at a time, so nothing of the
+    // Enforce HTTP rules. A body-reading rule needs the body, which is still on
+    // the socket: both doors read the head one byte at a time, so nothing of the
     // body has been consumed yet.
     let mut buffered_body: Option<Vec<u8>> = None;
     let mut graphql_frames: Vec<GraphqlMatcher> = Vec::new();
+    let mut mcp_request: Option<crate::mcp::RequestInfo> = None;
     match crate::routing::classify_http_request(ctx.http_rules, method, path) {
         crate::routing::HttpRuleOutcome::Allow => {
             // An upgrade replaces the head this rule judged with a raw pipe, and
@@ -1002,6 +1003,36 @@ async fn mitm_inject_after_accept(
             if let Err(reason) = crate::graphql::check_request(method, raw_path, &body, &matchers) {
                 return Err(facts.deny(&mut tls_client, "graphql_denied", &reason).await);
             }
+            buffered_body = Some(body);
+        }
+        // MCP has no WebSocket: its streams are SSE responses to a `POST`. So no
+        // MCP rule can go on judging a raw pipe, and none grants one.
+        crate::routing::HttpRuleOutcome::Mcp(_) if is_upgrade => {
+            return Err(facts
+                .deny(
+                    &mut tls_client,
+                    "upgrade_denied",
+                    "an MCP rule never grants a connection upgrade",
+                )
+                .await);
+        }
+        crate::routing::HttpRuleOutcome::Mcp(matchers) => {
+            let body =
+                match crate::mcp::read_body_for_inspection(&mut tls_client, &header_str, body_mode)
+                    .await
+                {
+                    Ok(body) => body,
+                    Err(reason) => {
+                        return Err(facts.deny(&mut tls_client, "mcp_denied", &reason).await);
+                    }
+                };
+            let info = match crate::mcp::judge(&header_str, &body, &matchers) {
+                Ok(info) => info,
+                Err(reason) => {
+                    return Err(facts.deny(&mut tls_client, "mcp_denied", &reason).await);
+                }
+            };
+            mcp_request = Some(info);
             buffered_body = Some(body);
         }
     }
@@ -1234,8 +1265,53 @@ async fn mitm_inject_after_accept(
                             .await);
                     }
                 },
+                // No MCP rule grants an upgrade, so the rewrite cannot have found
+                // one that does.
+                crate::routing::HttpRuleOutcome::Mcp(_) if is_upgrade => {
+                    return Err(facts
+                        .deny(
+                            &mut tls_client,
+                            "rewritten_path_denied",
+                            "an MCP rule never grants a connection upgrade",
+                        )
+                        .await);
+                }
+                // The credential value moved the request onto an MCP rule. The
+                // body does not change under the rewrite, so the one already read
+                // still answers for it — but the head does change, so the mirrored
+                // headers are re-checked against the head that will be sent.
+                crate::routing::HttpRuleOutcome::Mcp(matchers) => match &buffered_body {
+                    Some(body) => match crate::mcp::judge(&modified, body, &matchers) {
+                        Ok(info) => mcp_request = Some(info),
+                        Err(reason) => {
+                            return Err(facts
+                                .deny(&mut tls_client, "rewritten_path_denied", &reason)
+                                .await);
+                        }
+                    },
+                    // The path before the rewrite reached no MCP rule, so no body
+                    // was read. There is nothing to judge the new path with.
+                    None => {
+                        return Err(facts
+                            .deny(
+                                &mut tls_client,
+                                "rewritten_path_denied",
+                                "rewritten URI reaches an MCP rule, but the body was not read",
+                            )
+                            .await);
+                    }
+                },
             }
         }
+    }
+
+    // Credential injection runs after the rule judged the head, and an injected
+    // `Mcp-Name` or `Mcp-Method` would otherwise reach upstream unread. Upstream
+    // acts on the head it receives, so that is the one the agreement binds.
+    if let Some(info) = &mcp_request
+        && let Err(reason) = crate::mcp::check_headers_agree(&modified, info)
+    {
+        return Err(facts.deny(&mut tls_client, "mcp_denied", &reason).await);
     }
 
     // The body is in hand, so the head must describe it and the relay must not
@@ -2527,6 +2603,7 @@ mod tests {
             method: Some("GET".to_string()),
             path: Some("/api/v1/*".to_string()),
             graphql: None,
+            mcp: None,
         }];
         let (_headers, response, audits) = run_mitm_harness_with_rules(
             vec![],
@@ -2546,6 +2623,7 @@ mod tests {
             method: Some("GET".to_string()),
             path: Some("/api/v1/*".to_string()),
             graphql: None,
+            mcp: None,
         }];
         let (_err, response, audits) = run_mitm_harness_with_rules(
             vec![],
@@ -2574,6 +2652,7 @@ mod tests {
             method: None,
             path: Some("/api/**".to_string()),
             graphql: None,
+            mcp: None,
         }];
         let (_err, response, audits) = run_mitm_harness_with_rules(
             vec![],
@@ -2596,6 +2675,7 @@ mod tests {
             method: Some("GET".to_string()),
             path: Some("/api/v1/*".to_string()),
             graphql: None,
+            mcp: None,
         }];
         let (_headers, response, audits) = run_mitm_harness_with_rules(
             vec![],
@@ -2618,6 +2698,7 @@ mod tests {
             method: Some("GET".to_string()),
             path: None,
             graphql: None,
+            mcp: None,
         }];
         let (headers, response, _audits) = run_mitm_harness_with_rules(
             vec![CredentialInjection {
@@ -2770,6 +2851,7 @@ mod tests {
             method: Some("GET".into()),
             path: Some("/bot/*/sendMessage".into()),
             graphql: None,
+            mcp: None,
         }];
         let placeholders = vec![("__lens_cred:tg__".to_string(), "123456:ABC-DEF".to_string())];
         let (headers, response, _audits) = run_mitm_harness_full(
@@ -2797,6 +2879,7 @@ mod tests {
             method: Some("GET".into()),
             path: Some("/bot/*/sendMessage".into()),
             graphql: None,
+            mcp: None,
         }];
         let placeholders = vec![(
             "__lens_cred:tg__".to_string(),
@@ -3117,6 +3200,257 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
+    // MCP rules at the door
+    // ----------------------------------------------------------------------
+
+    /// A rule permitting read-only MCP tools on `/mcp`.
+    fn mcp_read_rule() -> Vec<HttpRule> {
+        vec![HttpRule {
+            method: Some("POST".to_string()),
+            path: Some("/mcp".to_string()),
+            graphql: None,
+            mcp: Some(crate::policy_schema::McpMatcher {
+                method: "tools/call".to_string(),
+                tool: Some("read_*".to_string()),
+                uri: None,
+                arguments: Vec::new(),
+            }),
+        }]
+    }
+
+    fn mcp_request(body: &str, extra_headers: &str) -> Vec<u8> {
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: test.example.com\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_permitted_tool_call_reaches_the_origin_unchanged() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file"}}"#;
+        let request: &'static [u8] = Box::leak(mcp_request(body, "").into_boxed_slice());
+        let (upstream_saw, response, audits) =
+            run_mitm_harness_with_rules(vec![], mcp_read_rule(), request, true).await;
+
+        assert!(response.contains("200 OK"), "expected 200, got: {response}");
+        assert_eq!(audits[0]["result"], "success");
+        // The body policy read must still arrive, byte for byte.
+        assert!(upstream_saw.ends_with(body), "{upstream_saw}");
+        assert!(
+            upstream_saw.contains(&format!("Content-Length: {}", body.len())),
+            "{upstream_saw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_no_rule_names_is_denied_at_the_door() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"write_file"}}"#;
+        let request: &'static [u8] = Box::leak(mcp_request(body, "").into_boxed_slice());
+        let (_err, response, audits) =
+            run_mitm_harness_with_rules(vec![], mcp_read_rule(), request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+        assert_eq!(audits[0]["result"], "failure");
+        assert_eq!(audits[0]["metadata"]["mcp_denied"], true);
+    }
+
+    #[tokio::test]
+    async fn a_mirrored_header_disagreeing_with_the_body_is_denied_at_the_door() {
+        // The header says a permitted tool, the body names another. A component
+        // behind this door that routed on the header would run what policy never
+        // read.
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file"}}"#;
+        let request: &'static [u8] =
+            Box::leak(mcp_request(body, "Mcp-Name: write_file\r\n").into_boxed_slice());
+        let (_err, response, audits) =
+            run_mitm_harness_with_rules(vec![], mcp_read_rule(), request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+        assert_eq!(audits[0]["metadata"]["mcp_denied"], true);
+    }
+
+    #[tokio::test]
+    async fn an_mcp_rule_never_grants_an_upgrade() {
+        // MCP has no WebSocket, so nothing here can go on judging a raw pipe.
+        let request: &'static [u8] = b"GET /mcp HTTP/1.1\r\nHost: test.example.com\r\n\
+            Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let rules = vec![HttpRule {
+            method: None,
+            path: None,
+            graphql: None,
+            mcp: Some(crate::policy_schema::McpMatcher {
+                method: "*".to_string(),
+                tool: None,
+                uri: None,
+                arguments: Vec::new(),
+            }),
+        }];
+        let (_err, response, audits) =
+            run_mitm_harness_with_rules(vec![], rules, request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+        assert_eq!(audits[0]["metadata"]["upgrade_denied"], true);
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_path_is_re_judged_against_the_mcp_rules_it_reaches() {
+        // A credential in the path moves the request onto a different rule. The
+        // body does not change, so the one already read answers for it — against
+        // the rules the new path actually reaches, not the old ones.
+        let placeholder = "__lens_cred:tok__";
+        let rules = vec![
+            HttpRule {
+                method: Some("POST".to_string()),
+                path: Some(format!("/mcp/{placeholder}")),
+                graphql: None,
+                mcp: Some(crate::policy_schema::McpMatcher {
+                    method: "tools/call".to_string(),
+                    tool: Some("*".to_string()),
+                    uri: None,
+                    arguments: Vec::new(),
+                }),
+            },
+            HttpRule {
+                method: Some("POST".to_string()),
+                path: Some("/mcp/real-token".to_string()),
+                graphql: None,
+                mcp: Some(crate::policy_schema::McpMatcher {
+                    method: "tools/call".to_string(),
+                    tool: Some("read_*".to_string()),
+                    uri: None,
+                    arguments: Vec::new(),
+                }),
+            },
+        ];
+        let body = r#"{"method":"tools/call","params":{"name":"write_file"}}"#;
+        let request: &[u8] = Box::leak(
+            format!(
+                "POST /mcp/{placeholder} HTTP/1.1\r\nHost: test.example.com\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        );
+        let (upstream_saw, response, audits) = run_mitm_harness_full(
+            vec![],
+            rules,
+            vec![(placeholder.to_string(), "real-token".to_string())],
+            request,
+            true,
+        )
+        .await;
+
+        assert!(
+            response.contains("403"),
+            "the pre-rewrite rule permits any tool, the post-rewrite one does not: {response}"
+        );
+        assert!(
+            !upstream_saw.contains("real-token"),
+            "the credential must not reach the origin: {upstream_saw}"
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|event| event["metadata"]["rewritten_path_denied"] == true),
+            "the rewritten path is what must refuse it: {audits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_path_reaching_an_mcp_rule_with_no_body_read_is_denied() {
+        // The path before the rewrite reached no body rule, so nothing was read.
+        // There is nothing to judge the new path with, and guessing is fail-open.
+        let placeholder = "__lens_cred:tok__";
+        let rules = vec![
+            HttpRule {
+                method: Some("POST".to_string()),
+                path: Some(format!("/mcp/{placeholder}")),
+                graphql: None,
+                mcp: None,
+            },
+            HttpRule {
+                method: Some("POST".to_string()),
+                path: Some("/mcp/real-token".to_string()),
+                graphql: None,
+                mcp: Some(crate::policy_schema::McpMatcher {
+                    method: "tools/call".to_string(),
+                    tool: Some("read_*".to_string()),
+                    uri: None,
+                    arguments: Vec::new(),
+                }),
+            },
+        ];
+        let body = r#"{"method":"tools/call","params":{"name":"read_file"}}"#;
+        let request: &[u8] = Box::leak(
+            format!(
+                "POST /mcp/{placeholder} HTTP/1.1\r\nHost: test.example.com\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        );
+        let (_upstream_saw, response, audits) = run_mitm_harness_full(
+            vec![],
+            rules,
+            vec![(placeholder.to_string(), "real-token".to_string())],
+            request,
+            true,
+        )
+        .await;
+
+        assert!(response.contains("403"), "got {response}");
+        assert!(
+            audits
+                .iter()
+                .any(|event| event["metadata"]["rewritten_path_denied"] == true),
+            "{audits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_body_is_denied_at_the_door() {
+        let body =
+            r#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file"}}]"#;
+        let request: &'static [u8] = Box::leak(mcp_request(body, "").into_boxed_slice());
+        let (_err, response, _audits) =
+            run_mitm_harness_with_rules(vec![], mcp_read_rule(), request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compressed_mcp_body_is_denied_rather_than_relayed_unread() {
+        let body = r#"{"method":"tools/call","params":{"name":"read_file"}}"#;
+        let request: &'static [u8] =
+            Box::leak(mcp_request(body, "Content-Encoding: gzip\r\n").into_boxed_slice());
+        let (_err, response, _audits) =
+            run_mitm_harness_with_rules(vec![], mcp_read_rule(), request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+    }
+
+    // ----------------------------------------------------------------------
     // GraphQL rules at the door
     // ----------------------------------------------------------------------
 
@@ -3131,6 +3465,7 @@ mod tests {
                 operation_name: None,
                 fields: vec!["viewer".to_string(), "repository".to_string()],
             }),
+            mcp: None,
         }]
     }
 
@@ -3258,6 +3593,7 @@ mod tests {
             method: Some("GET".to_string()),
             path: Some("/api/v1/*".to_string()),
             graphql: None,
+            mcp: None,
         }];
         let (_err, response, audits) =
             run_mitm_harness_with_rules(vec![], rules, request, true).await;
@@ -3293,6 +3629,7 @@ mod tests {
                 operation_name: None,
                 fields: vec!["viewer".to_string()],
             }),
+            mcp: None,
         }]
     }
 
@@ -3342,6 +3679,7 @@ mod tests {
             method: Some("POST".to_string()),
             path: Some("/**".to_string()),
             graphql: None,
+            mcp: None,
         });
         let body = r#"{"query":"mutation { deleteRepository(id:\"x\") { id } }"}"#;
         let request: &'static [u8] = Box::leak(graphql_request(body).into_boxed_slice());
@@ -3361,6 +3699,7 @@ mod tests {
             method: Some("POST".to_string()),
             path: Some("/rest/**".to_string()),
             graphql: None,
+            mcp: None,
         });
         let request: &'static [u8] =
             b"POST /rest/things HTTP/1.1\r\nHost: test.example.com\r\nContent-Length: 2\r\n\r\n{}";
@@ -3604,6 +3943,7 @@ mod tests {
             method: Some("GET".to_string()),
             path: Some("/graphql".to_string()),
             graphql: Some(graphql_subscription_rule()),
+            mcp: None,
         }];
         let (upstream_saw, response, _audits) =
             run_mitm_harness_with_rules(vec![], rules, WS_HANDSHAKE, true).await;
@@ -3641,6 +3981,7 @@ mod tests {
                 operation_name: None,
                 fields: vec!["viewer".to_string()],
             }),
+            mcp: None,
         }];
         let (upstream_saw, response, _audits) =
             run_mitm_harness_with_rules(vec![], rules, WS_HANDSHAKE, true).await;
@@ -3666,6 +4007,7 @@ mod tests {
                 method: Some("GET".to_string()),
                 path: Some(format!("/graphql/{placeholder}")),
                 graphql: Some(graphql_subscription_rule()),
+                mcp: None,
             },
             HttpRule {
                 method: Some("GET".to_string()),
@@ -3675,6 +4017,7 @@ mod tests {
                     operation_name: None,
                     fields: vec![],
                 }),
+                mcp: None,
             },
         ];
         let request: &[u8] = Box::leak(
@@ -3721,6 +4064,7 @@ mod tests {
             method: Some("GET".to_string()),
             path: Some("/graphql".to_string()),
             graphql: Some(graphql_subscription_rule()),
+            mcp: None,
         }];
         let request: &[u8] = b"GET /graphql HTTP/1.1\r\nHost: test.example.com\r\n\
             Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\

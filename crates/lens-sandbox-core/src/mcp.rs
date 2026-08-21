@@ -1,0 +1,726 @@
+//! Read an MCP request and judge it against the rules that cover its route.
+//!
+//! This reads MCP revision `2026-07-28`, in which the client sends every
+//! JSON-RPC message as its own `POST` to a single endpoint, a body is one
+//! request or notification and never a batch, and a server never sends a request
+//! of its own. So one body carries one operation, and the sandbox is the only
+//! side whose asks need judging.
+//!
+//! What crosses in the other direction is relayed unread, as it is for GraphQL.
+//! A server that wants an LLM completion returns an `InputRequiredResult`, and
+//! the client re-posts the original request carrying its answer — which arrives
+//! here as an ordinary body this door reads.
+
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Value};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::http_body::BodyFraming;
+use crate::policy_schema::McpMatcher;
+use crate::routing::glob_matches;
+
+/// The prefix and suffix MCP wraps a Base64 header value in.
+const SENTINEL_PREFIX: &str = "=?base64?";
+const SENTINEL_SUFFIX: &str = "?=";
+
+/// What one MCP request asks the server to do.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RequestInfo {
+    /// The JSON-RPC method.
+    pub method: String,
+    /// `params.name`, which `tools/call` and `prompts/get` carry.
+    pub name: Option<String>,
+    /// `params.uri`, which `resources/read` carries.
+    pub uri: Option<String>,
+    /// `params.arguments`, held whole so a rule can point into it.
+    arguments: Option<Value>,
+}
+
+impl RequestInfo {
+    /// The value `Mcp-Name` is mirrored from: whichever of the two the request
+    /// carries.
+    fn mirrored_name(&self) -> Option<&str> {
+        self.name.as_deref().or(self.uri.as_deref())
+    }
+}
+
+/// Read the operation an MCP request asks for.
+///
+/// Returns `Err` with a reason fit for an audit record when the request cannot be
+/// classified. The caller denies on `Err`.
+pub fn classify_request(body: &[u8]) -> Result<RequestInfo, String> {
+    if body.is_empty() {
+        return Err("an MCP rule cannot judge a request with no body".to_string());
+    }
+
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let value = StrictValue::deserialize_from(&mut de)
+        .map_err(|err| format!("MCP request body does not parse: {err}"))?;
+    de.end()
+        .map_err(|err| format!("MCP request body has trailing content: {err}"))?;
+
+    let Value::Object(envelope) = value else {
+        // An array is a JSON-RPC batch, which this revision removed. Reading one
+        // member and forwarding all of them is how a rule gets walked past.
+        return Err(
+            "MCP request body is not a single JSON object, so no rule can judge it".to_string(),
+        );
+    };
+
+    let method = match envelope.get("method") {
+        Some(Value::String(method)) => method.clone(),
+        // A body with no method is a JSON-RPC *response*, which a client of this
+        // revision never sends, or something else entirely. Either way there is
+        // nothing for a rule to name.
+        _ => return Err("MCP request body declares no method".to_string()),
+    };
+
+    let params = match envelope.get("params") {
+        Some(Value::Object(params)) => Some(params),
+        None => None,
+        Some(_) => return Err(format!("MCP request \"{method}\" has non-object params")),
+    };
+
+    Ok(RequestInfo {
+        method,
+        name: params.and_then(|p| string_field(p, "name")),
+        uri: params.and_then(|p| string_field(p, "uri")),
+        arguments: params.and_then(|p| p.get("arguments").cloned()),
+    })
+}
+
+fn string_field(params: &Map<String, Value>, key: &str) -> Option<String> {
+    match params.get(key) {
+        Some(Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Read an MCP request and judge it against the rules that cover its head.
+///
+/// `header_block` is the request head, needed because MCP mirrors two body fields
+/// into headers and this door must confirm they agree — see
+/// [`check_headers_agree`].
+///
+/// Returns what it read, so a caller that goes on to change the head can bind the
+/// agreement to the head it will actually send.
+pub fn judge(
+    header_block: &str,
+    body: &[u8],
+    matchers: &[&McpMatcher],
+) -> Result<RequestInfo, String> {
+    let info = classify_request(body)?;
+    check_headers_agree(header_block, &info)?;
+    check_operation(&info, matchers)?;
+    Ok(info)
+}
+
+/// Judge one classified request.
+///
+/// One rule must cover a request by itself. Rules do not combine, for the reason
+/// [`crate::policy_schema::GraphqlMatcher::fields`] gives: two rules that each
+/// permit one half of a request would together permit a whole neither allows.
+pub fn check_operation(info: &RequestInfo, matchers: &[&McpMatcher]) -> Result<(), String> {
+    if matchers.iter().any(|matcher| covers(info, matcher)) {
+        return Ok(());
+    }
+    Err(match info.mirrored_name() {
+        Some(name) => format!(
+            "no MCP rule permits method \"{}\" naming \"{name}\"",
+            info.method
+        ),
+        None => format!("no MCP rule permits method \"{}\"", info.method),
+    })
+}
+
+/// Whether one rule covers a request whole.
+fn covers(info: &RequestInfo, matcher: &McpMatcher) -> bool {
+    if !glob_matches(&matcher.method, &info.method) {
+        return false;
+    }
+    if let Some(tool) = &matcher.tool
+        && !info.name.as_deref().is_some_and(|n| glob_matches(tool, n))
+    {
+        return false;
+    }
+    if let Some(uri) = &matcher.uri
+        && !info.uri.as_deref().is_some_and(|u| glob_matches(uri, u))
+    {
+        return false;
+    }
+    matcher.arguments.iter().all(|condition| {
+        info.arguments
+            .as_ref()
+            .and_then(|args| args.pointer(&condition.pointer))
+            .and_then(Value::as_str)
+            .is_some_and(|value| glob_matches(&condition.glob, value))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Mirrored headers
+// ---------------------------------------------------------------------------
+
+/// Confirm the headers MCP mirrors from the body agree with the body.
+///
+/// The body is what a rule judges and what a compliant server runs, so this
+/// changes no verdict on its own. It closes a gap behind this door: a component
+/// that routes or meters on `Mcp-Method` or `Mcp-Name` would otherwise act on a
+/// value the policy never read.
+///
+/// A missing header is not a mismatch. This revision leaves the header rules for
+/// a notification `POST` undefined, so demanding one would refuse a compliant
+/// client.
+pub fn check_headers_agree(header_block: &str, info: &RequestInfo) -> Result<(), String> {
+    if let Some(claimed) = sole_header(header_block, "mcp-method")?
+        && claimed != info.method
+    {
+        return Err(format!(
+            "Mcp-Method header says \"{claimed}\" but the body says \"{}\"",
+            info.method
+        ));
+    }
+
+    if let Some(claimed) = sole_header(header_block, "mcp-name")? {
+        let claimed = decode_sentinel(&claimed)?;
+        match info.mirrored_name() {
+            Some(actual) if claimed == actual => {}
+            Some(actual) => {
+                return Err(format!(
+                    "Mcp-Name header says \"{claimed}\" but the body says \"{actual}\""
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "Mcp-Name header says \"{claimed}\" but the body names nothing"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Read a header that must appear at most once.
+///
+/// Two copies are refused rather than resolved: a server may read either, so a
+/// rule must never judge the one it did not act on.
+fn sole_header(header_block: &str, name: &str) -> Result<Option<String>, String> {
+    let mut found: Option<String> = None;
+    for line in header_block.split("\r\n").skip(1) {
+        let (field, value) = match line.split_once(':') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if !field.trim().eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let value = value.trim().to_string();
+        if found.is_some() {
+            return Err(format!("request carries more than one {name} header"));
+        }
+        found = Some(value);
+    }
+    Ok(found)
+}
+
+/// Undo the `=?base64?…?=` wrapper MCP uses for a value that is not plain ASCII.
+///
+/// A comparison that skipped this would pass any name the client chose to encode.
+fn decode_sentinel(value: &str) -> Result<String, String> {
+    let Some(encoded) = value
+        .strip_prefix(SENTINEL_PREFIX)
+        .and_then(|rest| rest.strip_suffix(SENTINEL_SUFFIX))
+    else {
+        return Ok(value.to_string());
+    };
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|err| format!("Mcp-Name header is not valid Base64: {err}"))?;
+    String::from_utf8(bytes).map_err(|_| "Mcp-Name header is not valid UTF-8".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Reading the body
+// ---------------------------------------------------------------------------
+
+/// Buffer the request body an MCP rule must read.
+///
+/// Bounded by [`crate::http_body::MAX_JUDGED_BODY_BYTES`], and a body over that
+/// is refused rather than truncated.
+pub async fn read_body_for_inspection<C>(
+    tls_client: &mut C,
+    header_str: &str,
+    framing: BodyFraming,
+) -> Result<Vec<u8>, String>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    crate::http_body::ensure_body_is_readable(header_str)?;
+
+    // A client that was told to wait is waiting on us, and we hold the body it
+    // has not sent yet. Answer so it sends.
+    crate::http_body::answer_continue_if_expected(tls_client, header_str).await?;
+
+    crate::http_body::read_body(tls_client, framing, crate::http_body::MAX_JUDGED_BODY_BYTES)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// A parse that refuses a duplicate key
+// ---------------------------------------------------------------------------
+
+/// A [`Value`] parsed with duplicate object keys refused at every depth.
+///
+/// `serde_json` keeps the last of two same-named keys without complaint, and a
+/// server may keep the first. That difference is exactly the proxy-reads-one,
+/// server-runs-the-other gap these rules exist to close, so a repeated key fails
+/// the request instead.
+struct StrictValue;
+
+impl StrictValue {
+    fn deserialize_from<'de, D: Deserializer<'de>>(de: D) -> Result<Value, D::Error> {
+        de.deserialize_any(StrictValue)
+    }
+}
+
+impl<'de> Visitor<'de> for StrictValue {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value with no repeated object key")
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, de: D) -> Result<Value, D::Error> {
+        Self::deserialize_from(de)
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_string()))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(StrictSeed)? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut object = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value_seed(StrictSeed)?;
+            if object.insert(key.clone(), value).is_some() {
+                return Err(de::Error::custom(format!("duplicate key \"{key}\"")));
+            }
+        }
+        Ok(Value::Object(object))
+    }
+}
+
+/// Carries the duplicate-key refusal into every nested value.
+struct StrictSeed;
+
+impl<'de> de::DeserializeSeed<'de> for StrictSeed {
+    type Value = Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, de: D) -> Result<Value, D::Error> {
+        StrictValue::deserialize_from(de)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy_schema::{McpArgumentMatch, McpMatcher};
+
+    fn matcher(method: &str) -> McpMatcher {
+        McpMatcher {
+            method: method.to_string(),
+            tool: None,
+            uri: None,
+            arguments: Vec::new(),
+        }
+    }
+
+    fn tool_rule(method: &str, tool: &str) -> McpMatcher {
+        McpMatcher {
+            tool: Some(tool.to_string()),
+            ..matcher(method)
+        }
+    }
+
+    fn call(tool: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}"}}}}"#)
+    }
+
+    fn judge(body: &str, matchers: &[&McpMatcher]) -> Result<(), String> {
+        super::judge("POST /mcp HTTP/1.1\r\nHost: x", body.as_bytes(), matchers).map(|_| ())
+    }
+
+    // ----------------------------------------------------------------------
+    // Reading the envelope
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn reads_a_tool_call() {
+        let info = classify_request(call("get_weather").as_bytes()).expect("should classify");
+        assert_eq!(info.method, "tools/call");
+        assert_eq!(info.name.as_deref(), Some("get_weather"));
+        assert_eq!(info.uri, None);
+    }
+
+    #[test]
+    fn reads_a_resource_read() {
+        let body = r#"{"method":"resources/read","params":{"uri":"file:///a/b.json"}}"#;
+        let info = classify_request(body.as_bytes()).expect("should classify");
+        assert_eq!(info.uri.as_deref(), Some("file:///a/b.json"));
+    }
+
+    #[test]
+    fn a_batch_array_is_refused() {
+        // This revision sends one message per POST. Judging one member of a batch
+        // and forwarding every member is how a rule gets walked past.
+        let err = classify_request(br#"[{"method":"tools/call"}]"#)
+            .expect_err("a batch must not be judged");
+        assert!(err.contains("single JSON object"), "{err}");
+    }
+
+    #[test]
+    fn a_body_with_no_method_is_refused() {
+        let err = classify_request(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#)
+            .expect_err("a response is not a request");
+        assert!(err.contains("no method"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_body_is_refused() {
+        assert!(classify_request(b"").is_err());
+    }
+
+    #[test]
+    fn trailing_content_after_the_object_is_refused() {
+        // Two documents in one body: the proxy would read the first and a server
+        // might read the second.
+        assert!(classify_request(br#"{"method":"ping"} {"method":"tools/call"}"#).is_err());
+    }
+
+    #[test]
+    fn a_duplicate_key_is_refused() {
+        let body = br#"{"method":"tools/call","method":"ping","params":{"name":"x"}}"#;
+        let err = classify_request(body).expect_err("a repeated key must be refused");
+        assert!(err.contains("duplicate key"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicate_key_nested_in_arguments_is_refused() {
+        let body =
+            br#"{"method":"tools/call","params":{"name":"x","arguments":{"h":"a","h":"b"}}}"#;
+        let err = classify_request(body).expect_err("a nested repeated key must be refused");
+        assert!(err.contains("duplicate key"), "{err}");
+    }
+
+    // ----------------------------------------------------------------------
+    // Matching
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn a_permitted_tool_passes() {
+        let rule = tool_rule("tools/call", "read_*");
+        assert!(judge(&call("read_file"), &[&rule]).is_ok());
+    }
+
+    #[test]
+    fn a_tool_no_rule_names_is_denied() {
+        let rule = tool_rule("tools/call", "read_*");
+        let err = judge(&call("write_file"), &[&rule]).expect_err("must be denied");
+        assert!(err.contains("write_file"), "{err}");
+    }
+
+    #[test]
+    fn a_method_no_rule_names_is_denied() {
+        let rule = tool_rule("tools/call", "*");
+        let body = r#"{"method":"resources/read","params":{"uri":"file:///a"}}"#;
+        assert!(judge(body, &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_wildcard_method_covers_any_method() {
+        let rule = matcher("*");
+        assert!(judge(r#"{"method":"tools/list"}"#, &[&rule]).is_ok());
+    }
+
+    #[test]
+    fn one_rule_must_cover_a_request_alone() {
+        // The method comes from one rule and the tool from the other; neither
+        // covers the request whole, so it is denied.
+        let by_method = matcher("tools/call");
+        let by_tool = tool_rule("*", "read_file");
+        let permissive = tool_rule("tools/call", "other");
+        assert!(judge(&call("read_file"), &[&permissive]).is_err());
+        // Each of these does cover it alone, so either one admits it.
+        assert!(judge(&call("read_file"), &[&by_method]).is_ok());
+        assert!(judge(&call("read_file"), &[&by_tool]).is_ok());
+    }
+
+    #[test]
+    fn a_uri_rule_reads_params_uri() {
+        let rule = McpMatcher {
+            uri: Some("file:///projects/*".to_string()),
+            ..matcher("resources/read")
+        };
+        let inside = r#"{"method":"resources/read","params":{"uri":"file:///projects/a.json"}}"#;
+        let outside = r#"{"method":"resources/read","params":{"uri":"file:///etc/shadow"}}"#;
+        assert!(judge(inside, &[&rule]).is_ok());
+        assert!(judge(outside, &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_tool_rule_does_not_match_a_request_that_names_nothing() {
+        let rule = tool_rule("tools/*", "*");
+        assert!(judge(r#"{"method":"tools/list"}"#, &[&rule]).is_err());
+    }
+
+    // ----------------------------------------------------------------------
+    // Argument pointers
+    // ----------------------------------------------------------------------
+
+    fn argument_rule(pointer: &str, glob: &str) -> McpMatcher {
+        McpMatcher {
+            arguments: vec![McpArgumentMatch {
+                pointer: pointer.to_string(),
+                glob: glob.to_string(),
+            }],
+            ..tool_rule("tools/call", "fetch")
+        }
+    }
+
+    fn fetch(arguments: &str) -> String {
+        format!(r#"{{"method":"tools/call","params":{{"name":"fetch","arguments":{arguments}}}}}"#)
+    }
+
+    #[test]
+    fn an_argument_pointer_bounds_its_value() {
+        let rule = argument_rule("/host", "*.example.com");
+        assert!(judge(&fetch(r#"{"host":"api.example.com"}"#), &[&rule]).is_ok());
+        assert!(judge(&fetch(r#"{"host":"evil.test"}"#), &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_pointer_that_reaches_nothing_does_not_match() {
+        // Fail closed: a mistyped pointer denies the request rather than widening
+        // the rule to everything.
+        let rule = argument_rule("/hsot", "*");
+        assert!(judge(&fetch(r#"{"host":"api.example.com"}"#), &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_pointer_that_reaches_a_non_string_does_not_match() {
+        let rule = argument_rule("/host", "*");
+        assert!(judge(&fetch(r#"{"host":{"name":"x"}}"#), &[&rule]).is_err());
+        assert!(judge(&fetch(r#"{"host":42}"#), &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_request_with_no_arguments_does_not_match_an_argument_rule() {
+        let rule = argument_rule("/host", "*");
+        assert!(judge(&call("fetch"), &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_pointer_reaches_a_nested_argument() {
+        let rule = argument_rule("/target/host", "*.example.com");
+        assert!(judge(&fetch(r#"{"target":{"host":"a.example.com"}}"#), &[&rule]).is_ok());
+    }
+
+    #[test]
+    fn a_pointer_reaches_a_key_holding_a_slash() {
+        // RFC 6901 writes a `/` inside a key as `~1`. A pointer that did not
+        // unescape it would reach nothing and deny every request.
+        let rule = argument_rule("/io.modelcontextprotocol~1region", "us-*");
+        let body = fetch(r#"{"io.modelcontextprotocol/region":"us-west1"}"#);
+        assert!(judge(&body, &[&rule]).is_ok());
+    }
+
+    #[test]
+    fn every_argument_condition_must_match() {
+        let rule = McpMatcher {
+            arguments: vec![
+                McpArgumentMatch {
+                    pointer: "/host".to_string(),
+                    glob: "*.example.com".to_string(),
+                },
+                McpArgumentMatch {
+                    pointer: "/scheme".to_string(),
+                    glob: "https".to_string(),
+                },
+            ],
+            ..tool_rule("tools/call", "fetch")
+        };
+        let both = fetch(r#"{"host":"a.example.com","scheme":"https"}"#);
+        let one = fetch(r#"{"host":"a.example.com","scheme":"http"}"#);
+        assert!(judge(&both, &[&rule]).is_ok());
+        assert!(judge(&one, &[&rule]).is_err());
+    }
+
+    // ----------------------------------------------------------------------
+    // Mirrored headers
+    // ----------------------------------------------------------------------
+
+    fn head(extra: &str) -> String {
+        format!("POST /mcp HTTP/1.1\r\nHost: x\r\n{extra}")
+    }
+
+    fn judge_with_head(extra: &str, body: &str) -> Result<(), String> {
+        let rule = tool_rule("tools/call", "*");
+        super::judge(&head(extra), body.as_bytes(), &[&rule]).map(|_| ())
+    }
+
+    #[test]
+    fn an_agreeing_header_passes() {
+        let extra = "Mcp-Method: tools/call\r\nMcp-Name: read_file";
+        assert!(judge_with_head(extra, &call("read_file")).is_ok());
+    }
+
+    #[test]
+    fn no_mirrored_header_is_not_a_mismatch() {
+        // This revision leaves the header rules for a notification POST
+        // undefined, so demanding one would refuse a compliant client.
+        assert!(judge_with_head("", &call("read_file")).is_ok());
+    }
+
+    #[test]
+    fn a_name_header_disagreeing_with_the_body_is_denied() {
+        // The whole point: a rule that judged the body while a component behind
+        // this door routed on the header would approve one thing and run another.
+        let extra = "Mcp-Name: read_file";
+        let err = judge_with_head(extra, &call("delete_everything"))
+            .expect_err("a mismatch must be denied");
+        assert!(err.contains("Mcp-Name"), "{err}");
+    }
+
+    #[test]
+    fn a_method_header_disagreeing_with_the_body_is_denied() {
+        let extra = "Mcp-Method: tools/list";
+        let err = judge_with_head(extra, &call("read_file")).expect_err("must be denied");
+        assert!(err.contains("Mcp-Method"), "{err}");
+    }
+
+    #[test]
+    fn a_base64_name_header_is_decoded_before_it_is_compared() {
+        // "read_file" encoded. A comparison that skipped the sentinel would pass
+        // any name a client chose to wrap.
+        let extra = "Mcp-Name: =?base64?cmVhZF9maWxl?=";
+        assert!(judge_with_head(extra, &call("read_file")).is_ok());
+        assert!(judge_with_head(extra, &call("write_file")).is_err());
+    }
+
+    #[test]
+    fn a_name_header_on_a_body_that_names_nothing_is_denied() {
+        let extra = "Mcp-Name: something";
+        let rule = matcher("*");
+        let err = super::judge(&head(extra), br#"{"method":"tools/list"}"#, &[&rule])
+            .expect_err("must be denied");
+        assert!(err.contains("names nothing"), "{err}");
+    }
+
+    #[test]
+    fn two_copies_of_a_mirrored_header_are_refused() {
+        // A server may read either copy, so a rule must never judge the one it
+        // did not act on.
+        let extra = "Mcp-Name: read_file\r\nMcp-Name: write_file";
+        let err = judge_with_head(extra, &call("read_file")).expect_err("must be refused");
+        assert!(err.contains("more than one"), "{err}");
+    }
+
+    #[test]
+    fn a_header_name_is_read_without_regard_to_case() {
+        let extra = "mcp-name: write_file";
+        assert!(judge_with_head(extra, &call("read_file")).is_err());
+    }
+
+    #[test]
+    fn a_uri_is_the_mirrored_name_for_a_resource_read() {
+        let rule = McpMatcher {
+            uri: Some("*".to_string()),
+            ..matcher("resources/read")
+        };
+        let body = r#"{"method":"resources/read","params":{"uri":"file:///a"}}"#;
+        let agreeing = head("Mcp-Name: file:///a");
+        let disagreeing = head("Mcp-Name: file:///b");
+        assert!(super::judge(&agreeing, body.as_bytes(), &[&rule]).is_ok());
+        assert!(super::judge(&disagreeing, body.as_bytes(), &[&rule]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_inspection_limit_is_refused() {
+        // The limit is what makes the rules affordable, so it has to hold: a body
+        // above it is refused rather than truncated, because a rule cannot be
+        // judged against bytes the proxy declined to read.
+        let oversized = crate::http_body::MAX_JUDGED_BODY_BYTES + 1;
+        let head = format!("POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: {oversized}");
+        let (mut near, mut far) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            // The reader gives up at the limit, so this write half is expected to
+            // break part way through.
+            let _ = far.write_all(&vec![b'x'; oversized]).await;
+        });
+
+        let err = read_body_for_inspection(&mut near, &head, BodyFraming::Fixed(oversized as u64))
+            .await
+            .expect_err("a body over the limit must be refused");
+        assert!(
+            err.contains(&crate::http_body::MAX_JUDGED_BODY_BYTES.to_string()),
+            "the reason must name the limit so the need is visible: {err}"
+        );
+        writer.abort();
+    }
+
+    #[test]
+    fn the_returned_info_lets_a_caller_rebind_the_agreement_to_a_new_head() {
+        // Credential injection changes the head after the rule judged it, so a
+        // door re-checks with what `judge` handed back.
+        let rule = tool_rule("tools/call", "read_*");
+        let info = super::judge(&head(""), call("read_file").as_bytes(), &[&rule])
+            .expect("should pass on its own");
+
+        assert!(check_headers_agree("POST /mcp HTTP/1.1\r\nMcp-Name: read_file", &info).is_ok());
+        let err = check_headers_agree("POST /mcp HTTP/1.1\r\nMcp-Name: write_file", &info)
+            .expect_err("an injected header disagreeing with the body must be caught");
+        assert!(err.contains("Mcp-Name"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_base64_name_header_is_refused() {
+        let extra = "Mcp-Name: =?base64?not-base64!!?=";
+        assert!(judge_with_head(extra, &call("read_file")).is_err());
+    }
+}

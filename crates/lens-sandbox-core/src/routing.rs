@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use ipnet::IpNet;
 
 pub use crate::policy_schema::{
-    GraphqlMatcher, HttpRequestMatch, HttpRule, Scheme, Transport, Verdict,
+    GraphqlMatcher, HttpRequestMatch, HttpRule, McpMatcher, Scheme, Transport, Verdict,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,31 +81,53 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             .filter_map(|r| {
                 // Filter out empty rules — every field absent is a match-all that
                 // would silently bypass deny-by-default semantics. A rule that
-                // carries only a `graphql` block is not empty: it constrains the
-                // operation on every method and path.
-                if r.method.is_none() && r.path.is_none() && r.graphql.is_none() {
+                // carries only a body matcher is not empty: it constrains the
+                // operation on every method and path. `body_matcher` is asked
+                // rather than each key in turn, so a grammar added there cannot
+                // be forgotten here and have its rules dropped as empty.
+                if r.method.is_none() && r.path.is_none() && body_matcher(&r).is_none() {
                     return None;
                 }
-                Some(HttpRule {
-                    method: r.method,
-                    path: r.path,
-                    graphql: r.graphql,
-                })
+                Some(r)
             })
             .collect();
 
-        // A GraphQL rule governs the requests its head covers, so a bodiless
+        // One request cannot be judged by two grammars, so a rule naming two is a
+        // mistake rather than a narrowing. Refused here, where a `TryFrom` error
+        // fails the whole policy closed.
+        for rule in &http_rules {
+            if rule.graphql.is_some() && rule.mcp.is_some() {
+                return Err(format!(
+                    "HTTP rule on {} sets both graphql and mcp; a request has one body grammar",
+                    raw.match_pattern
+                ));
+            }
+            if let Some(mcp) = &rule.mcp {
+                validate_mcp(mcp, &raw.match_pattern)?;
+            }
+        }
+
+        if http_rules.iter().any(|r| r.graphql.is_some())
+            && http_rules.iter().any(|r| r.mcp.is_some())
+        {
+            return Err(format!(
+                "route {} mixes graphql and mcp rules; one endpoint speaks one of them",
+                raw.match_pattern
+            ));
+        }
+
+        // A body-reading rule governs the requests its head covers, so a bodiless
         // rule beside it does not admit them. That is worth saying out loud at
         // load: the operator sees which shape wins before a request is denied
         // by it. Mirrors how an egress `tcp`/`http` overlap is logged, not
         // rejected — deciding glob subsumption between rules is its own
         // problem, and the runtime precedence already removes the ambiguity.
-        if http_rules.iter().any(|r| r.graphql.is_some())
-            && http_rules.iter().any(|r| r.graphql.is_none())
+        if http_rules.iter().any(|r| body_matcher(r).is_some())
+            && http_rules.iter().any(|r| body_matcher(r).is_none())
         {
             tracing::info!(
                 pattern = %raw.match_pattern,
-                "route mixes GraphQL and non-GraphQL HTTP rules: a request matching a GraphQL rule's method and path is decided by the GraphQL rules alone"
+                "route mixes body-reading and head-only HTTP rules: a request matching a body rule's method and path is decided by the body rules alone"
             );
         }
 
@@ -1083,18 +1105,77 @@ fn glob_match_segments(pattern: &[&str], path: &[&str]) -> bool {
     si == path.len()
 }
 
+/// The body grammar one [`HttpRule`] judges by.
+///
+/// The schema gives each grammar its own optional key, so "both set" is a state
+/// serde can build. Every reader asks [`body_matcher`] instead, and the
+/// exactly-one check runs once at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyMatcher<'a> {
+    Graphql(&'a GraphqlMatcher),
+    Mcp(&'a McpMatcher),
+}
+
+/// Which body grammar a rule judges by, if any.
+///
+/// The one place that knows the set of body keys. A grammar added to [`HttpRule`]
+/// and not added here is enforced nowhere, and the empty-rule filter — which asks
+/// this — would drop a rule carrying only that key and read the emptied list as
+/// allow-all.
+///
+/// Both keys set is refused at load, so the last arm is reachable only from a rule
+/// built by hand in a test. It answers with one of them rather than none: a rule
+/// that judged nothing would be the fail-open reading.
+pub fn body_matcher(rule: &HttpRule) -> Option<BodyMatcher<'_>> {
+    match (&rule.graphql, &rule.mcp) {
+        (Some(graphql), None) => Some(BodyMatcher::Graphql(graphql)),
+        (None, Some(mcp)) => Some(BodyMatcher::Mcp(mcp)),
+        (Some(graphql), Some(_)) => Some(BodyMatcher::Graphql(graphql)),
+        (None, None) => None,
+    }
+}
+
+/// Check what an [`McpMatcher`] cannot express as a type.
+fn validate_mcp(mcp: &McpMatcher, pattern: &str) -> Result<(), String> {
+    // One request carries one name: `tools/call` and `prompts/get` put it at
+    // `params.name`, `resources/read` at `params.uri`. A rule asking for both can
+    // never match, so it is a mistake, not a narrowing.
+    if mcp.tool.is_some() && mcp.uri.is_some() {
+        return Err(format!(
+            "mcp rule on {pattern} sets both tool and uri; a request names one or the other"
+        ));
+    }
+    for condition in &mcp.arguments {
+        // An RFC 6901 pointer to an argument opens with `/`. An empty pointer is
+        // the arguments value whole — an object, never a string — and anything
+        // else resolves to nothing. Either way the rule would deny every request
+        // it was written to permit, so it is said at load rather than found as a
+        // silent denial.
+        if !condition.pointer.starts_with('/') {
+            return Err(format!(
+                "mcp argument pointer {:?} on {pattern} is not a JSON pointer to an argument: it must open with '/'",
+                condition.pointer
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What a route's HTTP rules make of a request head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpRuleOutcome<'a> {
     /// No rule covers this method and path. The caller denies the request.
     NoMatch,
-    /// A rule with no GraphQL condition covers it. The caller allows it, and
-    /// no body is read.
+    /// A rule with no body condition covers it. The caller allows it, and no
+    /// body is read.
     Allow,
     /// GraphQL rules cover it, and they decide it once the body is read. Each
     /// matcher listed is a candidate; one of them must cover the operation
     /// whole.
     Graphql(Vec<&'a GraphqlMatcher>),
+    /// MCP rules cover it, and they decide it once the body is read. Each matcher
+    /// listed is a candidate; one of them must cover the request whole.
+    Mcp(Vec<&'a McpMatcher>),
 }
 
 /// Decide what a route's HTTP rules make of a request head.
@@ -1102,8 +1183,8 @@ pub enum HttpRuleOutcome<'a> {
 /// An empty rule list puts no restriction on the route, which is the
 /// deny-by-default contract on [`crate::policy_schema::RouteRule::rules`].
 ///
-/// Where both kinds of rule cover the same head, the GraphQL rules win and the
-/// body decides. [`crate::policy_schema::HttpRule::graphql`] says why.
+/// Where both kinds of rule cover the same head, the body-reading rules win and
+/// the body decides. [`crate::policy_schema::HttpRule::graphql`] says why.
 pub fn classify_http_request<'a>(
     rules: &'a [HttpRule],
     method: &str,
@@ -1114,19 +1195,25 @@ pub fn classify_http_request<'a>(
     }
 
     let mut graphql = Vec::new();
+    let mut mcp = Vec::new();
     let mut covered_by_head_alone = false;
     for rule in rules
         .iter()
         .filter(|rule| head_matches(rule.method.as_deref(), rule.path.as_deref(), method, path))
     {
-        match &rule.graphql {
-            Some(matcher) => graphql.push(matcher),
+        match body_matcher(rule) {
+            Some(BodyMatcher::Graphql(matcher)) => graphql.push(matcher),
+            Some(BodyMatcher::Mcp(matcher)) => mcp.push(matcher),
             None => covered_by_head_alone = true,
         }
     }
 
+    // A route carrying both grammars is refused at load, so at most one of these
+    // is non-empty for any head.
     if !graphql.is_empty() {
         HttpRuleOutcome::Graphql(graphql)
+    } else if !mcp.is_empty() {
+        HttpRuleOutcome::Mcp(mcp)
     } else if covered_by_head_alone {
         HttpRuleOutcome::Allow
     } else {
@@ -1181,6 +1268,7 @@ mod tests {
             method: Some(method.to_string()),
             path: Some(path.to_string()),
             graphql: None,
+            mcp: None,
         }
     }
 
@@ -1193,6 +1281,7 @@ mod tests {
                 operation_name: None,
                 fields: fields.iter().map(ToString::to_string).collect(),
             }),
+            mcp: None,
         }
     }
 
@@ -1292,6 +1381,174 @@ mod tests {
             classify_http_request(&routes[0].http_rules, "POST", "/anything"),
             HttpRuleOutcome::Graphql(_)
         ));
+    }
+
+    // ----------------------------------------------------------------------
+    // MCP rules
+    // ----------------------------------------------------------------------
+
+    fn route(rules: &str) -> Result<Vec<RouteRule>, String> {
+        parse_routes(&format!(
+            r#"[{{
+                "match": "mcp.example.com",
+                "verdict": "allow",
+                "transport": "direct",
+                "rules": {rules}
+            }}]"#
+        ))
+    }
+
+    #[test]
+    fn a_rule_of_only_an_mcp_block_survives_parsing_and_covers_any_head() {
+        // The fail-open trap: were `mcp` missing from the empty-rule filter, this
+        // rule would be dropped, the list would empty, and an empty list places no
+        // restriction at all.
+        let routes = route(r#"[{ "mcp": { "method": "tools/call" } }]"#).unwrap();
+        assert_eq!(
+            routes[0].http_rules.len(),
+            1,
+            "the rule must not be dropped as empty"
+        );
+        assert!(matches!(
+            classify_http_request(&routes[0].http_rules, "POST", "/anything"),
+            HttpRuleOutcome::Mcp(_)
+        ));
+    }
+
+    #[test]
+    fn an_mcp_rule_parses_its_matcher() {
+        let routes = route(
+            r#"[{
+                "method": "POST",
+                "path": "/mcp",
+                "mcp": {
+                    "method": "tools/call",
+                    "tool": "read_*",
+                    "arguments": [{ "pointer": "/host", "glob": "*.example.com" }]
+                }
+            }]"#,
+        )
+        .unwrap();
+        let matcher = routes[0].http_rules[0]
+            .mcp
+            .as_ref()
+            .expect("matcher parsed");
+        assert_eq!(matcher.method, "tools/call");
+        assert_eq!(matcher.tool.as_deref(), Some("read_*"));
+        assert_eq!(matcher.arguments[0].pointer, "/host");
+    }
+
+    #[test]
+    fn an_mcp_matcher_rejects_an_unknown_key() {
+        // A narrowing serde could not place would go missing, leaving the rule
+        // broader than it reads.
+        assert!(route(r#"[{ "mcp": { "method": "tools/call", "tol": "x" } }]"#).is_err());
+    }
+
+    #[test]
+    fn an_mcp_matcher_requires_a_method() {
+        assert!(route(r#"[{ "mcp": { "tool": "read_*" } }]"#).is_err());
+    }
+
+    #[test]
+    fn a_rule_setting_both_tool_and_uri_is_refused() {
+        // One request names one thing, so such a rule can never match.
+        let err = route(r#"[{ "mcp": { "method": "*", "tool": "a", "uri": "b" } }]"#)
+            .expect_err("a rule that cannot match must be refused");
+        assert!(err.contains("tool and uri"), "{err}");
+    }
+
+    #[test]
+    fn an_argument_pointer_that_is_not_a_pointer_is_refused() {
+        // `host` reaches nothing, so the rule would deny every request it was
+        // written to permit. Better said at load than found as a silent denial.
+        let err = route(
+            r#"[{ "mcp": { "method": "*", "arguments": [{ "pointer": "host", "glob": "*" }] } }]"#,
+        )
+        .expect_err("a bare name is not a JSON pointer");
+        assert!(err.contains("JSON pointer"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_argument_pointer_is_refused() {
+        // `""` reaches the arguments value whole, which is an object and never a
+        // string, so the rule would deny every request it was written to permit.
+        let err = route(
+            r#"[{ "mcp": { "method": "*", "arguments": [{ "pointer": "", "glob": "*" }] } }]"#,
+        )
+        .expect_err("an empty pointer names no argument");
+        assert!(err.contains("JSON pointer"), "{err}");
+    }
+
+    #[test]
+    fn one_rule_carrying_both_grammars_is_refused() {
+        let err =
+            route(r#"[{ "graphql": { "operationType": "query" }, "mcp": { "method": "*" } }]"#)
+                .expect_err("a request has one body grammar");
+        assert!(err.contains("both graphql and mcp"), "{err}");
+    }
+
+    #[test]
+    fn a_route_mixing_graphql_and_mcp_rules_is_refused() {
+        let err = route(
+            r#"[
+                { "path": "/graphql", "graphql": { "operationType": "query" } },
+                { "path": "/mcp", "mcp": { "method": "*" } }
+            ]"#,
+        )
+        .expect_err("one endpoint speaks one of them");
+        assert!(err.contains("mixes graphql and mcp"), "{err}");
+    }
+
+    #[test]
+    fn an_mcp_rule_claims_the_head_it_covers() {
+        let routes =
+            route(r#"[{ "method": "POST", "path": "/mcp", "mcp": { "method": "*" } }]"#).unwrap();
+        assert!(matches!(
+            classify_http_request(&routes[0].http_rules, "POST", "/mcp"),
+            HttpRuleOutcome::Mcp(matchers) if matchers.len() == 1
+        ));
+    }
+
+    #[test]
+    fn an_mcp_rule_wins_over_a_bodiless_rule_on_the_same_head() {
+        // A broad allow beside a narrow MCP rule must not let a request past
+        // unread, or the MCP rule would do nothing at all.
+        let routes = route(
+            r#"[
+                { "method": "POST", "path": "/**" },
+                { "method": "POST", "path": "/mcp", "mcp": { "method": "tools/list" } }
+            ]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_http_request(&routes[0].http_rules, "POST", "/mcp"),
+            HttpRuleOutcome::Mcp(_)
+        ));
+    }
+
+    #[test]
+    fn a_bodiless_rule_still_covers_a_head_no_mcp_rule_claims() {
+        let routes = route(
+            r#"[
+                { "method": "GET", "path": "/health" },
+                { "method": "POST", "path": "/mcp", "mcp": { "method": "*" } }
+            ]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_http_request(&routes[0].http_rules, "GET", "/health"),
+            HttpRuleOutcome::Allow
+        ));
+    }
+
+    #[test]
+    fn a_mistyped_mcp_key_leaves_no_unconditional_allow_behind() {
+        // `deny_unknown_fields` on the rule: were the misspelling dropped, the
+        // bare method and path would stay as an allow for every MCP call.
+        assert!(
+            route(r#"[{ "method": "POST", "path": "/mcp", "mpc": { "method": "*" } }]"#).is_err()
+        );
     }
 
     #[test]
@@ -2889,6 +3146,7 @@ mod tests {
             method: Some("GET".to_string()),
             path: None,
             graphql: None,
+            mcp: None,
         }];
         assert!(allows(&rules, "GET", "/foo"));
         assert!(allows(&rules, "get", "/foo"));
@@ -2901,6 +3159,7 @@ mod tests {
             method: None,
             path: Some("/api/v1/*".to_string()),
             graphql: None,
+            mcp: None,
         }];
         assert!(allows(&rules, "GET", "/api/v1/download"));
         assert!(allows(&rules, "POST", "/api/v1/upload"));
@@ -2913,6 +3172,7 @@ mod tests {
             method: Some("GET".to_string()),
             path: Some("/api/v1/*".to_string()),
             graphql: None,
+            mcp: None,
         }];
         assert!(allows(&rules, "GET", "/api/v1/download"));
         assert!(!allows(&rules, "POST", "/api/v1/download"));
@@ -2926,11 +3186,13 @@ mod tests {
                 method: Some("GET".to_string()),
                 path: Some("/api/v1/*".to_string()),
                 graphql: None,
+                mcp: None,
             },
             HttpRule {
                 method: Some("POST".to_string()),
                 path: Some("/api/v1/upload".to_string()),
                 graphql: None,
+                mcp: None,
             },
         ];
         assert!(allows(&rules, "GET", "/api/v1/download"));
@@ -2965,6 +3227,7 @@ mod tests {
             method: Some("*".to_string()),
             path: Some("/health".to_string()),
             graphql: None,
+            mcp: None,
         }];
         assert!(allows(&rules, "GET", "/health"));
         assert!(allows(&rules, "POST", "/health"));
@@ -3010,6 +3273,7 @@ mod tests {
             method: None,
             path: Some("/repos/**".to_string()),
             graphql: None,
+            mcp: None,
         }];
         assert!(allows(&rules, "GET", &normalize_path("/repos/v1/list")));
         assert!(!allows(
