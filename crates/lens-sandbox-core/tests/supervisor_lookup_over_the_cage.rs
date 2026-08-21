@@ -6,8 +6,29 @@
 //! the stub at all. Whether one does is a kernel question: an unmarked UDP/53
 //! query is carried into the stub by an nftables redirect, and only a real chain
 //! can say whether a query carried the mark. So this needs Linux and
-//! `CAP_NET_ADMIN`, and it is `#[ignore]`d like the other cage tests. Run it
-//! with `cargo test -- --ignored` on a host that has both.
+//! `CAP_NET_ADMIN`, and it is `#[ignore]`d like the other cage tests.
+//!
+//! # Why a network namespace of its own
+//!
+//! It needs one, and `lo` as the only way out:
+//!
+//! ```sh
+//! sudo unshare -n -- sh -c 'ip link set lo up && ip route add default dev lo &&
+//!     cargo test -p lens-sandbox-core --test supervisor_lookup_over_the_cage -- --ignored'
+//! ```
+//!
+//! A sandbox owns its namespace. A developer's machine does not: `resolv.conf`
+//! there usually names a forwarding daemon on loopback, and that daemon's own
+//! upstream query carries no mark. In a shared namespace the cage catches that
+//! query and the stub refuses it, so a refusal no longer says whose lookup it
+//! judged and the test cannot tell a marked query from an unmarked one.
+//!
+//! Alone in a namespace nothing can forward on the supervisor's behalf, and the
+//! redirect becomes the only thing that can carry a query to the stub. The
+//! default route over `lo` is what gives a query somewhere to go: without any
+//! route the send fails before netfilter sees the packet, and a query that lost
+//! its mark would never be redirected for the test to catch. A marked query
+//! reaches nothing instead, which is the point, and the test needs no network.
 //!
 //! # Why two names
 //!
@@ -37,6 +58,10 @@ const FENCED_BINARY: &str = "/usr/bin/curl";
 /// arrive. The control phase asks for one name, the phase under test the other.
 const CONTROL_NAME: &str = "control.invalid";
 const PROBE_NAME: &str = "probe.invalid";
+
+/// Where the control phase aims its query. `TEST-NET-1` is documented as
+/// unreachable, so nothing but the cage's own redirect can answer for it.
+const OFF_BOX_RESOLVER: &str = "192.0.2.1:53";
 
 /// Long enough for a stub denial to reach the audit channel, short enough not
 /// to stall the suite.
@@ -83,7 +108,7 @@ fn fenced_state() -> Arc<ProxyState> {
 /// Bind the stub where the cage's redirect points, so a query that is carried
 /// into it arrives. The upstream address is never used: every query this stub
 /// judges is refused.
-async fn spawn_stub(state: Arc<ProxyState>) -> SocketAddr {
+async fn spawn_stub(state: Arc<ProxyState>) {
     let listen = SocketAddr::from(([127, 0, 0, 1], DEFAULT_DNS_STUB_PORT));
     let socket = UdpSocket::bind(listen)
         .await
@@ -92,7 +117,6 @@ async fn spawn_stub(state: Arc<ProxyState>) -> SocketAddr {
     tokio::spawn(async move {
         lens_sandbox_core::dns::serve(Arc::new(socket), state, unreachable).await;
     });
-    listen
 }
 
 #[tokio::test]
@@ -101,19 +125,20 @@ async fn the_supervisors_own_lookup_never_reaches_the_stub() {
     let state = fenced_state();
     let (audit_tx, mut audit) = mpsc::unbounded_channel();
     *state.audit_tx.lock().unwrap() = Some(audit_tx);
-    let stub = spawn_stub(state).await;
+    spawn_stub(state).await;
     let _cage = Cage::install();
 
-    // Control: a query the stub does receive. This is the failure the report
-    // describes — the fence names one binary, the caller is another, and the
-    // name is refused. It proves the fence is live and that a refusal reaches
-    // the audit channel this test then reads for silence.
+    // Control: an unmarked query, aimed away from the stub. The redirect is
+    // what carries it there, the fence names another binary, and the refusal
+    // reaches the audit channel. So this walks the whole delivery path whose
+    // silence the next phase reads — redirect live, stub judging, audit
+    // flowing — and a phase that cannot fail is not left proving anything.
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    client.connect(stub).await.unwrap();
+    client.connect(OFF_BOX_RESOLVER).await.unwrap();
     client
         .send(&query_for(CONTROL_NAME))
         .await
-        .expect("the stub is listening");
+        .expect("the default route over lo gives the query somewhere to go");
     tokio::time::sleep(SETTLE).await;
     let refusal = audit
         .try_recv()
