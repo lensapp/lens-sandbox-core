@@ -599,11 +599,11 @@
       ]
     },
     "McpMatcher": {
-      "description": "The MCP requests one [`HttpRule`] covers. Every field that is set must match.\n\nThis reads MCP revision `2026-07-28`: one JSON-RPC request or notification per\n`POST`, never a batch, and the sandbox is the only side that sends a request.\nAn earlier revision let a server drive the client over a stream this door\nrelays unread. Those revisions are refused as a consequence rather than by a\nversion test — no rule here names `initialize`, so their handshake matches\nnothing.",
+      "description": "The MCP requests one [`HttpRule`] covers. Every field that is set must match.\n\nThis reads MCP revision `2026-07-28`: one JSON-RPC request or notification per\n`POST`, never a batch, and the sandbox is the only side that sends a request.\nA request that names any other revision in its `MCP-Protocol-Version` header\nis refused, and so is one that names none.\n\nEach field bounds only the methods that read it: `tool` the ones that name at\n`params.name`, `uri` the ones that name at `params.uri`, `arguments` the ones\nthat carry them.",
       "type": "object",
       "properties": {
         "arguments": {
-          "description": "Conditions on the tool arguments. Every entry must match.\n\nEach entry bounds the argument it names and says nothing about the rest.\nThis is unlike [`GraphqlMatcher::fields`], which every root field must\nsatisfy: a tool whose arguments decide what it reaches needs one entry per\nargument that matters.",
+          "description": "Conditions on the arguments, which `tools/call` and `prompts/get` carry.\nEvery entry must match.\n\nEach entry bounds the argument it names and says nothing about the rest.\nThis is unlike [`GraphqlMatcher::fields`], which every root field must\nsatisfy: a tool whose arguments decide what it reaches needs one entry per\nargument that matters.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/McpArgumentMatch"
@@ -621,7 +621,7 @@
           ]
         },
         "uri": {
-          "description": "The resource the request must name, as a glob, read from `params.uri`.\nOnly `resources/read` carries it.\n\n`*` spans a `/` here, unlike a `path` glob, so `file:///projects/*` also\ncovers `file:///projects/a/b/anything`.",
+          "description": "The resource the request must name, as a glob, read from `params.uri`.\nThe `resources/*` methods carry it.\n\n`*` spans a `/` here, unlike a `path` glob, so `file:///projects/*` also\ncovers `file:///projects/a/b/anything`.",
           "type": [
             "string",
             "null"

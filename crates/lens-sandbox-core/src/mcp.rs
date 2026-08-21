@@ -22,6 +22,19 @@ use crate::routing::glob_matches;
 const SENTINEL_PREFIX: &str = "=?base64?";
 const SENTINEL_SUFFIX: &str = "?=";
 
+/// The revisions these rules can enforce.
+///
+/// Pinned rather than inferred. Every revision from `2025-03-26` to `2025-11-25`
+/// lets a server send JSON-RPC requests of its own on the SSE stream this door
+/// relays unread, so admitting one would put traffic beyond any rule's reach. An
+/// upstream that serves both eras picks its handler from this header, so refusing
+/// an absent or older value is what keeps the request inside the era the rules
+/// were written for.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 1] = ["2026-07-28"];
+
+/// The JSON-RPC version every MCP message declares.
+const JSONRPC_VERSION: &str = "2.0";
+
 /// What one MCP request asks the server to do.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RequestInfo {
@@ -37,10 +50,44 @@ pub struct RequestInfo {
 
 impl RequestInfo {
     /// The value `Mcp-Name` is mirrored from: whichever of the two the request
-    /// carries.
+    /// carries. A body carrying both is refused at classification, so this is
+    /// never a choice between two live values.
     fn mirrored_name(&self) -> Option<&str> {
         self.name.as_deref().or(self.uri.as_deref())
     }
+}
+
+/// Which parameter names what a method acts on.
+///
+/// A method reads one of them and ignores the other, so a rule that bounds the
+/// one being ignored bounds nothing: it would check a value the server never
+/// reads while the server acted on the value beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Subject {
+    /// `params.name`.
+    Name,
+    /// `params.uri`.
+    Uri,
+    /// The method acts on neither, so neither `tool` nor `uri` can bound it.
+    Neither,
+}
+
+impl Subject {
+    /// An unknown method reads as [`Subject::Neither`], so a new method in a
+    /// later revision is one a rule must name on purpose rather than one an old
+    /// rule admits by accident.
+    fn of(method: &str) -> Self {
+        match method {
+            "tools/call" | "prompts/get" => Self::Name,
+            "resources/read" | "resources/subscribe" | "resources/unsubscribe" => Self::Uri,
+            _ => Self::Neither,
+        }
+    }
+}
+
+/// Whether a method carries `params.arguments`, which a condition can point into.
+fn carries_arguments(method: &str) -> bool {
+    matches!(method, "tools/call" | "prompts/get")
 }
 
 /// Read the operation an MCP request asks for.
@@ -63,6 +110,20 @@ pub fn classify_request(body: &[u8]) -> Result<RequestInfo, String> {
         );
     };
 
+    // A JSON-RPC message declares its version. A body that does not is not one
+    // this door can read as MCP at all, and reading it as MCP anyway is how an
+    // envelope of another shape gets judged by rules written for this one.
+    match envelope.get("jsonrpc") {
+        Some(Value::String(version)) if version == JSONRPC_VERSION => {}
+        Some(Value::String(version)) => {
+            return Err(format!(
+                "MCP request body declares jsonrpc {version:?}, not {JSONRPC_VERSION:?}"
+            ));
+        }
+        // A non-string `jsonrpc` is not the version any MCP message declares.
+        _ => return Err("MCP request body declares no jsonrpc version string".to_string()),
+    }
+
     let method = match envelope.get("method") {
         Some(Value::String(method)) => method.clone(),
         // A body with no method is a JSON-RPC *response*, which a client of this
@@ -77,10 +138,21 @@ pub fn classify_request(body: &[u8]) -> Result<RequestInfo, String> {
         Some(_) => return Err(format!("MCP request \"{method}\" has non-object params")),
     };
 
+    let name = params.and_then(|p| string_field(p, "name"));
+    let uri = params.and_then(|p| string_field(p, "uri"));
+
+    // One method acts on one of them. A body carrying both leaves which one the
+    // server reads to the server, and no rule can bound a choice it cannot see.
+    if name.is_some() && uri.is_some() {
+        return Err(format!(
+            "MCP request \"{method}\" carries both a name and a uri, so what it acts on is ambiguous"
+        ));
+    }
+
     Ok(RequestInfo {
         method,
-        name: params.and_then(|p| string_field(p, "name")),
-        uri: params.and_then(|p| string_field(p, "uri")),
+        name,
+        uri,
         arguments: params.and_then(|p| p.get("arguments").cloned()),
     })
 }
@@ -134,14 +206,19 @@ fn covers(info: &RequestInfo, matcher: &McpMatcher) -> bool {
     if !glob_matches(&matcher.method, &info.method) {
         return false;
     }
+    let subject = Subject::of(&info.method);
     if let Some(tool) = &matcher.tool
-        && !info.name.as_deref().is_some_and(|n| glob_matches(tool, n))
+        && (subject != Subject::Name
+            || !info.name.as_deref().is_some_and(|n| glob_matches(tool, n)))
     {
         return false;
     }
     if let Some(uri) = &matcher.uri
-        && !info.uri.as_deref().is_some_and(|u| glob_matches(uri, u))
+        && (subject != Subject::Uri || !info.uri.as_deref().is_some_and(|u| glob_matches(uri, u)))
     {
+        return false;
+    }
+    if !matcher.arguments.is_empty() && !carries_arguments(&info.method) {
         return false;
     }
     matcher.arguments.iter().all(|condition| {
@@ -157,17 +234,21 @@ fn covers(info: &RequestInfo, matcher: &McpMatcher) -> bool {
 // Mirrored headers
 // ---------------------------------------------------------------------------
 
-/// Confirm the headers MCP mirrors from the body agree with the body.
+/// Check the request head: the revision it names, the `Mcp-Param-*` headers it
+/// must not carry, and the agreement of the headers MCP mirrors from the body.
 ///
-/// The body is what a rule judges and what a compliant server runs, so this
-/// changes no verdict on its own. It closes a gap behind this door: a component
-/// that routes or meters on `Mcp-Method` or `Mcp-Name` would otherwise act on a
-/// value the policy never read.
+/// The mirror check changes no verdict on its own, because the body is what a
+/// rule judges and what a compliant server runs. It closes a gap behind this
+/// door: a component that routes or meters on `Mcp-Method` or `Mcp-Name` would
+/// otherwise act on a value the policy never read.
 ///
-/// A missing header is not a mismatch. This revision leaves the header rules for
-/// a notification `POST` undefined, so demanding one would refuse a compliant
-/// client.
+/// A missing mirrored header is not a mismatch. This revision leaves the header
+/// rules for a notification `POST` undefined, so demanding one would refuse a
+/// compliant client. The revision header is another matter: it is required.
 pub fn check_headers_agree(header_block: &str, info: &RequestInfo) -> Result<(), String> {
+    ensure_supported_revision(header_block)?;
+    ensure_no_unverifiable_param_header(header_block)?;
+
     if let Some(claimed) = sole_header(header_block, "mcp-method")?
         && claimed != info.method
     {
@@ -194,6 +275,51 @@ pub fn check_headers_agree(header_block: &str, info: &RequestInfo) -> Result<(),
         }
     }
 
+    Ok(())
+}
+
+/// Refuse a request that does not name a revision these rules can enforce.
+///
+/// The header is mandatory on every `POST` of this revision, so an absent one is
+/// as much a refusal as an older one. [`SUPPORTED_PROTOCOL_VERSIONS`] says why.
+fn ensure_supported_revision(header_block: &str) -> Result<(), String> {
+    let Some(claimed) = sole_header(header_block, "mcp-protocol-version")? else {
+        return Err(
+            "request names no MCP-Protocol-Version, so the revision it speaks is unknown"
+                .to_string(),
+        );
+    };
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&claimed.as_str()) {
+        return Ok(());
+    }
+    Err(format!(
+        "MCP revision {claimed:?} is not one these rules enforce (expected one of {SUPPORTED_PROTOCOL_VERSIONS:?})"
+    ))
+}
+
+/// Refuse an `Mcp-Param-*` header, which this door cannot check against the body.
+///
+/// A server names these through the `x-mcp-header` annotation on its own tool
+/// schema, and the annotation's name need not be the argument's name. Without the
+/// server's `inputSchema` there is no way to say which argument a given header
+/// mirrors, so a rule that bounds an argument cannot tell whether the header
+/// beside it agrees. Since something behind this door may route or meter on that
+/// header, an unverifiable one is refused rather than forwarded.
+///
+/// The cost is real: a server that annotates its tools this way cannot be reached
+/// through an MCP rule until this door can read its schema.
+fn ensure_no_unverifiable_param_header(header_block: &str) -> Result<(), String> {
+    for line in header_block.split("\r\n").skip(1) {
+        let Some((field, _)) = line.split_once(':') else {
+            continue;
+        };
+        if field.trim().to_ascii_lowercase().starts_with("mcp-param-") {
+            return Err(format!(
+                "request carries {}, which this door cannot check against the body",
+                field.trim()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -314,7 +440,7 @@ mod tests {
     }
 
     fn judge(body: &str, matchers: &[&McpMatcher]) -> Result<(), String> {
-        super::judge("POST /mcp HTTP/1.1\r\nHost: x", body.as_bytes(), matchers).map(|_| ())
+        super::judge(&head(""), body.as_bytes(), matchers).map(|_| ())
     }
 
     // ----------------------------------------------------------------------
@@ -331,9 +457,34 @@ mod tests {
 
     #[test]
     fn reads_a_resource_read() {
-        let body = r#"{"method":"resources/read","params":{"uri":"file:///a/b.json"}}"#;
+        let body =
+            r#"{"jsonrpc":"2.0","method":"resources/read","params":{"uri":"file:///a/b.json"}}"#;
         let info = classify_request(body.as_bytes()).expect("should classify");
         assert_eq!(info.uri.as_deref(), Some("file:///a/b.json"));
+    }
+
+    #[test]
+    fn a_body_declaring_no_jsonrpc_version_is_refused() {
+        let err = classify_request(br#"{"method":"tools/call","params":{"name":"ls"}}"#)
+            .expect_err("an envelope of unknown shape must not be judged as MCP");
+        assert!(err.contains("no jsonrpc version"), "{err}");
+    }
+
+    #[test]
+    fn a_body_declaring_another_jsonrpc_version_is_refused() {
+        let err = classify_request(br#"{"jsonrpc":"1.0","method":"tools/call"}"#)
+            .expect_err("only 2.0 is the version MCP messages declare");
+        assert!(err.contains("jsonrpc \"1.0\""), "{err}");
+    }
+
+    #[test]
+    fn a_body_carrying_both_a_name_and_a_uri_is_refused() {
+        // Which one the server reads is the server's choice, and no rule can
+        // bound a choice it cannot see.
+        let body =
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ls","uri":"file:///a"}}"#;
+        let err = classify_request(body.as_bytes()).expect_err("the subject is ambiguous");
+        assert!(err.contains("both a name and a uri"), "{err}");
     }
 
     #[test]
@@ -399,14 +550,14 @@ mod tests {
     #[test]
     fn a_method_no_rule_names_is_denied() {
         let rule = tool_rule("tools/call", "*");
-        let body = r#"{"method":"resources/read","params":{"uri":"file:///a"}}"#;
+        let body = r#"{"jsonrpc":"2.0","method":"resources/read","params":{"uri":"file:///a"}}"#;
         assert!(judge(body, &[&rule]).is_err());
     }
 
     #[test]
     fn a_wildcard_method_covers_any_method() {
         let rule = matcher("*");
-        assert!(judge(r#"{"method":"tools/list"}"#, &[&rule]).is_ok());
+        assert!(judge(r#"{"jsonrpc":"2.0","method":"tools/list"}"#, &[&rule]).is_ok());
     }
 
     #[test]
@@ -428,8 +579,9 @@ mod tests {
             uri: Some("file:///projects/*".to_string()),
             ..matcher("resources/read")
         };
-        let inside = r#"{"method":"resources/read","params":{"uri":"file:///projects/a.json"}}"#;
-        let outside = r#"{"method":"resources/read","params":{"uri":"file:///etc/shadow"}}"#;
+        let inside = r#"{"jsonrpc":"2.0","method":"resources/read","params":{"uri":"file:///projects/a.json"}}"#;
+        let outside =
+            r#"{"jsonrpc":"2.0","method":"resources/read","params":{"uri":"file:///etc/shadow"}}"#;
         assert!(judge(inside, &[&rule]).is_ok());
         assert!(judge(outside, &[&rule]).is_err());
     }
@@ -437,7 +589,27 @@ mod tests {
     #[test]
     fn a_tool_rule_does_not_match_a_request_that_names_nothing() {
         let rule = tool_rule("tools/*", "*");
-        assert!(judge(r#"{"method":"tools/list"}"#, &[&rule]).is_err());
+        assert!(judge(r#"{"jsonrpc":"2.0","method":"tools/list"}"#, &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_uri_rule_does_not_cover_a_method_that_reads_a_name() {
+        // `tools/call` reads `params.name` and ignores `params.uri`. A rule
+        // bounding the uri would otherwise admit every tool on the host.
+        let rule = McpMatcher {
+            uri: Some("file:///safe/*".to_string()),
+            ..matcher("tools/call")
+        };
+        let decoy = r#"{"jsonrpc":"2.0","method":"tools/call",
+            "params":{"name":"delete_everything"}}"#;
+        assert!(judge(decoy, &[&rule]).is_err());
+    }
+
+    #[test]
+    fn a_tool_rule_does_not_cover_a_method_that_reads_a_uri() {
+        let rule = tool_rule("resources/read", "*");
+        let body = r#"{"jsonrpc":"2.0","method":"resources/read","params":{"uri":"file:///a"}}"#;
+        assert!(judge(body, &[&rule]).is_err());
     }
 
     // ----------------------------------------------------------------------
@@ -455,7 +627,9 @@ mod tests {
     }
 
     fn fetch(arguments: &str) -> String {
-        format!(r#"{{"method":"tools/call","params":{{"name":"fetch","arguments":{arguments}}}}}"#)
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"tools/call","params":{{"name":"fetch","arguments":{arguments}}}}}"#
+        )
     }
 
     #[test]
@@ -502,6 +676,40 @@ mod tests {
     }
 
     #[test]
+    fn an_argument_condition_does_not_cover_a_method_carrying_no_arguments() {
+        // Nothing else carries `params.arguments`, so the condition would read as
+        // satisfied by a method it never bounded.
+        let rule = McpMatcher {
+            arguments: vec![McpArgumentMatch {
+                pointer: "/host".to_string(),
+                glob: "*".to_string(),
+            }],
+            ..matcher("*")
+        };
+        assert!(judge(r#"{"jsonrpc":"2.0","method":"tools/list"}"#, &[&rule]).is_err());
+    }
+
+    #[test]
+    fn an_argument_condition_bounds_a_prompt_too() {
+        // `prompts/get` carries `params.arguments` as well, so a condition on
+        // them must bound it rather than read as satisfied.
+        let rule = McpMatcher {
+            arguments: vec![McpArgumentMatch {
+                pointer: "/language".to_string(),
+                glob: "en".to_string(),
+            }],
+            ..tool_rule("prompts/get", "summarise")
+        };
+        let prompt = |language: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"prompts/get","params":{{"name":"summarise","arguments":{{"language":"{language}"}}}}}}"#
+            )
+        };
+        assert!(judge(&prompt("en"), &[&rule]).is_ok());
+        assert!(judge(&prompt("fr"), &[&rule]).is_err());
+    }
+
+    #[test]
     fn every_argument_condition_must_match() {
         let rule = McpMatcher {
             arguments: vec![
@@ -526,8 +734,9 @@ mod tests {
     // Mirrored headers
     // ----------------------------------------------------------------------
 
+    /// A compliant head: this revision requires the version header on every POST.
     fn head(extra: &str) -> String {
-        format!("POST /mcp HTTP/1.1\r\nHost: x\r\n{extra}")
+        format!("POST /mcp HTTP/1.1\r\nHost: x\r\nMCP-Protocol-Version: 2026-07-28\r\n{extra}")
     }
 
     fn judge_with_head(extra: &str, body: &str) -> Result<(), String> {
@@ -578,8 +787,12 @@ mod tests {
     fn a_name_header_on_a_body_that_names_nothing_is_denied() {
         let extra = "Mcp-Name: something";
         let rule = matcher("*");
-        let err = super::judge(&head(extra), br#"{"method":"tools/list"}"#, &[&rule])
-            .expect_err("must be denied");
+        let err = super::judge(
+            &head(extra),
+            br#"{"jsonrpc":"2.0","method":"tools/list"}"#,
+            &[&rule],
+        )
+        .expect_err("must be denied");
         assert!(err.contains("names nothing"), "{err}");
     }
 
@@ -604,7 +817,7 @@ mod tests {
             uri: Some("*".to_string()),
             ..matcher("resources/read")
         };
-        let body = r#"{"method":"resources/read","params":{"uri":"file:///a"}}"#;
+        let body = r#"{"jsonrpc":"2.0","method":"resources/read","params":{"uri":"file:///a"}}"#;
         let agreeing = head("Mcp-Name: file:///a");
         let disagreeing = head("Mcp-Name: file:///b");
         assert!(super::judge(&agreeing, body.as_bytes(), &[&rule]).is_ok());
@@ -629,9 +842,9 @@ mod tests {
     fn a_folded_mirrored_header_is_refused() {
         // An obs-fold continuation belongs to the value above, so comparing this
         // line alone would check a prefix of what upstream receives.
-        let head = "POST /mcp HTTP/1.1\r\nMcp-Name: read_file\r\n write_file";
+        let head = head("Mcp-Name: read_file\r\n write_file");
         let rule = tool_rule("tools/call", "*");
-        let err = super::judge(head, call("read_file").as_bytes(), &[&rule])
+        let err = super::judge(&head, call("read_file").as_bytes(), &[&rule])
             .expect_err("a folded value must not be compared piecemeal");
         assert!(err.contains("folded"), "{err}");
     }
@@ -642,7 +855,9 @@ mod tests {
         // above it is refused rather than truncated, because a rule cannot be
         // judged against bytes the proxy declined to read.
         let oversized = crate::http_body::MAX_JUDGED_BODY_BYTES + 1;
-        let head = format!("POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: {oversized}");
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: x\r\nMCP-Protocol-Version: 2026-07-28\r\nContent-Length: {oversized}"
+        );
         let (mut near, mut far) = tokio::io::duplex(64 * 1024);
         let writer = tokio::spawn(async move {
             use tokio::io::AsyncWriteExt as _;
@@ -674,10 +889,37 @@ mod tests {
         let info = super::judge(&head(""), call("read_file").as_bytes(), &[&rule])
             .expect("should pass on its own");
 
-        assert!(check_headers_agree("POST /mcp HTTP/1.1\r\nMcp-Name: read_file", &info).is_ok());
-        let err = check_headers_agree("POST /mcp HTTP/1.1\r\nMcp-Name: write_file", &info)
+        assert!(check_headers_agree(&head("Mcp-Name: read_file"), &info).is_ok());
+        let err = check_headers_agree(&head("Mcp-Name: write_file"), &info)
             .expect_err("an injected header disagreeing with the body must be caught");
         assert!(err.contains("Mcp-Name"), "{err}");
+    }
+
+    #[test]
+    fn a_request_naming_no_revision_is_refused() {
+        let bare = "POST /mcp HTTP/1.1\r\nHost: x";
+        let rule = tool_rule("tools/call", "*");
+        let err = super::judge(bare, call("read_file").as_bytes(), &[&rule])
+            .expect_err("an unnamed revision may be one whose server talks back unread");
+        assert!(err.contains("MCP-Protocol-Version"), "{err}");
+    }
+
+    #[test]
+    fn a_request_naming_an_older_revision_is_refused() {
+        let old = "POST /mcp HTTP/1.1\r\nHost: x\r\nMCP-Protocol-Version: 2025-06-18";
+        let rule = tool_rule("tools/call", "*");
+        let err = super::judge(old, call("read_file").as_bytes(), &[&rule])
+            .expect_err("an older revision puts server-initiated traffic beyond the rules");
+        assert!(err.contains("2025-06-18"), "{err}");
+    }
+
+    #[test]
+    fn an_mcp_param_header_is_refused() {
+        // Which argument it mirrors is named by the server's own schema, which
+        // this door cannot read, so the header cannot be checked against the body.
+        let err = judge_with_head("Mcp-Param-Host: evil.test", &call("read_file"))
+            .expect_err("an unverifiable mirror must not be forwarded");
+        assert!(err.contains("Mcp-Param-Host"), "{err}");
     }
 
     #[test]
