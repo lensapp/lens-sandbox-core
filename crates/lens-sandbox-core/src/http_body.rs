@@ -25,6 +25,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// fail open.
 pub const MAX_INSPECT_BYTES: usize = 64 * 1024;
 
+/// Largest request body buffered to judge an MCP rule.
+///
+/// Larger than [`MAX_INSPECT_BYTES`] because the bodies differ in kind, not in
+/// degree: a GraphQL document is a query, while an MCP request can carry a whole
+/// model completion back to the server. A multi-round-trip `tools/call` retry
+/// embeds the sampling result the server asked for, images included.
+pub const MAX_JUDGED_BODY_BYTES: usize = 1024 * 1024;
+
 /// Largest message head [`read_head`] will read. A head is metadata; one that
 /// keeps growing is a stream that will never reach its blank line.
 pub const MAX_HEAD_BYTES: usize = 64 * 1024;
@@ -188,8 +196,9 @@ impl ResponseBody {
 /// body and we cannot show it one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyReadError {
-    /// The body is larger than the caller's inspection budget.
-    TooLarge,
+    /// The body is larger than the caller's inspection budget, which it carries:
+    /// an operator reading a denial needs the number to compare against.
+    TooLarge { limit: usize },
     /// The stream ended early, or its chunked framing was malformed.
     Malformed(&'static str),
 }
@@ -198,7 +207,7 @@ impl BodyReadError {
     /// Stable token for audit metadata.
     pub fn audit_reason(&self) -> &'static str {
         match self {
-            Self::TooLarge => "body-too-large",
+            Self::TooLarge { .. } => "body-too-large",
             Self::Malformed(_) => "body-malformed",
         }
     }
@@ -207,7 +216,9 @@ impl BodyReadError {
 impl std::fmt::Display for BodyReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooLarge => write!(f, "request body exceeds the inspection limit"),
+            Self::TooLarge { limit } => {
+                write!(f, "request body exceeds the {limit}-byte inspection limit")
+            }
             Self::Malformed(detail) => write!(f, "{detail}"),
         }
     }
@@ -296,9 +307,10 @@ where
         BodyFraming::Fixed(len) => {
             // A length that doesn't fit this platform's usize is past any cap
             // we would accept anyway.
-            let len = usize::try_from(len).map_err(|_| BodyReadError::TooLarge)?;
+            let len =
+                usize::try_from(len).map_err(|_| BodyReadError::TooLarge { limit: max_bytes })?;
             if len > max_bytes {
-                return Err(BodyReadError::TooLarge);
+                return Err(BodyReadError::TooLarge { limit: max_bytes });
             }
             let mut body = vec![0u8; len];
             reader
@@ -336,7 +348,7 @@ where
         }
 
         if decoded.len().saturating_add(chunk_size) > max_bytes {
-            return Err(BodyReadError::TooLarge);
+            return Err(BodyReadError::TooLarge { limit: max_bytes });
         }
         let start = decoded.len();
         decoded.resize(start + chunk_size, 0);
@@ -390,7 +402,9 @@ where
             return Ok(line);
         }
         if line.len() > MAX_FRAMING_LINE_BYTES {
-            return Err(BodyReadError::TooLarge);
+            return Err(BodyReadError::TooLarge {
+                limit: MAX_FRAMING_LINE_BYTES,
+            });
         }
     }
 }
@@ -455,7 +469,9 @@ where
             return Ok(head);
         }
         if head.len() > MAX_HEAD_BYTES {
-            return Err(BodyReadError::TooLarge);
+            return Err(BodyReadError::TooLarge {
+                limit: MAX_HEAD_BYTES,
+            });
         }
     }
 }
@@ -495,6 +511,31 @@ pub fn reframe_head_as_content_length(head: &str, body_len: usize) -> String {
     out.push_str("\r\nContent-Length: ");
     out.push_str(&body_len.to_string());
     out
+}
+
+/// Confirm that a request head does not hide its body from inspection.
+///
+/// A body the proxy cannot read is a body a rule cannot judge, so a coding it
+/// does not undo and a format it does not split are refused rather than passed
+/// on unread.
+pub fn ensure_body_is_readable(header_block: &str) -> Result<(), String> {
+    for line in header_block.split("\r\n").skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-encoding:") {
+            let coding = value.trim();
+            if !coding.is_empty() && coding != "identity" {
+                return Err(format!(
+                    "request body uses content-encoding {coding}, which the proxy does not decode"
+                ));
+            }
+        }
+        if let Some(value) = lower.strip_prefix("content-type:")
+            && value.trim_start().starts_with("multipart/")
+        {
+            return Err("a multipart request body is not inspected".to_string());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -547,7 +588,7 @@ mod tests {
         let err = read_body(&mut stream, BodyFraming::Fixed(64), 32)
             .await
             .expect_err("cap should refuse");
-        assert_eq!(err, BodyReadError::TooLarge);
+        assert!(matches!(err, BodyReadError::TooLarge { .. }), "{err:?}");
         // Refused before consuming, so the cap costs nothing to enforce.
         assert_eq!(stream.position(), 0);
     }
@@ -612,7 +653,7 @@ mod tests {
         let err = read_body(&mut stream, BodyFraming::Chunked, 16)
             .await
             .expect_err("cap should refuse");
-        assert_eq!(err, BodyReadError::TooLarge);
+        assert!(matches!(err, BodyReadError::TooLarge { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -622,7 +663,7 @@ mod tests {
         let err = read_body(&mut stream, BodyFraming::Chunked, 12)
             .await
             .expect_err("the cap bounds the whole body, not one chunk");
-        assert_eq!(err, BodyReadError::TooLarge);
+        assert!(matches!(err, BodyReadError::TooLarge { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -668,7 +709,7 @@ mod tests {
         oversized.extend_from_slice(b"\r\n\r\n");
         let mut stream = std::io::Cursor::new(oversized);
         let err = read_head(&mut stream).await.expect_err("cap should refuse");
-        assert_eq!(err, BodyReadError::TooLarge);
+        assert!(matches!(err, BodyReadError::TooLarge { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -710,5 +751,46 @@ mod tests {
         let head = "POST / HTTP/1.1\r\nHost: x\r\n";
         let out = reframe_head_as_content_length(head, 3);
         assert_eq!(out, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3");
+    }
+
+    #[test]
+    fn a_plain_head_is_readable() {
+        let head = "POST /graphql HTTP/1.1\r\nHost: x\r\nContent-Type: application/json";
+        assert!(ensure_body_is_readable(head).is_ok());
+    }
+
+    #[test]
+    fn an_identity_encoding_is_readable() {
+        let head = "POST /graphql HTTP/1.1\r\nContent-Encoding: identity";
+        assert!(ensure_body_is_readable(head).is_ok());
+    }
+
+    #[test]
+    fn a_compressed_body_is_refused() {
+        for coding in ["gzip", "deflate", "br", "zstd"] {
+            let head = format!("POST /graphql HTTP/1.1\r\nContent-Encoding: {coding}");
+            let err = ensure_body_is_readable(&head)
+                .expect_err("a coding the proxy cannot undo must be refused");
+            assert!(err.contains(coding), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_multipart_body_is_refused() {
+        let head = "POST /graphql HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=xyz";
+        assert!(ensure_body_is_readable(head).is_err());
+    }
+
+    #[test]
+    fn a_header_name_is_read_without_regard_to_case() {
+        let head = "POST /graphql HTTP/1.1\r\nCONTENT-ENCODING: GZIP";
+        assert!(ensure_body_is_readable(head).is_err());
+    }
+
+    #[test]
+    fn a_request_line_that_looks_like_a_header_is_not_read_as_one() {
+        // The first line is the request line, never a field.
+        let head = "POST /content-encoding:gzip HTTP/1.1\r\nHost: x";
+        assert!(ensure_body_is_readable(head).is_ok());
     }
 }

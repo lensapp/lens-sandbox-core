@@ -673,6 +673,16 @@ fn check_http_rules(
                 Err("a GraphQL rule cannot read a streamed request payload".to_string())
             }
         },
+        crate::routing::HttpRuleOutcome::Mcp(matchers) => match &prepared.outgoing_body {
+            // The outgoing head and the outgoing body, not the ones that arrived:
+            // re-signing rewrites the head, and upstream acts on what it receives.
+            OutgoingBody::Buffered { bytes, .. } => {
+                crate::mcp::judge(&prepared.new_head, bytes, &matchers).map(|_| ())
+            }
+            OutgoingBody::Stream => {
+                Err("an MCP rule cannot read a streamed request payload".to_string())
+            }
+        },
     }
 }
 
@@ -1531,6 +1541,7 @@ mod tests {
                 operation_name: None,
                 fields: vec![],
             }),
+            mcp: None,
         }]
     }
 
@@ -1581,6 +1592,67 @@ mod tests {
             check_http_rules(&rules, &prepared_post("/graphql?x=1", buffered(QUERY))).is_ok(),
             "the query string is not part of the path a rule covers"
         );
+    }
+
+    /// A rule permitting read-only MCP tools on `/mcp`.
+    fn mcp_read_rule() -> Vec<HttpRule> {
+        vec![HttpRule {
+            method: Some("POST".to_string()),
+            path: Some("/mcp".to_string()),
+            graphql: None,
+            mcp: Some(crate::policy_schema::McpMatcher {
+                method: "tools/call".to_string(),
+                tool: Some("read_*".to_string()),
+                uri: None,
+                arguments: Vec::new(),
+            }),
+        }]
+    }
+
+    fn prepared_mcp(head: &str, body: &str) -> PreparedResign {
+        PreparedResign {
+            new_head: head.to_string(),
+            outgoing_body: buffered(body),
+            method: "POST".to_string(),
+            uri: "/mcp".to_string(),
+            path: "/mcp".to_string(),
+            service: "appsync".to_string(),
+        }
+    }
+
+    const TOOL_CALL: &str = r#"{"method":"tools/call","params":{"name":"read_file"}}"#;
+
+    #[test]
+    fn an_mcp_rule_judges_the_re_signed_request() {
+        let rules = mcp_read_rule();
+        assert!(check_http_rules(&rules, &prepared_mcp("", TOOL_CALL)).is_ok());
+
+        let denied = r#"{"method":"tools/call","params":{"name":"write_file"}}"#;
+        let detail = check_http_rules(&rules, &prepared_mcp("", denied))
+            .expect_err("a tool no rule names must not pass");
+        assert!(detail.contains("write_file"), "unexpected detail: {detail}");
+    }
+
+    #[test]
+    fn an_mcp_rule_reads_the_outgoing_head_for_the_mirrored_headers() {
+        // Re-signing rewrites the head, and upstream acts on what it receives.
+        let rules = mcp_read_rule();
+        let head = "POST /mcp HTTP/1.1\r\nMcp-Name: write_file";
+        let detail = check_http_rules(&rules, &prepared_mcp(head, TOOL_CALL))
+            .expect_err("a header disagreeing with the body must not pass");
+        assert!(detail.contains("Mcp-Name"), "unexpected detail: {detail}");
+    }
+
+    #[test]
+    fn an_mcp_rule_denies_a_streamed_payload() {
+        let rules = mcp_read_rule();
+        let prepared = PreparedResign {
+            outgoing_body: OutgoingBody::Stream,
+            ..prepared_mcp("", TOOL_CALL)
+        };
+        let detail =
+            check_http_rules(&rules, &prepared).expect_err("an unread payload must not pass");
+        assert!(detail.contains("streamed"), "unexpected detail: {detail}");
     }
 
     #[test]

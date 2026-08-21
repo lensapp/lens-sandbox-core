@@ -472,8 +472,8 @@ pub struct RouteRule {
 ///
 /// An unknown key fails the policy. Every field here narrows what the rule
 /// admits, so a key serde could not place is a narrowing that would go missing:
-/// a misspelt `graphql` would leave the bare method and path behind as an
-/// unconditional allow.
+/// a misspelt `graphql` or `mcp` would leave the bare method and path behind as
+/// an unconditional allow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HttpRule {
@@ -517,6 +517,29 @@ pub struct HttpRule {
     /// an accepted upgrade from a declined one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphqlMatcher>,
+
+    /// MCP operation this rule covers. Set it only for an MCP endpoint: the
+    /// proxy then reads the request body, because an MCP request puts its method
+    /// and its tool there and every call looks like the same `POST /mcp`.
+    ///
+    /// This governs a remote MCP server only. A server the agent launches as a
+    /// child process speaks over its standard streams and never reaches this
+    /// proxy, so no rule here can bound it.
+    ///
+    /// An MCP rule is authoritative over the requests its `method` and `path`
+    /// cover, exactly as [`Self::graphql`] is. The two cannot be combined, on one
+    /// rule or on one route: two body grammars over one request have no defined
+    /// winner.
+    ///
+    /// A request the proxy cannot read is denied, never passed on. This covers a
+    /// compressed or `multipart/*` body, a body above
+    /// [`crate::http_body::MAX_JUDGED_BODY_BYTES`], a body that is not one
+    /// JSON-RPC object, and a body carrying a duplicate key.
+    ///
+    /// An MCP rule never grants a `Connection: upgrade`, because MCP has no
+    /// WebSocket. Its streams are ordinary SSE responses to a `POST`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpMatcher>,
 }
 
 /// The GraphQL operations one [`HttpRule`] covers. Every field that is set must
@@ -564,6 +587,70 @@ pub enum GraphqlOperationTypeMatcher {
     /// Any operation type, `subscription` included, so this grants an upgrade too.
     #[serde(rename = "*")]
     Any,
+}
+
+/// The MCP requests one [`HttpRule`] covers. Every field that is set must match.
+///
+/// This reads MCP revision `2026-07-28`: one JSON-RPC request or notification per
+/// `POST`, never a batch, and the sandbox is the only side that sends a request.
+/// An earlier revision let a server drive the client over a stream this door
+/// relays unread. Those revisions are refused as a consequence rather than by a
+/// version test — no rule here names `initialize`, so their handshake matches
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpMatcher {
+    /// The JSON-RPC method this rule covers, as a glob (`tools/call`, `tools/*`).
+    /// It is required, with `*` for any: a rule that left the method out would
+    /// read as narrow but would cover every method there is.
+    pub method: String,
+
+    /// The tool the request must name, as a glob, read from `params.name`.
+    ///
+    /// `prompts/get` carries its name in the same place, so this bounds a prompt
+    /// too — the field is named for its common case. Omit to put no condition on
+    /// the name. Setting this beside `uri` is refused: one request carries one
+    /// name, so a rule asking for both can never match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+
+    /// The resource the request must name, as a glob, read from `params.uri`.
+    /// Only `resources/read` carries it.
+    ///
+    /// `*` spans a `/` here, unlike a `path` glob, so `file:///projects/*` also
+    /// covers `file:///projects/a/b/anything`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+
+    /// Conditions on the tool arguments. Every entry must match.
+    ///
+    /// Each entry bounds the argument it names and says nothing about the rest.
+    /// This is unlike [`GraphqlMatcher::fields`], which every root field must
+    /// satisfy: a tool whose arguments decide what it reaches needs one entry per
+    /// argument that matters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<McpArgumentMatch>,
+}
+
+/// One condition on an MCP tool argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpArgumentMatch {
+    /// RFC 6901 JSON pointer to the argument, rooted at `params.arguments`, so
+    /// `/region` reaches the `region` argument. A `/` inside a key is written
+    /// `~1`, and a `~` is written `~0`.
+    ///
+    /// A pointer is used rather than a dotted path because a `.` is a legal
+    /// character in a JSON key: a dotted path would leave such an argument
+    /// unreachable and read ambiguously for the rest.
+    pub pointer: String,
+
+    /// Glob the argument value must match.
+    ///
+    /// A pointer that reaches nothing, or reaches a value that is not a string,
+    /// does not match. So a mistyped pointer denies the request rather than
+    /// widening the rule.
+    pub glob: String,
 }
 
 /// HTTP method/path restriction on a credential injection.
