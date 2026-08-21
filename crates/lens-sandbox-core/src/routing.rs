@@ -105,6 +105,9 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             if let Some(mcp) = &rule.mcp {
                 validate_mcp(mcp, &raw.match_pattern)?;
             }
+            if let Some(graphql) = &rule.graphql {
+                validate_graphql(graphql, &raw.match_pattern)?;
+            }
         }
 
         // A body-reading rule governs the requests its head covers, so a bodiless
@@ -1126,6 +1129,42 @@ pub fn body_matcher(rule: &HttpRule) -> Option<BodyMatcher<'_>> {
     }
 }
 
+/// Check what a [`GraphqlMatcher`] cannot express as a type.
+fn validate_graphql(graphql: &GraphqlMatcher, pattern: &str) -> Result<(), String> {
+    // Both checks below are the loader's half of the rule stated on
+    // `GraphqlMatcher::arguments`: an entry decides nothing about an operation
+    // that does not select its field, so `fields` is what bounds the rest.
+    for condition in &graphql.arguments {
+        if graphql.fields.is_empty() {
+            return Err(format!(
+                "graphql rule on {pattern} bounds the argument {} of {} but names no fields; \
+                 an operation selecting neither would satisfy it",
+                condition.pointer, condition.field
+            ));
+        }
+        if !graphql
+            .fields
+            .iter()
+            .any(|permitted| glob_matches(permitted, &condition.field))
+        {
+            return Err(format!(
+                "graphql rule on {pattern} bounds the arguments of {} but its fields do not admit that field",
+                condition.field
+            ));
+        }
+        // The same reading as an MCP argument pointer: an empty pointer is the
+        // arguments object whole, never a value a glob can match, and a pointer
+        // not opening with `/` resolves to nothing.
+        if !condition.pointer.starts_with('/') {
+            return Err(format!(
+                "graphql argument pointer {:?} on {pattern} is not a JSON pointer to an argument: it must open with '/'",
+                condition.pointer
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check what an [`McpMatcher`] cannot express as a type.
 fn validate_mcp(mcp: &McpMatcher, pattern: &str) -> Result<(), String> {
     // One request carries one name: `tools/call` and `prompts/get` put it at
@@ -1284,6 +1323,7 @@ mod tests {
                 operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
                 operation_name: None,
                 fields: fields.iter().map(ToString::to_string).collect(),
+                arguments: vec![],
             }),
             mcp: None,
         }
@@ -1440,6 +1480,89 @@ mod tests {
         assert_eq!(matcher.method, "tools/call");
         assert_eq!(matcher.tool.as_deref(), Some("read_*"));
         assert_eq!(matcher.arguments[0].pointer, "/host");
+    }
+
+    // ----------------------------------------------------------------------
+    // GraphQL argument conditions the loader refuses
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn a_graphql_argument_condition_parses() {
+        let routes = route(
+            r#"[{
+                "method": "POST",
+                "path": "/graphql",
+                "graphql": {
+                    "operationType": "query",
+                    "fields": ["repository"],
+                    "arguments": [{ "field": "repository", "pointer": "/owner", "glob": "acme" }]
+                }
+            }]"#,
+        )
+        .unwrap();
+        let matcher = routes[0].http_rules[0]
+            .graphql
+            .as_ref()
+            .expect("matcher parsed");
+        assert_eq!(matcher.arguments[0].field, "repository");
+        assert_eq!(matcher.arguments[0].pointer, "/owner");
+    }
+
+    #[test]
+    fn a_graphql_argument_condition_without_fields_is_refused() {
+        // A condition holds where its field is not selected, so a rule naming no
+        // fields would still admit every other root field:
+        // `repository(owner: acme)` would permit `organization(login: other)`.
+        let err = route(
+            r#"[{ "graphql": { "operationType": "query",
+                 "arguments": [{ "field": "repository", "pointer": "/owner", "glob": "acme" }] } }]"#,
+        )
+        .expect_err("a condition beside no fields bound leaves the rule open");
+        assert!(err.contains("names no fields"), "{err}");
+    }
+
+    #[test]
+    fn a_graphql_argument_condition_on_a_denied_field_is_refused() {
+        // The rule already denies `repository`, so the condition can never
+        // decide anything. That is a mistake in the rule, not a narrowing.
+        let err = route(
+            r#"[{ "graphql": { "operationType": "query", "fields": ["viewer"],
+                 "arguments": [{ "field": "repository", "pointer": "/owner", "glob": "acme" }] } }]"#,
+        )
+        .expect_err("a dead condition must be refused");
+        assert!(err.contains("do not admit that field"), "{err}");
+    }
+
+    #[test]
+    fn a_fields_glob_admits_a_conditions_field() {
+        assert!(
+            route(
+                r#"[{ "graphql": { "operationType": "query", "fields": ["repo*"],
+                     "arguments": [{ "field": "repository", "pointer": "/owner", "glob": "acme" }] } }]"#
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_graphql_argument_pointer_that_is_not_a_pointer_is_refused() {
+        let err = route(
+            r#"[{ "graphql": { "operationType": "query", "fields": ["repository"],
+                 "arguments": [{ "field": "repository", "pointer": "owner", "glob": "acme" }] } }]"#,
+        )
+        .expect_err("a bare name is not a JSON pointer");
+        assert!(err.contains("JSON pointer"), "{err}");
+    }
+
+    #[test]
+    fn a_graphql_argument_condition_rejects_an_unknown_key() {
+        assert!(
+            route(
+                r#"[{ "graphql": { "operationType": "query", "fields": ["repository"],
+                     "arguments": [{ "field": "repository", "pointer": "/owner", "glob": "acme", "name": "owner" }] } }]"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

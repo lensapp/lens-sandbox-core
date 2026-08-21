@@ -389,6 +389,7 @@ mod tests {
             operation_type: GraphqlOperationTypeMatcher::Subscription,
             operation_name: None,
             fields: vec!["messageAdded".to_string()],
+            arguments: vec![],
         }
     }
 
@@ -469,6 +470,28 @@ mod tests {
         let reason =
             judge(r#"{"id":"1","type":"subscribe"}"#).expect_err("there is no operation to judge");
         assert!(reason.contains("no operation payload"), "{reason}");
+    }
+
+    #[test]
+    fn a_subscribe_payload_carries_variables_an_argument_condition_reads() {
+        // The payload is the same envelope a POST body carries, so a rule
+        // bounding an argument holds on this door too.
+        let rule = GraphqlMatcher {
+            fields: vec!["messageAdded".to_string()],
+            arguments: vec![crate::policy_schema::GraphqlArgumentMatch {
+                field: "messageAdded".to_string(),
+                pointer: "/room".to_string(),
+                glob: "lobby".to_string(),
+            }],
+            ..subscription_rule()
+        };
+        let message = |room: &str| {
+            format!(
+                r#"{{"id":"1","type":"subscribe","payload":{{"query":"subscription($r:String!){{ messageAdded(room: $r) {{ id }} }}","variables":{{"r":"{room}"}}}}}}"#
+            )
+        };
+        assert_eq!(judge_message(&message("lobby"), &[&rule]), Ok(()));
+        assert!(judge_message(&message("private"), &[&rule]).is_err());
     }
 
     #[test]

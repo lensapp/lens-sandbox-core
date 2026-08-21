@@ -3529,6 +3529,7 @@ mod tests {
                 operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
                 operation_name: None,
                 fields: vec!["viewer".to_string(), "repository".to_string()],
+                arguments: vec![],
             }),
             mcp: None,
         }]
@@ -3585,6 +3586,60 @@ mod tests {
             response.contains("403 Forbidden"),
             "expected 403, got: {response}"
         );
+    }
+
+    /// The rule a GitHub-shaped policy writes: read one owner's repositories,
+    /// and nothing else on the endpoint.
+    fn graphql_owner_rule() -> Vec<HttpRule> {
+        vec![HttpRule {
+            method: Some("POST".to_string()),
+            path: Some("/graphql".to_string()),
+            graphql: Some(crate::policy_schema::GraphqlMatcher {
+                operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
+                operation_name: None,
+                fields: vec!["repository".to_string(), "rateLimit".to_string()],
+                arguments: vec![crate::policy_schema::GraphqlArgumentMatch {
+                    field: "repository".to_string(),
+                    pointer: "/owner".to_string(),
+                    glob: "acme".to_string(),
+                }],
+            }),
+            mcp: None,
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_query_on_the_permitted_owner_reaches_the_origin_unchanged() {
+        let body = r#"{"query":"query($o:String!,$n:String!){ repository(owner: $o, name: $n) { id } }","variables":{"o":"acme","n":"api"}}"#;
+        let request: &'static [u8] = Box::leak(graphql_request(body).into_boxed_slice());
+        let (upstream_saw, response, audits) =
+            run_mitm_harness_with_rules(vec![], graphql_owner_rule(), request, true).await;
+
+        assert!(response.contains("200 OK"), "expected 200, got: {response}");
+        assert_eq!(audits[0]["result"], "success");
+        // The variables the door resolved to judge the request must still arrive
+        // byte for byte: the origin acts on them, not on what the door read.
+        assert!(upstream_saw.ends_with(body), "{upstream_saw}");
+    }
+
+    #[tokio::test]
+    async fn a_query_on_another_owner_is_denied_at_the_door() {
+        let body = r#"{"query":"{ repository(owner: \"globex\", name: \"secret\") { id } }"}"#;
+        let request: &'static [u8] = Box::leak(graphql_request(body).into_boxed_slice());
+        let (reason, response, audits) =
+            run_mitm_harness_with_rules(vec![], graphql_owner_rule(), request, true).await;
+
+        assert!(
+            response.contains("403 Forbidden"),
+            "expected 403, got: {response}"
+        );
+        assert_eq!(audits[0]["result"], "failure");
+        assert_eq!(audits[0]["status_code"], 403);
+        assert_eq!(audits[0]["metadata"]["graphql_denied"], true);
+        // What the reason says is pinned where it is rendered, in
+        // `graphql::tests::the_denial_names_the_argument_it_objected_to`. What
+        // this proves is that it travels intact to the 403 channel.
+        assert!(reason.contains("globex"), "deny reason was: {reason:?}");
     }
 
     #[tokio::test]
@@ -3693,6 +3748,7 @@ mod tests {
                 operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
                 operation_name: None,
                 fields: vec!["viewer".to_string()],
+                arguments: vec![],
             }),
             mcp: None,
         }]
@@ -3984,6 +4040,7 @@ mod tests {
             operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Subscription,
             operation_name: None,
             fields: vec!["messageAdded".to_string()],
+            arguments: vec![],
         }
     }
 
@@ -4045,6 +4102,7 @@ mod tests {
                 operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
                 operation_name: None,
                 fields: vec!["viewer".to_string()],
+                arguments: vec![],
             }),
             mcp: None,
         }];
@@ -4081,6 +4139,7 @@ mod tests {
                     operation_type: crate::policy_schema::GraphqlOperationTypeMatcher::Query,
                     operation_name: None,
                     fields: vec![],
+                    arguments: vec![],
                 }),
                 mcp: None,
             },

@@ -272,10 +272,41 @@
         "keyPem"
       ]
     },
+    "GraphqlArgumentMatch": {
+      "description": "One condition on the arguments of one GraphQL root field.",
+      "type": "object",
+      "properties": {
+        "field": {
+          "description": "The root field this condition reads, by exact name — never a glob, and\nnever an alias. [`GraphqlMatcher::fields`] is what selects which fields a\nrule admits; a glob here would only spread one condition thinner.",
+          "type": "string"
+        },
+        "glob": {
+          "description": "Glob the argument value must match, compared against the value written as\ntext: a string bare, a number in the form the document wrote it, an enum\nby its name.\n\nA pointer that reaches nothing, or reaches `null`, a list, or an object,\ndoes not match. So a mistyped pointer denies the request rather than\nwidening the rule. The comparison is case-sensitive, which for a subject\nthe server treats case-insensitively — a GitHub owner or repository name\n— denies a spelling the server would have accepted.",
+          "type": "string"
+        },
+        "pointer": {
+          "description": "RFC 6901 JSON pointer to the argument, rooted at the field's arguments,\nso `/owner` reaches the `owner` argument and `/input/name` reaches inside\nan input object. A `/` inside a key is written `~1`, and a `~` is written\n`~0`. See [`McpArgumentMatch::pointer`] for why a pointer and not a\ndotted path.\n\nAn argument given as a variable is resolved from the request's\n`variables` before the pointer reads it. A variable the request does not\nsupply resolves to nothing and so does not match.\n\nA pointer into a list addresses one element (`/ids/0`) and says nothing\nabout the others.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "pointer",
+        "glob"
+      ]
+    },
     "GraphqlMatcher": {
       "description": "The GraphQL operations one [`HttpRule`] covers. Every field that is set must\nmatch the operation.",
       "type": "object",
       "properties": {
+        "arguments": {
+          "description": "Conditions on the arguments a root field carries. Every entry must match.\n\nThis is what binds an operation to a subject rather than to a shape:\n`repository(owner: \"acme\")` and `repository(owner: $o)` with\n`variables: {\"o\": \"acme\"}` both resolve to `acme`, and a condition reads\nthe resolved value — what the server acts on.\n\nEach entry bounds the argument it names on the field it names, and says\nnothing about other arguments. A field whose arguments decide what it\nreaches needs one entry per argument that matters. Where a field occurs\nmore than once — aliases and fragments both allow it — every occurrence\nmust satisfy the entry, so `{ a: repository(owner: \"acme\") b:\nrepository(owner: \"other\") }` cannot pass on the strength of its first\nhalf.\n\n# An entry needs a `fields` bound beside it\n\nAn entry says nothing about an operation that does not select its field,\nso it is [`fields`](Self::fields) that decides what else the rule admits.\nA policy writing entries beside no `fields` is refused, and so is an entry\nnaming a field that `fields` denies. Neither check can judge how tightly\n`fields` is written: with `fields: [\"*\"]`, an entry on `repository` leaves\nevery other root field free. Draw that bound as narrowly as the rule needs\nto mean what it says.\n\n# What arguments cannot bound\n\nThey bound the operation's entry points, not everything it reaches. A\nselection nested under a permitted field can leave the subject through\narguments of its own or through no argument at all — a fork's `parent`,\nan `owner { repositories }`. Nor can they bound a mutation, whose subject\nis an opaque node id the caller can build offline. Only the credential's\nown scope bounds those, so a rule that must confine an agent to a subject\npairs this with a token scoped to it.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GraphqlArgumentMatch"
+          }
+        },
         "fields": {
           "description": "The root fields this rule permits, as globs.\n\nThese bound the selection. They do not pick a part of it: **every** root\nfield the operation selects must match one of the patterns. Thus\n`{ viewer deleteRepository }` does not satisfy a rule that lists only\n`viewer`. One rule must cover an operation alone — two rules that each\npermit one half of a selection do not combine.\n\nOmit to put no condition on the fields. A rule that names fields also\ndenies every field it does not name, which includes introspection\nthrough `__schema`.",
           "type": "array",
