@@ -210,7 +210,7 @@ pub fn prepare_writable_dir(path: &Path, creds: &SandboxCredentials) -> Result<(
 }
 
 /// Resolved sandbox uid/gid/home, cached at startup.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCredentials {
     uid: nix::unistd::Uid,
     gid: nix::unistd::Gid,
@@ -282,6 +282,14 @@ impl SandboxCredentials {
         (self.uid, self.gid)
     }
 
+    /// Attach the uid drop to a `Command`.
+    ///
+    /// Correct only for a non-root identity: the kernel zeroes the
+    /// capability sets on a `setuid` to a non-zero uid, and this function
+    /// relies on that instead of dropping capabilities itself. Do not call
+    /// it directly on credentials that may resolve to uid 0 — go through
+    /// [`privilege_drop_for`], which routes those to
+    /// [`apply_cap_drop`], or the child keeps `CAP_NET_ADMIN`.
     pub fn apply(&self, cmd: &mut Command) {
         let uid = self.uid;
         let gid = self.gid;
@@ -321,8 +329,9 @@ pub fn lock_down_after_setuid() -> io::Result<()> {
 }
 
 /// Attach `drop_capabilities_in_child` to a `Command` without changing the
-/// child's UID/GID. Use this for agent commands that run as root (the
-/// supervisor's UID) because the image had no `sandbox` user. The child
+/// child's UID/GID. This is the path for every child that stays root —
+/// whether no `sandbox` user resolved in the image, or the caller resolved
+/// one that *is* root (see [`privilege_drop_for`]). The child
 /// keeps `KEEP_CAP_MASK` (identity-management caps so third-party
 /// entrypoints can `chown` shared volumes and `setuid` to a service
 /// account); everything else — notably `CAP_NET_ADMIN` and `CAP_NET_RAW`
@@ -336,6 +345,44 @@ pub fn apply_cap_drop(cmd: &mut Command) {
             set_pdeathsig_sigterm()?;
             Ok(())
         });
+    }
+}
+
+/// Which privilege drop a child earns before `exec`.
+///
+/// Deciding this separately from applying it keeps the one rule that
+/// matters — root reaches the capability drop — in a pure function every
+/// spawn path consults, rather than in a condition each of them repeats.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivilegeDrop<'a> {
+    /// Become this identity. The kernel zeroes the capability sets on a
+    /// `setuid` to a non-zero uid, so nothing else is needed.
+    Setuid(&'a SandboxCredentials),
+    /// Stay root and drop the capabilities by hand.
+    Capabilities,
+    /// An unprivileged parent has neither a uid to drop nor a capability
+    /// to lose, and `capset` would `EPERM`.
+    Nothing,
+}
+
+/// Decide how a child gives up privilege.
+///
+/// Root credentials take the capability path, not the `setuid` one:
+/// `setuid(0)` is a no-op that leaves `CAP_NET_ADMIN` in place, and the
+/// child could then rewrite the netfilter cage or set `SO_MARK` to bypass
+/// the proxy redirect. A caller that resolved its workload to uid 0 —
+/// because the image says `USER root`, or because a `pre-start` script
+/// asks to install a package — must not have to know that.
+///
+/// The gid on root credentials is deliberately not applied: the child stays
+/// uid 0 and keeps `CAP_SETGID` from `KEEP_CAP_MASK`, so a `setgid` would
+/// confine nothing. `Capabilities` carries no gid rather than offering a
+/// knob with no security meaning.
+pub fn privilege_drop_for(creds: Option<&SandboxCredentials>, is_root: bool) -> PrivilegeDrop<'_> {
+    match creds {
+        Some(creds) if !creds.uid_gid().0.is_root() => PrivilegeDrop::Setuid(creds),
+        _ if is_root => PrivilegeDrop::Capabilities,
+        _ => PrivilegeDrop::Nothing,
     }
 }
 
@@ -540,5 +587,64 @@ mod tests {
         assert_eq!(gid.as_raw(), 60001);
         assert_eq!(creds.user(), "60001");
         assert_eq!(creds.home(), "/");
+    }
+
+    fn creds_for(uid: u32, gid: u32) -> SandboxCredentials {
+        SandboxCredentials::resolve_by_uid(uid, gid).expect("resolve_by_uid never fails on a host")
+    }
+
+    #[test]
+    fn root_credentials_take_the_capability_path_rather_than_a_setuid_no_op() {
+        assert_eq!(
+            privilege_drop_for(Some(&creds_for(0, 0)), true),
+            PrivilegeDrop::Capabilities,
+            "setuid(0) is a no-op that leaves CAP_NET_ADMIN in place, so a child resolved to root has to reach the capability drop or it can rewrite the netfilter cage"
+        );
+    }
+
+    #[test]
+    fn a_root_uid_under_a_non_root_group_still_takes_the_capability_path() {
+        assert_eq!(
+            privilege_drop_for(Some(&creds_for(0, 20)), true),
+            PrivilegeDrop::Capabilities,
+            "the kernel only zeroes the capability sets on a setuid to a non-zero uid; the gid does not enter into it"
+        );
+    }
+
+    #[test]
+    fn a_non_root_identity_is_a_setuid_target() {
+        let creds = creds_for(65534, 65534);
+        assert_eq!(
+            privilege_drop_for(Some(&creds), true),
+            PrivilegeDrop::Setuid(&creds),
+            "the kernel zeroes the capability sets for us here, so the uid drop is the whole drop"
+        );
+    }
+
+    #[test]
+    fn a_root_parent_with_no_resolved_identity_drops_capabilities() {
+        assert_eq!(
+            privilege_drop_for(None, true),
+            PrivilegeDrop::Capabilities,
+            "an image with no sandbox user still runs its workload as the supervisor's root, which must not keep CAP_NET_ADMIN"
+        );
+    }
+
+    #[test]
+    fn an_unprivileged_parent_drops_nothing() {
+        assert_eq!(
+            privilege_drop_for(None, false),
+            PrivilegeDrop::Nothing,
+            "capset would EPERM, and there is no cage to break out of when the parent never had the capability"
+        );
+    }
+
+    #[test]
+    fn an_unprivileged_parent_naming_root_drops_nothing() {
+        assert_eq!(
+            privilege_drop_for(Some(&creds_for(0, 0)), false),
+            PrivilegeDrop::Nothing,
+            "a parent that is not root cannot setuid to root nor capset, so there is nothing this branch could honour"
+        );
     }
 }

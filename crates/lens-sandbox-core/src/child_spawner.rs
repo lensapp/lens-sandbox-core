@@ -2,9 +2,9 @@
 //!
 //! Single point of policy for everything the supervisor forks: the agent
 //! today, exec children next. Captures the security contract — env_clear
-//! then envs(); CA env wins over user env; uid drop *or* cap drop depending
-//! on whether sandbox creds resolved — so callers can't accidentally let
-//! a child out of the cage.
+//! then envs(); CA env wins over user env; a non-root identity takes the
+//! uid drop, while root credentials and bare root both take the capability
+//! drop — so callers can't accidentally let a child out of the cage.
 //!
 //! Env layering above this layer (proxy env, scrubbing internal vars,
 //! HOME/USER from creds, project env vs caller env) is each caller's
@@ -83,13 +83,13 @@ pub fn spawn_pty(
 }
 
 fn apply_privilege_drop(cmd: &mut Command, spec: &ChildSpec) {
-    if let Some(creds) = &spec.creds {
-        creds.apply(cmd);
-    } else if spec.is_root {
-        // Root supervisor with no resolved creds: drop caps so the child
-        // can't escape the netfilter cage. Unprivileged supervisor → noop;
-        // capset would EPERM and there's no iptables cage to break.
-        crate::privilege::apply_cap_drop(cmd);
+    // `privilege_drop_for` owns the rule, including that root credentials
+    // take the capability path — `setuid(0)` would leave the child holding
+    // CAP_NET_ADMIN and able to escape the netfilter cage.
+    match crate::privilege::privilege_drop_for(spec.creds.as_ref(), spec.is_root) {
+        crate::privilege::PrivilegeDrop::Setuid(creds) => creds.apply(cmd),
+        crate::privilege::PrivilegeDrop::Capabilities => crate::privilege::apply_cap_drop(cmd),
+        crate::privilege::PrivilegeDrop::Nothing => {}
     }
 }
 
@@ -186,5 +186,67 @@ mod tests {
         let mut cmd = build_command(&spec_for(argv, env, false));
         let status = cmd.status().await.expect("command should run");
         assert!(status.success(), "child must exit 0, got {status}");
+    }
+
+    /// The gid is the observable half of the bug: `creds.apply` would
+    /// `setgid` before its no-op `setuid(0)`, whereas the capability path
+    /// leaves the gid alone. A child that reports the *other* gid is a
+    /// child that took `apply`, and so also skipped the capability drop.
+    #[tokio::test]
+    async fn root_credentials_do_not_reach_the_setuid_path() {
+        let ours = nix::unistd::getgid().as_raw();
+        let other = if ours == 1 { 2 } else { 1 };
+        let creds = SandboxCredentials::resolve_by_uid(0, other)
+            .expect("resolve_by_uid never fails on a host");
+        let spec = ChildSpec {
+            argv: vec!["sh".into(), "-c".into(), "id -g".into()],
+            cwd: None,
+            env: HashMap::new(),
+            creds: Some(creds),
+            is_root: nix::unistd::geteuid().is_root(),
+        };
+
+        let out = build_command(&spec)
+            .output()
+            .await
+            .expect("command should run");
+        let reported = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        assert_eq!(
+            reported,
+            ours.to_string(),
+            "root credentials must take the capability path, which does not setgid; a child reporting {other} took `apply` and kept CAP_NET_ADMIN with it"
+        );
+    }
+
+    /// The control for the assertion above: a non-root identity *does*
+    /// reach `apply`, so the gid a child reports genuinely tells the two
+    /// paths apart rather than always being the caller's own.
+    #[tokio::test]
+    async fn non_root_credentials_still_reach_the_setuid_path() {
+        if !nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: only root may setuid to another identity");
+            return;
+        }
+        let creds = SandboxCredentials::resolve_by_uid(65534, 65534)
+            .expect("resolve_by_uid never fails on a host");
+        let spec = ChildSpec {
+            argv: vec!["sh".into(), "-c".into(), "id -g".into()],
+            cwd: None,
+            env: HashMap::new(),
+            creds: Some(creds),
+            is_root: true,
+        };
+
+        let out = build_command(&spec)
+            .output()
+            .await
+            .expect("command should run");
+
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "65534",
+            "a non-root identity is what the uid drop is for, and the kernel zeroes the capability sets on the way"
+        );
     }
 }
