@@ -35,6 +35,29 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo test --workspace
 
+  cage:
+    name: Cage tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: sudo apt-get update && sudo apt-get install -y nftables
+      # Build as the runner user, so root owns nothing in `target/` for the
+      # cache step that follows the tests to trip over.
+      - run: cargo test -p lens-sandbox-core --tests --no-run
+      # `CAP_NET_ADMIN` for the nftables rules, and one thread because the cage
+      # tests share one table and one queue reader (see
+      # `udp_egress_over_nfqueue.rs`).
+      - run: sudo -E env "PATH=$PATH" cargo test -p lens-sandbox-core --tests -- --ignored --test-threads=1
+      # A killed test binary never runs its drop guard, and a stranded table
+      # confines the runner itself.
+      - if: always()
+        run: sudo nft delete table inet lens_sandbox || true
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
