@@ -31,8 +31,13 @@ pub const MAX_INSPECT_BYTES: usize = 64 * 1024;
 ///
 /// Larger than [`MAX_INSPECT_BYTES`] because the bodies differ in kind, not in
 /// degree: a GraphQL document is a query, while an MCP request can carry a whole
-/// model completion back to the server. A multi-round-trip `tools/call` retry
-/// embeds the sampling result the server asked for, images included.
+/// model completion back to the server, sampling results included.
+///
+/// One kind of body outgrows this cap: a Base64 image is often a megabyte on its
+/// own. Such a request is denied, and the denial names the limit. Raise this
+/// constant when a real fleet needs the room. It is not a policy field on
+/// purpose: how much a door reads before it decides is the door's budget, and an
+/// operator who could widen it could make every request cost what they liked.
 pub const MAX_JUDGED_BODY_BYTES: usize = 1024 * 1024;
 
 /// Largest message head [`read_head`] will read. A head is metadata; one that
