@@ -18,10 +18,13 @@
 //! aborts the workload, and with what status, because only the caller
 //! knows what a workload is.
 
+use std::process::Stdio;
+
 use async_trait::async_trait;
+use tokio::process::Command;
 
 use crate::activity::ActivityStream;
-use crate::child_spawner::ChildSpec;
+use crate::child_spawner::{ChildSpec, build_command};
 use crate::privilege::{Passwd, SandboxCredentials};
 
 /// One script to run, as the caller staged it.
@@ -126,7 +129,9 @@ impl std::error::Error for PreStartFailure {}
 /// Spawns one prepared script and reports the status it exited with.
 ///
 /// A port because how output reaches a person differs per caller: one
-/// streams it to an attached console, another collects it for a log.
+/// streams it to an attached console, another collects it for a log. An
+/// implementation builds its `Command` with [`script_command`], which
+/// settles the one part of the stdio that is not the caller's to choose.
 #[async_trait]
 pub trait StepRunner: Send + Sync {
     async fn run(
@@ -191,6 +196,20 @@ pub fn script_cwd(creds: Option<&SandboxCredentials>) -> String {
         .filter(|home| !home.is_empty())
         .unwrap_or("/")
         .to_string()
+}
+
+/// The hardened `Command` for one prepared script, reading no stdin.
+///
+/// A script gets `/dev/null` on fd 0. The caller's own stdin belongs to
+/// whoever attached to the run, and nobody answers it before the
+/// workload starts; nothing bounds a script with a timeout either, so a
+/// tool that stops to ask a question holds the boot open for good — and
+/// a quiet tool gives no clue that it did. The caller still chooses
+/// stdout and stderr, which is where the two differ.
+pub fn script_command(script: &PreparedScript) -> Command {
+    let mut cmd = build_command(&script.spec);
+    cmd.stdin(Stdio::null());
+    cmd
 }
 
 /// Run every script in order, stopping at the first that fails.
@@ -526,5 +545,49 @@ mod tests {
             "/",
             "a numeric identity with no passwd line has no home to offer, and every image has a root directory"
         );
+    }
+
+    fn reads_own_stdin() -> PreparedScript {
+        PreparedScript {
+            label: "install".into(),
+            spec: ChildSpec {
+                argv: vec!["sh".into(), "-c".into(), "readlink /proc/self/fd/0".into()],
+                cwd: None,
+                env: HashMap::new(),
+                creds: None,
+                is_root: false,
+            },
+        }
+    }
+
+    async fn fd_zero_of(mut cmd: Command) -> String {
+        cmd.stdout(Stdio::piped());
+        let out = cmd
+            .spawn()
+            .expect("sh should spawn")
+            .wait_with_output()
+            .await
+            .expect("the child should be waitable");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A script that reads fd 0 gets an EOF. On the caller's own stdin it
+    /// would get a descriptor nobody answers before the workload starts,
+    /// and no timeout would ever end the wait.
+    #[tokio::test]
+    async fn a_script_reads_no_stdin() {
+        let script = reads_own_stdin();
+        assert_eq!(fd_zero_of(script_command(&script)).await, "/dev/null");
+    }
+
+    /// The control: fd 0 reports what the parent wired, so the assertion
+    /// above is about `script_command` and not about what a child always
+    /// says.
+    #[tokio::test]
+    async fn the_stdin_a_child_reports_is_the_one_it_was_given() {
+        let script = reads_own_stdin();
+        let mut cmd = build_command(&script.spec);
+        cmd.stdin(Stdio::piped());
+        assert!(fd_zero_of(cmd).await.starts_with("pipe:"));
     }
 }
