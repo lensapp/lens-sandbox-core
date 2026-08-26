@@ -1152,15 +1152,20 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     // a residual collision then means a hostile pre-plant and fails closed.
     {
         let old_paths = state.previous_policy_files.read().unwrap().clone();
+        // `/tmp` plus the sandbox user's home, so a `~/…` policy path resolves
+        // without opening the rest of the filesystem to the policy frame.
+        let roots = crate::temp_files::FileRoots::for_sandbox(state.sandbox_creds.as_ref());
         // Symlink-safe: re-walk each path with O_NOFOLLOW rather than letting a
         // path-based unlink follow a parent component the agent may have swapped
         // for a symlink between refreshes.
-        crate::temp_files::remove_temp_files(&old_paths).await;
+        crate::temp_files::remove_temp_files(&old_paths, &roots).await;
 
         if let Some(files) = msg.files
             && !files.is_empty()
         {
-            match crate::temp_files::write_temp_files(&files, state.sandbox_creds.as_ref()).await {
+            match crate::temp_files::write_temp_files(&files, state.sandbox_creds.as_ref(), &roots)
+                .await
+            {
                 Ok(paths) => {
                     tracing::info!(count = paths.len(), "wrote policy files");
                     *state.previous_policy_files.write().unwrap() = paths;
