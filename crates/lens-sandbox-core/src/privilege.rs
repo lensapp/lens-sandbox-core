@@ -354,8 +354,10 @@ impl SandboxCredentials {
     ///   *named* for a numeral cannot outrank the id itself.
     ///
     /// With no group segment the user's primary gid applies, and failing
-    /// that the uid doubles as the gid — the usual convention for a
-    /// numeric identity with no passwd line.
+    /// that the uid doubles as the gid. That last step is deliberately
+    /// not what `docker run` does: runc gives such an identity gid 0, and
+    /// handing a numeric identity the root group is not something a
+    /// sandbox should do on its own.
     ///
     /// A name neither table can resolve is an error, never a fallback:
     /// falling back would run the child as an identity nobody named, and
