@@ -230,6 +230,21 @@
         }
       }
     },
+    "FileOwner": {
+      "description": "Who a [`TempFile`] is chowned to after the root supervisor creates it.",
+      "oneOf": [
+        {
+          "description": "The unprivileged sandbox user — the default, and the only owner that\nlets the workload read the file whatever its `mode`.",
+          "type": "string",
+          "const": "workload"
+        },
+        {
+          "description": "Left owned by root, so a `mode` that denies other keeps the contents\nfrom the workload. Two things this does not claim: a world-readable\n`mode` is still world-readable, and unlink and rename permission comes\nfrom the parent directory, so a workload that owns the parent can still\ndelete the file or put its own file at that path.",
+          "type": "string",
+          "const": "root"
+        }
+      ]
+    },
     "ForwardConfig": {
       "description": "TLS bridge forwarding config for tunnel-routed connections.",
       "type": "object",
@@ -822,12 +837,22 @@
       ]
     },
     "TempFile": {
-      "description": "A temporary file to write before executing a command.",
+      "description": "A file to write before executing a command.\n\nExactly one of [`content`](Self::content) and\n[`content_b64`](Self::content_b64) must be set; an entry setting both is\nrejected and the whole batch fails closed.",
       "type": "object",
       "properties": {
         "content": {
-          "description": "File content (text).",
-          "type": "string"
+          "description": "File content as text. Mutually exclusive with `contentB64`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contentB64": {
+          "description": "File content as standard base64, for bytes that are not valid text.\nMutually exclusive with `content`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mode": {
           "description": "Unix file mode as integer (e.g. 384 for rw-------).",
@@ -838,14 +863,24 @@
           "format": "uint32",
           "minimum": 0
         },
+        "owner": {
+          "description": "Who owns the delivered file. Absent means `workload`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileOwner"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "path": {
-          "description": "Absolute path inside the sandbox.",
+          "description": "Path inside the sandbox. Absolute, relative to the primary allowed\nroot, or `~/`-prefixed to resolve against the sandbox user's home.",
           "type": "string"
         }
       },
       "required": [
-        "path",
-        "content"
+        "path"
       ]
     },
     "Transport": {

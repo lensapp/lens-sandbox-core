@@ -6,17 +6,47 @@ use serde::{Deserialize, Serialize};
 /// Bump to today's date in the same commit as any change to `policy_schema.rs`
 /// or the wire types in this file — an older sandbox must not accept a policy it
 /// cannot enforce.
-pub const SANDBOX_PROTOCOL_DATE: &str = "2026-08-21";
+pub const SANDBOX_PROTOCOL_DATE: &str = "2026-08-26";
 
-/// A temporary file to write before executing a command.
+/// A file to write before executing a command.
+///
+/// Exactly one of [`content`](Self::content) and
+/// [`content_b64`](Self::content_b64) must be set; an entry setting both is
+/// rejected and the whole batch fails closed.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct TempFile {
-    /// Absolute path inside the sandbox.
+    /// Path inside the sandbox. Absolute, relative to the primary allowed
+    /// root, or `~/`-prefixed to resolve against the sandbox user's home.
     pub path: String,
-    /// File content (text).
-    pub content: String,
+    /// File content as text. Mutually exclusive with `contentB64`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// File content as standard base64, for bytes that are not valid text.
+    /// Mutually exclusive with `content`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_b64: Option<String>,
     /// Unix file mode as integer (e.g. 384 for rw-------).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<u32>,
+    /// Who owns the delivered file. Absent means `workload`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<FileOwner>,
+}
+
+/// Who a [`TempFile`] is chowned to after the root supervisor creates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOwner {
+    /// The unprivileged sandbox user — the default, and the only owner that
+    /// lets the workload read the file whatever its `mode`.
+    Workload,
+    /// Left owned by root, so a `mode` that denies other keeps the contents
+    /// from the workload. Two things this does not claim: a world-readable
+    /// `mode` is still world-readable, and unlink and rename permission comes
+    /// from the parent directory, so a workload that owns the parent can still
+    /// delete the file or put its own file at that path.
+    Root,
 }
 
 /// Check strict YYYY-MM-DD format: length 10, dashes at positions 4 and 7, digits elsewhere.
@@ -344,6 +374,43 @@ mod tests {
         assert_eq!(json["reason"], "placeholder-unauthorized");
         assert!(
             json.get("credential_id").is_none(),
+            "rust ident leaked: {json}"
+        );
+    }
+
+    #[test]
+    fn temp_file_from_an_old_sender_still_parses() {
+        let raw = r#"{"path":"/tmp/x.json","content":"hi","mode":384}"#;
+        let f: TempFile = serde_json::from_str(raw).unwrap();
+        assert_eq!(f.content.as_deref(), Some("hi"));
+        assert_eq!(f.content_b64, None);
+        assert_eq!(f.mode, Some(384));
+        assert_eq!(f.owner, None);
+    }
+
+    #[test]
+    fn temp_file_reads_camel_case_content_b64_and_owner() {
+        let raw = r#"{"path":"~/blob.bin","contentB64":"AAE=","owner":"root"}"#;
+        let f: TempFile = serde_json::from_str(raw).unwrap();
+        assert_eq!(f.content, None);
+        assert_eq!(f.content_b64.as_deref(), Some("AAE="));
+        assert_eq!(f.owner, Some(FileOwner::Root));
+    }
+
+    #[test]
+    fn temp_file_serializes_content_b64_as_camel_case() {
+        let f = TempFile {
+            path: "/tmp/blob.bin".to_string(),
+            content: None,
+            content_b64: Some("AAE=".to_string()),
+            mode: None,
+            owner: Some(FileOwner::Workload),
+        };
+        let json = serde_json::to_value(&f).unwrap();
+        assert_eq!(json["contentB64"], "AAE=");
+        assert_eq!(json["owner"], "workload");
+        assert!(
+            json.get("content_b64").is_none(),
             "rust ident leaked: {json}"
         );
     }

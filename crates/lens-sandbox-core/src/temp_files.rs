@@ -1,54 +1,283 @@
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use base64::Engine;
 use nix::errno::Errno;
 
 use crate::privilege::SandboxCredentials;
-use crate::protocol::TempFile;
+use crate::protocol::{FileOwner, TempFile};
 
-const TEMP_BASE: &str = "/tmp";
+const DEFAULT_ROOT: &str = "/tmp";
 const DEFAULT_FILE_MODE: u32 = 0o600;
-/// Intermediate directories are created by the root supervisor but are only
-/// path-prefix waypoints to a file that gets chowned to the unprivileged
+/// A directory the root supervisor creates under the shared `/tmp` root is only
+/// a path-prefix waypoint to a file that gets chowned to the unprivileged
 /// sandbox user. `0o711` (execute, no read) lets that user *traverse* to its
-/// file without being able to list the directory; the delivered file itself
-/// stays `0o600` and owned by the sandbox user, so traversability grants no
-/// extra read access. `0o700` here would be root-only and would lock the
-/// sandbox user out of every multi-component policy path.
-const DIR_MODE: u32 = 0o711;
+/// file without being able to list the directory, and root keeps ownership so
+/// no workload can rename the waypoint out from under a later refresh.
+const WAYPOINT_DIR_MODE: u32 = 0o711;
+/// A directory the root supervisor creates inside the sandbox home belongs to
+/// the workload: the agent has to list it and add siblings of the delivered
+/// file (`~/.claude` needs `settings.json` and `todos/` next to
+/// `.credentials.json`). It is chowned to the sandbox user with `0o700`.
+const WORKLOAD_DIR_MODE: u32 = 0o700;
 
-/// Validate a temp file path lexically and return its base-relative component
-/// sequence. Every separator-delimited segment must be a normal name; `..`,
-/// `.`, and empty segments (from a leading slash or `//`) are rejected so no
-/// component can redirect the directory walk. Legacy absolute `/tmp/...` inputs
-/// are accepted by stripping the base prefix; absolute paths outside the base
-/// are rejected.
-fn safe_temp_path(requested: &str) -> Result<Vec<OsString>, String> {
-    let path = Path::new(requested);
+/// What the root supervisor does with a directory it *creates* on the way to
+/// the delivered file. A directory that already exists is never chowned or
+/// chmod'd under either variant — handing over a pre-existing directory would
+/// let a policy frame grab any directory the supervisor can traverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewDirs {
+    /// Root-owned and traverse-only, for a shared root like `/tmp`.
+    Waypoint,
+    /// Chowned to the sandbox user and `0o700`, so the workload can use it.
+    WorkloadOwned,
+}
 
-    let relative = if path.is_absolute() {
-        path.strip_prefix(TEMP_BASE).map_err(|_| {
-            format!("temp file path must be relative or under {TEMP_BASE}: {requested}")
-        })?
-    } else {
-        path
-    };
+impl NewDirs {
+    /// One source for the mode, because the walk that creates a directory and
+    /// the hand-over that finishes it must not disagree about it.
+    fn mode(self) -> u32 {
+        match self {
+            Self::Waypoint => WAYPOINT_DIR_MODE,
+            Self::WorkloadOwned => WORKLOAD_DIR_MODE,
+        }
+    }
+}
 
-    let mut components = Vec::new();
-    for segment in relative.as_os_str().as_bytes().split(|b| *b == b'/') {
-        if segment.is_empty() || segment == b"." || segment == b".." {
+#[derive(Debug, Clone)]
+struct Root {
+    components: Vec<OsString>,
+    new_dirs: NewDirs,
+}
+
+/// Where policy files may land. Every requested path must resolve inside one of
+/// the allowed roots; anything else is refused before a single syscall runs.
+///
+/// The default is `/tmp` alone, which is the whole path policy this module used
+/// to hardcode. Widening it is an explicit caller decision, and the method that
+/// does it names what happens to the directories it creates: a root added
+/// through [`Self::allow_workload_owned`] hands them to the sandbox user, while
+/// the default `/tmp` keeps them root-owned and traverse-only. A path binds to
+/// the longest root that contains it, so a home nested inside another root still
+/// gets its own policy.
+#[derive(Debug, Clone)]
+pub struct FileRoots {
+    roots: Vec<Root>,
+    home: Option<Vec<OsString>>,
+}
+
+impl Default for FileRoots {
+    fn default() -> Self {
+        Self {
+            roots: vec![Root {
+                components: DEFAULT_ROOT
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .map(OsString::from)
+                    .collect(),
+                new_dirs: NewDirs::Waypoint,
+            }],
+            home: None,
+        }
+    }
+}
+
+impl FileRoots {
+    /// The roots policy files are allowed to land in for a given sandbox user:
+    /// the default `/tmp`, plus that user's home so a `~/…` path resolves. A
+    /// user whose passwd home is `/` contributes no root — widening to the
+    /// whole filesystem is never implied.
+    pub fn for_sandbox(sandbox_creds: Option<&SandboxCredentials>) -> Self {
+        Self::rooted_at_home(sandbox_creds.map(SandboxCredentials::home))
+    }
+
+    /// The fallback is deliberate and loud: an unusable home contributes no
+    /// root, so a `~/…` path is refused outright rather than quietly landing
+    /// somewhere the sender did not name.
+    fn rooted_at_home(home: Option<&str>) -> Self {
+        let base = Self::default();
+        let Some(home) = home else {
+            return base;
+        };
+        match base.clone().with_home(home) {
+            Ok(roots) => roots,
+            Err(reason) => {
+                tracing::warn!(
+                    home,
+                    reason,
+                    "sandbox home is unusable as a policy-file root; `~/` paths will be refused"
+                );
+                base
+            }
+        }
+    }
+
+    /// Allow one more root whose created directories the workload owns. The
+    /// hand-over is in the name because a root added later must state it rather
+    /// than inherit whatever the last one chose. A root is absolute and
+    /// lexically plain — one carrying `.` or `..` is a configuration error, not
+    /// something to normalise away.
+    pub fn allow_workload_owned(mut self, root: impl AsRef<Path>) -> Result<Self, String> {
+        self.roots.push(Root {
+            components: root_components(root.as_ref())?,
+            new_dirs: NewDirs::WorkloadOwned,
+        });
+        Ok(self)
+    }
+
+    /// Set the home directory a leading `~` expands against, and allow it as a
+    /// root.
+    pub fn with_home(mut self, home: impl AsRef<Path>) -> Result<Self, String> {
+        let components = root_components(home.as_ref())?;
+        if components.is_empty() {
+            return Err("sandbox home must not be the filesystem root".to_string());
+        }
+        self.home = Some(components.clone());
+        self.roots.push(Root {
+            components,
+            new_dirs: NewDirs::WorkloadOwned,
+        });
+        Ok(self)
+    }
+
+    fn primary(&self) -> &[OsString] {
+        self.roots
+            .first()
+            .map(|r| r.components.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Validate a requested path lexically and bind it to the allowed root it
+    /// belongs to.
+    ///
+    /// Every separator-delimited segment must be a normal name; `..` and `.` are
+    /// rejected so no component can redirect the directory walk. A leading `~/`
+    /// expands against the sandbox home. A relative path resolves under the
+    /// primary root. An absolute path must sit strictly inside one of the roots.
+    fn resolve(&self, requested: &str) -> Result<ResolvedPath, String> {
+        let absolute = self.to_absolute(requested)?;
+
+        let mut best: Option<&Root> = None;
+        for root in &self.roots {
+            let len = root.components.len();
+            if absolute.len() > len
+                && absolute[..len] == root.components[..]
+                && best.is_none_or(|b| len > b.components.len())
+            {
+                best = Some(root);
+            }
+        }
+
+        let root = best
+            .ok_or_else(|| format!("temp file path is outside the allowed roots: {requested}"))?;
+
+        Ok(ResolvedPath {
+            root: render(&root.components, &[]),
+            components: absolute[root.components.len()..].to_vec(),
+            new_dirs: root.new_dirs,
+        })
+    }
+
+    fn to_absolute(&self, requested: &str) -> Result<Vec<OsString>, String> {
+        let bytes = requested.as_bytes();
+
+        if bytes.first() == Some(&b'~') {
+            let rest = match bytes.get(1) {
+                None => return Err(format!("temp file path is empty: {requested}")),
+                Some(&b'/') => &bytes[2..],
+                Some(_) => {
+                    return Err(format!(
+                        "temp file path may only use `~/` for the sandbox home: {requested}"
+                    ));
+                }
+            };
+            let home = self.home.as_ref().ok_or_else(|| {
+                format!("temp file path uses `~` but no sandbox home is known: {requested}")
+            })?;
+            return join(home, rest, requested);
+        }
+
+        if bytes.first() == Some(&b'/') {
+            return join(&[], &bytes[1..], requested);
+        }
+
+        join(self.primary(), bytes, requested)
+    }
+}
+
+/// An allowed root plus the safe, root-relative component sequence beneath it.
+#[derive(Debug)]
+struct ResolvedPath {
+    root: PathBuf,
+    components: Vec<OsString>,
+    new_dirs: NewDirs,
+}
+
+impl ResolvedPath {
+    fn display(&self) -> String {
+        let mut path = self.root.clone();
+        for comp in &self.components {
+            path.push(comp);
+        }
+        path.to_string_lossy().to_string()
+    }
+}
+
+fn render(root: &[OsString], components: &[OsString]) -> PathBuf {
+    let mut path = PathBuf::from("/");
+    for comp in root.iter().chain(components) {
+        path.push(comp);
+    }
+    path
+}
+
+/// Append a requested tail to a prefix, one separator-delimited segment at a
+/// time. An empty segment — a doubled or trailing separator — is dropped, which
+/// is exactly what the `Path::strip_prefix` this replaced did via `Components`,
+/// so a sender's `/tmp//x` or `/tmp/x/` keeps resolving instead of failing the
+/// whole all-or-nothing batch. `.` and `..` are the unsafe forms and stay
+/// rejected: they redirect the walk, whereas a redundant separator cannot.
+fn join(prefix: &[OsString], tail: &[u8], requested: &str) -> Result<Vec<OsString>, String> {
+    let mut components = prefix.to_vec();
+    for segment in tail.split(|b| *b == b'/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == b"." || segment == b".." {
             return Err(format!(
                 "temp file path contains an unsafe component: {requested}"
             ));
         }
         components.push(OsString::from_vec(segment.to_vec()));
     }
+    Ok(components)
+}
 
-    if components.is_empty() {
-        return Err(format!("temp file path is empty: {requested}"));
+/// Split an allowed root into components, rejecting a relative root or one
+/// carrying `.` / `..`. Repeated and trailing separators are tolerated because a
+/// root is operator configuration, not an agent-supplied path.
+fn root_components(root: &Path) -> Result<Vec<OsString>, String> {
+    let bytes = root.as_os_str().as_bytes();
+    if bytes.first() != Some(&b'/') {
+        return Err(format!(
+            "allowed root must be absolute: {}",
+            root.to_string_lossy()
+        ));
     }
-
+    let mut components = Vec::new();
+    for segment in bytes[1..].split(|b| *b == b'/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == b"." || segment == b".." {
+            return Err(format!(
+                "allowed root contains an unsafe component: {}",
+                root.to_string_lossy()
+            ));
+        }
+        components.push(OsString::from_vec(segment.to_vec()));
+    }
     Ok(components)
 }
 
@@ -56,7 +285,7 @@ fn safe_temp_path(requested: &str) -> Result<Vec<OsString>, String> {
 /// EEXIST tolerance, O_EXCL collisions, chown, and chmod are unit-testable
 /// without root or a real filesystem.
 trait TempFs {
-    fn open_base(&self) -> Result<Box<dyn DirHandle>, Errno>;
+    fn open_root(&self, root: &Path) -> Result<Box<dyn DirHandle>, Errno>;
 }
 
 trait DirHandle {
@@ -66,6 +295,8 @@ trait DirHandle {
     /// Unlink a child of this directory by name. Operates on the directory fd,
     /// so a symlink at `name` unlinks the link itself rather than its target.
     fn unlink_child(&self, name: &OsStr) -> Result<(), Errno>;
+    fn chown(&self, uid: u32, gid: u32) -> Result<(), Errno>;
+    fn chmod(&self, mode: u32) -> Result<(), Errno>;
 }
 
 trait FileHandle {
@@ -77,18 +308,20 @@ trait FileHandle {
 pub async fn write_temp_files(
     files: &[TempFile],
     sandbox_creds: Option<&SandboxCredentials>,
+    roots: &FileRoots,
 ) -> Result<Vec<String>, String> {
     let creds = sandbox_creds.map(|c| {
         let (uid, gid) = c.uid_gid();
         (uid.as_raw(), gid.as_raw())
     });
-    write_temp_files_with(&RealTempFs, files, creds)
+    write_temp_files_with(&RealTempFs, files, creds, roots)
 }
 
 fn write_temp_files_with(
     fs: &dyn TempFs,
     files: &[TempFile],
     creds: Option<(u32, u32)>,
+    roots: &FileRoots,
 ) -> Result<Vec<String>, String> {
     // All-or-nothing: if any file fails, roll back the files already created so
     // the batch never leaves half-written, sandbox-owned secret files behind.
@@ -98,19 +331,21 @@ fn write_temp_files_with(
     //
     // Rollback is file-only: `remove_one` unlinks the final (file) component but
     // does not `rmdir` the intermediate directories the walk may have created.
-    // That residue is harmless — empty, root-owned dirs that the next refresh's
+    // That residue is harmless — empty directories that the next refresh's
     // EEXIST-tolerant `mkdirat` + `O_NOFOLLOW` `openat` re-traverses cleanly — so
     // a fully clean, dir-inclusive rollback isn't worth the extra unwind.
     let mut written = Vec::with_capacity(files.len());
     for f in files {
-        let result = safe_temp_path(&f.path).and_then(|components| {
-            write_one(fs, &components, &f.content, f.mode, creds).map(|p| (components, p))
+        let result = roots.resolve(&f.path).and_then(|resolved| {
+            let bytes = file_bytes(f)?;
+            write_one(fs, &resolved, &bytes, f.mode, owner_creds(f, creds), creds)
+                .map(|path| (resolved, path))
         });
         match result {
-            Ok((components, path)) => written.push((components, path)),
+            Ok((resolved, path)) => written.push((resolved, path)),
             Err(e) => {
-                for (components, _) in &written {
-                    remove_one(fs, components);
+                for (resolved, _) in &written {
+                    remove_one(fs, resolved);
                 }
                 return Err(e);
             }
@@ -119,17 +354,47 @@ fn write_temp_files_with(
     Ok(written.into_iter().map(|(_, path)| path).collect())
 }
 
+/// The exact bytes to deliver. `content` and `contentB64` are mutually
+/// exclusive, and one of them is required — an entry that sets both, or
+/// neither, is a malformed policy and fails the batch rather than silently
+/// picking one or writing an empty file.
+fn file_bytes(f: &TempFile) -> Result<Vec<u8>, String> {
+    match (&f.content, &f.content_b64) {
+        (Some(_), Some(_)) => Err(format!(
+            "temp file sets both content and contentB64: {}",
+            f.path
+        )),
+        (Some(text), None) => Ok(text.as_bytes().to_vec()),
+        (None, Some(encoded)) => base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| format!("temp file contentB64 is not valid base64: {}: {e}", f.path)),
+        (None, None) => Err(format!(
+            "temp file sets neither content nor contentB64: {}",
+            f.path
+        )),
+    }
+}
+
+/// The uid/gid the delivered file is chowned to, or `None` to leave it owned by
+/// the root supervisor that created it.
+fn owner_creds(f: &TempFile, sandbox: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    match f.owner.unwrap_or(FileOwner::Workload) {
+        FileOwner::Workload => sandbox,
+        FileOwner::Root => None,
+    }
+}
+
 /// Best-effort symlink-safe removal of a previously-written temp file. Re-walks
 /// the path with `O_NOFOLLOW` exactly like the writer, then unlinks the final
 /// component via the directory fd — so a parent component the agent swapped for
 /// a symlink between refreshes can't redirect the root supervisor's unlink at
 /// an attacker-chosen target. A missing or planted-symlink component is treated
 /// as "nothing safe to remove" and skipped.
-fn remove_one(fs: &dyn TempFs, components: &[OsString]) {
-    let Some((file_name, dir_components)) = components.split_last() else {
+fn remove_one(fs: &dyn TempFs, resolved: &ResolvedPath) {
+    let Some((file_name, dir_components)) = resolved.components.split_last() else {
         return;
     };
-    let Ok(mut dir) = fs.open_base() else {
+    let Ok(mut dir) = fs.open_root(&resolved.root) else {
         return;
     };
     for comp in dir_components {
@@ -141,43 +406,85 @@ fn remove_one(fs: &dyn TempFs, components: &[OsString]) {
     let _ = dir.unlink_child(file_name);
 }
 
-fn write_one(
+/// Open the directory that holds the delivered file, creating the missing
+/// components on the way. A component this walk creates is finished according to
+/// the root's [`NewDirs`] policy; a component that already exists is opened and
+/// otherwise untouched.
+fn walk_to_parent(
     fs: &dyn TempFs,
-    components: &[OsString],
-    content: &str,
-    mode: Option<u32>,
-    creds: Option<(u32, u32)>,
-) -> Result<String, String> {
-    let display = render_path(components);
+    resolved: &ResolvedPath,
+    dir_components: &[OsString],
+    workload: Option<(u32, u32)>,
+) -> Result<Box<dyn DirHandle>, String> {
+    let root = resolved.root.to_string_lossy().to_string();
     let mut dir = fs
-        .open_base()
-        .map_err(|e| format!("open base {TEMP_BASE}: {e}"))?;
+        .open_root(&resolved.root)
+        .map_err(|e| format!("open root {root}: {e}"))?;
 
-    let (file_name, dir_components) = components
-        .split_last()
-        .ok_or_else(|| format!("temp file path is empty: {display}"))?;
+    let dir_mode = resolved.new_dirs.mode();
 
     for comp in dir_components {
-        match dir.make_child_dir(comp, DIR_MODE) {
-            Ok(()) | Err(Errno::EEXIST) => {}
-            Err(e) => {
-                return Err(format!("mkdir {}: {e}", comp.to_string_lossy()));
-            }
-        }
+        let created = match dir.make_child_dir(comp, dir_mode) {
+            Ok(()) => true,
+            Err(Errno::EEXIST) => false,
+            Err(e) => return Err(format!("mkdir {}: {e}", comp.to_string_lossy())),
+        };
         dir = dir.open_child_dir(comp).map_err(|e| {
             format!(
-                "open dir component {} under {TEMP_BASE}: {e}",
+                "open dir component {} under {root}: {e}",
                 comp.to_string_lossy()
             )
         })?;
+        if created && resolved.new_dirs == NewDirs::WorkloadOwned {
+            hand_dir_to_workload(dir.as_ref(), comp, dir_mode, workload)?;
+        }
     }
+
+    Ok(dir)
+}
+
+/// Finish a directory this walk just created so the workload can actually use
+/// it: `0o700` and owned by the sandbox user. The chmod is explicit because the
+/// supervisor's umask can strip bits off the `mkdirat` mode.
+fn hand_dir_to_workload(
+    dir: &dyn DirHandle,
+    name: &OsStr,
+    mode: u32,
+    workload: Option<(u32, u32)>,
+) -> Result<(), String> {
+    let name = name.to_string_lossy();
+    dir.chmod(mode)
+        .map_err(|e| format!("chmod dir {name}: {e}"))?;
+    if let Some((uid, gid)) = workload {
+        dir.chown(uid, gid)
+            .map_err(|e| format!("chown dir {name}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn write_one(
+    fs: &dyn TempFs,
+    resolved: &ResolvedPath,
+    content: &[u8],
+    mode: Option<u32>,
+    creds: Option<(u32, u32)>,
+    workload: Option<(u32, u32)>,
+) -> Result<String, String> {
+    let display = resolved.display();
+
+    let (file_name, dir_components) = resolved
+        .components
+        .split_last()
+        .ok_or_else(|| format!("temp file path is empty: {display}"))?;
+
+    let dir = walk_to_parent(fs, resolved, dir_components, workload)?;
 
     let file_mode = mode.unwrap_or(DEFAULT_FILE_MODE);
     let mut file = dir
         .create_child_file(file_name, file_mode)
         .map_err(|e| format!("create {display}: {e}"))?;
 
-    file.write_all(content.as_bytes())
+    file.write_all(content)
         .map_err(|e| format!("write {display}: {e}"))?;
     file.chmod(file_mode)
         .map_err(|e| format!("chmod {display}: {e}"))?;
@@ -190,30 +497,31 @@ fn write_one(
     Ok(display)
 }
 
-fn render_path(components: &[OsString]) -> String {
-    let mut path = std::path::PathBuf::from(TEMP_BASE);
-    for comp in components {
-        path.push(comp);
-    }
-    path.to_string_lossy().to_string()
-}
-
 /// Symlink-safe removal of previously-written temp files. Each path is
 /// re-validated and re-walked with `O_NOFOLLOW`, so a parent component the
 /// agent swapped for a symlink between refreshes can't redirect the root
 /// supervisor's unlink at an attacker-chosen target — the same hazard the write
-/// path guards against. Unknown / already-gone / planted-symlink paths are
-/// silently skipped. Best-effort: failures are not surfaced.
-pub async fn remove_temp_files(paths: &[String]) {
-    remove_temp_files_with(&RealTempFs, paths);
+/// path guards against. Already-gone and planted-symlink paths are skipped
+/// silently. A path that no longer resolves inside the allowed roots is
+/// reported, because it names a file this cleanup is leaving behind.
+pub async fn remove_temp_files(paths: &[String], roots: &FileRoots) {
+    for reason in remove_temp_files_with(&RealTempFs, paths, roots) {
+        tracing::warn!(
+            reason,
+            "policy file left in place: it is no longer removable"
+        );
+    }
 }
 
-fn remove_temp_files_with(fs: &dyn TempFs, paths: &[String]) {
+fn remove_temp_files_with(fs: &dyn TempFs, paths: &[String], roots: &FileRoots) -> Vec<String> {
+    let mut unresolved = Vec::new();
     for path in paths {
-        if let Ok(components) = safe_temp_path(path) {
-            remove_one(fs, &components);
+        match roots.resolve(path) {
+            Ok(resolved) => remove_one(fs, &resolved),
+            Err(reason) => unresolved.push(reason),
         }
     }
+    unresolved
 }
 
 struct RealTempFs;
@@ -223,8 +531,19 @@ struct RealDir(std::os::fd::OwnedFd);
 struct RealFile(std::os::fd::OwnedFd);
 
 impl TempFs for RealTempFs {
-    fn open_base(&self) -> Result<Box<dyn DirHandle>, Errno> {
-        let fd = open_dir_nofollow(&nix::fcntl::AT_FDCWD, TEMP_BASE)?;
+    /// Walk the root one component at a time with `O_NOFOLLOW` instead of
+    /// opening it by full path, so a symlink anywhere in the root — not just its
+    /// final component — fails closed rather than redirecting the whole batch.
+    fn open_root(&self, root: &Path) -> Result<Box<dyn DirHandle>, Errno> {
+        let mut fd = open_dir_nofollow(&nix::fcntl::AT_FDCWD, "/")?;
+        for segment in root
+            .as_os_str()
+            .as_bytes()
+            .split(|b| *b == b'/')
+            .filter(|s| !s.is_empty())
+        {
+            fd = open_dir_nofollow(&fd, segment)?;
+        }
         Ok(Box::new(RealDir(fd)))
     }
 }
@@ -253,6 +572,18 @@ impl DirHandle for RealDir {
             name.as_bytes(),
             nix::unistd::UnlinkatFlags::NoRemoveDir,
         )
+    }
+
+    fn chown(&self, uid: u32, gid: u32) -> Result<(), Errno> {
+        nix::unistd::fchown(
+            &self.0,
+            Some(nix::unistd::Uid::from_raw(uid)),
+            Some(nix::unistd::Gid::from_raw(gid)),
+        )
+    }
+
+    fn chmod(&self, mode: u32) -> Result<(), Errno> {
+        nix::sys::stat::fchmod(&self.0, mode_from(mode))
     }
 }
 
@@ -305,20 +636,29 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    fn tmp() -> FileRoots {
+        FileRoots::default()
+    }
+
+    fn home_roots() -> FileRoots {
+        FileRoots::default().with_home("/home/sandbox").unwrap()
+    }
+
     #[test]
     fn safe_relative_path() {
-        let result = safe_temp_path("creds/aws.json").unwrap();
+        let result = tmp().resolve("creds/aws.json").unwrap();
         assert_eq!(
-            result,
+            result.components,
             vec![OsString::from("creds"), OsString::from("aws.json")]
         );
+        assert_eq!(result.display(), "/tmp/creds/aws.json");
     }
 
     #[test]
     fn safe_already_under_tmp() {
-        let result = safe_temp_path("/tmp/lens-sandbox/creds/aws.json").unwrap();
+        let result = tmp().resolve("/tmp/lens-sandbox/creds/aws.json").unwrap();
         assert_eq!(
-            result,
+            result.components,
             vec![
                 OsString::from("lens-sandbox"),
                 OsString::from("creds"),
@@ -329,39 +669,135 @@ mod tests {
 
     #[test]
     fn safe_sandbox_kubeconfig() {
-        let result = safe_temp_path("/tmp/sandbox-kubeconfig-abc123").unwrap();
-        assert_eq!(result, vec![OsString::from("sandbox-kubeconfig-abc123")]);
+        let result = tmp().resolve("/tmp/sandbox-kubeconfig-abc123").unwrap();
+        assert_eq!(
+            result.components,
+            vec![OsString::from("sandbox-kubeconfig-abc123")]
+        );
     }
 
     #[test]
     fn reject_dotdot_component() {
-        assert!(safe_temp_path("../etc/passwd").is_err());
+        assert!(tmp().resolve("../etc/passwd").is_err());
     }
 
     #[test]
     fn reject_dotdot_mid_path() {
-        assert!(safe_temp_path("creds/../../etc/passwd").is_err());
+        assert!(tmp().resolve("creds/../../etc/passwd").is_err());
     }
 
     #[test]
     fn reject_single_dot_component() {
-        assert!(safe_temp_path("creds/./aws.json").is_err());
+        assert!(tmp().resolve("creds/./aws.json").is_err());
     }
 
     #[test]
     fn reject_absolute_outside_tmp() {
-        assert!(safe_temp_path("/etc/passwd").is_err());
+        assert!(tmp().resolve("/etc/passwd").is_err());
     }
 
     #[test]
     fn reject_dotdot_in_tmp() {
-        assert!(safe_temp_path("/tmp/../etc/passwd").is_err());
+        assert!(tmp().resolve("/tmp/../etc/passwd").is_err());
     }
 
     #[test]
     fn reject_empty_path() {
-        assert!(safe_temp_path("").is_err());
-        assert!(safe_temp_path("/tmp").is_err());
+        assert!(tmp().resolve("").is_err());
+        assert!(tmp().resolve("/tmp").is_err());
+    }
+
+    #[test]
+    fn reject_path_outside_the_allowed_roots() {
+        let roots = FileRoots::default()
+            .allow_workload_owned("/opt/lens")
+            .unwrap();
+        let err = roots.resolve("/etc/passwd").unwrap_err();
+        assert!(err.contains("/etc/passwd"), "{err}");
+        assert!(roots.resolve("/opt/lens/x.json").is_ok());
+        assert!(roots.resolve("/tmp/x.json").is_ok());
+    }
+
+    #[test]
+    fn reject_root_prefix_that_is_only_a_string_prefix() {
+        let roots = FileRoots::default()
+            .allow_workload_owned("/opt/lens")
+            .unwrap();
+        assert!(roots.resolve("/opt/lens-evil/x").is_err());
+        assert!(roots.resolve("/tmpfoo/x").is_err());
+    }
+
+    #[test]
+    fn reject_dotdot_that_would_escape_an_allowed_root() {
+        let roots = home_roots();
+        assert!(roots.resolve("/home/sandbox/../../etc/passwd").is_err());
+        assert!(roots.resolve("~/../../etc/passwd").is_err());
+        assert!(roots.resolve("~/..").is_err());
+    }
+
+    #[test]
+    fn tilde_resolves_under_the_sandbox_home() {
+        let resolved = home_roots().resolve("~/.claude/settings.json").unwrap();
+        assert_eq!(resolved.display(), "/home/sandbox/.claude/settings.json");
+        assert_eq!(
+            resolved.components,
+            vec![OsString::from(".claude"), OsString::from("settings.json")]
+        );
+    }
+
+    #[test]
+    fn tilde_without_a_configured_home_is_refused() {
+        assert!(tmp().resolve("~/x").is_err());
+    }
+
+    #[test]
+    fn tilde_user_form_is_refused() {
+        assert!(home_roots().resolve("~root/.ssh/authorized_keys").is_err());
+        assert!(home_roots().resolve("~").is_err());
+    }
+
+    #[test]
+    fn a_root_must_be_absolute_and_lexically_safe() {
+        assert!(
+            FileRoots::default()
+                .allow_workload_owned("relative/dir")
+                .is_err()
+        );
+        assert!(
+            FileRoots::default()
+                .allow_workload_owned("/opt/../etc")
+                .is_err()
+        );
+        assert!(FileRoots::default().with_home("/").is_err());
+    }
+
+    #[test]
+    fn for_sandbox_without_creds_is_the_default_root_set() {
+        let roots = FileRoots::for_sandbox(None);
+        assert!(roots.resolve("/tmp/x").is_ok());
+        assert!(roots.resolve("/home/sandbox/x").is_err());
+    }
+
+    #[test]
+    fn an_unusable_sandbox_home_keeps_the_default_roots_and_refuses_tilde() {
+        let roots = FileRoots::rooted_at_home(Some("/"));
+        assert!(roots.resolve("/tmp/x").is_ok());
+        let err = roots.resolve("~/x").unwrap_err();
+        assert!(err.contains("no sandbox home"), "{err}");
+    }
+
+    #[test]
+    fn redundant_separators_resolve_like_the_old_strip_prefix() {
+        // `Path::strip_prefix` normalised through `Components`, so an existing
+        // sender's `//tmp/x`, `/tmp/x/` and `/tmp//x` were all accepted. The
+        // batch is all-or-nothing, so rejecting them now would turn one sloppy
+        // path into zero delivered policy files. Only `.` and `..` are unsafe.
+        for requested in ["//tmp/x", "/tmp/x/", "/tmp//x"] {
+            let resolved = tmp()
+                .resolve(requested)
+                .unwrap_or_else(|e| panic!("{requested}: {e}"));
+            assert_eq!(resolved.display(), "/tmp/x", "{requested}");
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +808,8 @@ mod tests {
         Write(String, Vec<u8>),
         Chmod(String, u32),
         Chown(String, u32, u32),
+        ChmodDir(String, u32),
+        ChownDir(String, u32, u32),
         Unlink(String),
     }
 
@@ -409,6 +847,7 @@ mod tests {
 
     struct FakeDir {
         recorder: Rc<RefCell<Recorder>>,
+        name: String,
         symlink_dirs: Vec<String>,
         existing_files: Vec<String>,
         existing_dirs: Vec<String>,
@@ -424,9 +863,10 @@ mod tests {
     }
 
     impl TempFs for FakeTempFs {
-        fn open_base(&self) -> Result<Box<dyn DirHandle>, Errno> {
+        fn open_root(&self, root: &Path) -> Result<Box<dyn DirHandle>, Errno> {
             Ok(Box::new(FakeDir {
                 recorder: self.recorder.clone(),
+                name: root.to_string_lossy().to_string(),
                 symlink_dirs: self.symlink_dirs.clone(),
                 existing_files: self.existing_files.clone(),
                 existing_dirs: self.existing_dirs.clone(),
@@ -442,9 +882,13 @@ mod tests {
             if self.symlink_dirs.contains(&n) {
                 return Err(Errno::ELOOP);
             }
-            self.recorder.borrow_mut().events.push(Event::OpenDir(n));
+            self.recorder
+                .borrow_mut()
+                .events
+                .push(Event::OpenDir(n.clone()));
             Ok(Box::new(FakeDir {
                 recorder: self.recorder.clone(),
+                name: n,
                 symlink_dirs: self.symlink_dirs.clone(),
                 existing_files: self.existing_files.clone(),
                 existing_dirs: self.existing_dirs.clone(),
@@ -487,6 +931,22 @@ mod tests {
             self.recorder.borrow_mut().events.push(Event::Unlink(n));
             Ok(())
         }
+
+        fn chown(&self, uid: u32, gid: u32) -> Result<(), Errno> {
+            self.recorder
+                .borrow_mut()
+                .events
+                .push(Event::ChownDir(self.name.clone(), uid, gid));
+            Ok(())
+        }
+
+        fn chmod(&self, mode: u32) -> Result<(), Errno> {
+            self.recorder
+                .borrow_mut()
+                .events
+                .push(Event::ChmodDir(self.name.clone(), mode));
+            Ok(())
+        }
     }
 
     impl FileHandle for FakeFile {
@@ -524,8 +984,10 @@ mod tests {
     fn file(path: &str, content: &str, mode: Option<u32>) -> TempFile {
         TempFile {
             path: path.to_string(),
-            content: content.to_string(),
+            content: Some(content.to_string()),
+            content_b64: None,
             mode,
+            owner: None,
         }
     }
 
@@ -536,7 +998,7 @@ mod tests {
         fs.symlink_dirs.push("creds".to_string());
         let files = vec![file("creds/aws.json", "secret", None)];
 
-        let result = write_temp_files_with(&fs, &files, Some((1000, 1000)));
+        let result = write_temp_files_with(&fs, &files, Some((1000, 1000)), &tmp());
         let err = result.unwrap_err();
         assert!(
             err.contains("creds"),
@@ -558,7 +1020,7 @@ mod tests {
         fs.existing_files.push("aws.json".to_string());
         let files = vec![file("aws.json", "secret", None)];
 
-        let result = write_temp_files_with(&fs, &files, Some((1000, 1000)));
+        let result = write_temp_files_with(&fs, &files, Some((1000, 1000)), &tmp());
         assert!(result.is_err());
 
         let events = &rec.borrow().events;
@@ -575,14 +1037,14 @@ mod tests {
         let fs = FakeTempFs::new(rec.clone());
         let files = vec![file("creds/aws.json", "secret", Some(0o640))];
 
-        let written = write_temp_files_with(&fs, &files, Some((1000, 2000))).unwrap();
+        let written = write_temp_files_with(&fs, &files, Some((1000, 2000)), &tmp()).unwrap();
         assert_eq!(written, vec!["/tmp/creds/aws.json".to_string()]);
 
         let events = rec.borrow().events.clone();
         assert_eq!(
             events,
             vec![
-                Event::MakeDir("creds".to_string(), DIR_MODE),
+                Event::MakeDir("creds".to_string(), WAYPOINT_DIR_MODE),
                 Event::OpenDir("creds".to_string()),
                 Event::CreateFile("aws.json".to_string(), 0o640),
                 Event::Write("aws.json".to_string(), b"secret".to_vec()),
@@ -598,7 +1060,7 @@ mod tests {
         let fs = FakeTempFs::new(rec.clone());
         let files = vec![file("aws.json", "secret", None)];
 
-        write_temp_files_with(&fs, &files, None).unwrap();
+        write_temp_files_with(&fs, &files, None, &tmp()).unwrap();
         let events = rec.borrow().events.clone();
         assert!(events.contains(&Event::CreateFile(
             "aws.json".to_string(),
@@ -613,7 +1075,7 @@ mod tests {
         let fs = FakeTempFs::new(rec.clone());
         let files = vec![file("aws.json", "secret", None)];
 
-        write_temp_files_with(&fs, &files, None).unwrap();
+        write_temp_files_with(&fs, &files, None, &tmp()).unwrap();
         let events = rec.borrow().events.clone();
         assert!(events.iter().any(|e| matches!(e, Event::CreateFile(..))));
         assert!(events.iter().any(|e| matches!(e, Event::Write(..))));
@@ -627,7 +1089,7 @@ mod tests {
         fs.existing_dirs.push("creds".to_string());
         let files = vec![file("creds/aws.json", "secret", None)];
 
-        let written = write_temp_files_with(&fs, &files, None).unwrap();
+        let written = write_temp_files_with(&fs, &files, None, &tmp()).unwrap();
         assert_eq!(written, vec!["/tmp/creds/aws.json".to_string()]);
 
         let events = rec.borrow().events.clone();
@@ -643,7 +1105,7 @@ mod tests {
         fs.chown_err = Some(Errno::EPERM);
         let files = vec![file("aws.json", "secret", None)];
 
-        let result = write_temp_files_with(&fs, &files, Some((1000, 1000)));
+        let result = write_temp_files_with(&fs, &files, Some((1000, 1000)), &tmp());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("chown"));
     }
@@ -655,7 +1117,7 @@ mod tests {
         fs.write_err = Some(Errno::EIO);
         let files = vec![file("aws.json", "secret", None)];
 
-        let result = write_temp_files_with(&fs, &files, None);
+        let result = write_temp_files_with(&fs, &files, None, &tmp());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("write"));
     }
@@ -673,7 +1135,7 @@ mod tests {
             file("second.json", "two", None),
         ];
 
-        let result = write_temp_files_with(&fs, &files, None);
+        let result = write_temp_files_with(&fs, &files, None, &tmp());
         assert!(result.is_err(), "the batch must fail when any file fails");
 
         let events = rec.borrow().events.clone();
@@ -695,7 +1157,7 @@ mod tests {
         let rec = Rc::new(RefCell::new(Recorder::default()));
         let fs = FakeTempFs::new(rec.clone());
 
-        remove_temp_files_with(&fs, &["/tmp/creds/aws.json".to_string()]);
+        remove_temp_files_with(&fs, &["/tmp/creds/aws.json".to_string()], &tmp());
 
         let events = rec.borrow().events.clone();
         assert!(events.contains(&Event::OpenDir("creds".to_string())));
@@ -711,12 +1173,333 @@ mod tests {
         let mut fs = FakeTempFs::new(rec.clone());
         fs.symlink_dirs.push("creds".to_string());
 
-        remove_temp_files_with(&fs, &["/tmp/creds/aws.json".to_string()]);
+        remove_temp_files_with(&fs, &["/tmp/creds/aws.json".to_string()], &tmp());
 
         let events = rec.borrow().events.clone();
         assert!(
             !events.iter().any(|e| matches!(e, Event::Unlink(..))),
             "must not unlink through a symlinked parent: {events:?}"
         );
+    }
+
+    #[test]
+    fn symlinked_parent_under_the_home_root_fails_closed() {
+        // Widening the allowed roots must not weaken the component walk: a
+        // directory the agent swapped for a symlink between refreshes still
+        // stops the root supervisor before it creates anything.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.symlink_dirs.push(".claude".to_string());
+        let files = vec![file("~/.claude/.credentials.json", "secret", None)];
+
+        let err = write_temp_files_with(&fs, &files, Some((1000, 1000)), &home_roots())
+            .expect_err("a symlinked parent must fail closed");
+        assert!(err.contains(".claude"), "{err}");
+
+        let events = &rec.borrow().events;
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            Event::CreateFile(..) | Event::Write(..) | Event::Chown(..) | Event::Chmod(..)
+        )));
+    }
+
+    #[test]
+    fn tilde_path_is_written_under_the_sandbox_home() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![file("~/.claude/.credentials.json", "tok", None)];
+
+        let written =
+            write_temp_files_with(&fs, &files, Some((1000, 1000)), &home_roots()).unwrap();
+        assert_eq!(
+            written,
+            vec!["/home/sandbox/.claude/.credentials.json".to_string()]
+        );
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn binary_file(path: &str, bytes: &[u8]) -> TempFile {
+        TempFile {
+            path: path.to_string(),
+            content: None,
+            content_b64: Some(b64(bytes)),
+            mode: None,
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn base64_content_round_trips_byte_exact() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let bytes: Vec<u8> = vec![0x00, 0xff, 0x80, 0x0a, b'a', 0xc3, 0x28];
+        let files = vec![binary_file("blob.bin", &bytes)];
+
+        write_temp_files_with(&fs, &files, None, &tmp()).unwrap();
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::Write("blob.bin".to_string(), bytes)),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_base64_content_is_refused() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![TempFile {
+            path: "blob.bin".to_string(),
+            content: None,
+            content_b64: Some("not base64!!".to_string()),
+            mode: None,
+            owner: None,
+        }];
+
+        let err = write_temp_files_with(&fs, &files, None, &tmp()).unwrap_err();
+        assert!(err.contains("contentB64"), "{err}");
+        let events = rec.borrow().events.clone();
+        assert!(!events.iter().any(|e| matches!(e, Event::CreateFile(..))));
+    }
+
+    #[test]
+    fn content_and_content_b64_together_is_refused() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![TempFile {
+            path: "both.json".to_string(),
+            content: Some("text".to_string()),
+            content_b64: Some(b64(b"bytes")),
+            mode: None,
+            owner: None,
+        }];
+
+        let err = write_temp_files_with(&fs, &files, None, &tmp()).unwrap_err();
+        assert!(err.contains("both"), "{err}");
+        let events = rec.borrow().events.clone();
+        assert!(!events.iter().any(|e| matches!(e, Event::CreateFile(..))));
+    }
+
+    #[test]
+    fn neither_content_nor_content_b64_is_refused() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![TempFile {
+            path: "empty.json".to_string(),
+            content: None,
+            content_b64: None,
+            mode: None,
+            owner: None,
+        }];
+
+        assert!(write_temp_files_with(&fs, &files, None, &tmp()).is_err());
+        let events = rec.borrow().events.clone();
+        assert!(!events.iter().any(|e| matches!(e, Event::CreateFile(..))));
+    }
+
+    #[test]
+    fn owner_root_leaves_the_file_root_owned() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![TempFile {
+            path: "root-only.json".to_string(),
+            content: Some("secret".to_string()),
+            content_b64: None,
+            mode: None,
+            owner: Some(FileOwner::Root),
+        }];
+
+        write_temp_files_with(&fs, &files, Some((1000, 2000)), &tmp()).unwrap();
+        let events = rec.borrow().events.clone();
+        assert!(events.iter().any(|e| matches!(e, Event::Write(..))));
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Chown(..))),
+            "owner root must not chown to the sandbox user: {events:?}"
+        );
+    }
+
+    #[test]
+    fn real_root_walk_refuses_a_symlinked_root_component() {
+        // Widening the roots must not hand the agent a followed symlink: the
+        // root prefix is walked with O_NOFOLLOW just like the path beneath it.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("inner")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(RealTempFs.open_root(&real.join("inner")).is_ok());
+        let err = RealTempFs
+            .open_root(&link.join("inner"))
+            .err()
+            .expect("a symlinked root component must fail closed");
+        assert!(
+            matches!(err, Errno::ENOTDIR | Errno::ELOOP),
+            "unexpected errno: {err}"
+        );
+    }
+
+    #[test]
+    fn a_created_dir_under_the_home_root_is_handed_to_the_workload() {
+        // The motivating case: `~/.claude/.credentials.json`. If `.claude` were
+        // left root-owned and traverse-only, the agent could not create
+        // `settings.json` or `todos/` beside the delivered file.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![file("~/.claude/.credentials.json", "tok", None)];
+
+        write_temp_files_with(&fs, &files, Some((1000, 2000)), &home_roots()).unwrap();
+
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::MakeDir(".claude".to_string(), WORKLOAD_DIR_MODE)),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&Event::ChmodDir(".claude".to_string(), WORKLOAD_DIR_MODE)),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&Event::ChownDir(".claude".to_string(), 1000, 2000)),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_home_nested_inside_another_root_still_binds_to_the_home() {
+        // A sandbox user whose passwd home sits under /tmp puts one root inside
+        // another. The path must bind to the longest match: taking /tmp instead
+        // would give ~/.claude root-owned waypoint semantics and lock the agent
+        // out of its own home.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let roots = FileRoots::default().with_home("/tmp/sandbox").unwrap();
+        let files = vec![file("~/.claude/.credentials.json", "tok", None)];
+
+        let written = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap();
+
+        assert_eq!(written, vec!["/tmp/sandbox/.claude/.credentials.json"]);
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::MakeDir(".claude".to_string(), WORKLOAD_DIR_MODE)),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&Event::ChownDir(".claude".to_string(), 1000, 2000)),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_created_dir_under_tmp_stays_a_root_owned_waypoint() {
+        // `/tmp` is shared, so its intermediate dirs stay root-owned and
+        // unlistable — exactly what this module always did.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![file("creds/aws.json", "secret", None)];
+
+        write_temp_files_with(&fs, &files, Some((1000, 2000)), &tmp()).unwrap();
+
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::MakeDir("creds".to_string(), WAYPOINT_DIR_MODE)),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ChmodDir(..) | Event::ChownDir(..))),
+            "a /tmp waypoint must stay root-owned: {events:?}"
+        );
+    }
+
+    #[test]
+    fn an_existing_dir_is_never_chowned_or_chmoded() {
+        // Handing over a directory the walk did not create would be a
+        // privilege-escalation primitive: a policy frame naming `~/..`-free but
+        // pre-existing paths could give the workload any directory the root
+        // supervisor can traverse.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.existing_dirs.push(".claude".to_string());
+        let files = vec![file("~/.claude/.credentials.json", "tok", None)];
+
+        write_temp_files_with(&fs, &files, Some((1000, 2000)), &home_roots()).unwrap();
+
+        let events = rec.borrow().events.clone();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ChmodDir(..) | Event::ChownDir(..))),
+            "an existing directory must be left alone: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::CreateFile(..))));
+    }
+
+    #[test]
+    fn a_root_owned_file_still_lands_in_a_workload_owned_home_dir() {
+        // Directory ownership follows the root the path resolves in, not the
+        // file's `owner` — otherwise a root-owned credential file would make its
+        // whole parent directory unusable to the agent.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![TempFile {
+            path: "~/.claude/.credentials.json".to_string(),
+            content: Some("tok".to_string()),
+            content_b64: None,
+            mode: None,
+            owner: Some(FileOwner::Root),
+        }];
+
+        write_temp_files_with(&fs, &files, Some((1000, 2000)), &home_roots()).unwrap();
+
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::ChownDir(".claude".to_string(), 1000, 2000)),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Chown(..))),
+            "the file itself stays root-owned: {events:?}"
+        );
+    }
+
+    #[test]
+    fn remove_reports_a_path_it_can_no_longer_resolve() {
+        // A file written under an older root policy would otherwise be skipped
+        // in silence and never cleaned up.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+
+        let unresolved = remove_temp_files_with(
+            &fs,
+            &["/tmp/a.json".to_string(), "/var/old.json".to_string()],
+            &tmp(),
+        );
+
+        assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+        assert!(unresolved[0].contains("/var/old.json"), "{unresolved:?}");
+        let events = rec.borrow().events.clone();
+        assert!(events.contains(&Event::Unlink("a.json".to_string())));
+    }
+
+    #[test]
+    fn owner_workload_chowns_like_the_default() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![TempFile {
+            path: "workload.json".to_string(),
+            content: Some("secret".to_string()),
+            content_b64: None,
+            mode: None,
+            owner: Some(FileOwner::Workload),
+        }];
+
+        write_temp_files_with(&fs, &files, Some((1000, 2000)), &tmp()).unwrap();
+        let events = rec.borrow().events.clone();
+        assert!(events.contains(&Event::Chown("workload.json".to_string(), 1000, 2000)));
     }
 }
