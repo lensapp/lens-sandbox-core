@@ -471,7 +471,11 @@ pub enum PrivilegeDrop<'a> {
     /// Stay root and drop the capabilities by hand.
     Capabilities,
     /// An unprivileged parent has neither a uid to drop nor a capability
-    /// to lose, and `capset` would `EPERM`.
+    /// to lose, and `capset` would `EPERM`. It also cannot honour an
+    /// identity it was asked for, so a step naming `root` runs as the
+    /// parent's own identity instead; the decision warns when it does,
+    /// because the child gains nothing but the caller asked for
+    /// something it did not get.
     Nothing,
 }
 
@@ -492,7 +496,14 @@ pub fn privilege_drop_for(creds: Option<&SandboxCredentials>, is_root: bool) -> 
     match creds {
         Some(creds) if !creds.uid_gid().0.is_root() => PrivilegeDrop::Setuid(creds),
         _ if is_root => PrivilegeDrop::Capabilities,
-        _ => PrivilegeDrop::Nothing,
+        Some(creds) => {
+            tracing::warn!(
+                user = creds.user(),
+                "requested identity ignored: this parent is not root, so the child runs as the parent's own identity"
+            );
+            PrivilegeDrop::Nothing
+        }
+        None => PrivilegeDrop::Nothing,
     }
 }
 
@@ -918,6 +929,75 @@ mod tests {
             privilege_drop_for(Some(&creds_for(0, 0)), false),
             PrivilegeDrop::Nothing,
             "a parent that is not root cannot setuid to root nor capset, so there is nothing this branch could honour"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture buffer is uncontended")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("the capture buffer is uncontended"))
+                .into_owned()
+        }
+    }
+
+    /// The parent honours no identity here, so the one thing the caller
+    /// gets is the report that it did not. Without it a script that asked
+    /// for root runs as somebody else and only fails further downstream,
+    /// where nothing names the identity as the cause.
+    #[test]
+    fn an_unprivileged_parent_says_which_identity_it_ignored() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            privilege_drop_for(Some(&creds_for(0, 0)), false);
+        });
+
+        let text = captured.text();
+        assert!(
+            text.contains("requested identity ignored") && text.contains(r#"user="root""#),
+            "the warning has to name the identity that was asked for, and the sentence alone says only that somebody was ignored; got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn every_other_decision_warns_about_nothing() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            privilege_drop_for(Some(&creds_for(0, 0)), true);
+            privilege_drop_for(Some(&creds_for(65534, 65534)), true);
+            privilege_drop_for(None, false);
+        });
+
+        assert_eq!(
+            captured.text(),
+            "",
+            "a drop that happened is not news, and a warning on every spawn teaches a reader to skip the one that matters"
         );
     }
 }
