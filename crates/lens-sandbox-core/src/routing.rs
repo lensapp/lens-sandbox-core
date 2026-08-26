@@ -550,6 +550,16 @@ fn qname_matches_rule(rule: &RouteRule, lower: &str) -> bool {
     }
 }
 
+/// Whether any rule in `rules` covers `hostname` as a name. This is the
+/// caller-independent half of the condition the DNS stub pins on (see
+/// `dns::classify_query`): a caller-excluded hostname rule pins too, so a name
+/// some rule's matcher covers is pinnable under `rules`. `apply_network_policy`
+/// uses it to keep exactly the pins the new tables would produce again.
+pub(crate) fn any_rule_covers_qname(rules: &[RouteRule], hostname: &str) -> bool {
+    let lower = hostname.to_ascii_lowercase();
+    rules.iter().any(|rule| qname_matches_rule(rule, &lower))
+}
+
 /// Outcome of resolving a connection's destination against the route table.
 /// Distinguishes a plain host miss from a host match that a rule's `binaries`
 /// filter excluded, so the proxy can fail that case closed instead of leaking

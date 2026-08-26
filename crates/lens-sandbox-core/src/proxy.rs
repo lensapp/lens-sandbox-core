@@ -125,9 +125,9 @@ pub struct NetworkPolicy {
     /// Bumped every time the policy is (re)applied. The DNS stub captures it
     /// when it authorizes a lookup and hands it back at pin-insertion time; an
     /// in-flight answer whose generation no longer matches is dropped, so a
-    /// lookup authorized under a revoked policy can't reinstate its pin after
-    /// the new policy cleared it. Living under the same lock as the rules is
-    /// what keeps the capture consistent with the rule reads.
+    /// lookup authorized under a revoked policy can't reinstate a pin the new
+    /// policy's tables no longer cover. Living under the same lock as the rules
+    /// is what keeps the capture consistent with the rule reads.
     pub generation: u64,
 }
 
@@ -1897,20 +1897,27 @@ fn tcp_egress_admits(
 
 /// (Re)apply the entire network egress policy in one atomic swap: publish the
 /// L7 `routes` and their `default_verdict`/`default_transport`, the ordered
-/// `tcp_egress` rules, clear the pins from the previous policy, and bump the
-/// generation — all under one `policy` write lock. This is the ONLY entry point
-/// for changing the egress policy; it is what makes the snapshot `NetworkPolicy`
-/// promises actually atomic. Pass empty vectors / the deny defaults to reset.
+/// `tcp_egress` rules, drop every pin the new tables no longer cover, and bump
+/// the generation — all under one `policy` write lock. This is the ONLY entry
+/// point for changing the egress policy; it is what makes the snapshot
+/// `NetworkPolicy` promises actually atomic. Pass empty vectors / the deny
+/// defaults to reset.
 ///
-/// Bumping the generation in the same swap that clears the pins is what makes
+/// The pins are filtered, not cleared: a pin survives exactly when a hostname
+/// matcher in the new `tcp_egress` or `udp_egress` still covers its `qname` —
+/// see [`pins_the_next_tables_still_cover`].
+///
+/// Bumping the generation in the same swap that filters the pins is what makes
 /// [`pin_dns_answers`]'s check race-free: an in-flight answer from the old
-/// generation either inserted before this ran (and is cleared here) or runs
-/// after (and is rejected by the check), never surviving.
+/// generation either inserted before this ran (and is filtered here against the
+/// new tables) or runs after (and is rejected by the check), never landing a
+/// name the new policy does not cover.
 ///
 /// Takes the next policy as a whole `NetworkPolicy` value so callers name every
 /// field — the rules, defaults, and tcp lists can't be transposed at a call
 /// site the way positional same-typed `Vec`s could. Whatever `next` carries for
-/// `pins`/`generation` is ignored: pins always reset and the generation always
+/// `pins`/`generation` is ignored: the surviving pins come from the previous
+/// snapshot filtered against `next`'s raw tables, and the generation always
 /// advances monotonically, controlled here.
 ///
 /// Re-applying an unchanged egress policy is a no-op — policy frames also carry
@@ -1940,11 +1947,37 @@ pub fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
              apply over TCP"
         );
     }
+    let pins = pins_the_next_tables_still_cover(&policy.pins, &next);
     *policy = NetworkPolicy {
         generation: policy.generation + 1,
-        pins: HashMap::new(),
+        pins,
         ..next
     };
+}
+
+/// The subset of `pins` whose `qname` a hostname rule of the next raw tables
+/// still covers. A name neither table names loses its binding, so a revoked
+/// hostname rule takes its IPs with it; a name still covered keeps a binding the
+/// next lookup would re-establish unchanged, because a pin carries a name and no
+/// verdict.
+fn pins_the_next_tables_still_cover(
+    pins: &HashMap<IpAddr, Vec<PinnedIp>>,
+    next: &NetworkPolicy,
+) -> HashMap<IpAddr, Vec<PinnedIp>> {
+    let covered = |qname: &str| {
+        crate::routing::any_rule_covers_qname(&next.tcp_egress, qname)
+            || crate::routing::any_rule_covers_qname(&next.udp_egress, qname)
+    };
+    pins.iter()
+        .filter_map(|(ip, entries)| {
+            let kept: Vec<PinnedIp> = entries
+                .iter()
+                .filter(|p| covered(&p.qname))
+                .cloned()
+                .collect();
+            (!kept.is_empty()).then_some((*ip, kept))
+        })
+        .collect()
 }
 
 /// Record `ips` (from a DNS answer) against `qname` (the normalized name whose
@@ -1958,8 +1991,8 @@ pub fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
 ///
 /// `generation` is the policy generation in force when the lookup was
 /// authorized; if a policy has since been applied (bumping the generation and
-/// clearing pins) the answer is stale and dropped, so a lookup authorized under
-/// a now-revoked policy can't reinstate its pin.
+/// filtering the pins) the answer is stale and dropped, so a lookup authorized
+/// under a now-revoked policy can't reinstate its pin.
 ///
 /// Re-resolving the same name refreshes an existing pin's expiry rather than
 /// appending a duplicate, so a hot name's per-IP list stays bounded by the
@@ -1981,7 +2014,7 @@ pub(crate) fn pin_dns_answers(
     // Reject an answer whose authorizing policy has since been replaced. The
     // check and the generation bump happen under the same `policy` lock, so
     // there is no window where a stale pin slips in between the bump and the
-    // clear.
+    // filter.
     if policy.generation != generation {
         return;
     }
@@ -3809,7 +3842,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn applying_a_changed_policy_still_clears_the_pins() {
+    fn applying_a_changed_policy_drops_a_pin_the_new_table_no_longer_covers() {
         let (state, _rx) = test_state();
         apply_network_policy(
             &state,
@@ -3834,6 +3867,153 @@ pub(crate) mod tests {
         let policy = state.policy.read().unwrap();
         assert!(policy.pins.is_empty(), "a revoked policy's pins must go");
         assert!(policy.generation > generation);
+    }
+
+    #[test]
+    fn applying_a_changed_policy_keeps_a_pin_the_new_table_still_covers() {
+        // The ordinary "Allow always" click adds a rule and leaves the rest of
+        // the table standing. A raw-TCP connection to an already-resolved IP
+        // must keep matching its hostname rule across that reload.
+        let (state, _rx) = test_state();
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                tcp_egress: vec![fqdn_rule("db.internal", 5432, Verdict::Allow)],
+                ..Default::default()
+            },
+        );
+        let generation = state.policy.read().unwrap().generation;
+        let ip: IpAddr = "203.0.113.92".parse().unwrap();
+        pin_dns_answers(&state, &[ip], "db.internal", 300, generation);
+        assert_eq!(
+            tcp_verdict(&state, "203.0.113.92:5432", None),
+            Some(Verdict::Allow)
+        );
+
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                tcp_egress: vec![
+                    fqdn_rule("db.internal", 5432, Verdict::Allow),
+                    fqdn_rule("api.example.com", 443, Verdict::Allow),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            state.policy.read().unwrap().generation > generation,
+            "a changed policy must still bump the generation"
+        );
+        assert_eq!(
+            tcp_verdict(&state, "203.0.113.92:5432", None),
+            Some(Verdict::Allow),
+            "a pin the new table still covers must survive the reload"
+        );
+    }
+
+    #[test]
+    fn applying_a_changed_policy_keeps_a_pin_the_new_udp_table_still_covers() {
+        // One pin serves both raw tables, so the udp table alone is enough to
+        // keep a name's binding alive.
+        let (state, _rx) = test_state();
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                tcp_egress: vec![fqdn_rule("db.internal", 5432, Verdict::Allow)],
+                ..Default::default()
+            },
+        );
+        let generation = state.policy.read().unwrap().generation;
+        let ip: IpAddr = "203.0.113.93".parse().unwrap();
+        pin_dns_answers(&state, &[ip], "db.internal", 300, generation);
+
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                udp_egress: vec![fqdn_rule("db.internal", 5432, Verdict::Allow)],
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            state.policy.read().unwrap().pins.contains_key(&ip),
+            "a name the new udp table covers must keep its pin"
+        );
+    }
+
+    #[test]
+    fn applying_a_changed_policy_drops_only_the_pins_the_new_table_lost() {
+        let (state, _rx) = test_state();
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                tcp_egress: vec![
+                    fqdn_rule("db.internal", 5432, Verdict::Allow),
+                    fqdn_rule("gone.internal", 5432, Verdict::Allow),
+                ],
+                ..Default::default()
+            },
+        );
+        let generation = state.policy.read().unwrap().generation;
+        let shared: IpAddr = "203.0.113.94".parse().unwrap();
+        pin_dns_answers(&state, &[shared], "db.internal", 300, generation);
+        pin_dns_answers(&state, &[shared], "gone.internal", 300, generation);
+
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                tcp_egress: vec![fqdn_rule("db.internal", 5432, Verdict::Allow)],
+                ..Default::default()
+            },
+        );
+
+        let policy = state.policy.read().unwrap();
+        let names: Vec<&str> = policy
+            .pins
+            .get(&shared)
+            .map(|e| e.iter().map(|p| p.qname.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            names,
+            vec!["db.internal"],
+            "only the name the new table dropped loses its pin"
+        );
+    }
+
+    #[test]
+    fn a_revoked_lookup_cannot_reinstate_its_pin_even_when_the_name_survives() {
+        // Pin retention must not weaken the generation guard: an in-flight
+        // answer authorized under the old policy is still refused, whether or
+        // not the new table happens to cover the same name.
+        let (state, _rx) = test_state();
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                tcp_egress: vec![fqdn_rule("db.internal", 5432, Verdict::Allow)],
+                ..Default::default()
+            },
+        );
+        let stale_generation = state.policy.read().unwrap().generation;
+
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                tcp_egress: vec![
+                    fqdn_rule("db.internal", 5432, Verdict::Allow),
+                    fqdn_rule("api.example.com", 443, Verdict::Allow),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let ip: IpAddr = "203.0.113.95".parse().unwrap();
+        pin_dns_answers(&state, &[ip], "db.internal", 300, stale_generation);
+
+        assert!(
+            state.policy.read().unwrap().pins.is_empty(),
+            "an answer from a superseded generation must never land"
+        );
     }
 
     #[test]

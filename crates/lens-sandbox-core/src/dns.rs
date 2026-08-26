@@ -743,6 +743,100 @@ mod tests {
     }
 
     #[test]
+    fn pin_retention_predicate_agrees_with_what_the_stub_pins() {
+        // `apply_network_policy` keeps a pin iff `routing::any_rule_covers_qname`
+        // holds for one of the new raw tables; the stub creates one iff
+        // `classify_query` reports `should_pin`. The two must answer alike for
+        // the same table, or a reload keeps a pin a fresh lookup would not
+        // create (or drops one it would). An http allow for the name keeps every
+        // case an `Allow`, so `should_pin` is observable in all of them.
+        let name = "db.internal";
+        let cases = vec![
+            ("no raw rule", Vec::new(), Vec::new(), None),
+            (
+                "tcp host:port allow",
+                vec![tcp_rule(name, 5432, Verdict::Allow)],
+                Vec::new(),
+                None,
+            ),
+            (
+                "udp table only",
+                Vec::new(),
+                vec![tcp_rule(name, 53, Verdict::Allow)],
+                None,
+            ),
+            (
+                "port-scoped tcp deny",
+                vec![tcp_rule(name, 5432, Verdict::Deny)],
+                Vec::new(),
+                None,
+            ),
+            ("bare tcp deny", vec![deny_rule(name)], Vec::new(), None),
+            (
+                "wildcard domain",
+                vec![rule("*.internal")],
+                Vec::new(),
+                None,
+            ),
+            (
+                "binary rule excluding the caller",
+                vec![binary_rule(name, &["/usr/bin/curl"])],
+                Vec::new(),
+                Some(caller("/usr/bin/wget")),
+            ),
+            (
+                "binary rule admitting the caller",
+                vec![binary_rule(name, &["/usr/bin/curl"])],
+                Vec::new(),
+                Some(caller("/usr/bin/curl")),
+            ),
+            (
+                "cidr rule cannot cover a name",
+                vec![RouteRule {
+                    matcher: RouteMatcher::Cidr("203.0.113.0/24".parse().unwrap()),
+                    ..rule(name)
+                }],
+                Vec::new(),
+                None,
+            ),
+            (
+                "rule for another name",
+                vec![tcp_rule("other.internal", 5432, Verdict::Allow)],
+                Vec::new(),
+                None,
+            ),
+        ];
+
+        let mut seen_pinned = false;
+        let mut seen_unpinned = false;
+        for (label, tcp_egress, udp_egress, peer) in cases {
+            let state = state_with_routes(vec![rule(name)]);
+            {
+                let mut policy = state.policy.write().unwrap();
+                policy.tcp_egress = tcp_egress.clone();
+                policy.udp_egress = udp_egress.clone();
+            }
+            let packet = make_query(name, RecordType::A);
+            let should_pin = match classify_query(&packet, &state, peer.as_ref()) {
+                Decision::Allow { should_pin, .. } => should_pin,
+                other => panic!("{label}: expected Allow, got: {}", describe(&other)),
+            };
+            let retained = crate::routing::any_rule_covers_qname(&tcp_egress, name)
+                || crate::routing::any_rule_covers_qname(&udp_egress, name);
+            assert_eq!(
+                should_pin, retained,
+                "{label}: the stub pins {should_pin} but a reload retains {retained}"
+            );
+            seen_pinned |= should_pin;
+            seen_unpinned |= !should_pin;
+        }
+        assert!(
+            seen_pinned && seen_unpinned,
+            "the matrix must exercise both answers, or the agreement is vacuous"
+        );
+    }
+
+    #[test]
     fn classify_pairs_routes_and_fqdn_from_one_snapshot() {
         // The DNS verdict pairs an L7-route match with an FQDN-derived pin, so
         // both must come from the same policy snapshot. The race this guards
