@@ -266,6 +266,17 @@ fn split_user_spec(spec: &str) -> Result<(&str, Option<&str>), String> {
     Ok((name, group))
 }
 
+/// A segment read as a bare id, which is all an image's `USER`
+/// directive can carry. `str::parse` would also take a signed `+0`, a
+/// shape no table ever answered and no directive ever wrote.
+fn as_id(segment: &str) -> Option<u32> {
+    segment
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| segment.parse().ok())
+        .flatten()
+}
+
 /// Resolved sandbox uid/gid/home, cached at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCredentials {
@@ -353,12 +364,10 @@ impl SandboxCredentials {
         let (name, group) = split_user_spec(spec)?;
         let uid = passwd
             .uid_of(name)
-            .or_else(|| name.parse::<u32>().ok())
+            .or_else(|| as_id(name))
             .ok_or_else(|| format!("no user {name:?} in passwd"))?;
         let gid = match group {
-            Some(group) => group
-                .parse::<u32>()
-                .ok()
+            Some(group) => as_id(group)
                 .or_else(|| passwd.gid_of_group(group))
                 .ok_or_else(|| format!("no group {group:?} in the group file"))?,
             None => passwd.primary_gid_of(name).unwrap_or(uid),
@@ -807,6 +816,25 @@ mod tests {
         assert!(
             err.contains("nobody-here"),
             "falling back would run as an identity nobody named, and root is the likeliest thing it would fall back to; got: {err}"
+        );
+    }
+
+    #[test]
+    fn only_digits_are_read_as_an_id() {
+        for spec in ["+0", " 7", "node:+50", "node:0x10"] {
+            assert!(
+                SandboxCredentials::resolve_user_spec(spec, &image()).is_err(),
+                "an id is what an image's USER directive can carry, and no directive wrote this — reading it as a number would resolve a spec no table ever answered: {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leading_zero_still_reads_as_decimal() {
+        assert_eq!(
+            ids("node:010", &image()),
+            (1000, 10),
+            "a leading zero is the one digits-only shape that could mean two things, and octal is not what the number says"
         );
     }
 
