@@ -47,3 +47,4 @@ path = "src/bin/generate_policy_schema.rs"
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
