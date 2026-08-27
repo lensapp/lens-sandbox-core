@@ -100,18 +100,17 @@ pub async fn wait_with_signal_forwarding(
 /// number against `kill -l` expects. A child with neither, which the
 /// platform should not produce, reports a plain failure rather than
 /// success.
-#[cfg(unix)]
+///
+/// Unix only, and unguarded on purpose: the crate calls
+/// `Command::pre_exec` in `privilege.rs`, which tokio defines only for
+/// unix, so a non-unix build fails long before it reaches this line. A
+/// second arm here would report a portability this crate does not have.
 pub fn exit_code_of(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(1)
-}
-
-#[cfg(not(unix))]
-pub fn exit_code_of(status: ExitStatus) -> i32 {
-    status.code().unwrap_or(1)
 }
 
 /// Send SIGTERM to the child. Safe to call once: `child.id()` only
