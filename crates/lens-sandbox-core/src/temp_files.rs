@@ -58,13 +58,11 @@ struct Root {
 /// the allowed roots; anything else is refused before a single syscall runs.
 ///
 /// The default is `/tmp` alone, which is the whole path policy this module used
-/// to hardcode. Widening it is an explicit caller decision, and the method that
-/// does it names what happens to the directories it creates: a root added
-/// through [`Self::allow_workload_owned`] hands them to the sandbox user, while
-/// the default `/tmp` keeps them root-owned and traverse-only. A path binds to
-/// the longest root that contains it, and to the last-added of two equal ones, so
-/// a home nested inside another root — or duplicating one — still gets its own
-/// policy.
+/// to hardcode. The only widening is the sandbox home, whose created directories
+/// are handed to the workload, while the default `/tmp` keeps them root-owned
+/// and traverse-only. A path binds to the longest root that contains it, and to
+/// the last-added of two equal ones, so a home nested inside another root — or
+/// duplicating one — still gets its own policy.
 #[derive(Debug, Clone)]
 pub struct FileRoots {
     roots: Vec<Root>,
@@ -118,23 +116,9 @@ impl FileRoots {
         }
     }
 
-    /// Allow one more root whose created directories the workload owns. The
-    /// hand-over is in the name because a root added later must state it rather
-    /// than inherit whatever the last one chose. A root is absolute and
-    /// lexically plain — one carrying `.` or `..` is a configuration error, not
-    /// something to normalise away.
-    pub fn allow_workload_owned(mut self, root: impl AsRef<Path>) -> Result<Self, String> {
-        self.roots.push(Root {
-            components: root_components(root.as_ref())?,
-            new_dirs: NewDirs::WorkloadOwned,
-            from_home: false,
-        });
-        Ok(self)
-    }
-
     /// Set the home directory a leading `~` expands against, and allow it as a
     /// root.
-    pub fn with_home(mut self, home: impl AsRef<Path>) -> Result<Self, String> {
+    fn with_home(mut self, home: impl AsRef<Path>) -> Result<Self, String> {
         let components = root_components(home.as_ref())?;
         if components.is_empty() {
             return Err("sandbox home must not be the filesystem root".to_string());
@@ -214,7 +198,15 @@ impl FileRoots {
     /// and binds to the longest of them — the last added, where two are equal, so
     /// a home that duplicates an existing root still gets its own policy.
     fn resolve(&self, requested: &str) -> Result<ResolvedPath, String> {
+        if requested.is_empty() {
+            return Err("temp file path is empty".to_string());
+        }
         let absolute = self.to_absolute(requested)?;
+        if self.roots.iter().any(|r| r.components == absolute) {
+            return Err(format!(
+                "temp file path names no file under it: {requested}"
+            ));
+        }
 
         let mut best: Option<&Root> = None;
         for root in &self.roots {
@@ -242,7 +234,11 @@ impl FileRoots {
 
         if bytes.first() == Some(&b'~') {
             let rest = match bytes.get(1) {
-                None => return Err(format!("temp file path is empty: {requested}")),
+                None => {
+                    return Err(format!(
+                        "temp file path names no file under it: {requested}"
+                    ));
+                }
                 Some(&b'/') => &bytes[2..],
                 Some(_) => {
                     return Err(format!(
@@ -554,7 +550,7 @@ fn write_one(
     resolved: &ResolvedPath,
     content: &[u8],
     mode: Option<u32>,
-    creds: Option<(u32, u32)>,
+    file_owner: Option<(u32, u32)>,
     workload: Option<(u32, u32)>,
 ) -> Result<String, String> {
     let display = resolved.display();
@@ -576,7 +572,7 @@ fn write_one(
     file.chmod(file_mode)
         .map_err(|e| format!("chmod {display}: {e}"))?;
 
-    if let Some((uid, gid)) = creds {
+    if let Some((uid, gid)) = file_owner {
         file.chown(uid, gid)
             .map_err(|e| format!("chown {display}: {e}"))?;
     }
@@ -806,15 +802,27 @@ mod tests {
 
     #[test]
     fn reject_empty_path() {
-        assert!(tmp().resolve("").is_err());
-        assert!(tmp().resolve("/tmp").is_err());
+        // Three mistakes, three messages: nothing at all, a root with no file
+        // under it, and the home with no file under it. This error is what gets
+        // logged when a whole batch is dropped, so it has to say which one the
+        // sender wrote rather than trailing off after the colon.
+        let home = FileRoots::default().with_home("/home/sandbox").unwrap();
+        for (roots, path, want) in [
+            (tmp(), "", "is empty"),
+            (tmp(), "/tmp", "names no file"),
+            (home, "~", "names no file"),
+        ] {
+            let err = roots.resolve(path).unwrap_err();
+            assert!(
+                err.contains(want),
+                "{path:?} should say {want:?}, got: {err}"
+            );
+        }
     }
 
     #[test]
     fn reject_path_outside_the_allowed_roots() {
-        let roots = FileRoots::default()
-            .allow_workload_owned("/opt/lens")
-            .unwrap();
+        let roots = FileRoots::default().with_home("/opt/lens").unwrap();
         let err = roots.resolve("/etc/passwd").unwrap_err();
         assert!(err.contains("/etc/passwd"), "{err}");
         assert!(roots.resolve("/opt/lens/x.json").is_ok());
@@ -823,9 +831,7 @@ mod tests {
 
     #[test]
     fn reject_root_prefix_that_is_only_a_string_prefix() {
-        let roots = FileRoots::default()
-            .allow_workload_owned("/opt/lens")
-            .unwrap();
+        let roots = FileRoots::default().with_home("/opt/lens").unwrap();
         assert!(roots.resolve("/opt/lens-evil/x").is_err());
         assert!(roots.resolve("/tmpfoo/x").is_err());
     }
@@ -861,16 +867,8 @@ mod tests {
 
     #[test]
     fn a_root_must_be_absolute_and_lexically_safe() {
-        assert!(
-            FileRoots::default()
-                .allow_workload_owned("relative/dir")
-                .is_err()
-        );
-        assert!(
-            FileRoots::default()
-                .allow_workload_owned("/opt/../etc")
-                .is_err()
-        );
+        assert!(FileRoots::default().with_home("relative/dir").is_err());
+        assert!(FileRoots::default().with_home("/opt/../etc").is_err());
         assert!(FileRoots::default().with_home("/").is_err());
     }
 
