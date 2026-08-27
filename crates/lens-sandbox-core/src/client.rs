@@ -1152,14 +1152,13 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     // all three; see `refresh_policy_files_with`.
     {
         let old_paths = state.previous_policy_files.read().unwrap().clone();
-        // `/tmp` plus the sandbox user's home, so a `~/…` policy path resolves
-        // without opening the rest of the filesystem to the policy frame.
-        let roots = crate::temp_files::FileRoots::for_sandbox(state.sandbox_creds.as_ref());
+        // The roots — `/tmp` plus the sandbox user's home, so a `~/…` policy
+        // path resolves without opening the rest of the filesystem — come from
+        // these same credentials, inside the call.
         if let Some(tracked) = crate::temp_files::refresh_policy_files(
             &old_paths,
             msg.files.as_deref(),
             state.sandbox_creds.as_ref(),
-            &roots,
         )
         .await
         {
