@@ -49,6 +49,9 @@ impl NewDirs {
 struct Root {
     components: Vec<OsString>,
     new_dirs: NewDirs,
+    /// Set only on the root `with_home` pushed, so refusing the home removes
+    /// that one root and never a same-valued root somebody else added.
+    from_home: bool,
 }
 
 /// Where policy files may land. Every requested path must resolve inside one of
@@ -78,6 +81,7 @@ impl Default for FileRoots {
                     .map(OsString::from)
                     .collect(),
                 new_dirs: NewDirs::Waypoint,
+                from_home: false,
             }],
             home: None,
         }
@@ -123,6 +127,7 @@ impl FileRoots {
         self.roots.push(Root {
             components: root_components(root.as_ref())?,
             new_dirs: NewDirs::WorkloadOwned,
+            from_home: false,
         });
         Ok(self)
     }
@@ -138,8 +143,58 @@ impl FileRoots {
         self.roots.push(Root {
             components,
             new_dirs: NewDirs::WorkloadOwned,
+            from_home: true,
         });
         Ok(self)
+    }
+
+    /// Drop a sandbox home this machine cannot safely use as a root, so an
+    /// unusable home costs `~/` expansion rather than the whole batch.
+    ///
+    /// The home comes from passwd, which a custom image controls, so it is the
+    /// one root that has to earn its place: a home pointing somewhere the
+    /// sandbox user does not own would let `owner: root` plant a file in a
+    /// privileged directory. The check reads the uid off the fd `open_root`
+    /// returns rather than off the path, so it describes the inode the walk
+    /// opened. It is still advisory across calls — the walk re-opens by path
+    /// later, so a rename between the two is not covered; `O_NOFOLLOW` means a
+    /// swap to a symlink fails closed, and a swap to another real directory the
+    /// sandbox user owns grants nothing it did not already have.
+    fn usable(&self, fs: &dyn TempFs, sandbox_uid: Option<u32>) -> Self {
+        let Some(home) = &self.home else {
+            return self.clone();
+        };
+        let path = render(home, &[]);
+        let refuse = |reason: String| {
+            tracing::warn!(
+                home = %path.display(),
+                reason,
+                "refusing the sandbox home as a policy-file root; `~/` paths will be refused"
+            );
+            Self {
+                roots: self
+                    .roots
+                    .iter()
+                    .filter(|r| !r.from_home)
+                    .cloned()
+                    .collect(),
+                home: None,
+            }
+        };
+        let dir = match fs.open_root(&path) {
+            Ok(dir) => dir,
+            Err(e) => return refuse(format!("it cannot be opened ({e})")),
+        };
+        match (dir.owner_uid(), sandbox_uid) {
+            (_, None) => {
+                refuse("the sandbox uid is unknown, so its ownership cannot be checked".to_string())
+            }
+            (Err(e), _) => refuse(format!("its owner cannot be read ({e})")),
+            (Ok(owner), Some(uid)) if owner != uid => refuse(format!(
+                "it is owned by uid {owner}, not the sandbox user {uid}"
+            )),
+            _ => self.clone(),
+        }
     }
 
     fn primary(&self) -> &[OsString] {
@@ -301,6 +356,9 @@ trait DirHandle {
     /// Remove an empty child directory. Only ever called on one this walk just
     /// created, to undo an open or a hand-over that failed after the mkdir.
     fn remove_child_dir(&self, name: &OsStr) -> Result<(), Errno>;
+    /// The uid owning this directory, read from the open fd rather than the
+    /// path, so the answer describes the inode the caller already holds.
+    fn owner_uid(&self) -> Result<u32, Errno>;
     fn chown(&self, uid: u32, gid: u32) -> Result<(), Errno>;
     fn chmod(&self, mode: u32) -> Result<(), Errno>;
 }
@@ -340,6 +398,7 @@ fn write_temp_files_with(
     // That residue is harmless — empty directories that the next refresh's
     // EEXIST-tolerant `mkdirat` + `O_NOFOLLOW` `openat` re-traverses cleanly — so
     // a fully clean, dir-inclusive rollback isn't worth the extra unwind.
+    let roots = &roots.usable(fs, creds.map(|(uid, _)| uid));
     let mut written = Vec::with_capacity(files.len());
     for f in files {
         let result = roots.resolve(&f.path).and_then(|resolved| {
@@ -541,6 +600,10 @@ pub async fn remove_temp_files(paths: &[String], roots: &FileRoots) {
     }
 }
 
+/// Deliberately does not call [`FileRoots::usable`]: these paths are ones the
+/// writer produced and recorded, so re-validating them against roots that may
+/// have changed since could strand a file this process created. `O_NOFOLLOW`
+/// still guards the walk.
 fn remove_temp_files_with(fs: &dyn TempFs, paths: &[String], roots: &FileRoots) -> Vec<String> {
     let mut unresolved = Vec::new();
     for path in paths {
@@ -608,6 +671,10 @@ impl DirHandle for RealDir {
             name.as_bytes(),
             nix::unistd::UnlinkatFlags::RemoveDir,
         )
+    }
+
+    fn owner_uid(&self) -> Result<u32, Errno> {
+        nix::sys::stat::fstat(&self.0).map(|st| st.st_uid)
     }
 
     fn chown(&self, uid: u32, gid: u32) -> Result<(), Errno> {
@@ -869,6 +936,12 @@ mod tests {
         write_err: Option<Errno>,
         // If set, opening a child directory returns this error.
         open_err: Option<Errno>,
+        // Roots that cannot be opened at all, as an absent home would be.
+        unopenable_roots: Vec<String>,
+        // The uid every directory reports as its owner.
+        dir_uid: u32,
+        // If set, reading a directory's owner returns this error.
+        owner_uid_err: Option<Errno>,
     }
 
     impl FakeTempFs {
@@ -881,6 +954,9 @@ mod tests {
                 chown_err: None,
                 write_err: None,
                 open_err: None,
+                unopenable_roots: Vec::new(),
+                dir_uid: 1000,
+                owner_uid_err: None,
             }
         }
     }
@@ -894,6 +970,8 @@ mod tests {
         chown_err: Option<Errno>,
         write_err: Option<Errno>,
         open_err: Option<Errno>,
+        dir_uid: u32,
+        owner_uid_err: Option<Errno>,
     }
 
     struct FakeFile {
@@ -905,6 +983,12 @@ mod tests {
 
     impl TempFs for FakeTempFs {
         fn open_root(&self, root: &Path) -> Result<Box<dyn DirHandle>, Errno> {
+            if self
+                .unopenable_roots
+                .contains(&root.to_string_lossy().to_string())
+            {
+                return Err(Errno::ENOENT);
+            }
             Ok(Box::new(FakeDir {
                 recorder: self.recorder.clone(),
                 name: root.to_string_lossy().to_string(),
@@ -914,6 +998,8 @@ mod tests {
                 chown_err: self.chown_err,
                 write_err: self.write_err,
                 open_err: self.open_err,
+                dir_uid: self.dir_uid,
+                owner_uid_err: self.owner_uid_err,
             }))
         }
     }
@@ -940,6 +1026,8 @@ mod tests {
                 chown_err: self.chown_err,
                 write_err: self.write_err,
                 open_err: self.open_err,
+                dir_uid: self.dir_uid,
+                owner_uid_err: self.owner_uid_err,
             }))
         }
 
@@ -976,6 +1064,13 @@ mod tests {
             let n = name.to_string_lossy().to_string();
             self.recorder.borrow_mut().events.push(Event::RemoveDir(n));
             Ok(())
+        }
+
+        fn owner_uid(&self) -> Result<u32, Errno> {
+            match self.owner_uid_err {
+                Some(e) => Err(e),
+                None => Ok(self.dir_uid),
+            }
         }
 
         fn unlink_child(&self, name: &OsStr) -> Result<(), Errno> {
@@ -1420,6 +1515,121 @@ mod tests {
         assert!(
             events.contains(&Event::ChownDir(".claude".to_string(), 1000, 2000)),
             "{events:?}"
+        );
+    }
+
+    #[test]
+    fn refusing_a_home_that_duplicates_a_root_keeps_the_root() {
+        // /tmp is uid 0 in every image, so a passwd home of exactly /tmp always
+        // fails the ownership check. Removing the home by value would take the
+        // hardcoded default with it and refuse the entire batch.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.dir_uid = 0;
+        let roots = FileRoots::default().with_home("/tmp").unwrap();
+        let files = vec![file("/tmp/aws.json", "secret", None)];
+
+        let written = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap();
+
+        assert_eq!(written, vec!["/tmp/aws.json"]);
+    }
+
+    #[test]
+    fn refusing_a_home_that_duplicates_a_root_keeps_the_primary() {
+        // The same collateral, seen through a relative path: it resolves under
+        // the primary root, which is gone entirely if the refusal over-removes.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.dir_uid = 0;
+        let roots = FileRoots::default().with_home("/tmp").unwrap();
+        let files = vec![file("aws.json", "secret", None)];
+
+        let written = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap();
+
+        assert_eq!(written, vec!["/tmp/aws.json"]);
+    }
+
+    #[test]
+    fn a_home_whose_owner_cannot_be_read_is_refused() {
+        // The third refusal reason. An fstat that fails leaves the ownership
+        // question unanswered, and unanswered is not the same as answered yes.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.owner_uid_err = Some(Errno::EACCES);
+        let roots = FileRoots::default().with_home("/etc/cron.d").unwrap();
+        let files = vec![file("~/payload", "x", None)];
+
+        let err = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap_err();
+
+        assert!(err.contains("no sandbox home is known"), "got: {err}");
+        let events = rec.borrow().events.clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::CreateFile(..))),
+            "a home whose owner we could not read must not be written to: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_home_is_refused_when_the_sandbox_uid_is_unknown() {
+        // Nothing to compare the owner against is not a pass. This module fails
+        // closed, and an unverifiable home is exactly the escalation vector the
+        // ownership check exists to shut.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.dir_uid = 0;
+        let roots = FileRoots::default().with_home("/etc/cron.d").unwrap();
+        let files = vec![file("~/payload", "x", None)];
+
+        let err = write_temp_files_with(&fs, &files, None, &roots).unwrap_err();
+
+        assert!(err.contains("no sandbox home is known"), "got: {err}");
+        let events = rec.borrow().events.clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::CreateFile(..))),
+            "an unverifiable home must not be written to: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_home_the_sandbox_user_does_not_own_is_refused_as_a_root() {
+        // passwd is image-controlled, so a home can point at a privileged
+        // directory. Trusting it would let `owner: root` plant a file there.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.dir_uid = 0;
+        let roots = FileRoots::default().with_home("/etc/cron.d").unwrap();
+        let files = vec![file("~/payload", "x", None)];
+
+        let err = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap_err();
+
+        assert!(
+            err.contains("no sandbox home is known"),
+            "the refusal must read as a missing home, not a mangled path: {err}"
+        );
+        let events = rec.borrow().events.clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::CreateFile(..))),
+            "nothing may land under a home we refused: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_home_that_is_not_there_is_refused_before_the_walk_reaches_it() {
+        // A user made without -m has a passwd home that does not exist. Caught
+        // up front it reads as a missing home; left to the walk it surfaces as
+        // an ENOENT on a root the operator never named, which is the same
+        // outcome described far less usefully.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.unopenable_roots = vec!["/home/sandbox".to_string()];
+        let roots = FileRoots::default().with_home("/home/sandbox").unwrap();
+        let files = vec![file("~/.claude/creds", "tok", None)];
+
+        let err = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap_err();
+
+        assert!(
+            err.contains("no sandbox home is known"),
+            "an absent home must read as a missing home, not as a failed walk: {err}"
         );
     }
 
