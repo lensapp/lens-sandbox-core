@@ -89,7 +89,11 @@ fn apply_privilege_drop(cmd: &mut Command, spec: &ChildSpec) {
     match crate::privilege::privilege_drop_for(spec.creds.as_ref(), spec.is_root) {
         crate::privilege::PrivilegeDrop::Setuid(creds) => creds.apply(cmd),
         crate::privilege::PrivilegeDrop::Capabilities => crate::privilege::apply_cap_drop(cmd),
-        crate::privilege::PrivilegeDrop::Nothing => {}
+        // An unprivileged parent honours no identity. `privilege_drop_for`
+        // has already warned with the one it ignored; a caller that cannot
+        // accept the substitute reads `requested` for itself before it
+        // builds a spec.
+        crate::privilege::PrivilegeDrop::Nothing { .. } => {}
     }
 }
 

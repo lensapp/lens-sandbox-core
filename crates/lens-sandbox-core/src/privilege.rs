@@ -471,12 +471,25 @@ pub enum PrivilegeDrop<'a> {
     /// Stay root and drop the capabilities by hand.
     Capabilities,
     /// An unprivileged parent has neither a uid to drop nor a capability
-    /// to lose, and `capset` would `EPERM`. It also cannot honour an
-    /// identity it was asked for, so a step naming `root` runs as the
-    /// parent's own identity instead; the decision warns when it does,
-    /// because the child gains nothing but the caller asked for
-    /// something it did not get.
-    Nothing,
+    /// to lose, and `capset` would `EPERM`.
+    ///
+    /// It also cannot honour a **root** identity it was asked for, so a
+    /// step naming `root` runs as the parent's own identity instead. Only
+    /// root: a non-root identity still takes [`Setuid`] here and fails at
+    /// spawn with `EPERM` — even the parent's own identity, because
+    /// [`SandboxCredentials::apply`] opens with `setgroups`, which wants
+    /// `CAP_SETGID` whatever the list holds. That asymmetry is what a
+    /// reader arrives with.
+    ///
+    /// `requested` carries the identity that was ignored, so a caller
+    /// that cannot use a lesser one can refuse rather than let a script
+    /// half-do its work under the wrong ownership. The decision also
+    /// warns, for callers that do not look.
+    ///
+    /// [`Setuid`]: PrivilegeDrop::Setuid
+    Nothing {
+        requested: Option<&'a SandboxCredentials>,
+    },
 }
 
 /// Decide how a child gives up privilege.
@@ -501,9 +514,11 @@ pub fn privilege_drop_for(creds: Option<&SandboxCredentials>, is_root: bool) -> 
                 user = creds.user(),
                 "requested identity ignored: this parent is not root, so the child runs as the parent's own identity"
             );
-            PrivilegeDrop::Nothing
+            PrivilegeDrop::Nothing {
+                requested: Some(creds),
+            }
         }
-        None => PrivilegeDrop::Nothing,
+        None => PrivilegeDrop::Nothing { requested: None },
     }
 }
 
@@ -918,17 +933,23 @@ mod tests {
     fn an_unprivileged_parent_drops_nothing() {
         assert_eq!(
             privilege_drop_for(None, false),
-            PrivilegeDrop::Nothing,
+            PrivilegeDrop::Nothing { requested: None },
             "capset would EPERM, and there is no cage to break out of when the parent never had the capability"
         );
     }
 
+    /// The identity travels with the decision, not only into a log line.
+    /// A caller that cannot let a script run under the wrong ownership
+    /// has to be able to read what it did not get and refuse.
     #[test]
-    fn an_unprivileged_parent_naming_root_drops_nothing() {
+    fn an_unprivileged_parent_naming_root_reports_the_identity_it_dropped() {
+        let root = creds_for(0, 0);
         assert_eq!(
-            privilege_drop_for(Some(&creds_for(0, 0)), false),
-            PrivilegeDrop::Nothing,
-            "a parent that is not root cannot setuid to root nor capset, so there is nothing this branch could honour"
+            privilege_drop_for(Some(&root), false),
+            PrivilegeDrop::Nothing {
+                requested: Some(&root)
+            },
+            "a parent that is not root cannot setuid to root nor capset, so it honours nothing — but it must still say whose identity it ignored"
         );
     }
 
