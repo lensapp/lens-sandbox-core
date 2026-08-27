@@ -365,6 +365,77 @@ trait FileHandle {
     fn chmod(&self, mode: u32) -> Result<(), Errno>;
 }
 
+/// Replace the policy files on disk, and say what the caller should now track.
+///
+/// The order is the whole point and is why this is one function rather than
+/// three calls at the call site: the batch is resolved and decoded first, and
+/// the previous set is removed only once the new one is known to be
+/// well-formed. A frame that cannot be prepared leaves the last good set
+/// exactly where it was.
+///
+/// `None` means "leave the tracked set alone" — nothing was removed, so the
+/// paths the caller already holds still describe what is on disk. `Some(paths)`
+/// means "the tracked set is now this", empty included.
+fn refresh_policy_files_with(
+    fs: &dyn TempFs,
+    old_paths: &[String],
+    files: Option<&[TempFile]>,
+    creds: Option<(u32, u32)>,
+    roots: &FileRoots,
+) -> Option<Vec<String>> {
+    let prepared = match files.filter(|f| !f.is_empty()) {
+        None => None,
+        Some(files) => match prepare_with(fs, files, creds, roots) {
+            Ok(prepared) => Some(prepared),
+            Err(e) => {
+                tracing::warn!(
+                    "refusing a malformed policy file set; keeping the previous one: {e}"
+                );
+                return None;
+            }
+        },
+    };
+
+    for reason in remove_temp_files_with(fs, old_paths, roots) {
+        tracing::warn!(
+            reason,
+            "policy file left in place: it is no longer removable"
+        );
+    }
+
+    let Some(prepared) = prepared else {
+        return Some(Vec::new());
+    };
+    match write_prepared_with(fs, &prepared) {
+        Ok(paths) => {
+            tracing::info!(count = paths.len(), "wrote policy files");
+            Some(paths)
+        }
+        Err(e) => {
+            // All-or-nothing: the rollback removed whatever this batch created,
+            // and the previous set went above, so nothing policy-written remains.
+            tracing::warn!("Failed to write policy files: {e}");
+            Some(Vec::new())
+        }
+    }
+}
+
+/// The real-filesystem entry point for the refresh described below.
+pub async fn refresh_policy_files(
+    old_paths: &[String],
+    files: Option<&[TempFile]>,
+    sandbox_creds: Option<&SandboxCredentials>,
+    roots: &FileRoots,
+) -> Option<Vec<String>> {
+    refresh_policy_files_with(
+        &RealTempFs,
+        old_paths,
+        files,
+        raw_creds(sandbox_creds),
+        roots,
+    )
+}
+
 fn raw_creds(sandbox_creds: Option<&SandboxCredentials>) -> Option<(u32, u32)> {
     sandbox_creds.map(|c| {
         let (uid, gid) = c.uid_gid();
@@ -372,27 +443,9 @@ fn raw_creds(sandbox_creds: Option<&SandboxCredentials>) -> Option<(u32, u32)> {
     })
 }
 
-/// Resolve and decode a batch before the caller destroys anything.
-///
-/// Split from [`write_prepared`] so a malformed entry cannot cost the working
-/// set: every failure that does not need a syscall happens here, while the
-/// previous files are still on disk and still the caller's to keep.
-pub async fn prepare_temp_files(
-    files: &[TempFile],
-    sandbox_creds: Option<&SandboxCredentials>,
-    roots: &FileRoots,
-) -> Result<Prepared, String> {
-    prepare_with(&RealTempFs, files, raw_creds(sandbox_creds), roots)
-}
-
-/// Write what [`prepare_temp_files`] accepted. All-or-nothing.
-pub async fn write_prepared(prepared: &Prepared) -> Result<Vec<String>, String> {
-    write_prepared_with(&RealTempFs, prepared)
-}
-
 /// One entry, resolved and decoded, with nothing left to fail but the syscalls.
 #[derive(Debug)]
-pub struct Prepared {
+struct Prepared {
     entries: Vec<PreparedFile>,
     /// Carried from prepare so the write phase cannot be handed a different
     /// sandbox user — or none — and silently skip every directory hand-over.
@@ -649,22 +702,6 @@ fn write_one(
     Ok(display)
 }
 
-/// Symlink-safe removal of previously-written temp files. Each path is
-/// re-validated and re-walked with `O_NOFOLLOW`, so a parent component the
-/// agent swapped for a symlink between refreshes can't redirect the root
-/// supervisor's unlink at an attacker-chosen target — the same hazard the write
-/// path guards against. Already-gone and planted-symlink paths are skipped
-/// silently. A path that no longer resolves inside the allowed roots is
-/// reported, because it names a file this cleanup is leaving behind.
-pub async fn remove_temp_files(paths: &[String], roots: &FileRoots) {
-    for reason in remove_temp_files_with(&RealTempFs, paths, roots) {
-        tracing::warn!(
-            reason,
-            "policy file left in place: it is no longer removable"
-        );
-    }
-}
-
 /// Deliberately does not call [`FileRoots::usable`]: these paths are ones the
 /// writer produced and recorded, so re-validating them against roots that may
 /// have changed since could strand a file this process created. `O_NOFOLLOW`
@@ -876,6 +913,7 @@ mod tests {
         // costs that entry and not every credential the guest already had.
         let rec = Rc::new(RefCell::new(Recorder::default()));
         let fs = FakeTempFs::new(rec.clone());
+        let roots = home_roots();
         let files = vec![
             file("/tmp/good.json", "fine", None),
             TempFile {
@@ -887,13 +925,136 @@ mod tests {
             },
         ];
 
-        let err = prepare_with(&fs, &files, Some((1000, 2000)), &tmp()).unwrap_err();
+        let err = prepare_with(&fs, &files, Some((1000, 2000)), &roots).unwrap_err();
 
         assert!(err.contains("bad.json"), "got: {err}");
         let events = rec.borrow().events.clone();
         assert!(
             events.iter().all(|e| matches!(e, Event::OpenRoot(_))),
             "preparing may read the roots and do nothing else: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_batch_leaves_the_previous_files_alone() {
+        // The state the old ordering could not reach: the frame is malformed, so
+        // nothing is removed and the caller keeps tracking files that are still
+        // on disk. Returning Some(vec![]) here would orphan every one of them.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let malformed = vec![TempFile {
+            path: "/tmp/bad.json".to_string(),
+            content: None,
+            content_b64: None,
+            mode: None,
+            owner: None,
+        }];
+
+        let tracked = refresh_policy_files_with(
+            &fs,
+            &["/tmp/old.json".to_string()],
+            Some(&malformed),
+            Some((1000, 2000)),
+            &tmp(),
+        );
+
+        assert!(
+            tracked.is_none(),
+            "a refused batch must not retrack anything"
+        );
+        let events = rec.borrow().events.clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Unlink(_))),
+            "the previous set must survive a batch that never got written: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_fails_to_write_clears_the_tracked_set() {
+        // Here the removal did happen, and the rollback took back what this
+        // batch created, so nothing policy-written is left to track.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.write_err = Some(Errno::ENOSPC);
+        let files = vec![file("/tmp/new.json", "x", None)];
+
+        let tracked = refresh_policy_files_with(
+            &fs,
+            &["/tmp/old.json".to_string()],
+            Some(&files),
+            Some((1000, 2000)),
+            &tmp(),
+        );
+
+        assert_eq!(tracked, Some(Vec::new()));
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Unlink(_))),
+            "the previous set is removed before the write is attempted: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_writes_tracks_what_it_wrote() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![file("/tmp/new.json", "x", None)];
+
+        let tracked = refresh_policy_files_with(
+            &fs,
+            &["/tmp/old.json".to_string()],
+            Some(&files),
+            Some((1000, 2000)),
+            &tmp(),
+        );
+
+        assert_eq!(tracked, Some(vec!["/tmp/new.json".to_string()]));
+    }
+
+    #[test]
+    fn an_empty_batch_clears_the_tracked_set() {
+        // A frame carrying `files: []` and one carrying no `files` key at all
+        // mean the same thing, and the predicate that collapses them is only
+        // exercised by the first.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+
+        for files in [None, Some(&[][..])] {
+            let tracked = refresh_policy_files_with(
+                &fs,
+                &["/tmp/old.json".to_string()],
+                files,
+                Some((1000, 2000)),
+                &tmp(),
+            );
+            assert_eq!(tracked, Some(Vec::new()), "for {files:?}");
+        }
+    }
+
+    #[test]
+    fn a_tracked_path_that_no_longer_resolves_neither_unlinks_nor_fails_the_batch() {
+        // A home usable last refresh can be refused this one, stranding a
+        // tracked path outside every root. The batch still has to land, and a
+        // path that is no longer ours must not be unlinked. That it is also
+        // warned about is not pinned here — nothing in this module captures
+        // tracing output.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![file("/tmp/new.json", "x", None)];
+
+        let tracked = refresh_policy_files_with(
+            &fs,
+            &["/etc/passwd".to_string()],
+            Some(&files),
+            Some((1000, 2000)),
+            &tmp(),
+        );
+
+        assert_eq!(tracked, Some(vec!["/tmp/new.json".to_string()]));
+        let events = rec.borrow().events.clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Unlink(_))),
+            "a path outside the roots is not ours to unlink: {events:?}"
         );
     }
 

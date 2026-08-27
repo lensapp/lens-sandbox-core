@@ -1146,61 +1146,24 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         state.aws_resign.update(aws_config_map, aws_domains);
     }
 
-    // Write persistent files from policy (e.g. AWS credential files, synthetic kubeconfig).
-    // Remove every previously-written file before recreating so the symlink-safe
-    // O_EXCL create never collides with a file we ourselves own from the last refresh;
-    // a residual collision then means a hostile pre-plant and fails closed.
+    // Write persistent files from policy (e.g. AWS credential files, synthetic
+    // kubeconfig). The ordering — prepare, then remove, then write — and the
+    // bookkeeping for each outcome live in `temp_files` where a fake can drive
+    // all three; see `refresh_policy_files_with`.
     {
         let old_paths = state.previous_policy_files.read().unwrap().clone();
         // `/tmp` plus the sandbox user's home, so a `~/…` policy path resolves
         // without opening the rest of the filesystem to the policy frame.
         let roots = crate::temp_files::FileRoots::for_sandbox(state.sandbox_creds.as_ref());
-
-        // Resolve and decode the whole batch before removing anything. Every
-        // cheap way a frame can be malformed is caught here, while the previous
-        // files are still on disk — otherwise one bad entry costs the guest every
-        // credential it already had, and the only trace is this warning.
-        let prepared = match msg.files.as_deref().filter(|f| !f.is_empty()) {
-            None => None,
-            Some(files) => match crate::temp_files::prepare_temp_files(
-                files,
-                state.sandbox_creds.as_ref(),
-                &roots,
-            )
-            .await
-            {
-                Ok(prepared) => Some(prepared),
-                Err(e) => {
-                    tracing::warn!(
-                        "refusing a malformed policy file set; keeping the previous one: {e}"
-                    );
-                    return PolicyResult::Ok(policy_env);
-                }
-            },
-        };
-
-        // Symlink-safe: re-walk each path with O_NOFOLLOW rather than letting a
-        // path-based unlink follow a parent component the agent may have swapped
-        // for a symlink between refreshes.
-        crate::temp_files::remove_temp_files(&old_paths, &roots).await;
-
-        if let Some(prepared) = prepared {
-            match crate::temp_files::write_prepared(&prepared).await {
-                Ok(paths) => {
-                    tracing::info!(count = paths.len(), "wrote policy files");
-                    *state.previous_policy_files.write().unwrap() = paths;
-                }
-                Err(e) => {
-                    // All-or-nothing: the rollback removed whatever this batch
-                    // created, and the previous set was already removed above, so
-                    // nothing policy-written remains on disk. Clear the tracked set
-                    // so it matches reality and the next cleanup chases nothing.
-                    tracing::warn!("Failed to write policy files: {e}");
-                    *state.previous_policy_files.write().unwrap() = Vec::new();
-                }
-            }
-        } else {
-            *state.previous_policy_files.write().unwrap() = Vec::new();
+        if let Some(tracked) = crate::temp_files::refresh_policy_files(
+            &old_paths,
+            msg.files.as_deref(),
+            state.sandbox_creds.as_ref(),
+            &roots,
+        )
+        .await
+        {
+            *state.previous_policy_files.write().unwrap() = tracked;
         }
     }
 
