@@ -365,54 +365,123 @@ trait FileHandle {
     fn chmod(&self, mode: u32) -> Result<(), Errno>;
 }
 
-pub async fn write_temp_files(
+fn raw_creds(sandbox_creds: Option<&SandboxCredentials>) -> Option<(u32, u32)> {
+    sandbox_creds.map(|c| {
+        let (uid, gid) = c.uid_gid();
+        (uid.as_raw(), gid.as_raw())
+    })
+}
+
+/// Resolve and decode a batch before the caller destroys anything.
+///
+/// Split from [`write_prepared`] so a malformed entry cannot cost the working
+/// set: every failure that does not need a syscall happens here, while the
+/// previous files are still on disk and still the caller's to keep.
+pub async fn prepare_temp_files(
     files: &[TempFile],
     sandbox_creds: Option<&SandboxCredentials>,
     roots: &FileRoots,
-) -> Result<Vec<String>, String> {
-    let creds = sandbox_creds.map(|c| {
-        let (uid, gid) = c.uid_gid();
-        (uid.as_raw(), gid.as_raw())
-    });
-    write_temp_files_with(&RealTempFs, files, creds, roots)
+) -> Result<Prepared, String> {
+    prepare_with(&RealTempFs, files, raw_creds(sandbox_creds), roots)
 }
 
+/// Write what [`prepare_temp_files`] accepted. All-or-nothing.
+pub async fn write_prepared(prepared: &Prepared) -> Result<Vec<String>, String> {
+    write_prepared_with(&RealTempFs, prepared)
+}
+
+/// One entry, resolved and decoded, with nothing left to fail but the syscalls.
+#[derive(Debug)]
+pub struct Prepared {
+    entries: Vec<PreparedFile>,
+    /// Carried from prepare so the write phase cannot be handed a different
+    /// sandbox user — or none — and silently skip every directory hand-over.
+    workload: Option<(u32, u32)>,
+}
+
+#[derive(Debug)]
+struct PreparedFile {
+    resolved: ResolvedPath,
+    bytes: Vec<u8>,
+    mode: Option<u32>,
+    file_owner: Option<(u32, u32)>,
+}
+
+/// Resolve and decode a whole batch without touching the filesystem, so a
+/// malformed entry is refused while the previous set is still on disk.
+///
+/// Every cheap check lives here — path resolution, `~` expansion, root
+/// membership, the content-field arity, base64 decoding — and none of them can
+/// fail once [`write_prepared_with`] starts. The one thing this does open is the
+/// roots, read-only, to decide which of them are usable.
+fn prepare_with(
+    fs: &dyn TempFs,
+    files: &[TempFile],
+    creds: Option<(u32, u32)>,
+    roots: &FileRoots,
+) -> Result<Prepared, String> {
+    let roots = roots.usable(fs, creds.map(|(uid, _)| uid));
+    let entries = files
+        .iter()
+        .map(|f| {
+            Ok(PreparedFile {
+                resolved: roots.resolve(&f.path)?,
+                bytes: file_bytes(f)?,
+                mode: f.mode,
+                file_owner: owner_creds(f, creds),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Prepared {
+        entries,
+        workload: creds,
+    })
+}
+
+/// Write a prepared batch. Everything left here can only fail on a syscall.
+///
+/// All-or-nothing: if any file fails, roll back the files already created so
+/// the batch never leaves half-written, sandbox-owned secret files behind.
+/// A leaked partial would otherwise be untracked by the caller (never
+/// cleaned) and, because creation is `O_EXCL`, would make every later
+/// refresh of that path fail closed forever as a phantom "hostile pre-plant".
+///
+/// Rollback is file-only: `remove_one` unlinks the final (file) component but
+/// does not `rmdir` the intermediate directories the walk may have created.
+/// That residue is harmless — empty directories that the next refresh's
+/// EEXIST-tolerant `mkdirat` + `O_NOFOLLOW` `openat` re-traverses cleanly — so
+/// a fully clean, dir-inclusive rollback isn't worth the extra unwind.
+fn write_prepared_with(fs: &dyn TempFs, prepared: &Prepared) -> Result<Vec<String>, String> {
+    let mut written: Vec<(&ResolvedPath, String)> = Vec::with_capacity(prepared.entries.len());
+    for e in &prepared.entries {
+        match write_one(
+            fs,
+            &e.resolved,
+            &e.bytes,
+            e.mode,
+            e.file_owner,
+            prepared.workload,
+        ) {
+            Ok(path) => written.push((&e.resolved, path)),
+            Err(failure) => {
+                for (resolved, _) in &written {
+                    remove_one(fs, resolved);
+                }
+                return Err(failure);
+            }
+        }
+    }
+    Ok(written.into_iter().map(|(_, path)| path).collect())
+}
+
+#[cfg(test)]
 fn write_temp_files_with(
     fs: &dyn TempFs,
     files: &[TempFile],
     creds: Option<(u32, u32)>,
     roots: &FileRoots,
 ) -> Result<Vec<String>, String> {
-    // All-or-nothing: if any file fails, roll back the files already created so
-    // the batch never leaves half-written, sandbox-owned secret files behind.
-    // A leaked partial would otherwise be untracked by the caller (never
-    // cleaned) and, because creation is `O_EXCL`, would make every later
-    // refresh of that path fail closed forever as a phantom "hostile pre-plant".
-    //
-    // Rollback is file-only: `remove_one` unlinks the final (file) component but
-    // does not `rmdir` the intermediate directories the walk may have created.
-    // That residue is harmless — empty directories that the next refresh's
-    // EEXIST-tolerant `mkdirat` + `O_NOFOLLOW` `openat` re-traverses cleanly — so
-    // a fully clean, dir-inclusive rollback isn't worth the extra unwind.
-    let roots = &roots.usable(fs, creds.map(|(uid, _)| uid));
-    let mut written = Vec::with_capacity(files.len());
-    for f in files {
-        let result = roots.resolve(&f.path).and_then(|resolved| {
-            let bytes = file_bytes(f)?;
-            write_one(fs, &resolved, &bytes, f.mode, owner_creds(f, creds), creds)
-                .map(|path| (resolved, path))
-        });
-        match result {
-            Ok((resolved, path)) => written.push((resolved, path)),
-            Err(e) => {
-                for (resolved, _) in &written {
-                    remove_one(fs, resolved);
-                }
-                return Err(e);
-            }
-        }
-    }
-    Ok(written.into_iter().map(|(_, path)| path).collect())
+    write_prepared_with(fs, &prepare_with(fs, files, creds, roots)?)
 }
 
 /// The exact bytes to deliver. `content` and `contentB64` are mutually
@@ -801,6 +870,73 @@ mod tests {
     }
 
     #[test]
+    fn preparing_a_malformed_batch_touches_nothing() {
+        // The whole point of the split: a batch that cannot be prepared is
+        // refused before the caller destroys the working set, so one bad entry
+        // costs that entry and not every credential the guest already had.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![
+            file("/tmp/good.json", "fine", None),
+            TempFile {
+                path: "/tmp/bad.json".to_string(),
+                content: None,
+                content_b64: None,
+                mode: None,
+                owner: None,
+            },
+        ];
+
+        let err = prepare_with(&fs, &files, Some((1000, 2000)), &tmp()).unwrap_err();
+
+        assert!(err.contains("bad.json"), "got: {err}");
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.iter().all(|e| matches!(e, Event::OpenRoot(_))),
+            "preparing may read the roots and do nothing else: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_prepared_batch_carries_the_creds_it_was_prepared_with() {
+        // The write phase takes no creds of its own, so it cannot be handed a
+        // different sandbox user — or none — and silently skip every directory
+        // hand-over. That omission would leave `.claude` root-owned with the
+        // credential inside it unreachable, and still return Ok.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let roots = FileRoots::default().with_home("/home/sandbox").unwrap();
+        let files = vec![file("~/.claude/creds", "tok", None)];
+
+        let prepared = prepare_with(&fs, &files, Some((1000, 2000)), &roots).unwrap();
+        write_prepared_with(&fs, &prepared).unwrap();
+
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::ChownDir(".claude".to_string(), 1000, 2000)),
+            "the hand-over must not depend on a second creds argument: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_prepared_batch_has_no_cheap_failures_left() {
+        // The other half of the guarantee: once prepared, nothing but a syscall
+        // can fail, so the caller can destroy the old set knowing the new one
+        // will either land or roll back cleanly.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![
+            file("/tmp/one.json", "a", None),
+            file("/tmp/two.json", "b", None),
+        ];
+
+        let prepared = prepare_with(&fs, &files, Some((1000, 2000)), &tmp()).unwrap();
+        let written = write_prepared_with(&fs, &prepared).unwrap();
+
+        assert_eq!(written, vec!["/tmp/one.json", "/tmp/two.json"]);
+    }
+
+    #[test]
     fn reject_empty_path() {
         // Three mistakes, three messages: nothing at all, a root with no file
         // under it, and the home with no file under it. This error is what gets
@@ -913,6 +1049,7 @@ mod tests {
         ChownDir(String, u32, u32),
         Unlink(String),
         RemoveDir(String),
+        OpenRoot(String),
     }
 
     #[derive(Default)]
@@ -981,12 +1118,11 @@ mod tests {
 
     impl TempFs for FakeTempFs {
         fn open_root(&self, root: &Path) -> Result<Box<dyn DirHandle>, Errno> {
-            if self
-                .unopenable_roots
-                .contains(&root.to_string_lossy().to_string())
-            {
+            let n = root.to_string_lossy().to_string();
+            if self.unopenable_roots.contains(&n) {
                 return Err(Errno::ENOENT);
             }
+            self.recorder.borrow_mut().events.push(Event::OpenRoot(n));
             Ok(Box::new(FakeDir {
                 recorder: self.recorder.clone(),
                 name: root.to_string_lossy().to_string(),
@@ -1192,6 +1328,7 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                Event::OpenRoot("/tmp".to_string()),
                 Event::MakeDir("creds".to_string(), WAYPOINT_DIR_MODE),
                 Event::OpenDir("creds".to_string()),
                 Event::CreateFile("aws.json".to_string(), 0o640),
