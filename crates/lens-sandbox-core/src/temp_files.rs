@@ -298,6 +298,9 @@ trait DirHandle {
     /// Unlink a child of this directory by name. Operates on the directory fd,
     /// so a symlink at `name` unlinks the link itself rather than its target.
     fn unlink_child(&self, name: &OsStr) -> Result<(), Errno>;
+    /// Remove an empty child directory. Only ever called on one this walk just
+    /// created, to undo an open or a hand-over that failed after the mkdir.
+    fn remove_child_dir(&self, name: &OsStr) -> Result<(), Errno>;
     fn chown(&self, uid: u32, gid: u32) -> Result<(), Errno>;
     fn chmod(&self, mode: u32) -> Result<(), Errno>;
 }
@@ -432,15 +435,37 @@ fn walk_to_parent(
             Err(Errno::EEXIST) => false,
             Err(e) => return Err(format!("mkdir {}: {e}", comp.to_string_lossy())),
         };
-        dir = dir.open_child_dir(comp).map_err(|e| {
-            format!(
-                "open dir component {} under {root}: {e}",
-                comp.to_string_lossy()
-            )
-        })?;
-        if created && resolved.new_dirs == NewDirs::WorkloadOwned {
-            hand_dir_to_workload(dir.as_ref(), comp, dir_mode, workload)?;
-        }
+        let parent = dir;
+        let finished = parent
+            .open_child_dir(comp)
+            .map_err(|e| {
+                format!(
+                    "open dir component {} under {root}: {e}",
+                    comp.to_string_lossy()
+                )
+            })
+            .and_then(|child| {
+                if created && resolved.new_dirs == NewDirs::WorkloadOwned {
+                    hand_dir_to_workload(child.as_ref(), comp, dir_mode, workload)?;
+                }
+                Ok(child)
+            });
+        dir = match finished {
+            Ok(child) => child,
+            // A dir left half-finished is wedged: the next refresh reads EEXIST
+            // as pre-existing and by design never retries the hand-over, so undo
+            // what this walk created and let that refresh start over.
+            Err(failure) => {
+                if created && let Err(e) = parent.remove_child_dir(comp) {
+                    tracing::warn!(
+                        dir = %comp.to_string_lossy(),
+                        error = %e,
+                        "could not undo a half-created policy directory; a later refresh will read it as pre-existing and skip the hand-over"
+                    );
+                }
+                return Err(failure);
+            }
+        };
     }
 
     Ok(dir)
@@ -574,6 +599,14 @@ impl DirHandle for RealDir {
             &self.0,
             name.as_bytes(),
             nix::unistd::UnlinkatFlags::NoRemoveDir,
+        )
+    }
+
+    fn remove_child_dir(&self, name: &OsStr) -> Result<(), Errno> {
+        nix::unistd::unlinkat(
+            &self.0,
+            name.as_bytes(),
+            nix::unistd::UnlinkatFlags::RemoveDir,
         )
     }
 
@@ -814,6 +847,7 @@ mod tests {
         ChmodDir(String, u32),
         ChownDir(String, u32, u32),
         Unlink(String),
+        RemoveDir(String),
     }
 
     #[derive(Default)]
@@ -833,6 +867,8 @@ mod tests {
         chown_err: Option<Errno>,
         // If set, write returns this error.
         write_err: Option<Errno>,
+        // If set, opening a child directory returns this error.
+        open_err: Option<Errno>,
     }
 
     impl FakeTempFs {
@@ -844,6 +880,7 @@ mod tests {
                 existing_dirs: Vec::new(),
                 chown_err: None,
                 write_err: None,
+                open_err: None,
             }
         }
     }
@@ -856,6 +893,7 @@ mod tests {
         existing_dirs: Vec<String>,
         chown_err: Option<Errno>,
         write_err: Option<Errno>,
+        open_err: Option<Errno>,
     }
 
     struct FakeFile {
@@ -875,6 +913,7 @@ mod tests {
                 existing_dirs: self.existing_dirs.clone(),
                 chown_err: self.chown_err,
                 write_err: self.write_err,
+                open_err: self.open_err,
             }))
         }
     }
@@ -884,6 +923,9 @@ mod tests {
             let n = name.to_string_lossy().to_string();
             if self.symlink_dirs.contains(&n) {
                 return Err(Errno::ELOOP);
+            }
+            if let Some(e) = self.open_err {
+                return Err(e);
             }
             self.recorder
                 .borrow_mut()
@@ -897,6 +939,7 @@ mod tests {
                 existing_dirs: self.existing_dirs.clone(),
                 chown_err: self.chown_err,
                 write_err: self.write_err,
+                open_err: self.open_err,
             }))
         }
 
@@ -929,6 +972,12 @@ mod tests {
             }))
         }
 
+        fn remove_child_dir(&self, name: &OsStr) -> Result<(), Errno> {
+            let n = name.to_string_lossy().to_string();
+            self.recorder.borrow_mut().events.push(Event::RemoveDir(n));
+            Ok(())
+        }
+
         fn unlink_child(&self, name: &OsStr) -> Result<(), Errno> {
             let n = name.to_string_lossy().to_string();
             self.recorder.borrow_mut().events.push(Event::Unlink(n));
@@ -936,6 +985,9 @@ mod tests {
         }
 
         fn chown(&self, uid: u32, gid: u32) -> Result<(), Errno> {
+            if let Some(e) = self.chown_err {
+                return Err(e);
+            }
             self.recorder
                 .borrow_mut()
                 .events
@@ -1368,6 +1420,72 @@ mod tests {
         assert!(
             events.contains(&Event::ChownDir(".claude".to_string(), 1000, 2000)),
             "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_walk_leaves_a_directory_it_did_not_create_alone() {
+        // The other half of the undo, and the security-relevant one: a dir that
+        // was already there belongs to whoever made it. Removing it on a failure
+        // this walk caused would let a policy frame delete a directory it only
+        // ever traversed.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.existing_dirs = vec![".claude".to_string()];
+        fs.open_err = Some(Errno::EMFILE);
+        let roots = FileRoots::default().with_home("/home/sandbox").unwrap();
+        let files = vec![file("~/.claude/.credentials.json", "tok", None)];
+
+        let err = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap_err();
+
+        assert!(err.contains("open dir component"), "got: {err}");
+        let events = rec.borrow().events.clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::RemoveDir(_))),
+            "a pre-existing directory is not this walk's to remove: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_open_removes_the_directory_it_just_created() {
+        // The sibling edge of the same wedge: mkdir succeeded, so the dir is
+        // there, but the open that follows it can fail for reasons that have
+        // nothing to do with a swap — EMFILE, ENFILE, ENOMEM. Returning then
+        // leaves the same never-handed-over dir behind.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.open_err = Some(Errno::EMFILE);
+        let roots = FileRoots::default().with_home("/home/sandbox").unwrap();
+        let files = vec![file("~/.claude/.credentials.json", "tok", None)];
+
+        let err = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap_err();
+
+        assert!(err.contains("open dir component"), "got: {err}");
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::RemoveDir(".claude".to_string())),
+            "a created dir must not outlive the walk that failed to finish it: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_hand_over_removes_the_directory_it_created() {
+        // Leaving the dir behind wedges it forever: it is root-owned, and the
+        // next refresh sees EEXIST, calls it pre-existing, and by design never
+        // retries the hand-over. Removing it lets the next refresh start over.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.chown_err = Some(Errno::EPERM);
+        let roots = FileRoots::default().with_home("/home/sandbox").unwrap();
+        let files = vec![file("~/.claude/.credentials.json", "tok", None)];
+
+        let err = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap_err();
+
+        assert!(err.contains("chown dir"), "got: {err}");
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::RemoveDir(".claude".to_string())),
+            "a half-handed-over dir must not survive to be mistaken for pre-existing: {events:?}"
         );
     }
 
