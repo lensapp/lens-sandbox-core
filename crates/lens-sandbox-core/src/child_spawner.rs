@@ -226,12 +226,21 @@ mod tests {
     /// The control for the assertion above: a non-root identity *does*
     /// reach `apply`, so the gid a child reports genuinely tells the two
     /// paths apart rather than always being the caller's own.
+    ///
+    /// Ignored by default, because only root may `setuid` to another
+    /// identity and most dev boxes and much of CI are not root. It
+    /// asserts that rather than returning early: a control that reports
+    /// green without running is a skip wearing a pass, and on such a run
+    /// the assertion above has nothing showing its observable can tell
+    /// anything apart. CI runs it in the `cage` job, which is root:
+    /// `sudo -E cargo test -p lens-sandbox-core --tests -- --ignored`.
     #[tokio::test]
+    #[ignore = "requires root: only root may setuid to another identity"]
     async fn non_root_credentials_still_reach_the_setuid_path() {
-        if !nix::unistd::geteuid().is_root() {
-            eprintln!("skipping: only root may setuid to another identity");
-            return;
-        }
+        assert!(
+            nix::unistd::geteuid().is_root(),
+            "this control runs as root only. As anyone else the setuid it exists to observe would EPERM"
+        );
         let creds = SandboxCredentials::resolve_by_uid(65534, 65534)
             .expect("resolve_by_uid never fails on a host");
         let spec = ChildSpec {
