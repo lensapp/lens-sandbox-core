@@ -1155,27 +1155,46 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         // `/tmp` plus the sandbox user's home, so a `~/…` policy path resolves
         // without opening the rest of the filesystem to the policy frame.
         let roots = crate::temp_files::FileRoots::for_sandbox(state.sandbox_creds.as_ref());
+
+        // Resolve and decode the whole batch before removing anything. Every
+        // cheap way a frame can be malformed is caught here, while the previous
+        // files are still on disk — otherwise one bad entry costs the guest every
+        // credential it already had, and the only trace is this warning.
+        let prepared = match msg.files.as_deref().filter(|f| !f.is_empty()) {
+            None => None,
+            Some(files) => match crate::temp_files::prepare_temp_files(
+                files,
+                state.sandbox_creds.as_ref(),
+                &roots,
+            )
+            .await
+            {
+                Ok(prepared) => Some(prepared),
+                Err(e) => {
+                    tracing::warn!(
+                        "refusing a malformed policy file set; keeping the previous one: {e}"
+                    );
+                    return PolicyResult::Ok(policy_env);
+                }
+            },
+        };
+
         // Symlink-safe: re-walk each path with O_NOFOLLOW rather than letting a
         // path-based unlink follow a parent component the agent may have swapped
         // for a symlink between refreshes.
         crate::temp_files::remove_temp_files(&old_paths, &roots).await;
 
-        if let Some(files) = msg.files
-            && !files.is_empty()
-        {
-            match crate::temp_files::write_temp_files(&files, state.sandbox_creds.as_ref(), &roots)
-                .await
-            {
+        if let Some(prepared) = prepared {
+            match crate::temp_files::write_prepared(&prepared).await {
                 Ok(paths) => {
                     tracing::info!(count = paths.len(), "wrote policy files");
                     *state.previous_policy_files.write().unwrap() = paths;
                 }
                 Err(e) => {
-                    // write_temp_files is all-or-nothing: on failure it rolls back
-                    // any files it created this batch, and the previous set was
-                    // already removed above, so nothing policy-written remains on
-                    // disk. Clear the tracked set so it matches reality (and the
-                    // next refresh's cleanup doesn't chase already-gone paths).
+                    // All-or-nothing: the rollback removed whatever this batch
+                    // created, and the previous set was already removed above, so
+                    // nothing policy-written remains on disk. Clear the tracked set
+                    // so it matches reality and the next cleanup chases nothing.
                     tracing::warn!("Failed to write policy files: {e}");
                     *state.previous_policy_files.write().unwrap() = Vec::new();
                 }
