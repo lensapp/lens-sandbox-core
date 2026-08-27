@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use base64::Engine;
 use nix::errno::Errno;
@@ -45,6 +47,23 @@ impl NewDirs {
     }
 }
 
+/// Report a root problem once per process instead of once per policy frame.
+///
+/// The refresh rebuilds [`FileRoots`] from the sandbox credentials on every
+/// frame, and those credentials are resolved at startup and never change. A home
+/// this machine cannot use is therefore the same fact on every frame, and
+/// repeating it turns a real signal into log noise. The first frame reports each
+/// distinct reason; later ones stay quiet.
+fn warn_once(key: String, warn: impl FnOnce()) {
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+    // A poisoned lock means another thread panicked while holding it. Warning
+    // one extra time is the harmless outcome, so treat it as not-yet-reported.
+    let first_time = SEEN.lock().map(|mut seen| seen.insert(key)).unwrap_or(true);
+    if first_time {
+        warn();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Root {
     components: Vec<OsString>,
@@ -64,7 +83,7 @@ struct Root {
 /// the last-added of two equal ones, so a home nested inside another root — or
 /// duplicating one — still gets its own policy.
 #[derive(Debug, Clone)]
-pub struct FileRoots {
+struct FileRoots {
     roots: Vec<Root>,
     home: Option<Vec<OsString>>,
 }
@@ -91,7 +110,7 @@ impl FileRoots {
     /// the default `/tmp`, plus that user's home so a `~/…` path resolves. A
     /// user whose passwd home is `/` contributes no root — widening to the
     /// whole filesystem is never implied.
-    pub fn for_sandbox(sandbox_creds: Option<&SandboxCredentials>) -> Self {
+    fn for_sandbox(sandbox_creds: Option<&SandboxCredentials>) -> Self {
         Self::rooted_at_home(sandbox_creds.map(SandboxCredentials::home))
     }
 
@@ -106,11 +125,13 @@ impl FileRoots {
         match base.clone().with_home(home) {
             Ok(roots) => roots,
             Err(reason) => {
-                tracing::warn!(
-                    home,
-                    reason,
-                    "sandbox home is unusable as a policy-file root; `~/` paths will be refused"
-                );
+                warn_once(format!("home {home}: {reason}"), || {
+                    tracing::warn!(
+                        home,
+                        reason,
+                        "sandbox home is unusable as a policy-file root; `~/` paths will be refused"
+                    );
+                });
                 base
             }
         }
@@ -150,11 +171,13 @@ impl FileRoots {
         };
         let path = render(home, &[]);
         let refuse = |reason: String| {
-            tracing::warn!(
-                home = %path.display(),
-                reason,
-                "refusing the sandbox home as a policy-file root; `~/` paths will be refused"
-            );
+            warn_once(format!("refused home {}: {reason}", path.display()), || {
+                tracing::warn!(
+                    home = %path.display(),
+                    reason,
+                    "refusing the sandbox home as a policy-file root; `~/` paths will be refused"
+                );
+            });
             Self {
                 roots: self
                     .roots
@@ -421,18 +444,22 @@ fn refresh_policy_files_with(
 }
 
 /// The real-filesystem entry point for the refresh described below.
+///
+/// The roots are derived here rather than passed in, so the only sandbox
+/// credentials in play are the ones the caller hands over. Taking both would let
+/// a call site resolve paths against one user's home and chown the files to
+/// another — the same divergence `Prepared.workload` closes one level down.
 pub async fn refresh_policy_files(
     old_paths: &[String],
     files: Option<&[TempFile]>,
     sandbox_creds: Option<&SandboxCredentials>,
-    roots: &FileRoots,
 ) -> Option<Vec<String>> {
     refresh_policy_files_with(
         &RealTempFs,
         old_paths,
         files,
         raw_creds(sandbox_creds),
-        roots,
+        &FileRoots::for_sandbox(sandbox_creds),
     )
 }
 
@@ -467,6 +494,18 @@ struct PreparedFile {
 /// membership, the content-field arity, base64 decoding — and none of them can
 /// fail once [`write_prepared_with`] starts. The one thing this does open is the
 /// roots, read-only, to decide which of them are usable.
+///
+/// The refusal is per entry, not per batch. An image whose passwd home this
+/// machine cannot use makes every `~/…` entry unresolvable, and failing the
+/// whole frame on that would cost the sibling `/tmp` entries — the AWS
+/// credentials and the kubeconfig — that resolve perfectly well. So each entry
+/// that fails is dropped with a warning, and only a batch where *nothing*
+/// survives is refused, which is what keeps the previous set on disk.
+///
+/// A dropped entry still costs its own previous file: [`refresh_policy_files_with`]
+/// removes the whole tracked set before it writes. That is the fail-closed side
+/// of the trade — a credential the new policy could not restate is deleted
+/// rather than left behind stale.
 fn prepare_with(
     fs: &dyn TempFs,
     files: &[TempFile],
@@ -474,20 +513,40 @@ fn prepare_with(
     roots: &FileRoots,
 ) -> Result<Prepared, String> {
     let roots = roots.usable(fs, creds.map(|(uid, _)| uid));
-    let entries = files
-        .iter()
-        .map(|f| {
-            Ok(PreparedFile {
-                resolved: roots.resolve(&f.path)?,
-                bytes: file_bytes(f)?,
-                mode: f.mode,
-                file_owner: owner_creds(f, creds),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let mut entries = Vec::with_capacity(files.len());
+    let mut refused = Vec::new();
+    for f in files {
+        match prepare_one(&roots, f, creds) {
+            Ok(entry) => entries.push(entry),
+            Err(reason) => refused.push(reason),
+        }
+    }
+
+    if entries.is_empty() && !refused.is_empty() {
+        return Err(refused.join("; "));
+    }
+    for reason in refused {
+        tracing::warn!(
+            reason,
+            "skipping one policy file; the rest of the batch still lands"
+        );
+    }
     Ok(Prepared {
         entries,
         workload: creds,
+    })
+}
+
+fn prepare_one(
+    roots: &FileRoots,
+    f: &TempFile,
+    creds: Option<(u32, u32)>,
+) -> Result<PreparedFile, String> {
+    Ok(PreparedFile {
+        resolved: roots.resolve(&f.path)?,
+        bytes: file_bytes(f)?,
+        mode: f.mode,
+        file_owner: owner_creds(f, creds),
     })
 }
 
@@ -907,32 +966,68 @@ mod tests {
     }
 
     #[test]
-    fn preparing_a_malformed_batch_touches_nothing() {
+    fn preparing_a_wholly_malformed_batch_touches_nothing() {
         // The whole point of the split: a batch that cannot be prepared is
-        // refused before the caller destroys the working set, so one bad entry
-        // costs that entry and not every credential the guest already had.
+        // refused before the caller destroys the working set, so a bad frame
+        // costs nothing the guest already had.
         let rec = Rc::new(RefCell::new(Recorder::default()));
         let fs = FakeTempFs::new(rec.clone());
         let roots = home_roots();
         let files = vec![
-            file("/tmp/good.json", "fine", None),
-            TempFile {
-                path: "/tmp/bad.json".to_string(),
-                content: None,
-                content_b64: None,
-                mode: None,
-                owner: None,
-            },
+            no_content("/tmp/bad.json"),
+            file("/etc/outside.json", "fine", None),
         ];
 
         let err = prepare_with(&fs, &files, Some((1000, 2000)), &roots).unwrap_err();
 
         assert!(err.contains("bad.json"), "got: {err}");
+        assert!(err.contains("outside.json"), "got: {err}");
         let events = rec.borrow().events.clone();
         assert!(
             events.iter().all(|e| matches!(e, Event::OpenRoot(_))),
             "preparing may read the roots and do nothing else: {events:?}"
         );
+    }
+
+    #[test]
+    fn one_malformed_entry_costs_only_itself() {
+        // The blast radius is one entry, not the frame. A batch that refused as
+        // a unit would drop the sibling credentials with the bad entry, and the
+        // gateway would still see a frame it delivered successfully.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![
+            file("/tmp/good.json", "fine", None),
+            no_content("/tmp/bad.json"),
+        ];
+
+        let prepared = prepare_with(&fs, &files, Some((1000, 2000)), &home_roots()).unwrap();
+
+        let kept: Vec<String> = prepared
+            .entries
+            .iter()
+            .map(|e| e.resolved.display())
+            .collect();
+        assert_eq!(kept, vec!["/tmp/good.json".to_string()]);
+    }
+
+    #[test]
+    fn an_unusable_home_costs_the_tilde_entry_and_not_its_siblings() {
+        // The reachable case this matters for: an image with a numeric `USER`
+        // and no passwd line reports `/` as its home, so no home root exists and
+        // every `~/…` entry is unresolvable. The AWS credentials under /tmp must
+        // still land.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let roots = FileRoots::rooted_at_home(Some("/"));
+        let files = vec![
+            file("~/.claude/.credentials.json", "tok", None),
+            file("/tmp/aws.json", "secret", None),
+        ];
+
+        let written = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap();
+
+        assert_eq!(written, vec!["/tmp/aws.json".to_string()]);
     }
 
     #[test]
@@ -966,6 +1061,48 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, Event::Unlink(_))),
             "the previous set must survive a batch that never got written: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_entry_still_costs_its_previous_file() {
+        // The fail-closed half of the per-entry refusal. The batch restates
+        // aws.json and drops kube.json, and the removal runs over the whole
+        // tracked set before the write. Removing only what the new batch
+        // restates would leave a superseded credential on disk with nothing
+        // tracking it, so nothing would ever clean it up.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![
+            file("/tmp/aws.json", "secret", None),
+            no_content("/tmp/kube.json"),
+        ];
+
+        let tracked = refresh_policy_files_with(
+            &fs,
+            &["/tmp/aws.json".to_string(), "/tmp/kube.json".to_string()],
+            Some(&files),
+            Some((1000, 2000)),
+            &tmp(),
+        );
+
+        assert_eq!(tracked, Some(vec!["/tmp/aws.json".to_string()]));
+        let unlinked: Vec<String> = rec
+            .borrow()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Unlink(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unlinked.contains(&"kube.json".to_string()),
+            "the dropped entry's previous file must go too: {unlinked:?}"
+        );
+        assert!(
+            unlinked.contains(&"aws.json".to_string()),
+            "the restated entry is removed before it is rewritten: {unlinked:?}"
         );
     }
 
@@ -1432,6 +1569,18 @@ mod tests {
             content: Some(content.to_string()),
             content_b64: None,
             mode,
+            owner: None,
+        }
+    }
+
+    /// An entry that names neither `content` nor `contentB64`, which is the
+    /// cheapest way to make one entry of a batch malformed.
+    fn no_content(path: &str) -> TempFile {
+        TempFile {
+            path: path.to_string(),
+            content: None,
+            content_b64: None,
+            mode: None,
             owner: None,
         }
     }
