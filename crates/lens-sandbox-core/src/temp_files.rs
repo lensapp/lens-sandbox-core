@@ -59,8 +59,9 @@ struct Root {
 /// does it names what happens to the directories it creates: a root added
 /// through [`Self::allow_workload_owned`] hands them to the sandbox user, while
 /// the default `/tmp` keeps them root-owned and traverse-only. A path binds to
-/// the longest root that contains it, so a home nested inside another root still
-/// gets its own policy.
+/// the longest root that contains it, and to the last-added of two equal ones, so
+/// a home nested inside another root — or duplicating one — still gets its own
+/// policy.
 #[derive(Debug, Clone)]
 pub struct FileRoots {
     roots: Vec<Root>,
@@ -154,7 +155,9 @@ impl FileRoots {
     /// Every separator-delimited segment must be a normal name; `..` and `.` are
     /// rejected so no component can redirect the directory walk. A leading `~/`
     /// expands against the sandbox home. A relative path resolves under the
-    /// primary root. An absolute path must sit strictly inside one of the roots.
+    /// primary root. An absolute path must sit strictly inside one of the roots,
+    /// and binds to the longest of them — the last added, where two are equal, so
+    /// a home that duplicates an existing root still gets its own policy.
     fn resolve(&self, requested: &str) -> Result<ResolvedPath, String> {
         let absolute = self.to_absolute(requested)?;
 
@@ -163,7 +166,7 @@ impl FileRoots {
             let len = root.components.len();
             if absolute.len() > len
                 && absolute[..len] == root.components[..]
-                && best.is_none_or(|b| len > b.components.len())
+                && best.is_none_or(|b| len >= b.components.len())
             {
                 best = Some(root);
             }
@@ -1365,6 +1368,26 @@ mod tests {
         assert!(
             events.contains(&Event::ChownDir(".claude".to_string(), 1000, 2000)),
             "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_home_equal_to_an_existing_root_still_binds_to_the_home() {
+        // The tie the length comparison cannot see: a passwd home of exactly
+        // /tmp duplicates the default root, and taking the earlier one gives
+        // ~/.claude the waypoint semantics the home root exists to override.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let roots = FileRoots::default().with_home("/tmp").unwrap();
+        let files = vec![file("~/.claude/.credentials.json", "tok", None)];
+
+        let written = write_temp_files_with(&fs, &files, Some((1000, 2000)), &roots).unwrap();
+
+        assert_eq!(written, vec!["/tmp/.claude/.credentials.json"]);
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::ChownDir(".claude".to_string(), 1000, 2000)),
+            "the home root was added last and must win the tie: {events:?}"
         );
     }
 
