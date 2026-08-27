@@ -129,14 +129,19 @@ impl std::error::Error for PreStartFailure {}
 /// Spawns one prepared script and reports the status it exited with.
 ///
 /// A port because how output reaches a person differs per caller: one
-/// streams it to an attached console, another collects it for a log. An
-/// implementation builds its `Command` with [`script_command`], which
-/// settles the one part of the stdio that is not the caller's to choose.
+/// streams it to an attached console, another collects it for a log.
+///
+/// The `Command` arrives built and with fd 0 already settled, rather than
+/// as the spec it came from. An implementation that built its own would
+/// reinherit the caller's stdin, which is the hang this module exists to
+/// prevent, and no test of the implementation would notice. Stdout and
+/// stderr are untouched, which is the whole of what a runner chooses.
 #[async_trait]
 pub trait StepRunner: Send + Sync {
     async fn run(
         &self,
-        script: &PreparedScript,
+        command: Command,
+        label: &str,
         position: &str,
         activity: ActivityStream,
     ) -> Result<i32, String>;
@@ -204,9 +209,12 @@ pub fn script_cwd(creds: Option<&SandboxCredentials>) -> String {
 /// whoever attached to the run, and nobody answers it before the
 /// workload starts; nothing bounds a script with a timeout either, so a
 /// tool that stops to ask a question holds the boot open for good — and
-/// a quiet tool gives no clue that it did. The caller still chooses
-/// stdout and stderr, which is where the two differ.
-pub fn script_command(script: &PreparedScript) -> Command {
+/// a quiet tool gives no clue that it did.
+///
+/// Private, and called by [`run_all`] rather than by a [`StepRunner`],
+/// so that fd 0 is a rule and not a convention an implementation has to
+/// remember.
+fn script_command(script: &PreparedScript) -> Command {
     let mut cmd = build_command(&script.spec);
     cmd.stdin(Stdio::null());
     cmd
@@ -224,7 +232,11 @@ pub async fn run_all(
     let total = scripts.len();
     for (index, script) in scripts.iter().enumerate() {
         let position = format!("{}/{total}", index + 1);
-        match runner.run(script, &position, activity.clone()).await {
+        let command = script_command(script);
+        match runner
+            .run(command, &script.label, &position, activity.clone())
+            .await
+        {
             Err(reason) => {
                 return Err(PreStartFailure::Spawn {
                     label: script.label.clone(),
@@ -249,6 +261,7 @@ pub async fn run_all(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::os::fd::{AsFd, OwnedFd};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -263,14 +276,15 @@ mod tests {
     impl StepRunner for FakeRunner {
         async fn run(
             &self,
-            script: &PreparedScript,
+            _command: Command,
+            label: &str,
             position: &str,
             _activity: ActivityStream,
         ) -> Result<i32, String> {
             self.seen
                 .lock()
                 .expect("the fake's log is uncontended")
-                .push(format!("{position} {}", script.label));
+                .push(format!("{position} {label}"));
             let mut answers = self
                 .answers
                 .lock()
@@ -571,18 +585,95 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// The most naive runner there is: it spawns exactly the `Command` it
+    /// was handed and chooses nothing but stdout. What fd 0 says here is
+    /// what `run_all` gave it, not what this implementation remembered.
+    #[derive(Default)]
+    struct ReportsFdZero(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl StepRunner for ReportsFdZero {
+        async fn run(
+            &self,
+            command: Command,
+            _label: &str,
+            _position: &str,
+            _activity: ActivityStream,
+        ) -> Result<i32, String> {
+            let reported = fd_zero_of(command).await;
+            self.0
+                .lock()
+                .expect("the fake's log is uncontended")
+                .push(reported);
+            Ok(0)
+        }
+    }
+
+    /// Holds a pipe on fd 0 of the test process until it is dropped.
+    ///
+    /// The assertion below is about what `run_all` wires, so the test
+    /// process must not already read `/dev/null` itself — under
+    /// `cargo test </dev/null` and on many CI runners it does, and a
+    /// child that merely inherited fd 0 would then report the same thing
+    /// a settled one does. With a pipe there, the two answers differ.
+    ///
+    /// Restoring fd 0 on drop keeps the swap invisible to the tests
+    /// running beside this one. None of them read stdin; those that spawn
+    /// a child inherit a pipe instead of a terminal for a moment, which
+    /// no assertion of theirs looks at.
+    ///
+    /// Every fd the guard holds is close-on-exec, so only fd 0 itself
+    /// crosses an `exec`. A child of some neighbouring test that kept the
+    /// write end alive would hold the pipe open, and a later reader of fd
+    /// 0 would wait for an EOF that never comes.
+    struct StdinIsAPipe {
+        saved: OwnedFd,
+        _ends: (OwnedFd, OwnedFd),
+    }
+
+    impl StdinIsAPipe {
+        fn install() -> Self {
+            let saved = std::io::stdin()
+                .as_fd()
+                .try_clone_to_owned()
+                .expect("fd 0 can be duplicated");
+            let ends =
+                nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("a pipe can be opened");
+            nix::unistd::dup2_stdin(&ends.0).expect("fd 0 can be replaced");
+            Self { saved, _ends: ends }
+        }
+    }
+
+    impl Drop for StdinIsAPipe {
+        fn drop(&mut self) {
+            nix::unistd::dup2_stdin(&self.saved).expect("fd 0 can be restored");
+        }
+    }
+
     /// A script that reads fd 0 gets an EOF. On the caller's own stdin it
     /// would get a descriptor nobody answers before the workload starts,
     /// and no timeout would ever end the wait.
+    ///
+    /// Driven through `run_all` on purpose: the rule is only a rule if a
+    /// runner that builds nothing itself still cannot reach the caller's
+    /// stdin.
     #[tokio::test]
     async fn a_script_reads_no_stdin() {
-        let script = reads_own_stdin();
-        assert_eq!(fd_zero_of(script_command(&script)).await, "/dev/null");
+        let _stdin = StdinIsAPipe::install();
+        let runner = ReportsFdZero::default();
+        run_all(&[reads_own_stdin()], &runner, &ActivityStream::new())
+            .await
+            .expect("the script succeeds");
+        assert_eq!(
+            *runner.0.lock().expect("uncontended"),
+            ["/dev/null"],
+            "a runner gets its stdin settled for it, so no implementation can hand a script the console nobody answers"
+        );
     }
 
     /// The control: fd 0 reports what the parent wired, so the assertion
-    /// above is about `script_command` and not about what a child always
-    /// says.
+    /// above is about what `run_all` builds and not about what a child
+    /// always says.
     #[tokio::test]
     async fn the_stdin_a_child_reports_is_the_one_it_was_given() {
         let script = reads_own_stdin();
