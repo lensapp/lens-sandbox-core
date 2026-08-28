@@ -447,9 +447,33 @@ pub fn lock_down_after_setuid() -> io::Result<()> {
 /// account); everything else — notably `CAP_NET_ADMIN` and `CAP_NET_RAW`
 /// — is dropped, so the agent cannot set `SO_MARK` to bypass the
 /// netfilter cage or rewrite iptables rules.
-pub fn apply_cap_drop(cmd: &mut Command) {
+///
+/// `gid` is the group the child adopts, if the caller resolved one. It
+/// confines nothing — the child stays uid 0 and keeps `CAP_SETGID`, so it
+/// can set the group back whenever it likes — but it decides which group
+/// owns the files the child creates. A step staged as `root:1000` to
+/// prepare a volume for a later non-root workload needs that, and
+/// discarding it would leave the workload with EACCES on files it was
+/// meant to reach by group.
+///
+/// The order is a rule, not a style: `set_pdeathsig_sigterm` must stay
+/// last, because the kernel zeroes `pdeath_signal` in `commit_creds`
+/// whenever the egid changes. A `setgid` moved after it would disarm the
+/// death signal and nothing would say so. Putting `setgid` first also
+/// keeps it correct if `KEEP_CAP_MASK` ever loses `CAP_SETGID`.
+///
+/// Supplementary groups are deliberately left alone:
+/// a uid-0 child with `CAP_DAC_OVERRIDE` gains nothing from them that it
+/// does not already have, so clearing them would be churn with a failure
+/// mode and no benefit. [`SandboxCredentials::apply`] clears them because
+/// that child really does become unprivileged.
+pub fn apply_cap_drop(cmd: &mut Command, gid: Option<nix::unistd::Gid>) {
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
+            if let Some(gid) = gid {
+                nix::unistd::setgid(gid)
+                    .map_err(|e| std::io::Error::other(format!("setgid {}: {e}", gid.as_raw())))?;
+            }
             drop_capabilities_in_child()?;
             // Make the agent die if we die — see set_pdeathsig_sigterm.
             set_pdeathsig_sigterm()?;
@@ -469,7 +493,12 @@ pub enum PrivilegeDrop<'a> {
     /// `setuid` to a non-zero uid, so nothing else is needed.
     Setuid(&'a SandboxCredentials),
     /// Stay root and drop the capabilities by hand.
-    Capabilities,
+    ///
+    /// `gid` is the group the caller resolved, or `None` where it
+    /// resolved no identity at all. It is not a confinement — see
+    /// [`apply_cap_drop`] — but it decides what group owns the files the
+    /// child writes.
+    Capabilities { gid: Option<nix::unistd::Gid> },
     /// An unprivileged parent has neither a uid to drop nor a capability
     /// to lose, and `capset` would `EPERM`.
     ///
@@ -486,6 +515,17 @@ pub enum PrivilegeDrop<'a> {
     /// half-do its work under the wrong ownership. The decision also
     /// warns, for callers that do not look.
     ///
+    /// A child on this arm still gets pdeathsig, which needs no
+    /// capability, so a script cannot outlive a crashed supervisor. It
+    /// deliberately does **not** get `NO_NEW_PRIVS`. That flag exists on
+    /// the other arms to stop a child re-acquiring `CAP_NET_ADMIN` across
+    /// `exec` and leaving the netfilter cage; an unprivileged parent
+    /// built no cage, so here it guards nothing and only breaks the
+    /// `sudo` a developer's own script may call. One consequence: a
+    /// script that execs a setuid binary loses the death signal, because
+    /// the kernel clears pdeathsig on a `secureexec` and no `NO_NEW_PRIVS`
+    /// suppresses that here.
+    ///
     /// [`Setuid`]: PrivilegeDrop::Setuid
     Nothing {
         requested: Option<&'a SandboxCredentials>,
@@ -501,14 +541,18 @@ pub enum PrivilegeDrop<'a> {
 /// because the image says `USER root`, or because a `pre-start` script
 /// asks to install a package — must not have to know that.
 ///
-/// The gid on root credentials is deliberately not applied: the child stays
-/// uid 0 and keeps `CAP_SETGID` from `KEEP_CAP_MASK`, so a `setgid` would
-/// confine nothing. `Capabilities` carries no gid rather than offering a
-/// knob with no security meaning.
+/// The gid on root credentials travels with the decision and is applied.
+/// It confines nothing — the child stays uid 0 and keeps `CAP_SETGID`
+/// from `KEEP_CAP_MASK` — but it decides what group owns the files the
+/// child creates, and a step written as `root:1000` asked for that. The
+/// one outcome with no defence is to accept a `USER:GROUP` and discard
+/// the group.
 pub fn privilege_drop_for(creds: Option<&SandboxCredentials>, is_root: bool) -> PrivilegeDrop<'_> {
     match creds {
         Some(creds) if !creds.uid_gid().0.is_root() => PrivilegeDrop::Setuid(creds),
-        _ if is_root => PrivilegeDrop::Capabilities,
+        _ if is_root => PrivilegeDrop::Capabilities {
+            gid: creds.map(|creds| creds.uid_gid().1),
+        },
         Some(creds) => {
             tracing::warn!(
                 user = creds.user(),
@@ -896,7 +940,9 @@ mod tests {
     fn root_credentials_take_the_capability_path_rather_than_a_setuid_no_op() {
         assert_eq!(
             privilege_drop_for(Some(&creds_for(0, 0)), true),
-            PrivilegeDrop::Capabilities,
+            PrivilegeDrop::Capabilities {
+                gid: Some(nix::unistd::Gid::from_raw(0))
+            },
             "setuid(0) is a no-op that leaves CAP_NET_ADMIN in place, so a child resolved to root has to reach the capability drop or it can rewrite the netfilter cage"
         );
     }
@@ -905,8 +951,10 @@ mod tests {
     fn a_root_uid_under_a_non_root_group_still_takes_the_capability_path() {
         assert_eq!(
             privilege_drop_for(Some(&creds_for(0, 20)), true),
-            PrivilegeDrop::Capabilities,
-            "the kernel only zeroes the capability sets on a setuid to a non-zero uid; the gid does not enter into it"
+            PrivilegeDrop::Capabilities {
+                gid: Some(nix::unistd::Gid::from_raw(20))
+            },
+            "the kernel only zeroes the capability sets on a setuid to a non-zero uid; the gid does not enter into it — but the group the caller asked for still travels with the decision, because it decides what owns the files the child writes"
         );
     }
 
@@ -924,8 +972,8 @@ mod tests {
     fn a_root_parent_with_no_resolved_identity_drops_capabilities() {
         assert_eq!(
             privilege_drop_for(None, true),
-            PrivilegeDrop::Capabilities,
-            "an image with no sandbox user still runs its workload as the supervisor's root, which must not keep CAP_NET_ADMIN"
+            PrivilegeDrop::Capabilities { gid: None },
+            "an image with no sandbox user still runs its workload as the supervisor's root, which must not keep CAP_NET_ADMIN; there is no resolved identity, so there is no group to adopt either"
         );
     }
 

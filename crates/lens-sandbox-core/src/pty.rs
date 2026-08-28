@@ -91,7 +91,14 @@ pub fn spawn_pty(
         crate::privilege::PrivilegeDrop::Setuid(creds) => Some(creds.uid_gid()),
         _ => None,
     };
-    let drop_capabilities = privilege == crate::privilege::PrivilegeDrop::Capabilities;
+    // `Some(gid)` means drop capabilities; the inner option is the group to
+    // adopt first, which is `None` when the caller resolved no identity.
+    // Matching rather than comparing, so the gid reaches the child here too
+    // — an equality test would silently drop it on this path alone.
+    let drop_capabilities = match privilege {
+        crate::privilege::PrivilegeDrop::Capabilities { gid } => Some(gid),
+        _ => None,
+    };
     unsafe {
         cmd.pre_exec(move || {
             // New session so this process becomes session leader
@@ -130,13 +137,25 @@ pub fn spawn_pty(
                     .map_err(|e| std::io::Error::other(format!("setuid: {e}")))?;
                 crate::privilege::lock_down_after_setuid()?;
                 crate::privilege::set_pdeathsig_sigterm()?;
-            } else if drop_capabilities {
+            } else if let Some(gid) = drop_capabilities {
                 // No UID drop — drop caps so the agent can't rewrite iptables
-                // or set SO_MARK to bypass the proxy redirect.
+                // or set SO_MARK to bypass the proxy redirect. The gid, if the
+                // caller resolved one, decides what group owns the files this
+                // child writes; it confines nothing.
+                if let Some(gid) = gid {
+                    nix::unistd::setgid(gid).map_err(|e| {
+                        std::io::Error::other(format!("setgid {}: {e}", gid.as_raw()))
+                    })?;
+                }
                 crate::privilege::drop_capabilities_in_child()?;
                 crate::privilege::set_pdeathsig_sigterm()?;
+            } else {
+                // Unprivileged supervisor: no privilege to drop, and
+                // NO_NEW_PRIVS would guard a cage this parent never built.
+                // pdeathsig needs no capability, so the child still dies
+                // with us. See `PrivilegeDrop::Nothing`.
+                crate::privilege::set_pdeathsig_sigterm()?;
             }
-            // else: unprivileged supervisor with no creds — nothing to drop.
 
             Ok(())
         });
@@ -318,12 +337,23 @@ mod tests {
         assert!(output.contains("NoNewPrivs:\t1"), "got: {output:?}");
     }
 
-    /// The PTY sibling of `child_spawner`'s gid assertion: root credentials
-    /// must reach the capability drop here too, or a PTY agent resolved to
-    /// uid 0 keeps CAP_NET_ADMIN.
+    /// The PTY sibling of `child_spawner`'s group assertion: the group a
+    /// caller resolved reaches a root child here too. The two paths run
+    /// different code — this one inlines its own `pre_exec` — so an
+    /// equality test on the decision would have dropped the gid on this
+    /// path alone and no assertion over there would have noticed.
+    ///
+    /// Ignored for the same reason as its sibling: under a non-root
+    /// parent these credentials take the `Nothing` arm, which adopts no
+    /// group, and the child reports the parent's own.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn spawn_pty_does_not_setuid_for_root_credentials() {
+    #[ignore = "requires root: an unprivileged parent takes the Nothing arm and adopts no group"]
+    async fn spawn_pty_applies_a_resolved_group_to_a_root_child() {
+        assert!(
+            nix::unistd::geteuid().is_root(),
+            "this test runs as root only. As anyone else the decision takes the Nothing arm and adopts no group at all"
+        );
         let ours = nix::unistd::getgid().as_raw();
         let other = if ours == 1 { 2 } else { 1 };
         let creds = SandboxCredentials::resolve_by_uid(0, other)
@@ -334,7 +364,7 @@ mod tests {
             Some("/tmp"),
             None,
             Some(&creds),
-            nix::unistd::geteuid().is_root(),
+            true,
             Some((80, 24)),
         )
         .expect("spawn should succeed");
@@ -359,8 +389,8 @@ mod tests {
 
         assert_eq!(
             reported,
-            ours.to_string(),
-            "root credentials must take the capability path, which does not setgid; a child reporting {other} took the uid drop and kept CAP_NET_ADMIN with it"
+            other.to_string(),
+            "a PTY child resolved to root:{other} has to write group-{other}, exactly as the piped path does"
         );
     }
 }
