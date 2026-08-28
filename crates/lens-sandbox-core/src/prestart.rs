@@ -261,7 +261,6 @@ pub async fn run_all(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::os::fd::{AsFd, OwnedFd};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -561,124 +560,137 @@ mod tests {
         );
     }
 
-    fn reads_own_stdin() -> PreparedScript {
-        PreparedScript {
-            label: "install".into(),
-            spec: ChildSpec {
-                argv: vec!["sh".into(), "-c".into(), "readlink /proc/self/fd/0".into()],
-                cwd: None,
-                env: HashMap::new(),
-                creds: None,
-                is_root: false,
-            },
-        }
-    }
-
-    async fn fd_zero_of(mut cmd: Command) -> String {
-        cmd.stdout(Stdio::piped());
-        let out = cmd
-            .spawn()
-            .expect("sh should spawn")
-            .wait_with_output()
-            .await
-            .expect("the child should be waitable");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    /// The most naive runner there is: it spawns exactly the `Command` it
-    /// was handed and chooses nothing but stdout. What fd 0 says here is
-    /// what `run_all` gave it, not what this implementation remembered.
-    #[derive(Default)]
-    struct ReportsFdZero(Mutex<Vec<String>>);
-
-    #[async_trait]
-    impl StepRunner for ReportsFdZero {
-        async fn run(
-            &self,
-            command: Command,
-            _label: &str,
-            _position: &str,
-            _activity: ActivityStream,
-        ) -> Result<i32, String> {
-            let reported = fd_zero_of(command).await;
-            self.0
-                .lock()
-                .expect("the fake's log is uncontended")
-                .push(reported);
-            Ok(0)
-        }
-    }
-
-    /// Holds a pipe on fd 0 of the test process until it is dropped.
+    /// What fd 0 a child was given, which only `/proc` can answer.
     ///
-    /// The assertion below is about what `run_all` wires, so the test
-    /// process must not already read `/dev/null` itself — under
-    /// `cargo test </dev/null` and on many CI runners it does, and a
-    /// child that merely inherited fd 0 would then report the same thing
-    /// a settled one does. With a pipe there, the two answers differ.
-    ///
-    /// Restoring fd 0 on drop keeps the swap invisible to the tests
-    /// running beside this one. None of them read stdin; those that spawn
-    /// a child inherit a pipe instead of a terminal for a moment, which
-    /// no assertion of theirs looks at.
-    ///
-    /// Every fd the guard holds is close-on-exec, so only fd 0 itself
-    /// crosses an `exec`. A child of some neighbouring test that kept the
-    /// write end alive would hold the pipe open, and a later reader of fd
-    /// 0 would wait for an EOF that never comes.
-    struct StdinIsAPipe {
-        saved: OwnedFd,
-        _ends: (OwnedFd, OwnedFd),
-    }
+    /// Guarded, because `readlink /proc/self/fd/0` prints nothing where
+    /// there is no `/proc`, and both tests would compare against an empty
+    /// string. CI is Linux, so such a failure lands on a macOS dev box
+    /// and reads there as one more environmental flake. Every other
+    /// `/proc` test in this crate carries the same guard.
+    #[cfg(target_os = "linux")]
+    mod stdin_is_settled {
+        use super::*;
+        use std::os::fd::{AsFd, OwnedFd};
 
-    impl StdinIsAPipe {
-        fn install() -> Self {
-            let saved = std::io::stdin()
-                .as_fd()
-                .try_clone_to_owned()
-                .expect("fd 0 can be duplicated");
-            let ends =
-                nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("a pipe can be opened");
-            nix::unistd::dup2_stdin(&ends.0).expect("fd 0 can be replaced");
-            Self { saved, _ends: ends }
+        fn reads_own_stdin() -> PreparedScript {
+            PreparedScript {
+                label: "install".into(),
+                spec: ChildSpec {
+                    argv: vec!["sh".into(), "-c".into(), "readlink /proc/self/fd/0".into()],
+                    cwd: None,
+                    env: HashMap::new(),
+                    creds: None,
+                    is_root: false,
+                },
+            }
         }
-    }
 
-    impl Drop for StdinIsAPipe {
-        fn drop(&mut self) {
-            nix::unistd::dup2_stdin(&self.saved).expect("fd 0 can be restored");
+        async fn fd_zero_of(mut cmd: Command) -> String {
+            cmd.stdout(Stdio::piped());
+            let out = cmd
+                .spawn()
+                .expect("sh should spawn")
+                .wait_with_output()
+                .await
+                .expect("the child should be waitable");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
-    }
 
-    /// A script that reads fd 0 gets an EOF. On the caller's own stdin it
-    /// would get a descriptor nobody answers before the workload starts,
-    /// and no timeout would ever end the wait.
-    ///
-    /// Driven through `run_all` on purpose: the rule is only a rule if a
-    /// runner that builds nothing itself still cannot reach the caller's
-    /// stdin.
-    #[tokio::test]
-    async fn a_script_reads_no_stdin() {
-        let _stdin = StdinIsAPipe::install();
-        let runner = ReportsFdZero::default();
-        run_all(&[reads_own_stdin()], &runner, &ActivityStream::new())
-            .await
-            .expect("the script succeeds");
-        assert_eq!(
-            *runner.0.lock().expect("uncontended"),
-            ["/dev/null"],
-            "a runner gets its stdin settled for it, so no implementation can hand a script the console nobody answers"
-        );
-    }
+        /// The most naive runner there is: it spawns exactly the `Command` it
+        /// was handed and chooses nothing but stdout. What fd 0 says here is
+        /// what `run_all` gave it, not what this implementation remembered.
+        #[derive(Default)]
+        struct ReportsFdZero(Mutex<Vec<String>>);
 
-    /// The control: fd 0 reports what the parent wired, so the assertion
-    /// above is about what `run_all` builds and not about what a child
-    /// always says.
-    #[tokio::test]
-    async fn the_stdin_a_child_reports_is_the_one_it_was_given() {
-        let script = reads_own_stdin();
-        let mut cmd = build_command(&script.spec);
-        cmd.stdin(Stdio::piped());
-        assert!(fd_zero_of(cmd).await.starts_with("pipe:"));
+        #[async_trait]
+        impl StepRunner for ReportsFdZero {
+            async fn run(
+                &self,
+                command: Command,
+                _label: &str,
+                _position: &str,
+                _activity: ActivityStream,
+            ) -> Result<i32, String> {
+                let reported = fd_zero_of(command).await;
+                self.0
+                    .lock()
+                    .expect("the fake's log is uncontended")
+                    .push(reported);
+                Ok(0)
+            }
+        }
+
+        /// Holds a pipe on fd 0 of the test process until it is dropped.
+        ///
+        /// The assertion below is about what `run_all` wires, so the test
+        /// process must not already read `/dev/null` itself — under
+        /// `cargo test </dev/null` and on many CI runners it does, and a
+        /// child that merely inherited fd 0 would then report the same thing
+        /// a settled one does. With a pipe there, the two answers differ.
+        ///
+        /// Restoring fd 0 on drop keeps the swap invisible to the tests
+        /// running beside this one. None of them read stdin; those that spawn
+        /// a child inherit a pipe instead of a terminal for a moment, which
+        /// no assertion of theirs looks at.
+        ///
+        /// Every fd the guard holds is close-on-exec, so only fd 0 itself
+        /// crosses an `exec`. A child of some neighbouring test that kept the
+        /// write end alive would hold the pipe open, and a later reader of fd
+        /// 0 would wait for an EOF that never comes.
+        struct StdinIsAPipe {
+            saved: OwnedFd,
+            _ends: (OwnedFd, OwnedFd),
+        }
+
+        impl StdinIsAPipe {
+            fn install() -> Self {
+                let saved = std::io::stdin()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .expect("fd 0 can be duplicated");
+                let ends =
+                    nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("a pipe can be opened");
+                nix::unistd::dup2_stdin(&ends.0).expect("fd 0 can be replaced");
+                Self { saved, _ends: ends }
+            }
+        }
+
+        impl Drop for StdinIsAPipe {
+            fn drop(&mut self) {
+                nix::unistd::dup2_stdin(&self.saved).expect("fd 0 can be restored");
+            }
+        }
+
+        /// A script that reads fd 0 gets an EOF. On the caller's own stdin it
+        /// would get a descriptor nobody answers before the workload starts,
+        /// and no timeout would ever end the wait.
+        ///
+        /// Driven through `run_all` on purpose: the rule is only a rule if a
+        /// runner that builds nothing itself still cannot reach the caller's
+        /// stdin.
+        #[tokio::test]
+        async fn a_script_reads_no_stdin() {
+            let _stdin = StdinIsAPipe::install();
+            let runner = ReportsFdZero::default();
+            run_all(&[reads_own_stdin()], &runner, &ActivityStream::new())
+                .await
+                .expect("the script succeeds");
+            assert_eq!(
+                *runner.0.lock().expect("uncontended"),
+                ["/dev/null"],
+                "a runner gets its stdin settled for it, so no implementation can hand a script the console nobody answers"
+            );
+        }
+
+        /// The control: fd 0 reports what the parent wired, so the assertion
+        /// above is about what `run_all` builds and not about what a child
+        /// always says.
+        #[tokio::test]
+        async fn the_stdin_a_child_reports_is_the_one_it_was_given() {
+            let script = reads_own_stdin();
+            let mut cmd = build_command(&script.spec);
+            cmd.stdin(Stdio::piped());
+            assert!(fd_zero_of(cmd).await.starts_with("pipe:"));
+        }
     }
 }
