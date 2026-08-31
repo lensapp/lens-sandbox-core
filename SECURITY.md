@@ -41,4 +41,6 @@ Security-sensitive areas include:
 
 This crate provides core enforcement primitives used inside sandboxed environments. It is not, by itself, a complete end-user sandbox product. The effective boundary depends on how callers deploy it, including the surrounding container, microVM, Linux capabilities, filesystem mounts, process model, and policy source.
 
+One boundary is easy to lose by accident. The egress cage matches on a socket mark rather than on a uid, so it covers every process in the sandbox's network namespace whatever user that process runs as. Setting that mark takes `CAP_NET_ADMIN` **or** `CAP_NET_RAW`, and a container's default capability set holds `CAP_NET_RAW`. Anything a caller joins to that namespace — a sidecar container, say — must therefore run with both capabilities dropped, or it can stamp the mark on its own sockets and leave the cage. The workload itself is already handled: the supervisor drops both before it execs the agent.
+
 When in doubt, treat changes to network, credentials, process execution, or policy behavior as security-sensitive.
