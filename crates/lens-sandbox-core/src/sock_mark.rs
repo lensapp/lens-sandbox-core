@@ -10,8 +10,19 @@
 //!
 //! This decouples policy from the agent's UID — the nftables rules no longer
 //! need to name a specific `meta skuid` value, so the agent can run as any user
-//! the user-supplied image expects. Bypass via mark-spoofing requires
-//! `CAP_NET_ADMIN`, which is dropped before exec'ing the agent.
+//! the user-supplied image expects.
+//!
+//! Forging the mark takes `CAP_NET_ADMIN` **or** `CAP_NET_RAW` in the user
+//! namespace that owns the socket's network namespace. `CAP_NET_RAW` has been
+//! enough since Linux 5.17, and it is easy to miss: a container's *default*
+//! capability set holds it. The agent keeps neither — `privilege.rs` drops both
+//! before exec — so the workload cannot spoof its way out.
+//!
+//! The wider rule follows from the same fact. The cage covers every process in
+//! the network namespace, so anything else placed there — a sidecar container,
+//! say — is covered too, but only while it holds neither capability. A sidecar
+//! started with default capabilities can stamp `MARK_VALUE` on its own sockets
+//! and leave the cage entirely.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -33,17 +44,19 @@ pub const MARK_VALUE: u32 = 0x4E_58_55_53; // "NXUS" in ASCII
 /// the packet to be judged again, which is what turns a refusal into the same
 /// immediate error the cage gave before any of this existed.
 ///
-/// The workload cannot forge it: `SO_MARK` needs `CAP_NET_ADMIN`, dropped before
-/// the agent execs, and a forged mark would only reject the forger's own packet.
+/// The workload cannot forge it: `SO_MARK` needs `CAP_NET_ADMIN` or
+/// `CAP_NET_RAW` (see the module docs), and `privilege.rs` drops both before the
+/// agent execs. A forged mark would only reject the forger's own packet anyway.
 /// It is deliberately not [`MARK_VALUE`] — that one means "this is ours, let it
 /// out", which is the opposite instruction.
 pub const REJECT_MARK: u32 = 0x4E_58_55_44; // "NXUD" in ASCII
 
-/// Apply `SO_MARK = MARK_VALUE` to a socket. Linux-only — requires
-/// `CAP_NET_ADMIN`. On other platforms this is a no-op so the rest of the
-/// crate continues to compile (nftables enforcement is Linux-only anyway).
+/// Apply `SO_MARK = MARK_VALUE` to a socket. Linux-only — needs
+/// `CAP_NET_ADMIN` or `CAP_NET_RAW` (see the module docs). On other platforms
+/// this is a no-op so the rest of the crate continues to compile (nftables
+/// enforcement is Linux-only anyway).
 ///
-/// EPERM is tolerated: in production the supervisor holds CAP_NET_ADMIN
+/// EPERM is tolerated: in production the supervisor holds the capability
 /// before privilege drop, and in tests / hosts without nftables rules there
 /// is nothing to bypass. Returning the error here would make every outbound
 /// connection from an unprivileged Linux process fail.
@@ -51,7 +64,7 @@ pub const REJECT_MARK: u32 = 0x4E_58_55_44; // "NXUD" in ASCII
 pub(crate) fn mark<F: AsFd>(fd: &F) -> io::Result<()> {
     match nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::Mark, &MARK_VALUE) {
         Err(nix::errno::Errno::EPERM) => {
-            tracing::debug!("SO_MARK setsockopt: EPERM (CAP_NET_ADMIN unavailable); continuing");
+            tracing::debug!("SO_MARK setsockopt: EPERM (no CAP_NET_ADMIN/CAP_NET_RAW); continuing");
             Ok(())
         }
         other => other.map_err(io::Error::from),
