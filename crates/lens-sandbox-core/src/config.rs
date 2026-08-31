@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// Loopback port the explicit CONNECT proxy binds to. `network.rs` renders
@@ -17,6 +17,22 @@ pub const DEFAULT_DNS_STUB_PORT: u16 = 5355;
 /// truth rule applies: `network.rs` renders this value into the nftables script
 /// and `udp_egress.rs` binds it (see `udp_egress.rs`).
 pub const DEFAULT_UDP_QUEUE_NUM: u16 = 0;
+
+/// Additional local addresses the redirect listeners accept, as a
+/// comma-separated list of IPs.
+///
+/// The cage normally delivers redirected traffic to `127.0.0.1`, because the
+/// nftables `redirect` rule rewrites the destination to the address of the
+/// interface the packet arrived on, and that interface is the loopback. A
+/// nested namespace changes that: traffic from it arrives on a veth, so
+/// `redirect` picks the veth's address and nothing on `127.0.0.1` accepts it.
+/// Naming the veth address here is what makes the cage reachable from inside
+/// the nested namespace.
+///
+/// It applies to the transparent listener and the DNS stub only. The explicit
+/// CONNECT proxy stays on loopback: it serves the agent process through
+/// `HTTPS_PROXY`, and a nested namespace has no business reaching it.
+pub const EXTRA_LISTEN_IPS_ENV: &str = "LENS_SANDBOX_EXTRA_LISTEN_IPS";
 
 #[derive(Debug, Clone)]
 pub enum SandboxMode {
@@ -42,6 +58,10 @@ pub struct CoreConfig {
     /// NAT REDIRECT rule, filters them against the route allowlist, and
     /// forwards allowed queries to the host resolver (see `dns.rs`).
     pub dns_stub_listen_addr: SocketAddr,
+    /// Local addresses the two redirect listeners accept in addition to
+    /// loopback, on the same ports. Empty unless `LENS_SANDBOX_EXTRA_LISTEN_IPS`
+    /// names some — see that constant for why a nested namespace needs it.
+    pub extra_listen_ips: Vec<IpAddr>,
     /// True when running as root — local proxy + nftables enforcement is enabled.
     pub is_root: bool,
     /// Unix user to drop privileges to for child processes.
@@ -114,6 +134,8 @@ pub fn load_core_config() -> CoreConfig {
     let proxy_listen_addr = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PROXY_PORT));
     let transparent_listen_addr = SocketAddr::from(([127, 0, 0, 1], DEFAULT_TRANSPARENT_PORT));
     let dns_stub_listen_addr = SocketAddr::from(([127, 0, 0, 1], DEFAULT_DNS_STUB_PORT));
+    let extra_listen_ips =
+        parse_extra_listen_ips(std::env::var(EXTRA_LISTEN_IPS_ENV).ok().as_deref());
 
     let is_root = nix::unistd::getuid().is_root();
 
@@ -125,6 +147,7 @@ pub fn load_core_config() -> CoreConfig {
         proxy_listen_addr,
         transparent_listen_addr,
         dns_stub_listen_addr,
+        extra_listen_ips,
         is_root,
         sandbox_user,
     }
@@ -147,9 +170,67 @@ pub fn parse_idle_timeout(raw: Option<String>) -> Option<Duration> {
     }
 }
 
+/// Parse the value of `EXTRA_LISTEN_IPS_ENV`.
+///
+/// An entry that is not an IP address is dropped with a warning rather than
+/// failing the whole list: the value reaches a `bind` call, and one typo should
+/// not silently take the cage's other listeners with it.
+pub fn parse_extra_listen_ips(raw: Option<&str>) -> Vec<IpAddr> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match s.parse::<IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => {
+                tracing::warn!(
+                    entry = %s,
+                    "{EXTRA_LISTEN_IPS_ENV} entry is not an IP address, ignoring it"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_listen_ips_is_empty_without_the_variable() {
+        assert!(parse_extra_listen_ips(None).is_empty());
+        assert!(parse_extra_listen_ips(Some("")).is_empty());
+        assert!(parse_extra_listen_ips(Some("  , ,")).is_empty());
+    }
+
+    #[test]
+    fn extra_listen_ips_reads_a_comma_separated_list() {
+        assert_eq!(
+            parse_extra_listen_ips(Some("169.254.32.1")),
+            vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            parse_extra_listen_ips(Some(" 169.254.32.1 , fd00::1 ")),
+            vec![
+                "169.254.32.1".parse::<IpAddr>().unwrap(),
+                "fd00::1".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_listen_ips_drops_entries_that_are_not_addresses() {
+        // The value reaches a `bind` call, so a hostname or a host:port pair
+        // must not survive parsing. Dropping the bad entry keeps the good ones
+        // — a typo in one address should not silently disable the whole cage.
+        assert_eq!(
+            parse_extra_listen_ips(Some("nope,169.254.32.1,169.254.32.2:3129")),
+            vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
+        );
+    }
 
     #[test]
     fn extract_host_handles_common_forms() {
