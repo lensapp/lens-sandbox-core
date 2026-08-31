@@ -489,9 +489,8 @@ async fn bind_all(addrs: &[SocketAddr], lane: Lane) -> Result<Vec<TcpListener>, 
     let kind = lane.kind();
     let mut listeners = Vec::with_capacity(addrs.len());
     for addr in addrs {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| format!("{kind} proxy bind {addr}: {e}"))?;
+        let listener =
+            crate::listen::tcp(*addr).map_err(|e| format!("{kind} proxy bind {addr}: {e}"))?;
         tracing::info!(kind, addr = %addr, "{}", lane.listening_message());
         listeners.push(listener);
     }

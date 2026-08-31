@@ -17,6 +17,8 @@ tracing = "0.1"
 nix = { version = "0.30", features = ["signal", "process", "user", "fs", "term", "ioctl", "net", "socket"] }
 base64 = "0.22"
 libc = "0.2"
+# Sets IP_FREEBIND before bind, which neither `std` nor `tokio` exposes.
+socket2 = "0.6"
 rand = "0.9"
 ipnet = "2"
 schemars = "1"

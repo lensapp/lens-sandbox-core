@@ -27,6 +27,7 @@ pub mod graphql;
 pub(crate) mod graphql_ws;
 pub mod http_body;
 pub mod lifecycle;
+pub(crate) mod listen;
 pub mod llm;
 pub mod mcp;
 pub mod mitm;
