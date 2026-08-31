@@ -40,8 +40,10 @@ pub fn harden_supervisor() -> io::Result<()> {
 /// prelude has no need to manipulate the bounding set, and
 /// `NO_NEW_PRIVS` already prevents bounding-set promotion across exec.
 ///
-/// Notable caps dropped: `NET_ADMIN` (iptables/SO_MARK — the cage),
-/// `NET_RAW`, `SYS_ADMIN`, `SYS_PTRACE`, `SYS_MODULE`, `SYS_RAWIO`,
+/// Notable caps dropped: `NET_ADMIN` and `NET_RAW` (either one sets
+/// `SO_MARK` and so spoofs its way out of the cage — see `sock_mark.rs`;
+/// `NET_ADMIN` also rewrites the rules), `SYS_ADMIN`, `SYS_PTRACE`,
+/// `SYS_MODULE`, `SYS_RAWIO`,
 /// `SYS_BOOT`, `MAC_*`, `AUDIT_*`, `SETFCAP`, `LINUX_IMMUTABLE`,
 /// `NET_BIND_SERVICE`, everything else.
 ///
