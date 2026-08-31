@@ -99,9 +99,7 @@ pub async fn run(listen_addrs: &[SocketAddr], state: Arc<ProxyState>) -> Result<
         .ok_or_else(|| "no upstream nameserver found (check /etc/resolv.conf)".to_string())?;
     let mut sockets = Vec::with_capacity(listen_addrs.len());
     for addr in listen_addrs {
-        let socket = UdpSocket::bind(addr)
-            .await
-            .map_err(|e| format!("dns stub bind {addr}: {e}"))?;
+        let socket = crate::listen::udp(*addr).map_err(|e| format!("dns stub bind {addr}: {e}"))?;
         tracing::info!(listen = %addr, upstream = %upstream, "dns stub listening");
         sockets.push((*addr, Arc::new(socket)));
     }

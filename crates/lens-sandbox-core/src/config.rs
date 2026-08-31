@@ -183,6 +183,17 @@ pub fn parse_extra_listen_ips(raw: Option<&str>) -> Vec<IpAddr> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|s| match s.parse::<IpAddr>() {
+            // `0.0.0.0` and `::` parse, and would bind every interface — the
+            // pod address included. The safety of this whole setting rests on
+            // the extra addresses reaching no further than the veth they live
+            // on, which the unspecified address does not.
+            Ok(ip) if ip.is_unspecified() => {
+                tracing::warn!(
+                    entry = %s,
+                    "{EXTRA_LISTEN_IPS_ENV} entry names every interface rather than one address, ignoring it"
+                );
+                None
+            }
             Ok(ip) => Some(ip),
             Err(_) => {
                 tracing::warn!(
@@ -228,6 +239,16 @@ mod tests {
         // — a typo in one address should not silently disable the whole cage.
         assert_eq!(
             parse_extra_listen_ips(Some("nope,169.254.32.1,169.254.32.2:3129")),
+            vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn extra_listen_ips_drops_the_wildcard_address() {
+        // It parses, so only an explicit check keeps it out — and it would put
+        // the transparent listener and the DNS stub on the pod address.
+        assert_eq!(
+            parse_extra_listen_ips(Some("0.0.0.0,::,169.254.32.1")),
             vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
         );
     }

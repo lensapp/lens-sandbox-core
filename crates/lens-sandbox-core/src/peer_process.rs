@@ -241,7 +241,17 @@ fn socket_inode_for<P: ProcReader>(proc: &P, peer: SocketAddr, proto: Proto) -> 
     // attributing it to a binary the allowlist trusts. TCP never needs this — an
     // established connection always has a concrete local address, and matching a
     // wildcard-bound *listener* here would be a false positive.
-    if matches!(proto, Proto::Udp) {
+    //
+    // Loopback peers only. The stub may also listen on a veth address (see
+    // `config::EXTRA_LISTEN_IPS_ENV`), and a datagram arriving there was sent
+    // from another network namespace, whose sockets are not in this `/proc` at
+    // all. An exact match can never succeed for one, so every such datagram
+    // would reach this fallback and be credited to whichever wildcard-bound
+    // socket in *this* namespace happens to hold the same ephemeral port —
+    // misattribution in the direction that grants access, since a `binaries`
+    // rule would then match a binary that sent nothing. `None` is the honest
+    // answer across a namespace boundary, and `binaries` fails closed on it.
+    if matches!(proto, Proto::Udp) && peer.ip().is_loopback() {
         let mut wildcard = rows
             .iter()
             .filter(|(local, _)| local.ip().is_unspecified() && local.port() == peer.port());
@@ -699,6 +709,22 @@ mod tests {
             format!("header\n{WILDCARD_A}\n{WILDCARD_B}"),
         );
         let peer: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(resolve_with(&fake, peer, Proto::Udp).is_none());
+    }
+
+    #[test]
+    fn resolve_with_does_not_apply_the_wildcard_fallback_across_a_namespace() {
+        // A datagram from a nested namespace reaches the stub on its veth
+        // address. That sender's socket is in another namespace and so in
+        // another /proc; the wildcard row here belongs to an unrelated local
+        // process that merely holds the same ephemeral port. Crediting it would
+        // let the nested namespace inherit that binary's `binaries` rules.
+        const WILDCARD_ROW: &str = "   3: 00000000:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 424242 1 ffff 100";
+        let mut fake = owning_fixture();
+        fake.files.remove("/proc/net/tcp");
+        fake.files
+            .insert("/proc/net/udp".into(), format!("header\n{WILDCARD_ROW}"));
+        let peer: SocketAddr = "169.254.32.2:8080".parse().unwrap();
         assert!(resolve_with(&fake, peer, Proto::Udp).is_none());
     }
 
