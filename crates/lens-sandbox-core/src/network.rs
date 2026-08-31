@@ -336,8 +336,9 @@ mod tests {
         // The relay's own refusal rules match `REJECT_MARK` instead. They are
         // consistent with the guard rather than an exception to it: the mark is
         // not MARK_VALUE, so only unmarked traffic the relay has judged can
-        // carry it, and the workload cannot set either mark without
-        // CAP_NET_ADMIN.
+        // carry it, and the workload can set neither mark — `privilege.rs`
+        // drops CAP_NET_ADMIN and CAP_NET_RAW, and either one would do (see
+        // `sock_mark.rs`).
         let reject_marked = format!("meta mark {REJECT_MARK} ");
         for line in s.lines() {
             let t = line.trim();

@@ -14,8 +14,9 @@
 //!
 //! Forging the mark takes `CAP_NET_ADMIN` **or** `CAP_NET_RAW` in the user
 //! namespace that owns the socket's network namespace. `CAP_NET_RAW` has been
-//! enough since Linux 5.17, and it is easy to miss: a container's *default*
-//! capability set holds it. The agent keeps neither — `privilege.rs` drops both
+//! enough since Linux 5.17 — commit `079925cce1d0`, "net: allow SO_MARK with
+//! CAP_NET_RAW" — and it is easy to miss: a container's *default* capability
+//! set holds it. The agent keeps neither — `privilege.rs` drops both
 //! before exec — so the workload cannot spoof its way out.
 //!
 //! The wider rule follows from the same fact. The cage covers every process in
