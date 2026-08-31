@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::task::JoinSet;
 
 use crate::routing::{
     HttpRule, RawTarget, RouteOutcome, RouteRule, Scheme, Transport, Verdict,
@@ -432,7 +433,127 @@ pub struct ProxyServer {
     listen_addr: SocketAddr,
     transparent_listen_addr: SocketAddr,
     dns_stub_listen_addr: SocketAddr,
+    extra_listen_ips: Vec<IpAddr>,
     state: Arc<ProxyState>,
+}
+
+/// Which handler an accepted connection goes to. The two lanes differ only in
+/// that, so they share one accept loop.
+#[derive(Clone, Copy)]
+enum Lane {
+    Explicit,
+    Transparent,
+}
+
+impl Lane {
+    fn kind(self) -> &'static str {
+        match self {
+            Lane::Explicit => "explicit",
+            Lane::Transparent => "transparent",
+        }
+    }
+
+    /// What a listener on this lane says when it comes up. The two read
+    /// differently because operators grep supervisor logs for them.
+    fn listening_message(self) -> &'static str {
+        match self {
+            Lane::Explicit => "local CONNECT proxy listening",
+            Lane::Transparent => "transparent redirect listener running",
+        }
+    }
+}
+
+/// Every address a listener binds: the primary first, then one per extra IP on
+/// the primary's port.
+///
+/// Duplicates are folded away. The extra IPs come from configuration, nothing
+/// stops that configuration repeating loopback or an address twice, and the
+/// second `bind` of the same address fails — which would take the whole proxy
+/// down for a harmless mistake.
+fn listen_addrs(primary: SocketAddr, extra: &[IpAddr]) -> Vec<SocketAddr> {
+    let mut addrs = vec![primary];
+    for ip in extra {
+        let addr = SocketAddr::new(*ip, primary.port());
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    addrs
+}
+
+/// Bind every address, or fail naming the one that would not bind.
+///
+/// All or nothing: a listener that is silently missing is a cage with a hole in
+/// it, so a partial success is reported as a failure.
+async fn bind_all(addrs: &[SocketAddr], lane: Lane) -> Result<Vec<TcpListener>, String> {
+    let kind = lane.kind();
+    let mut listeners = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("{kind} proxy bind {addr}: {e}"))?;
+        tracing::info!(kind, addr = %addr, "{}", lane.listening_message());
+        listeners.push(listener);
+    }
+    Ok(listeners)
+}
+
+/// True when no redirect rewrote this connection, so its reported "original
+/// destination" is not a destination at all.
+///
+/// Two shapes, both reachable only by dialling the listener directly:
+///
+///  * Loopback. The nat chain's `oifname "lo" return` rule should keep it out
+///    of here; this catches what slips through, such as a manual
+///    `curl 127.0.0.1:3129`.
+///  * The listener's own address. Conntrack has no rewritten tuple to report,
+///    so it reports where the packet actually went — here. Treating that as a
+///    destination would splice the listener to itself, once per dial, until the
+///    connection semaphore saturates. Only reachable since the listener may
+///    bind an address other than loopback (see `config::EXTRA_LISTEN_IPS_ENV`).
+///
+/// A redirected connection always names a destination that is not the listener,
+/// so nothing legitimate is refused here.
+fn is_unredirected(orig_dst: SocketAddr, local: Option<SocketAddr>) -> bool {
+    orig_dst.ip().is_loopback() || local == Some(orig_dst)
+}
+
+/// Accept forever on one listener, handing each connection to its lane.
+async fn accept_loop(
+    listener: TcpListener,
+    lane: Lane,
+    semaphore: Arc<Semaphore>,
+    state: Arc<ProxyState>,
+) {
+    let kind = lane.kind();
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(kind, "proxy accept error: {e}");
+                continue;
+            }
+        };
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(kind, peer = %peer, "proxy connection limit reached, dropping");
+                drop(stream);
+                continue;
+            }
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            let result = match lane {
+                Lane::Explicit => handle_connection(stream, peer, &state).await,
+                Lane::Transparent => handle_transparent_connection(stream, peer, state).await,
+            };
+            if let Err(e) = result {
+                tracing::debug!(kind, peer = %peer, "proxy connection error: {e}");
+            }
+            drop(permit);
+        });
+    }
 }
 
 impl ProxyServer {
@@ -473,93 +594,47 @@ impl ProxyServer {
             listen_addr,
             transparent_listen_addr,
             dns_stub_listen_addr,
+            extra_listen_ips: Vec::new(),
             state: state.clone(),
         };
         (server, state)
     }
 
+    /// Also accept redirected traffic on these local addresses, on the same
+    /// ports. See `config::EXTRA_LISTEN_IPS_ENV` for why a nested namespace
+    /// needs it. The explicit CONNECT proxy is deliberately not included.
+    pub fn with_extra_listen_ips(mut self, ips: Vec<IpAddr>) -> Self {
+        self.extra_listen_ips = ips;
+        self
+    }
+
     pub async fn run(self) -> Result<(), String> {
-        let explicit = TcpListener::bind(self.listen_addr)
-            .await
-            .map_err(|e| format!("proxy bind {}: {e}", self.listen_addr))?;
-        tracing::info!(addr = %self.listen_addr, "local CONNECT proxy listening");
+        let explicit = bind_all(&[self.listen_addr], Lane::Explicit).await?;
+        let transparent = bind_all(
+            &listen_addrs(self.transparent_listen_addr, &self.extra_listen_ips),
+            Lane::Transparent,
+        )
+        .await?;
+        let dns_listen = listen_addrs(self.dns_stub_listen_addr, &self.extra_listen_ips);
 
-        let transparent = TcpListener::bind(self.transparent_listen_addr)
-            .await
-            .map_err(|e| {
-                format!(
-                    "transparent proxy bind {}: {e}",
-                    self.transparent_listen_addr
-                )
-            })?;
-        tracing::info!(
-            addr = %self.transparent_listen_addr,
-            "transparent redirect listener running"
-        );
-
-        // One semaphore spans both listeners so a burst on one path can't
-        // starve the other of file descriptors or memory.
+        // One semaphore spans every listener so a burst on one path can't
+        // starve the others of file descriptors or memory.
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-        let explicit_sem = semaphore.clone();
-        let transparent_sem = semaphore;
-        let explicit_state = self.state.clone();
-        let transparent_state = self.state.clone();
-        let dns_state = self.state;
-        let dns_listen = self.dns_stub_listen_addr;
+        let dns_state = self.state.clone();
 
-        let explicit_task = tokio::spawn(async move {
-            loop {
-                let (stream, peer) = match explicit.accept().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(kind = "explicit", "proxy accept error: {e}");
-                        continue;
-                    }
-                };
-                let permit = match explicit_sem.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        tracing::warn!(kind = "explicit", peer = %peer, "proxy connection limit reached, dropping");
-                        drop(stream);
-                        continue;
-                    }
-                };
-                let state = explicit_state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, &state).await {
-                        tracing::debug!(kind = "explicit", peer = %peer, "proxy connection error: {e}");
-                    }
-                    drop(permit);
-                });
-            }
-        });
-
-        let transparent_task = tokio::spawn(async move {
-            loop {
-                let (stream, peer) = match transparent.accept().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(kind = "transparent", "proxy accept error: {e}");
-                        continue;
-                    }
-                };
-                let permit = match transparent_sem.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        tracing::warn!(kind = "transparent", peer = %peer, "proxy connection limit reached, dropping");
-                        drop(stream);
-                        continue;
-                    }
-                };
-                let state = transparent_state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_transparent_connection(stream, peer, state).await {
-                        tracing::debug!(kind = "transparent", peer = %peer, "proxy connection error: {e}");
-                    }
-                    drop(permit);
-                });
-            }
-        });
+        let mut lanes = JoinSet::new();
+        for (listener, lane) in explicit
+            .into_iter()
+            .map(|l| (l, Lane::Explicit))
+            .chain(transparent.into_iter().map(|l| (l, Lane::Transparent)))
+        {
+            lanes.spawn(accept_loop(
+                listener,
+                lane,
+                semaphore.clone(),
+                self.state.clone(),
+            ));
+        }
 
         // The UDP relay runs on its own thread, not a task: it judges each
         // datagram synchronously against the kernel queue. Failing to start is
@@ -573,22 +648,17 @@ impl ProxyServer {
             // do log loudly so the operator notices. UDP/53 from the sandbox
             // stays REDIRECTed to us — it will just start timing out for
             // the sandboxed process, which is the safe degrade.
-            if let Err(e) = crate::dns::run(dns_listen, dns_state).await {
+            if let Err(e) = crate::dns::run(&dns_listen, dns_state).await {
                 tracing::error!("dns stub task ended: {e}");
             }
         });
 
-        // Either TCP listener terminating is fatal. DNS stub failure degrades
-        // to "no hostname resolution for sandbox user" — loud log, proxy stays
-        // up so explicit-CONNECT traffic keeps flowing.
-        tokio::select! {
-            res = explicit_task => {
-                tracing::error!("explicit proxy listener task ended: {res:?}");
-            }
-            res = transparent_task => {
-                tracing::error!("transparent proxy listener task ended: {res:?}");
-            }
-        }
+        // Any TCP listener terminating is fatal, and dropping the set aborts
+        // the rest. DNS stub failure degrades to "no hostname resolution for
+        // sandbox user" — loud log, proxy stays up so explicit-CONNECT traffic
+        // keeps flowing.
+        let ended = lanes.join_next().await;
+        tracing::error!("proxy listener task ended: {ended:?}");
         dns_task.abort();
         Err("proxy listener terminated".into())
     }
@@ -1627,10 +1697,7 @@ async fn handle_transparent_connection(
         }
     };
 
-    if orig_dst.ip().is_loopback() {
-        // The nat chain's `-o lo -j RETURN` rule should keep loopback
-        // traffic out of the listener, but if it slips through (e.g.
-        // manual connection) we drop it to avoid amplifying.
+    if is_unredirected(orig_dst, stream.local_addr().ok()) {
         return Ok(());
     }
 
@@ -3363,6 +3430,84 @@ pub(crate) fn extract_port(target: &str, default: u16) -> u16 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn listen_addrs_keeps_loopback_first_and_reuses_its_port() {
+        let primary = SocketAddr::from(([127, 0, 0, 1], 3129));
+        let extra = vec!["169.254.32.1".parse().unwrap()];
+        assert_eq!(
+            listen_addrs(primary, &extra),
+            vec![primary, SocketAddr::from(([169, 254, 32, 1], 3129))]
+        );
+    }
+
+    #[test]
+    fn listen_addrs_without_extras_is_just_the_primary() {
+        let primary = SocketAddr::from(([127, 0, 0, 1], 3129));
+        assert_eq!(listen_addrs(primary, &[]), vec![primary]);
+    }
+
+    #[test]
+    fn listen_addrs_drops_a_repeat_of_the_primary() {
+        // The provisioner names the veth address, and nothing stops it naming
+        // loopback too. Binding the same address twice fails, and that failure
+        // is fatal to the proxy — so fold the duplicate away instead.
+        let primary = SocketAddr::from(([127, 0, 0, 1], 3129));
+        let extra = vec![
+            "127.0.0.1".parse().unwrap(),
+            "169.254.32.1".parse().unwrap(),
+            "169.254.32.1".parse().unwrap(),
+        ];
+        assert_eq!(
+            listen_addrs(primary, &extra),
+            vec![primary, SocketAddr::from(([169, 254, 32, 1], 3129))]
+        );
+    }
+
+    #[test]
+    fn a_dial_straight_at_the_listener_is_not_a_destination() {
+        let veth: SocketAddr = "169.254.32.1:3129".parse().unwrap();
+        assert!(is_unredirected(veth, Some(veth)));
+        assert!(is_unredirected(
+            "127.0.0.1:3129".parse().unwrap(),
+            Some(veth)
+        ));
+    }
+
+    #[test]
+    fn a_redirected_connection_still_names_its_destination() {
+        let veth: SocketAddr = "169.254.32.1:3129".parse().unwrap();
+        let real: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        assert!(!is_unredirected(real, Some(veth)));
+        // A listener address we could not read is not evidence of a direct
+        // dial, so the connection proceeds to policy rather than being dropped.
+        assert!(!is_unredirected(real, None));
+    }
+
+    #[tokio::test]
+    async fn bind_all_opens_every_address() {
+        let addrs = vec![
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        ];
+        let listeners = bind_all(&addrs, Lane::Transparent).await.expect("bind");
+        assert_eq!(listeners.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bind_all_reports_the_address_that_failed() {
+        let taken = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind");
+        let addr = taken.local_addr().expect("local addr");
+        let err = bind_all(
+            &[SocketAddr::from(([127, 0, 0, 1], 0)), addr],
+            Lane::Transparent,
+        )
+        .await
+        .expect_err("second bind must fail");
+        assert!(err.contains(&addr.to_string()), "{err}");
+    }
 
     #[test]
     fn parse_upstream_with_auth() {

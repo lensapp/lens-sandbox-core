@@ -81,19 +81,46 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// the sandbox exhaust the proxy's fd/memory budget. 64 is generous for
 /// real workloads (glibc's default is ~3 concurrent outstanding queries
 /// per resolver) and cheap to keep warm.
+///
+/// Per bound address, not global: `serve` makes its own semaphore, so a stub
+/// listening on two addresses admits twice this. That is the intent — each
+/// address is a separate door and neither should be able to starve the other.
 const MAX_INFLIGHT_QUERIES: usize = 64;
 
-/// Run the UDP DNS stub. One bound socket, one receive loop, one spawned task
-/// per query so a slow upstream doesn't block the accept path.
-pub async fn run(listen_addr: SocketAddr, state: Arc<ProxyState>) -> Result<(), String> {
+/// Run the UDP DNS stub. One bound socket per address, one receive loop each,
+/// one spawned task per query so a slow upstream doesn't block the accept path.
+///
+/// Usually one address — loopback. A sandbox with a nested namespace adds the
+/// address its veth redirects to; see `config::EXTRA_LISTEN_IPS_ENV`. All or
+/// nothing, like the TCP listeners: a stub that is silently missing on one
+/// address is a resolver the allowlist does not cover.
+pub async fn run(listen_addrs: &[SocketAddr], state: Arc<ProxyState>) -> Result<(), String> {
     let upstream = discover_upstream()
         .ok_or_else(|| "no upstream nameserver found (check /etc/resolv.conf)".to_string())?;
-    let socket = UdpSocket::bind(listen_addr)
-        .await
-        .map_err(|e| format!("dns stub bind {listen_addr}: {e}"))?;
-    tracing::info!(listen = %listen_addr, upstream = %upstream, "dns stub listening");
-    serve(Arc::new(socket), state, upstream).await;
-    Ok(())
+    let mut sockets = Vec::with_capacity(listen_addrs.len());
+    for addr in listen_addrs {
+        let socket = UdpSocket::bind(addr)
+            .await
+            .map_err(|e| format!("dns stub bind {addr}: {e}"))?;
+        tracing::info!(listen = %addr, upstream = %upstream, "dns stub listening");
+        sockets.push((*addr, Arc::new(socket)));
+    }
+
+    let mut loops = tokio::task::JoinSet::new();
+    for (addr, socket) in sockets {
+        let state = state.clone();
+        loops.spawn(async move {
+            serve(socket, state, upstream).await;
+            addr
+        });
+    }
+    // `serve` runs until its socket errors. Any of them stopping means the stub
+    // is no longer whole, so report it and let the set abort the others. Name
+    // the address: with several bound, "the stub died" does not say which.
+    Err(match loops.join_next().await {
+        Some(Ok(addr)) => format!("dns stub receive loop on {addr} ended"),
+        _ => "dns stub receive loop ended".to_string(),
+    })
 }
 
 /// Core receive loop, factored out so integration tests can drive it with a
