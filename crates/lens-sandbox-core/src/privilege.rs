@@ -349,7 +349,15 @@ impl SandboxCredentials {
     /// - the **user** is looked up by name first, so a name gets whatever
     ///   uid this image gave it, and falls back to being parsed as a
     ///   number. This is how the workload's own identity resolves, and a
-    ///   caller asking for a user by name has to land on the same one;
+    ///   caller asking for a user by name has to land on the same one.
+    ///   The guest's init does that resolution itself — it reads the
+    ///   image's `/etc/passwd`, matches the `USER` segment against the
+    ///   name column, and only falls back to the numeric form on a miss.
+    ///   It is deliberately not runc's `GetExecUser`, which matches a
+    ///   passwd line on the name *or* the stringified uid: on an image
+    ///   whose passwd holds a user literally named for a numeral, the two
+    ///   disagree, and a step naming that user would land on a different
+    ///   uid from the workload;
     /// - the **group** is parsed as a number first, so a group merely
     ///   *named* for a numeral cannot outrank the id itself.
     ///
@@ -400,7 +408,13 @@ impl SandboxCredentials {
     /// it directly on credentials that may resolve to uid 0 — go through
     /// [`privilege_drop_for`], which routes those to
     /// [`apply_cap_drop`], or the child keeps `CAP_NET_ADMIN`.
-    pub fn apply(&self, cmd: &mut Command) {
+    ///
+    /// Crate-private for that reason. Of the two halves this is the one
+    /// that fails open: misapplied to root credentials it is a
+    /// `setuid(0)` no-op that keeps every capability, which is the bug
+    /// [`privilege_drop_for`] exists to prevent. A doc note asking
+    /// callers not to is weaker than a compiler that will not let them.
+    pub(crate) fn apply(&self, cmd: &mut Command) {
         let uid = self.uid;
         let gid = self.gid;
         unsafe {
@@ -467,7 +481,11 @@ pub fn lock_down_after_setuid() -> io::Result<()> {
 /// does not already have, so clearing them would be churn with a failure
 /// mode and no benefit. [`SandboxCredentials::apply`] clears them because
 /// that child really does become unprivileged.
-pub fn apply_cap_drop(cmd: &mut Command, gid: Option<nix::unistd::Gid>) {
+///
+/// Crate-private, with [`SandboxCredentials::apply`], because
+/// [`privilege_drop_for`] owns the choice between them. A caller reaching
+/// past it is re-deciding the one rule this module exists to hold.
+pub(crate) fn apply_cap_drop(cmd: &mut Command, gid: Option<nix::unistd::Gid>) {
     unsafe {
         cmd.pre_exec(move || {
             if let Some(gid) = gid {
@@ -496,7 +514,7 @@ pub enum PrivilegeDrop<'a> {
     ///
     /// `gid` is the group the caller resolved, or `None` where it
     /// resolved no identity at all. It is not a confinement — see
-    /// [`apply_cap_drop`] — but it decides what group owns the files the
+    /// `apply_cap_drop` — but it decides what group owns the files the
     /// child writes.
     Capabilities { gid: Option<nix::unistd::Gid> },
     /// An unprivileged parent has neither a uid to drop nor a capability
@@ -506,7 +524,7 @@ pub enum PrivilegeDrop<'a> {
     /// step naming `root` runs as the parent's own identity instead. Only
     /// root: a non-root identity still takes [`Setuid`] here and fails at
     /// spawn with `EPERM` — even the parent's own identity, because
-    /// [`SandboxCredentials::apply`] opens with `setgroups`, which wants
+    /// `SandboxCredentials::apply` opens with `setgroups`, which wants
     /// `CAP_SETGID` whatever the list holds. That asymmetry is what a
     /// reader arrives with.
     ///
@@ -547,22 +565,49 @@ pub enum PrivilegeDrop<'a> {
 /// child creates, and a step written as `root:1000` asked for that. The
 /// one outcome with no defence is to accept a `USER:GROUP` and discard
 /// the group.
+///
+/// `is_root` is the caller's word for whether the parent is privileged,
+/// and this function reads the real euid only to check that word. A
+/// caller that says `false` on a genuinely root parent would otherwise
+/// get an undropped uid-0 child holding `CAP_NET_ADMIN` inside the cage,
+/// and nothing would say so. The mismatch warns rather than reroutes:
+/// believing the kernel over the caller here would change which drop
+/// every existing spawn path gets, which is not a thing to do quietly.
 pub fn privilege_drop_for(creds: Option<&SandboxCredentials>, is_root: bool) -> PrivilegeDrop<'_> {
+    decide_privilege_drop(creds, is_root, nix::unistd::geteuid().is_root())
+}
+
+/// The decision itself, with the euid an argument rather than an ambient
+/// read.
+///
+/// Pure, so both directions of the mismatch warning are testable and
+/// neither depends on who runs the suite — the `cage` job runs it as
+/// root, and a decision whose silence is asserted must not answer
+/// differently there.
+fn decide_privilege_drop(
+    creds: Option<&SandboxCredentials>,
+    is_root: bool,
+    parent_euid_is_root: bool,
+) -> PrivilegeDrop<'_> {
     match creds {
         Some(creds) if !creds.uid_gid().0.is_root() => PrivilegeDrop::Setuid(creds),
         _ if is_root => PrivilegeDrop::Capabilities {
             gid: creds.map(|creds| creds.uid_gid().1),
         },
-        Some(creds) => {
-            tracing::warn!(
-                user = creds.user(),
-                "requested identity ignored: this parent is not root, so the child runs as the parent's own identity"
-            );
-            PrivilegeDrop::Nothing {
-                requested: Some(creds),
+        _ => {
+            if parent_euid_is_root {
+                tracing::warn!(
+                    "parent is root but was flagged unprivileged: this child keeps CAP_NET_ADMIN and can leave the cage"
+                );
             }
+            if let Some(creds) = creds {
+                tracing::warn!(
+                    user = creds.user(),
+                    "requested identity ignored: this parent is not root, so the child runs as the parent's own identity"
+                );
+            }
+            PrivilegeDrop::Nothing { requested: creds }
         }
-        None => PrivilegeDrop::Nothing { requested: None },
     }
 }
 
@@ -1001,15 +1046,18 @@ mod tests {
         );
     }
 
-    #[derive(Clone, Default)]
-    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    thread_local! {
+        /// Every `WARN` this thread emitted since the last read.
+        static WARNINGS: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    impl std::io::Write for Captured {
+    /// Sends what a thread logs to that thread's own buffer.
+    struct ToThisThread;
+
+    impl std::io::Write for ToThisThread {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .expect("the capture buffer is uncontended")
-                .extend_from_slice(buf);
+            WARNINGS.with(|warnings| warnings.borrow_mut().extend_from_slice(buf));
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -1017,11 +1065,37 @@ mod tests {
         }
     }
 
-    impl Captured {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().expect("the capture buffer is uncontended"))
-                .into_owned()
-        }
+    /// Run `body` and answer both what it returned and what it warned.
+    ///
+    /// One global subscriber, installed once, rather than a scoped one
+    /// per test. `tracing` caches callsite interest globally: a thread
+    /// that reaches a `warn!` while no subscriber is installed can cache
+    /// it as uninteresting, and a scoped subscriber on another thread
+    /// then never sees it. That is a failure which depends on the
+    /// scheduler and reads as a flake — it cost this crate a real one.
+    ///
+    /// The buffer is thread-local, so tests still read only their own
+    /// warnings and need no lock between them. That also bounds what this
+    /// can see: a `body` that spawns a thread, or an async one whose work
+    /// lands on a runtime worker, warns somewhere this never reads, and
+    /// the test would pass having captured nothing.
+    fn capturing_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_writer(|| ToThisThread)
+                    .finish(),
+            )
+            .expect("nothing else in this crate installs a global subscriber");
+        });
+
+        WARNINGS.with(|warnings| warnings.borrow_mut().clear());
+        let answer = body();
+        let text =
+            WARNINGS.with(|warnings| String::from_utf8_lossy(&warnings.borrow()).into_owned());
+        (answer, text)
     }
 
     /// The parent honours no identity here, so the one thing the caller
@@ -1030,42 +1104,77 @@ mod tests {
     /// where nothing names the identity as the cause.
     #[test]
     fn an_unprivileged_parent_says_which_identity_it_ignored() {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, || {
-            privilege_drop_for(Some(&creds_for(0, 0)), false);
+        let (_, text) = capturing_warnings(|| {
+            decide_privilege_drop(Some(&creds_for(0, 0)), false, false);
         });
-
-        let text = captured.text();
         assert!(
             text.contains("requested identity ignored") && text.contains(r#"user="root""#),
             "the warning has to name the identity that was asked for, and the sentence alone says only that somebody was ignored; got: {text:?}"
         );
     }
 
+    /// A caller that says "not root" on a root parent gets `Nothing`:
+    /// no capability drop, and a uid-0 child holding `CAP_NET_ADMIN`
+    /// inside the cage. The routing cannot change without changing which
+    /// drop every existing spawn path gets, so the mismatch is reported
+    /// instead — a silent fail-open becomes something greppable.
+    #[test]
+    fn a_root_parent_flagged_unprivileged_says_so() {
+        let (decision, text) = capturing_warnings(|| decide_privilege_drop(None, false, true));
+
+        assert_eq!(
+            decision,
+            PrivilegeDrop::Nothing { requested: None },
+            "the caller's word still decides the routing; only the report is new"
+        );
+        assert!(
+            text.contains("parent is root but was flagged unprivileged"),
+            "an undropped root child inside the cage has to leave a line somebody can grep for; got: {text:?}"
+        );
+    }
+
+    /// Both reports are independent, so a caller that gets the flag wrong
+    /// *and* asked for an identity learns each thing separately.
+    #[test]
+    fn a_root_parent_flagged_unprivileged_still_names_the_identity_it_ignored() {
+        let (_, text) = capturing_warnings(|| {
+            decide_privilege_drop(Some(&creds_for(0, 0)), false, true);
+        });
+        assert!(
+            text.contains("parent is root but was flagged unprivileged")
+                && text.contains("requested identity ignored"),
+            "the two are different faults with different fixes, and one must not stand in for the other; got: {text:?}"
+        );
+    }
+
+    /// The wrapper reads the real euid and hands it to the decision.
+    ///
+    /// Everything else here drives `decide_privilege_drop` directly, so
+    /// nothing else would notice if the wrapper passed a literal `false`,
+    /// or read `getuid` where the question is what the parent may
+    /// actually do. Deterministic on any box: it asserts the warning
+    /// appears exactly when this process is effectively root.
+    #[test]
+    fn the_public_decision_asks_the_kernel_who_the_parent_is() {
+        let (_, text) = capturing_warnings(|| privilege_drop_for(None, false));
+
+        assert_eq!(
+            text.contains("parent is root but was flagged unprivileged"),
+            nix::unistd::geteuid().is_root(),
+            "the mismatch report has to follow the effective uid, which is what decides whether capset and setuid would have worked; got: {text:?}"
+        );
+    }
+
     #[test]
     fn every_other_decision_warns_about_nothing() {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-
-        tracing::subscriber::with_default(subscriber, || {
-            privilege_drop_for(Some(&creds_for(0, 0)), true);
-            privilege_drop_for(Some(&creds_for(65534, 65534)), true);
-            privilege_drop_for(None, false);
+        let (_, text) = capturing_warnings(|| {
+            decide_privilege_drop(Some(&creds_for(0, 0)), true, true);
+            decide_privilege_drop(Some(&creds_for(65534, 65534)), true, true);
+            decide_privilege_drop(None, false, false);
         });
 
         assert_eq!(
-            captured.text(),
-            "",
+            text, "",
             "a drop that happened is not news, and a warning on every spawn teaches a reader to skip the one that matters"
         );
     }

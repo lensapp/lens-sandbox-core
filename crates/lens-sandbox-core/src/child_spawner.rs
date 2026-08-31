@@ -223,11 +223,18 @@ mod tests {
     /// wedged.
     ///
     /// The retained stdout is the probe: it reaches EOF only once every
-    /// writer is gone, so a `sleep 30` that survived the drop would hold
-    /// the read open and the test would sit out its timeout instead.
+    /// writer is gone, so a `sleep` that survived the drop would hold the
+    /// read open and the test would sit out its timeout instead.
+    ///
+    /// `sleep` directly, not `sh -c "sleep 30"`. `kill_on_drop` signals
+    /// the immediate child alone, so through a shell the test would pass
+    /// only because dash and bash exec `sleep` in place rather than
+    /// forking it. A `/bin/sh` that does not would leave `sleep` holding
+    /// the write end, and the failure would read as a flake rather than
+    /// as the assumption it was.
     #[tokio::test]
     async fn dropping_a_childs_handle_kills_the_child() {
-        let argv = vec!["sh".into(), "-c".into(), "sleep 30".into()];
+        let argv = vec!["sleep".into(), "30".into()];
         let mut cmd = build_command(&spec_for(argv, HashMap::new(), false));
         cmd.stdout(std::process::Stdio::piped());
 
@@ -267,7 +274,7 @@ mod tests {
     /// child and then exits. That is a heavier seam than the claim earns.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn an_unprivileged_parent_adds_no_new_privs_to_its_child() {
+    async fn an_unprivileged_parent_leaves_no_new_privs_alone() {
         let ours = no_new_privs_of(
             &std::fs::read_to_string("/proc/self/status").expect("/proc/self/status reads"),
         );
