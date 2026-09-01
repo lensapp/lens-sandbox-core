@@ -515,6 +515,29 @@ mod tests {
     }
 
     #[test]
+    fn marked_traffic_is_accepted_before_udp_reaches_the_queue() {
+        // The supervisor's own listeners carry the mark (see `listen.rs`), and
+        // a DNS answer to a nested namespace is locally-generated UDP to a
+        // link-local destination. If the queue rule came first, that answer
+        // would be judged by `udp_egress::decide`, whose floor refuses
+        // link-local outright — every reply dropped, and a
+        // `blocked-destination` audit event filed for traffic the cage itself
+        // generated. The accept must win.
+        let s = render_install_script();
+        let chain = output_filter_chain(&s);
+        let accept_pos = chain
+            .find(&marked_accept_rule())
+            .expect("filter chain must explicitly accept marked (proxy-origin) traffic");
+        let queue_pos = chain
+            .find("queue num")
+            .expect("filter chain must keep its udp queue");
+        assert!(
+            accept_pos < queue_pos,
+            "marked-traffic accept ({accept_pos}) must precede the udp queue ({queue_pos})"
+        );
+    }
+
+    #[test]
     fn marked_proxy_traffic_is_explicitly_accepted_in_filter_chain() {
         // With the filter chain at `policy drop`, the proxy/MITM/DNS-upstream
         // sockets (SO_MARK == MARK_VALUE) need an explicit accept — and it must

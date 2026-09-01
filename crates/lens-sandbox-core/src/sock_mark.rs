@@ -61,11 +61,16 @@ pub const REJECT_MARK: u32 = 0x4E_58_55_44; // "NXUD" in ASCII
 /// before privilege drop, and in tests / hosts without nftables rules there
 /// is nothing to bypass. Returning the error here would make every outbound
 /// connection from an unprivileged Linux process fail.
+///
+/// It is warned about rather than noted, because an unmarked *listener* is not
+/// a harmless degradation: its replies to a nested namespace are judged as
+/// ordinary egress and refused (see `listen.rs`), and a cage that drops its own
+/// DNS answers should not explain itself only at debug level.
 #[cfg(target_os = "linux")]
 pub(crate) fn mark<F: AsFd>(fd: &F) -> io::Result<()> {
     match nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::Mark, &MARK_VALUE) {
         Err(nix::errno::Errno::EPERM) => {
-            tracing::debug!("SO_MARK setsockopt: EPERM (no CAP_NET_ADMIN/CAP_NET_RAW); continuing");
+            tracing::warn!("SO_MARK setsockopt: EPERM (no CAP_NET_ADMIN/CAP_NET_RAW); continuing");
             Ok(())
         }
         other => other.map_err(io::Error::from),

@@ -485,7 +485,7 @@ fn listen_addrs(primary: SocketAddr, extra: &[IpAddr]) -> Vec<SocketAddr> {
 ///
 /// All or nothing: a listener that is silently missing is a cage with a hole in
 /// it, so a partial success is reported as a failure.
-async fn bind_all(addrs: &[SocketAddr], lane: Lane) -> Result<Vec<TcpListener>, String> {
+fn bind_all(addrs: &[SocketAddr], lane: Lane) -> Result<Vec<TcpListener>, String> {
     let kind = lane.kind();
     let mut listeners = Vec::with_capacity(addrs.len());
     for addr in addrs {
@@ -518,6 +518,10 @@ fn is_unredirected(orig_dst: SocketAddr, local: Option<SocketAddr>) -> bool {
 }
 
 /// Accept forever on one listener, handing each connection to its lane.
+///
+/// Never returns: every error path continues the loop. It ends only by panic or
+/// by abort, so the caller cannot learn which listener died from a return value
+/// — see `run`, which keeps the names beside the `JoinSet` instead.
 async fn accept_loop(
     listener: TcpListener,
     lane: Lane,
@@ -608,12 +612,11 @@ impl ProxyServer {
     }
 
     pub async fn run(self) -> Result<(), String> {
-        let explicit = bind_all(&[self.listen_addr], Lane::Explicit).await?;
+        let explicit = bind_all(&[self.listen_addr], Lane::Explicit)?;
         let transparent = bind_all(
             &listen_addrs(self.transparent_listen_addr, &self.extra_listen_ips),
             Lane::Transparent,
-        )
-        .await?;
+        )?;
         let dns_listen = listen_addrs(self.dns_stub_listen_addr, &self.extra_listen_ips);
 
         // One semaphore spans every listener so a burst on one path can't
@@ -622,17 +625,27 @@ impl ProxyServer {
         let dns_state = self.state.clone();
 
         let mut lanes = JoinSet::new();
+        // A lane task never returns — it ends by panic or by abort, which
+        // carries a task id and nothing else. With one listener per address,
+        // "a listener ended" does not say which door fell off the cage, so keep
+        // the names here where the id can be looked up.
+        let mut doors: HashMap<tokio::task::Id, String> = HashMap::new();
         for (listener, lane) in explicit
             .into_iter()
             .map(|l| (l, Lane::Explicit))
             .chain(transparent.into_iter().map(|l| (l, Lane::Transparent)))
         {
-            lanes.spawn(accept_loop(
+            let door = match listener.local_addr() {
+                Ok(addr) => format!("{} {addr}", lane.kind()),
+                Err(_) => lane.kind().to_string(),
+            };
+            let handle = lanes.spawn(accept_loop(
                 listener,
                 lane,
                 semaphore.clone(),
                 self.state.clone(),
             ));
+            doors.insert(handle.id(), door);
         }
 
         // The UDP relay runs on its own thread, not a task: it judges each
@@ -656,8 +669,16 @@ impl ProxyServer {
         // the rest. DNS stub failure degrades to "no hostname resolution for
         // sandbox user" — loud log, proxy stays up so explicit-CONNECT traffic
         // keeps flowing.
-        let ended = lanes.join_next().await;
-        tracing::error!("proxy listener task ended: {ended:?}");
+        let ended = lanes.join_next_with_id().await;
+        let door = match &ended {
+            Some(Ok((id, ()))) => doors.get(id),
+            Some(Err(e)) => doors.get(&e.id()),
+            None => None,
+        };
+        tracing::error!(
+            listener = door.map(String::as_str).unwrap_or("unknown"),
+            "proxy listener task ended: {ended:?}"
+        );
         dns_task.abort();
         Err("proxy listener terminated".into())
     }
@@ -3489,7 +3510,7 @@ pub(crate) mod tests {
             SocketAddr::from(([127, 0, 0, 1], 0)),
             SocketAddr::from(([127, 0, 0, 1], 0)),
         ];
-        let listeners = bind_all(&addrs, Lane::Transparent).await.expect("bind");
+        let listeners = bind_all(&addrs, Lane::Transparent).expect("bind");
         assert_eq!(listeners.len(), 2);
     }
 
@@ -3503,7 +3524,6 @@ pub(crate) mod tests {
             &[SocketAddr::from(([127, 0, 0, 1], 0)), addr],
             Lane::Transparent,
         )
-        .await
         .expect_err("second bind must fail");
         assert!(err.contains(&addr.to_string()), "{err}");
     }

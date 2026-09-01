@@ -126,6 +126,7 @@ pub async fn run(listen_addrs: &[SocketAddr], state: Arc<ProxyState>) -> Result<
 /// `/etc/resolv.conf`). Runs until the socket errors or the task is
 /// cancelled.
 pub async fn serve(socket: Arc<UdpSocket>, state: Arc<ProxyState>, upstream: SocketAddr) {
+    let attributable = caller_is_attributable(socket.local_addr().ok());
     let semaphore = Arc::new(Semaphore::new(MAX_INFLIGHT_QUERIES));
     let mut buf = [0u8; QUERY_BUF_SIZE];
     loop {
@@ -158,9 +159,31 @@ pub async fn serve(socket: Arc<UdpSocket>, state: Arc<ProxyState>, upstream: Soc
         // the semaphore slot.
         tokio::spawn(async move {
             let _permit = permit;
-            handle_query(packet, peer, &socket, &state, upstream).await;
+            handle_query(packet, peer, &socket, &state, upstream, attributable).await;
         });
     }
+}
+
+/// Whether a datagram received on `listen` can have its sender attributed.
+///
+/// Only on loopback. Every other bound address is a veth reaching a nested
+/// namespace (see `config::EXTRA_LISTEN_IPS_ENV`), and that sender's socket
+/// lives in another `/proc` — no walk here can find it, and a walk that
+/// returns something anyway has found the wrong process.
+///
+/// This asks about the *listener*, not about the datagram's source. Source
+/// address is not the same question: the redirect that feeds this stub sits in
+/// the output hook, which rewrites only the destination, so an ordinary
+/// sandbox's query arrives carrying the pod address. Gating on that would stop
+/// attributing callers that this stub has always attributed.
+///
+/// A local address we cannot read fails closed, since the alternative is to
+/// attribute on an assumption.
+fn caller_is_attributable(listen: Option<SocketAddr>) -> bool {
+    // Canonicalized for the same reason `is_disallowed_egress_ip` is: an
+    // IPv4-mapped IPv6 form is the same address, and the two checks must not
+    // drift apart on it.
+    listen.is_some_and(|addr| addr.ip().to_canonical().is_loopback())
 }
 
 /// Handle one received datagram. Decides allow/deny against the route
@@ -171,8 +194,9 @@ async fn handle_query(
     socket: &UdpSocket,
     state: &Arc<ProxyState>,
     upstream: SocketAddr,
+    attributable: bool,
 ) {
-    let decision = resolve_decision(&packet, peer, state).await;
+    let decision = resolve_decision(&packet, peer, state, attributable).await;
 
     match decision {
         Decision::Allow {
@@ -252,7 +276,12 @@ const BINARY_DENY_REASON: &str = "dns-binary-not-allowed";
 /// the TCP layer would allow (allow-for-binary, then deny-the-broader-domain)
 /// would be wrongly NXDOMAIN'd. The walk under a binary policy is bounded by
 /// the inflight semaphore.
-async fn resolve_decision(packet: &[u8], peer: SocketAddr, state: &ProxyState) -> Decision {
+async fn resolve_decision(
+    packet: &[u8],
+    peer: SocketAddr,
+    state: &ProxyState,
+    attributable: bool,
+) -> Decision {
     // Scoped so the policy read guard drops before the `.await` below — a
     // std RwLock guard must never be held across an await point.
     let has_binary_rule = {
@@ -273,7 +302,11 @@ async fn resolve_decision(packet: &[u8], peer: SocketAddr, state: &ProxyState) -
             || gates_dns_by_binary(&policy.tcp_egress)
             || gates_dns_by_binary(&policy.udp_egress)
     };
-    let caller = if has_binary_rule {
+    // `attributable` is false for a datagram from a nested namespace, whose
+    // sender no walk of this `/proc` can find. `classify_query` then applies
+    // every `binaries` rule against no caller, which denies — the honest answer
+    // when nothing here can say which binary sent the packet.
+    let caller = if has_binary_rule && attributable {
         resolve_udp_offloaded(peer).await
     } else {
         None
@@ -577,6 +610,7 @@ fn emit_deny(state: &Arc<ProxyState>, qname: &str, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::proxy::ProxyServer;
     use crate::routing::{RouteMatcher, RouteRule, Transport, Verdict};
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
@@ -584,6 +618,25 @@ mod tests {
     use hickory_proto::rr::{DNSClass, RecordType};
     use std::path::PathBuf;
     use std::str::FromStr;
+
+    #[test]
+    fn only_a_loopback_listener_can_attribute_its_caller() {
+        // The listener decides, not the datagram's source. A query redirected
+        // by the output hook keeps its source address, so an ordinary sandbox
+        // reaches the loopback stub *from the pod address* — and must still be
+        // attributed. Only an extra listener, on the veth, hears a sender this
+        // /proc cannot see.
+        assert!(caller_is_attributable(Some(
+            "127.0.0.1:5355".parse().unwrap()
+        )));
+        assert!(caller_is_attributable(Some("[::1]:5355".parse().unwrap())));
+        assert!(!caller_is_attributable(Some(
+            "169.254.32.1:5355".parse().unwrap()
+        )));
+        // An address we could not read is not evidence either way, and
+        // attributing on an assumption is the failure that matters.
+        assert!(!caller_is_attributable(None));
+    }
 
     fn make_query(qname: &str, rtype: RecordType) -> Vec<u8> {
         let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
