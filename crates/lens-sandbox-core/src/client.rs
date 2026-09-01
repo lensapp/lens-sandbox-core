@@ -1093,8 +1093,25 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 // the gate scan trips). Arming = a follow-up policy resends the
                 // same injection with the real value. See
                 // `ProxyState::unarmed_credential_domains`.
+                //
+                // Only when this run holds the placeholder. The interception
+                // exists to catch that exact string in the request bytes and
+                // raise the first-use card; a run that carries no placeholder
+                // for the credential can never produce it, so terminating TLS
+                // on the domain gates nothing and breaks every client that
+                // carries its own trust anchors (rustls + webpki-roots).
                 if let Some(domain) = inj.unarmed_domain() {
-                    unarmed_domains.push(domain.to_lowercase());
+                    match cred.placeholder.as_deref() {
+                        Some(placeholder) if !placeholder.is_empty() => {
+                            unarmed_domains.push(domain.to_lowercase());
+                        }
+                        _ => tracing::debug!(
+                            credential = cred.id,
+                            domain,
+                            "unarmed credential carries no placeholder in this run; \
+                             leaving the domain spliced"
+                        ),
+                    }
                     continue;
                 }
                 apply_injection(&cred.id, cred.placeholder.as_deref(), inj, &mut apply);
@@ -1845,6 +1862,119 @@ mod tests {
                 .unwrap()
                 .contains_key("__lens_cred:cred-unarmed__")
         );
+    }
+
+    // A connector the run carries no placeholder for can never trip the
+    // credential gate: the gate fires on the placeholder string appearing in
+    // the request bytes, and this run holds no such string. Terminating TLS on
+    // that connector's domains buys nothing and breaks every client that
+    // carries its own trust anchors (rustls + webpki-roots), so the domain must
+    // not enter the unarmed set.
+    #[tokio::test]
+    async fn policy_unarmed_injection_without_placeholder_intercepts_nothing() {
+        let (listener, addr) = bind_server().await;
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, _read) = ws.split();
+
+            // The connector declares its domain, but this run holds no
+            // placeholder for it — no `placeholder`, no `envVar`.
+            let policy = serde_json::json!({
+                "type": "policy",
+                "credentials": [
+                    {
+                        "id": "cred-no-placeholder",
+                        "injections": [
+                            {
+                                "injectionType": "header",
+                                "domain": "api.github.com",
+                                "header": "Authorization",
+                                "value": ""
+                            }
+                        ]
+                    }
+                ]
+            });
+            write
+                .send(Message::Text(policy.to_string().into()))
+                .await
+                .unwrap();
+
+            write.send(Message::Close(None)).await.ok();
+        });
+
+        let (ws_url, token) = make_config(addr);
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let session = TestDispatcher.new_session();
+        let proxy_state = Some(state.clone());
+
+        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+
+        assert!(state.unarmed_credential_domains.read().unwrap().is_empty());
+        assert!(!state.intercept_for_unarmed("api.github.com"));
+    }
+
+    // An unarmed injection whose credential carries an empty placeholder is the
+    // same case: there is no string for the scan to match, so no interception.
+    #[tokio::test]
+    async fn policy_unarmed_injection_with_empty_placeholder_intercepts_nothing() {
+        let (listener, addr) = bind_server().await;
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, _read) = ws.split();
+
+            let policy = serde_json::json!({
+                "type": "policy",
+                "credentials": [
+                    {
+                        "id": "cred-empty-placeholder",
+                        "envVar": "GH_TOKEN",
+                        "placeholder": "",
+                        "injections": [
+                            {
+                                "injectionType": "header",
+                                "domain": "api.github.com",
+                                "header": "Authorization",
+                                "value": ""
+                            }
+                        ]
+                    }
+                ]
+            });
+            write
+                .send(Message::Text(policy.to_string().into()))
+                .await
+                .unwrap();
+
+            write.send(Message::Close(None)).await.ok();
+        });
+
+        let (ws_url, token) = make_config(addr);
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let session = TestDispatcher.new_session();
+        let proxy_state = Some(state.clone());
+
+        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+
+        assert!(!state.intercept_for_unarmed("api.github.com"));
     }
 
     // A credential with no injections at all declares no domain, so there is
