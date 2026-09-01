@@ -159,8 +159,42 @@ pub async fn handle_mitm(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server_config = build_ephemeral_server_config(ctx.ca, target_host)?;
     let acceptor = TlsAcceptor::from(server_config);
-    let tls_client = acceptor.accept(client).await?;
+    let tls_client = match acceptor.accept(client).await {
+        Ok(tls_client) => tls_client,
+        // A client with compiled-in trust anchors (rustls + webpki-roots) reads
+        // neither the system store nor `SSL_CERT_FILE`, so the boundary CA
+        // never reaches it and it alerts. Where a credential is armed there is
+        // no way on: the proxy cannot inject into bytes it cannot read. Name
+        // the cause rather than let `received fatal alert: UnknownCA` stand as
+        // the whole account of it.
+        Err(e) if !ctx.injections.is_empty() && is_boundary_ca_rejection(&e) => {
+            crate::proxy::emit_boundary_ca_rejection(ctx.state, target_host, ctx.actor);
+            return Err(format!(
+                "this client cannot be credential-injected on {target_host}: it rejects the \
+                 boundary CA ({e})"
+            )
+            .into());
+        }
+        Err(e) => return Err(e.into()),
+    };
     handle_mitm_pre_accepted(tls_client, target_host, upstream_mode, ctx).await
+}
+
+/// Whether a failed client handshake failed because the client does not trust
+/// the boundary CA — as opposed to a transport fault, a protocol mismatch, or
+/// any other alert.
+///
+/// `unknown_ca` is what rustls sends; `bad_certificate` is what several other
+/// stacks send for the same judgement. Both mean the same thing here: the chain
+/// the proxy presented did not terminate in an anchor the client holds.
+fn is_boundary_ca_rejection(err: &std::io::Error) -> bool {
+    matches!(
+        err.get_ref()
+            .and_then(|e| e.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::UnknownCA | rustls::AlertDescription::BadCertificate
+        ))
+    )
 }
 
 /// MITM variant that skips the initial TLS accept — for callers that have
@@ -5439,5 +5473,83 @@ mod tests {
             "expected a policy refusal, got: {err}"
         );
         client.abort();
+    }
+
+    /// A client that carries its own trust anchors (rustls + webpki-roots)
+    /// answers the boundary certificate with an `unknown_ca` alert. On a host
+    /// that arms a credential injection there is nothing else the proxy can do
+    /// — it cannot inject into bytes it cannot read — so the failure must name
+    /// the cause instead of surfacing a bare TLS error, and it must reach the
+    /// audit log.
+    #[tokio::test]
+    async fn a_client_rejecting_the_boundary_ca_is_named_on_an_injected_host() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = EphemeralCa::new().unwrap();
+        let (state, mut rx) = crate::proxy::tests::test_state();
+
+        let hostname = "api.github.com";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // An empty root store stands in for compiled-in trust anchors: the
+        // boundary CA is not among them, so the client alerts and gives up.
+        let client = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(config));
+            let name = ServerName::try_from(hostname.to_string()).unwrap();
+            connector
+                .connect(name, stream)
+                .await
+                .expect_err("a client with no matching anchor must reject the boundary cert");
+        });
+
+        let (client_stream, _) = listener.accept().await.unwrap();
+        let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+        let audit_tx = state.audit_tx.lock().unwrap().clone();
+        let injections = vec![CredentialInjection {
+            header: "Authorization".to_string(),
+            value: "token ghp_real".to_string(),
+            rules: Vec::new(),
+        }];
+        let ctx = MitmContext {
+            injections: &injections,
+            http_rules: &[],
+            ca: &ca,
+            audit_tx: &audit_tx,
+            extra_ca_certs: &[],
+            placeholder_map: &[],
+            state: &state,
+            match_host: hostname,
+            actor: &actor,
+        };
+
+        let err = handle_mitm(
+            client_stream,
+            hostname,
+            UpstreamMode::DirectTls {
+                host: hostname.to_string(),
+                port: 443,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("a rejected boundary cert cannot carry an injected credential");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be credential-injected on api.github.com")
+                && msg.contains("boundary CA"),
+            "expected the named boundary-CA failure, got: {msg}"
+        );
+
+        let event: serde_json::Value =
+            serde_json::from_str(&rx.try_recv().expect("the failure must be audited")).unwrap();
+        assert_eq!(event["host"], "api.github.com");
+        assert_eq!(event["result"], "error");
+        assert_eq!(event["metadata"]["reason"], "boundary-ca-rejected");
+
+        client.await.unwrap();
     }
 }
