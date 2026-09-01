@@ -29,6 +29,24 @@ pub const DEFAULT_UDP_QUEUE_NUM: u16 = 0;
 /// Naming the veth address here is what makes the cage reachable from inside
 /// the nested namespace.
 ///
+/// **This crate does not install that rule.** `network.rs` renders `output`
+/// hooks only, which see locally-generated traffic; a packet from a nested
+/// namespace arrives on the veth and traverses `prerouting`, which nothing
+/// here writes. The rule belongs to whatever creates the nested namespace —
+/// the sidecar — and it must target [`DEFAULT_TRANSPARENT_PORT`] and
+/// [`DEFAULT_DNS_STUB_PORT`], which are declared here and consumed out of
+/// tree. No test in this repository can see that pairing, so a change to
+/// either constant is a breaking change for that consumer.
+///
+/// What holds a packet the rule does not match is likewise not this crate's
+/// `policy drop`, which only guards the `output` hook. It is the shape of the
+/// nested namespace: its only interface is the veth, and its only route leads
+/// to the address named here. A packet the redirect misses is not forwarded
+/// onward — it has nowhere to go.
+///
+/// Only link-local addresses are accepted, so the value cannot name an
+/// interface the cluster network can reach. See `parse_extra_listen_ips`.
+///
 /// It applies to the transparent listener and the DNS stub only. The explicit
 /// CONNECT proxy stays on loopback: it serves the agent process through
 /// `HTTPS_PROXY`, and a nested namespace has no business reaching it.
@@ -183,18 +201,29 @@ pub fn parse_extra_listen_ips(raw: Option<&str>) -> Vec<IpAddr> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|s| match s.parse::<IpAddr>() {
-            // `0.0.0.0` and `::` parse, and would bind every interface — the
-            // pod address included. The safety of this whole setting rests on
-            // the extra addresses reaching no further than the veth they live
-            // on, which the unspecified address does not.
-            Ok(ip) if ip.is_unspecified() => {
+            // Link-local only, and the check is the containment argument
+            // rather than a tidiness rule. This setting is safe because an
+            // extra address reaches no further than the veth it lives on —
+            // which holds for `169.254.0.0/16` and `fe80::/10`, the range a
+            // sidecar provisioner picks its gateway from, and fails for
+            // anything else. `0.0.0.0` would bind every interface; the pod's
+            // own address would put the DNS stub in front of the whole cluster
+            // network, answering for callers that resolve to no actor. Neither
+            // is distinguishable from a veth address by parsing, and
+            // `IP_FREEBIND` means a wrong one binds cleanly and then hears
+            // nothing, so a bind failure will not report the mistake either.
+            Ok(ip) if !crate::sock_mark::is_link_local(ip.to_canonical()) => {
                 tracing::warn!(
                     entry = %s,
-                    "{EXTRA_LISTEN_IPS_ENV} entry names every interface rather than one address, ignoring it"
+                    "{EXTRA_LISTEN_IPS_ENV} entry is not a link-local address, ignoring it"
                 );
                 None
             }
-            Ok(ip) => Some(ip),
+            // Stored canonical, so the list holds the form every check above
+            // reasons about — otherwise `::ffff:169.254.32.1` would pass the
+            // link-local test on its canonical form and then bind as a
+            // v4-mapped dual-stack socket.
+            Ok(ip) => Some(ip.to_canonical()),
             Err(_) => {
                 tracing::warn!(
                     entry = %s,
@@ -224,10 +253,24 @@ mod tests {
             vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
         );
         assert_eq!(
-            parse_extra_listen_ips(Some(" 169.254.32.1 , fd00::1 ")),
+            parse_extra_listen_ips(Some(" 169.254.32.1 , fe80::1 ")),
             vec![
                 "169.254.32.1".parse::<IpAddr>().unwrap(),
-                "fd00::1".parse::<IpAddr>().unwrap(),
+                "fe80::1".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_listen_ips_keeps_only_link_local_addresses() {
+        // The wildcard binds every interface; the pod's own address would put
+        // the DNS stub in front of the cluster network. Neither is a veth, and
+        // parsing cannot tell them apart from one.
+        assert_eq!(
+            parse_extra_listen_ips(Some("0.0.0.0,::,10.42.0.7,169.254.32.1,fe80::1")),
+            vec![
+                "169.254.32.1".parse::<IpAddr>().unwrap(),
+                "fe80::1".parse::<IpAddr>().unwrap(),
             ]
         );
     }
@@ -239,16 +282,6 @@ mod tests {
         // — a typo in one address should not silently disable the whole cage.
         assert_eq!(
             parse_extra_listen_ips(Some("nope,169.254.32.1,169.254.32.2:3129")),
-            vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
-        );
-    }
-
-    #[test]
-    fn extra_listen_ips_drops_the_wildcard_address() {
-        // It parses, so only an explicit check keeps it out — and it would put
-        // the transparent listener and the DNS stub on the pod address.
-        assert_eq!(
-            parse_extra_listen_ips(Some("0.0.0.0,::,169.254.32.1")),
             vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
         );
     }

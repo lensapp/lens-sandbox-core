@@ -12,13 +12,26 @@
 //! arrives for that address, and the address still only answers on the link it
 //! is eventually assigned to — unlike `route_localnet`, which is the setting
 //! this whole design refused.
+//!
+//! Every listener here also carries [`crate::sock_mark::MARK_VALUE`], because
+//! what it sends is proxy-origin traffic and that is what the mark means. It
+//! was not needed while the only listeners were on loopback: a reply then went
+//! to a loopback destination, which `output_filter` accepts outright. A reply
+//! to a nested namespace leaves over the veth instead, and walks the chain to
+//! the UDP queue, where the shared egress floor refuses a link-local
+//! destination — so a DNS answer would be dropped and would file a
+//! `blocked-destination` audit event on the way. Marked, it is taken by the
+//! chain's first rule. TCP replies already pass on `ct state established`, so
+//! marking both lanes changes nothing there and keeps one rule to remember.
 
 use std::io;
 use std::net::SocketAddr;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-/// Matches `std`'s own listener backlog, so nothing changes for loopback.
+/// Deliberately above `std`'s 128. `somaxconn` caps it either way, and the
+/// supervisor is the only thing between a burst of sandbox connections and a
+/// refusal.
 const BACKLOG: i32 = 1024;
 
 /// Open a TCP listener on `addr`, whether or not `addr` is assigned yet.
@@ -29,6 +42,7 @@ pub(crate) fn tcp(addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
     allow_absent_address(&socket, addr)?;
     socket.bind(&addr.into())?;
     socket.listen(BACKLOG)?;
+    crate::sock_mark::mark(&socket)?;
     socket.set_nonblocking(true)?;
     tokio::net::TcpListener::from_std(socket.into())
 }
@@ -40,6 +54,7 @@ pub(crate) fn udp(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     // two stubs answering one address is not a state worth reaching quietly.
     allow_absent_address(&socket, addr)?;
     socket.bind(&addr.into())?;
+    crate::sock_mark::mark(&socket)?;
     socket.set_nonblocking(true)?;
     tokio::net::UdpSocket::from_std(socket.into())
 }
@@ -73,6 +88,18 @@ mod tests {
     async fn udp_binds_loopback_like_the_std_socket() {
         let socket = udp("127.0.0.1:0".parse().unwrap()).expect("bind");
         assert!(socket.local_addr().expect("local addr").port() != 0);
+    }
+
+    /// A listener's replies must pass the cage's first rule, or a DNS answer
+    /// to a nested namespace is judged as ordinary egress and refused.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_listener_carries_the_proxy_mark() {
+        use std::os::fd::AsFd;
+        let socket = udp("127.0.0.1:0".parse().unwrap()).expect("bind");
+        let mark = nix::sys::socket::getsockopt(&socket.as_fd(), nix::sys::socket::sockopt::Mark)
+            .expect("read SO_MARK");
+        assert_eq!(mark, crate::sock_mark::MARK_VALUE);
     }
 
     /// The point of the module. Without `IP_FREEBIND` this is `EADDRNOTAVAIL`.

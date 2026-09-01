@@ -242,16 +242,15 @@ fn socket_inode_for<P: ProcReader>(proc: &P, peer: SocketAddr, proto: Proto) -> 
     // established connection always has a concrete local address, and matching a
     // wildcard-bound *listener* here would be a false positive.
     //
-    // Loopback peers only. The stub may also listen on a veth address (see
-    // `config::EXTRA_LISTEN_IPS_ENV`), and a datagram arriving there was sent
-    // from another network namespace, whose sockets are not in this `/proc` at
-    // all. An exact match can never succeed for one, so every such datagram
-    // would reach this fallback and be credited to whichever wildcard-bound
-    // socket in *this* namespace happens to hold the same ephemeral port —
-    // misattribution in the direction that grants access, since a `binaries`
-    // rule would then match a binary that sent nothing. `None` is the honest
-    // answer across a namespace boundary, and `binaries` fails closed on it.
-    if matches!(proto, Proto::Udp) && peer.ip().is_loopback() {
+    // A datagram that crossed a namespace boundary must never reach here: its
+    // sender's socket is in another `/proc`, so the exact match above cannot
+    // succeed and this fallback would credit whichever local wildcard socket
+    // holds the same port. That is not a judgement this function can make —
+    // the sender's source address does not say which listener received it (a
+    // redirect in the output hook preserves the source, so an ordinary
+    // sandbox's query arrives from the pod address, not from loopback). The
+    // caller knows, and `dns::serve` decides there.
+    if matches!(proto, Proto::Udp) {
         let mut wildcard = rows
             .iter()
             .filter(|(local, _)| local.ip().is_unspecified() && local.port() == peer.port());
@@ -713,19 +712,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_does_not_apply_the_wildcard_fallback_across_a_namespace() {
-        // A datagram from a nested namespace reaches the stub on its veth
-        // address. That sender's socket is in another namespace and so in
-        // another /proc; the wildcard row here belongs to an unrelated local
-        // process that merely holds the same ephemeral port. Crediting it would
-        // let the nested namespace inherit that binary's `binaries` rules.
+    fn resolve_with_matches_a_wildcard_udp_socket_for_a_peer_that_is_not_loopback() {
+        // The redirect that feeds the stub sits in the output hook, which
+        // rewrites the destination and leaves the source alone. A sandbox whose
+        // resolv.conf names a non-loopback nameserver therefore reaches the
+        // stub from the pod address, and its caller must still resolve —
+        // otherwise every `binaries`-scoped domain rule denies it and its audit
+        // events lose the process. Measured: such a query arrives from the
+        // pod's own address, not from 127.0.0.1.
         const WILDCARD_ROW: &str = "   3: 00000000:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 424242 1 ffff 100";
         let mut fake = owning_fixture();
         fake.files.remove("/proc/net/tcp");
         fake.files
             .insert("/proc/net/udp".into(), format!("header\n{WILDCARD_ROW}"));
-        let peer: SocketAddr = "169.254.32.2:8080".parse().unwrap();
-        assert!(resolve_with(&fake, peer, Proto::Udp).is_none());
+        let peer: SocketAddr = "172.17.0.15:8080".parse().unwrap();
+        assert_eq!(
+            resolve_with(&fake, peer, Proto::Udp).map(|p| p.pid),
+            Some(100)
+        );
     }
 
     #[test]
