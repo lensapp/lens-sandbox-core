@@ -78,6 +78,11 @@ fn allow_absent_address(_socket: &Socket, _addr: SocketAddr) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn read_mark<F: std::os::fd::AsFd>(fd: &F) -> u32 {
+        nix::sys::socket::getsockopt(fd, nix::sys::socket::sockopt::Mark).expect("read SO_MARK")
+    }
+
     #[tokio::test]
     async fn tcp_binds_loopback_like_the_std_listener() {
         let listener = tcp("127.0.0.1:0".parse().unwrap()).expect("bind");
@@ -90,16 +95,45 @@ mod tests {
         assert!(socket.local_addr().expect("local addr").port() != 0);
     }
 
-    /// A listener's replies must pass the cage's first rule, or a DNS answer
-    /// to a nested namespace is judged as ordinary egress and refused.
+    /// A listener's replies must pass the cage's first rule, or a DNS answer to
+    /// a nested namespace is judged as ordinary egress and refused.
+    ///
+    /// Compared against a socket [`crate::sock_mark::mark`] marked directly,
+    /// not against `MARK_VALUE`. Setting `SO_MARK` needs a capability, and
+    /// `mark` deliberately tolerates being refused it — so on a runner without
+    /// that capability a bare `MARK_VALUE` assertion fails for a reason that
+    /// has nothing to do with this module. The comparison says what is meant
+    /// instead: a listener is marked exactly as the supervisor's own sockets
+    /// are. Where the capability is absent both read zero and this holds only
+    /// the shape — [`a_privileged_listener_carries_mark_value`] is the half
+    /// that bites, and the cage job is where it runs.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn a_listener_carries_the_proxy_mark() {
-        use std::os::fd::AsFd;
+    async fn a_listener_is_marked_like_any_supervisor_socket() {
+        let reference =
+            Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
+        crate::sock_mark::mark(&reference).expect("mark");
+        let expected = read_mark(&reference);
+
+        let listener = tcp("127.0.0.1:0".parse().unwrap()).expect("bind");
+        assert_eq!(read_mark(&listener), expected);
         let socket = udp("127.0.0.1:0".parse().unwrap()).expect("bind");
-        let mark = nix::sys::socket::getsockopt(&socket.as_fd(), nix::sys::socket::sockopt::Mark)
-            .expect("read SO_MARK");
-        assert_eq!(mark, crate::sock_mark::MARK_VALUE);
+        assert_eq!(read_mark(&socket), expected);
+    }
+
+    /// The strict half of the test above: holding the capability, the mark must
+    /// be `MARK_VALUE` itself, not merely whatever `mark` produced. Ignored
+    /// because an unprivileged runner cannot set `SO_MARK` at all; the cage job
+    /// runs it with `--ignored` under `sudo`, where the tolerated `EPERM` path
+    /// can no longer hide a listener that was never marked.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "needs CAP_NET_ADMIN or CAP_NET_RAW; the cage job runs it"]
+    async fn a_privileged_listener_carries_mark_value() {
+        let listener = tcp("127.0.0.1:0".parse().unwrap()).expect("bind");
+        assert_eq!(read_mark(&listener), crate::sock_mark::MARK_VALUE);
+        let socket = udp("127.0.0.1:0".parse().unwrap()).expect("bind");
+        assert_eq!(read_mark(&socket), crate::sock_mark::MARK_VALUE);
     }
 
     /// The point of the module. Without `IP_FREEBIND` this is `EADDRNOTAVAIL`.
