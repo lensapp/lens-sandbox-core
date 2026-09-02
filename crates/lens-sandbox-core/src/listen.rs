@@ -42,7 +42,7 @@ pub(crate) fn tcp(addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
     allow_absent_address(&socket, addr)?;
     socket.bind(&addr.into())?;
     socket.listen(BACKLOG)?;
-    crate::sock_mark::mark(&socket)?;
+    mark_listener(&socket, addr)?;
     socket.set_nonblocking(true)?;
     tokio::net::TcpListener::from_std(socket.into())
 }
@@ -54,9 +54,41 @@ pub(crate) fn udp(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     // two stubs answering one address is not a state worth reaching quietly.
     allow_absent_address(&socket, addr)?;
     socket.bind(&addr.into())?;
-    crate::sock_mark::mark(&socket)?;
+    mark_listener(&socket, addr)?;
     socket.set_nonblocking(true)?;
     tokio::net::UdpSocket::from_std(socket.into())
+}
+
+/// Mark the socket, and say so when the mark did not take.
+///
+/// [`crate::sock_mark::mark`] tolerates `EPERM` — it has to, or every outbound
+/// connection from an unprivileged process would fail — and reports it at
+/// debug, because it cannot tell a listener from a dial. Here we know, and an
+/// unmarked listener is worth a word: its replies to a nested namespace walk
+/// past `meta mark {mark} accept` to the UDP queue, where the egress floor
+/// refuses a link-local destination, so the cage silently drops its own DNS
+/// answers. One read-back per listener buys a log line that names the address.
+#[cfg(target_os = "linux")]
+fn mark_listener(socket: &Socket, addr: SocketAddr) -> io::Result<()> {
+    use std::os::fd::AsFd;
+
+    crate::sock_mark::mark(socket)?;
+    let applied =
+        nix::sys::socket::getsockopt(&socket.as_fd(), nix::sys::socket::sockopt::Mark).unwrap_or(0);
+    if applied != crate::sock_mark::MARK_VALUE {
+        tracing::warn!(
+            %addr,
+            "listener carries no proxy mark; replies to a nested namespace \
+             will be refused as ordinary egress"
+        );
+    }
+    Ok(())
+}
+
+/// Elsewhere the mark is a no-op, so there is nothing to read back.
+#[cfg(not(target_os = "linux"))]
+fn mark_listener(socket: &Socket, _addr: SocketAddr) -> io::Result<()> {
+    crate::sock_mark::mark(socket)
 }
 
 #[cfg(target_os = "linux")]
@@ -147,5 +179,18 @@ mod tests {
     #[tokio::test]
     async fn udp_binds_an_address_that_is_not_assigned_yet() {
         udp("169.254.32.1:0".parse().unwrap()).expect("bind before assignment");
+    }
+
+    /// The limit of the trick, and the reason `parse_extra_listen_ips` accepts
+    /// `169.254.0.0/16` alone. A v6 link-local bind needs a scope id, which a
+    /// `SocketAddr` built from an `IpAddr` does not carry, and the kernel
+    /// refuses it with `EINVAL` *before* it consults `IPV6_FREEBIND` — so this
+    /// is not an address that merely does not exist yet. Measured: with the
+    /// option set and without it, the errno is the same.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_v6_link_local_address_cannot_be_bound_at_all() {
+        let err = tcp("[fe80::1]:0".parse().unwrap()).expect_err("must not bind");
+        assert_eq!(err.raw_os_error(), Some(nix::libc::EINVAL));
     }
 }

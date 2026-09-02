@@ -44,8 +44,10 @@ pub const DEFAULT_UDP_QUEUE_NUM: u16 = 0;
 /// to the address named here. A packet the redirect misses is not forwarded
 /// onward — it has nowhere to go.
 ///
-/// Only link-local addresses are accepted, so the value cannot name an
-/// interface the cluster network can reach. See `parse_extra_listen_ips`.
+/// Only IPv4 link-local addresses (`169.254.0.0/16`) are accepted, so the value
+/// cannot name an interface the cluster network can reach. `fe80::/10` is
+/// link-local too and is still refused, because a v6 link-local bind needs a
+/// scope id that an `IpAddr` cannot carry. See `parse_extra_listen_ips`.
 ///
 /// It applies to the transparent listener and the DNS stub only. The explicit
 /// CONNECT proxy stays on loopback: it serves the agent process through
@@ -188,6 +190,13 @@ pub fn parse_idle_timeout(raw: Option<String>) -> Option<Duration> {
     }
 }
 
+/// Whether `ip` is in `169.254.0.0/16`. Narrower than
+/// [`crate::sock_mark::is_link_local`], which also covers `fe80::/10` — see
+/// the reasoning in [`parse_extra_listen_ips`] for why v6 is excluded here.
+fn is_v4_link_local(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.is_link_local())
+}
+
 /// Parse the value of `EXTRA_LISTEN_IPS_ENV`.
 ///
 /// An entry that is not an IP address is dropped with a warning rather than
@@ -201,21 +210,30 @@ pub fn parse_extra_listen_ips(raw: Option<&str>) -> Vec<IpAddr> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|s| match s.parse::<IpAddr>() {
-            // Link-local only, and the check is the containment argument
+            // IPv4 link-local only, and the check is the containment argument
             // rather than a tidiness rule. This setting is safe because an
             // extra address reaches no further than the veth it lives on —
-            // which holds for `169.254.0.0/16` and `fe80::/10`, the range a
-            // sidecar provisioner picks its gateway from, and fails for
-            // anything else. `0.0.0.0` would bind every interface; the pod's
-            // own address would put the DNS stub in front of the whole cluster
-            // network, answering for callers that resolve to no actor. Neither
-            // is distinguishable from a veth address by parsing, and
+            // which holds for `169.254.0.0/16`, the range a sidecar
+            // provisioner picks its gateway from, and fails for anything else.
+            // `0.0.0.0` would bind every interface; the pod's own address
+            // would put the DNS stub in front of the whole cluster network,
+            // answering for callers that resolve to no actor. Neither is
+            // distinguishable from a veth address by parsing, and
             // `IP_FREEBIND` means a wrong one binds cleanly and then hears
             // nothing, so a bind failure will not report the mistake either.
-            Ok(ip) if !crate::sock_mark::is_link_local(ip.to_canonical()) => {
+            //
+            // `fe80::/10` is excluded even though it is equally link-local,
+            // because an `IpAddr` cannot carry the scope id a v6 link-local
+            // bind requires: `__inet6_bind` refuses an unscoped one with
+            // `EINVAL`, and it does so before the test `IPV6_FREEBIND` waives,
+            // so no such entry can ever bind. Accepting one would take the
+            // whole proxy down, binding being all-or-nothing. A v6 sidecar
+            // would have to pass `fe80::1%eth0`, which is not an `IpAddr` at
+            // all, so it needs a different parser as well as a different type.
+            Ok(ip) if !is_v4_link_local(ip.to_canonical()) => {
                 tracing::warn!(
                     entry = %s,
-                    "{EXTRA_LISTEN_IPS_ENV} entry is not a link-local address, ignoring it"
+                    "{EXTRA_LISTEN_IPS_ENV} entry is not an IPv4 link-local address, ignoring it"
                 );
                 None
             }
@@ -253,25 +271,38 @@ mod tests {
             vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
         );
         assert_eq!(
-            parse_extra_listen_ips(Some(" 169.254.32.1 , fe80::1 ")),
+            parse_extra_listen_ips(Some(" 169.254.32.1 , 169.254.32.9 ")),
             vec![
                 "169.254.32.1".parse::<IpAddr>().unwrap(),
-                "fe80::1".parse::<IpAddr>().unwrap(),
+                "169.254.32.9".parse::<IpAddr>().unwrap(),
             ]
         );
     }
 
     #[test]
-    fn extra_listen_ips_keeps_only_link_local_addresses() {
+    fn extra_listen_ips_keeps_only_v4_link_local_addresses() {
         // The wildcard binds every interface; the pod's own address would put
         // the DNS stub in front of the cluster network. Neither is a veth, and
         // parsing cannot tell them apart from one.
         assert_eq!(
-            parse_extra_listen_ips(Some("0.0.0.0,::,10.42.0.7,169.254.32.1,fe80::1")),
-            vec![
-                "169.254.32.1".parse::<IpAddr>().unwrap(),
-                "fe80::1".parse::<IpAddr>().unwrap(),
-            ]
+            parse_extra_listen_ips(Some("0.0.0.0,::,10.42.0.7,169.254.32.1")),
+            vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn extra_listen_ips_drops_a_v6_link_local_address() {
+        // It is link-local, and it still cannot bind: an `IpAddr` carries no
+        // scope id, and the kernel refuses an unscoped `fe80::` with `EINVAL`
+        // before `IPV6_FREEBIND` is consulted. Since binding is
+        // all-or-nothing, keeping one would fail the whole proxy — the exact
+        // outcome `listen.rs` exists to avoid.
+        assert!(parse_extra_listen_ips(Some("fe80::1")).is_empty());
+        // The v4-mapped form is a different matter: it canonicalizes to a v4
+        // address, binds as one, and is kept in that form.
+        assert_eq!(
+            parse_extra_listen_ips(Some("::ffff:169.254.32.1")),
+            vec!["169.254.32.1".parse::<IpAddr>().unwrap()]
         );
     }
 
