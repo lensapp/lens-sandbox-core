@@ -463,6 +463,13 @@ impl Lane {
     }
 }
 
+/// What [`ProxyServer::lane_addrs`] returns: one address list per lane.
+struct LaneAddrs {
+    explicit: Vec<SocketAddr>,
+    transparent: Vec<SocketAddr>,
+    dns: Vec<SocketAddr>,
+}
+
 /// Every address a listener binds: the primary first, then one per extra IP on
 /// the primary's port.
 ///
@@ -611,13 +618,27 @@ impl ProxyServer {
         self
     }
 
+    /// The addresses each lane binds.
+    ///
+    /// Derived in one place because the asymmetry between them is a security
+    /// property rather than an oversight, and three separate `bind_all` calls
+    /// invite a reader to tidy it away. The extra addresses reach the
+    /// transparent listener and the DNS stub. They never reach the explicit
+    /// CONNECT proxy, which serves the agent process through `HTTPS_PROXY` and
+    /// has no business being reachable from a nested namespace.
+    fn lane_addrs(&self) -> LaneAddrs {
+        LaneAddrs {
+            explicit: vec![self.listen_addr],
+            transparent: listen_addrs(self.transparent_listen_addr, &self.extra_listen_ips),
+            dns: listen_addrs(self.dns_stub_listen_addr, &self.extra_listen_ips),
+        }
+    }
+
     pub async fn run(self) -> Result<(), String> {
-        let explicit = bind_all(&[self.listen_addr], Lane::Explicit)?;
-        let transparent = bind_all(
-            &listen_addrs(self.transparent_listen_addr, &self.extra_listen_ips),
-            Lane::Transparent,
-        )?;
-        let dns_listen = listen_addrs(self.dns_stub_listen_addr, &self.extra_listen_ips);
+        let addrs = self.lane_addrs();
+        let explicit = bind_all(&addrs.explicit, Lane::Explicit)?;
+        let transparent = bind_all(&addrs.transparent, Lane::Transparent)?;
+        let dns_listen = addrs.dns;
 
         // One semaphore spans every listener so a burst on one path can't
         // starve the others of file descriptors or memory.
@@ -3459,6 +3480,27 @@ pub(crate) mod tests {
             listen_addrs(primary, &extra),
             vec![primary, SocketAddr::from(([169, 254, 32, 1], 3129))]
         );
+    }
+
+    /// The one thing enforcing this is which list `run` hands each `bind_all`,
+    /// and the three calls look alike enough to invite tidying into one. A
+    /// reader who does that would open the explicit CONNECT proxy to the
+    /// nested namespace with a green suite.
+    #[test]
+    fn the_explicit_lane_never_takes_an_extra_address() {
+        let (mut server, _state) = ProxyServer::new(
+            "127.0.0.1:3128".parse().unwrap(),
+            "127.0.0.1:3129".parse().unwrap(),
+            "127.0.0.1:5355".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+        server = server.with_extra_listen_ips(vec!["169.254.32.1".parse().unwrap()]);
+
+        let addrs = server.lane_addrs();
+        assert_eq!(addrs.explicit, vec![server.listen_addr]);
+        assert_eq!(addrs.transparent.len(), 2);
+        assert_eq!(addrs.dns.len(), 2);
     }
 
     #[test]
