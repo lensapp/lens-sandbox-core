@@ -62,15 +62,17 @@ pub const REJECT_MARK: u32 = 0x4E_58_55_44; // "NXUD" in ASCII
 /// is nothing to bypass. Returning the error here would make every outbound
 /// connection from an unprivileged Linux process fail.
 ///
-/// It is warned about rather than noted, because an unmarked *listener* is not
-/// a harmless degradation: its replies to a nested namespace are judged as
-/// ordinary egress and refused (see `listen.rs`), and a cage that drops its own
-/// DNS answers should not explain itself only at debug level.
+/// Noted at debug rather than warned about, because this is the per-dial
+/// helper: `connect_marked` calls it for every outbound connection, and one
+/// warning per connection says nothing a reader can act on. Where a refusal
+/// does matter — a listener, whose replies to a nested namespace are then
+/// judged as ordinary egress and refused — `listen.rs` reads the mark back and
+/// warns there, once, in the code that knows what it just bound.
 #[cfg(target_os = "linux")]
 pub(crate) fn mark<F: AsFd>(fd: &F) -> io::Result<()> {
     match nix::sys::socket::setsockopt(fd, nix::sys::socket::sockopt::Mark, &MARK_VALUE) {
         Err(nix::errno::Errno::EPERM) => {
-            tracing::warn!("SO_MARK setsockopt: EPERM (no CAP_NET_ADMIN/CAP_NET_RAW); continuing");
+            tracing::debug!("SO_MARK setsockopt: EPERM (no CAP_NET_ADMIN/CAP_NET_RAW); continuing");
             Ok(())
         }
         other => other.map_err(io::Error::from),
