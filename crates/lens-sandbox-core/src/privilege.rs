@@ -577,6 +577,28 @@ pub fn privilege_drop_for(creds: Option<&SandboxCredentials>, is_root: bool) -> 
     decide_privilege_drop(creds, is_root, nix::unistd::geteuid().is_root())
 }
 
+/// Give `cmd`'s child the privilege drop [`privilege_drop_for`] decides.
+///
+/// This is the only public way to apply one. [`SandboxCredentials::apply`]
+/// and [`apply_cap_drop`] are each correct for one arm of the decision and
+/// wrong for the other — `setuid(0)` keeps every capability, and a
+/// capability drop on a non-root child leaves it root — so a caller that
+/// picks one by hand is re-deciding the rule this module exists to hold.
+/// Every spawn path in this crate goes through here, and a consumer that
+/// builds its own `Command` should too.
+pub fn apply_privilege_drop(cmd: &mut Command, creds: Option<&SandboxCredentials>, is_root: bool) {
+    match privilege_drop_for(creds, is_root) {
+        PrivilegeDrop::Setuid(creds) => creds.apply(cmd),
+        PrivilegeDrop::Capabilities { gid } => apply_cap_drop(cmd, gid),
+        // No privilege to drop, but pdeathsig needs none and the orphan it
+        // prevents is real. `NO_NEW_PRIVS` is deliberately absent — see
+        // `PrivilegeDrop::Nothing`.
+        PrivilegeDrop::Nothing { .. } => unsafe {
+            cmd.pre_exec(set_pdeathsig_sigterm);
+        },
+    }
+}
+
 /// The decision itself, with the euid an argument rather than an ambient
 /// read.
 ///
