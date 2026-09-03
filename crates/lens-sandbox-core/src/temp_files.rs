@@ -586,7 +586,6 @@ fn write_prepared_with(fs: &dyn TempFs, prepared: &Prepared) -> Result<Vec<Strin
     Ok(written.into_iter().map(|(_, path)| path).collect())
 }
 
-#[cfg(test)]
 fn write_temp_files_with(
     fs: &dyn TempFs,
     files: &[TempFile],
@@ -594,6 +593,41 @@ fn write_temp_files_with(
     roots: &FileRoots,
 ) -> Result<Vec<String>, String> {
     write_prepared_with(fs, &prepare_with(fs, files, creds, roots)?)
+}
+
+/// Write the files one request carries — an `exec`, a `spawn`, an agent turn —
+/// for the caller to remove with [`remove_temp_files`] when that request ends.
+///
+/// The policy path is [`refresh_policy_files`], and the two differ in who
+/// keeps the books. A policy set is tracked across frames by this crate, so a
+/// malformed batch keeps the previous set and returns nothing to the caller.
+/// Request files are tracked by the caller, live for one child process, and a
+/// malformed entry is that request's error to report — so this returns it.
+/// Same roots, same ownership hand-over, same all-or-nothing write.
+pub fn write_temp_files(
+    files: &[TempFile],
+    sandbox_creds: Option<&SandboxCredentials>,
+) -> Result<Vec<String>, String> {
+    write_temp_files_with(
+        &RealTempFs,
+        files,
+        raw_creds(sandbox_creds),
+        &FileRoots::for_sandbox(sandbox_creds),
+    )
+}
+
+/// Remove what [`write_temp_files`] wrote.
+///
+/// Takes the same credentials, because a `~/…` path resolves against that
+/// user's home and nothing else; handing over different ones would resolve the
+/// recorded paths somewhere the writer never touched. A path that no longer
+/// resolves is left in place and said so, not treated as an error — the file
+/// was this process's own, and refusing the rest over one would strand more.
+pub fn remove_temp_files(paths: &[String], sandbox_creds: Option<&SandboxCredentials>) {
+    for reason in remove_temp_files_with(&RealTempFs, paths, &FileRoots::for_sandbox(sandbox_creds))
+    {
+        tracing::warn!(reason, "temp file left in place: it is no longer removable");
+    }
 }
 
 /// The exact bytes to deliver. `content` and `contentB64` are mutually
@@ -1914,6 +1948,31 @@ mod tests {
             !events.iter().any(|e| matches!(e, Event::Chown(..))),
             "owner root must not chown to the sandbox user: {events:?}"
         );
+    }
+
+    /// The public pair round-trips on the real filesystem. Linux only: the
+    /// default root is `/tmp`, which macOS makes a symlink, and the walk
+    /// refuses a symlinked root component by design.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_request_file_is_written_and_then_removed() {
+        let name = format!("/tmp/lens-sandbox-core-{}", std::process::id());
+        let path = format!("{name}/one.txt");
+        let files = vec![TempFile {
+            path: path.clone(),
+            content: Some("hello".into()),
+            content_b64: None,
+            mode: None,
+            owner: None,
+        }];
+
+        let written = write_temp_files(&files, None).expect("write");
+        assert_eq!(written, vec![path.clone()]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+
+        remove_temp_files(&written, None);
+        assert!(!Path::new(&path).exists(), "the file must be gone");
+        let _ = std::fs::remove_dir(&name);
     }
 
     #[test]

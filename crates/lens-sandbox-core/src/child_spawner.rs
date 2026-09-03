@@ -75,7 +75,7 @@ pub fn build_command(spec: &ChildSpec) -> Command {
     // `killpg`, as `exec_manager::cancel` does.
     cmd.kill_on_drop(true);
 
-    apply_privilege_drop(&mut cmd, spec);
+    crate::privilege::apply_privilege_drop(&mut cmd, spec.creds.as_ref(), spec.is_root);
 
     cmd
 }
@@ -96,30 +96,6 @@ pub fn spawn_pty(
         spec.is_root,
         Some(initial_size),
     )
-}
-
-fn apply_privilege_drop(cmd: &mut Command, spec: &ChildSpec) {
-    // `privilege_drop_for` owns the rule, including that root credentials
-    // take the capability path — `setuid(0)` would leave the child holding
-    // CAP_NET_ADMIN and able to escape the netfilter cage.
-    match crate::privilege::privilege_drop_for(spec.creds.as_ref(), spec.is_root) {
-        crate::privilege::PrivilegeDrop::Setuid(creds) => creds.apply(cmd),
-        crate::privilege::PrivilegeDrop::Capabilities { gid } => {
-            crate::privilege::apply_cap_drop(cmd, gid)
-        }
-        // An unprivileged parent honours no identity. `privilege_drop_for`
-        // has already warned with the one it ignored; a caller that cannot
-        // accept the substitute reads `requested` for itself before it
-        // builds a spec.
-        //
-        // There is no privilege to drop, but pdeathsig needs none and the
-        // orphan it prevents is real: a script outliving a crashed
-        // supervisor keeps working on a guest nobody watches.
-        // `NO_NEW_PRIVS` is deliberately absent — see `PrivilegeDrop`.
-        crate::privilege::PrivilegeDrop::Nothing { .. } => unsafe {
-            cmd.pre_exec(crate::privilege::set_pdeathsig_sigterm);
-        },
-    }
 }
 
 #[cfg(test)]
