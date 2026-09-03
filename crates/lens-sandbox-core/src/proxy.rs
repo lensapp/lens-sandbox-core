@@ -2055,7 +2055,9 @@ pub fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
              apply over TCP"
         );
     }
-    let pins = pins_the_next_tables_still_cover(&policy.pins, &next);
+    let approved = state.gate_resolved_hosts.read().unwrap();
+    let pins = pins_the_next_tables_still_cover(&policy.pins, &next, &approved);
+    drop(approved);
     *policy = NetworkPolicy {
         generation: policy.generation + 1,
         pins,
@@ -2064,17 +2066,24 @@ pub fn apply_network_policy(state: &ProxyState, next: NetworkPolicy) {
 }
 
 /// The subset of `pins` whose `qname` a hostname rule of the next raw tables
-/// still covers. A name neither table names loses its binding, so a revoked
-/// hostname rule takes its IPs with it; a name still covered keeps a binding the
-/// next lookup would re-establish unchanged, because a pin carries a name and no
-/// verdict.
+/// still covers, plus the names a developer has approved at the gate. A name
+/// neither table names loses its binding, so a revoked hostname rule takes its
+/// IPs with it; a name still covered keeps a binding the next lookup would
+/// re-establish unchanged, because a pin carries a name and no verdict.
+///
+/// `approved` is in that second class for the same reason: the DNS stub pins an
+/// approved name itself (no rule does it), and a reload is not a revocation of a
+/// click — writing the approval down as a rule *is* a reload, so dropping the
+/// pin here would discard the binding the approval had just created.
 fn pins_the_next_tables_still_cover(
     pins: &HashMap<IpAddr, Vec<PinnedIp>>,
     next: &NetworkPolicy,
+    approved: &HashSet<String>,
 ) -> HashMap<IpAddr, Vec<PinnedIp>> {
     let covered = |qname: &str| {
         crate::routing::any_rule_covers_qname(&next.tcp_egress, qname)
             || crate::routing::any_rule_covers_qname(&next.udp_egress, qname)
+            || approved.contains(qname)
     };
     pins.iter()
         .filter_map(|(ip, entries)| {
@@ -4116,6 +4125,37 @@ pub(crate) mod tests {
             Some(Verdict::Allow),
             "a pin the new table still covers must survive the reload"
         );
+    }
+
+    #[test]
+    fn applying_a_changed_policy_keeps_a_pin_a_gate_approval_created() {
+        // Under `defaultVerdict: ask` the DNS stub pins a name the developer
+        // approved, because no rule names it and something has to bind the
+        // address to what was on the card. Persisting that very approval is a
+        // reload, so filtering the pin against the rules would throw away the
+        // binding the click had just bought.
+        let (state, _rx) = test_state();
+        let generation = state.policy.read().unwrap().generation;
+        let ip: IpAddr = "203.0.113.93".parse().unwrap();
+        state
+            .gate_resolved_hosts
+            .write()
+            .unwrap()
+            .insert("approved.internal".to_string());
+        pin_dns_answers(&state, &[ip], "approved.internal", 300, generation);
+
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                default_verdict: Verdict::Ask,
+                tcp_egress: vec![fqdn_rule("other.internal", 443, Verdict::Allow)],
+                ..Default::default()
+            },
+        );
+
+        let policy = state.policy.read().unwrap();
+        let entry = policy.pins.get(&ip).expect("the approved pin must survive");
+        assert!(entry.iter().any(|p| p.qname == "approved.internal"));
     }
 
     #[test]
