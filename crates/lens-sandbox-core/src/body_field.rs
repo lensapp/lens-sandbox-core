@@ -19,6 +19,14 @@ pub struct BodyField {
     pub value: String,
 }
 
+/// Largest urlencoded body rewritten for a body field.
+///
+/// A rewritten body is only split on `&`, never parsed as a whole, so it gets
+/// the budget of a judged body rather than an inspected one: a Slack message
+/// carries its blocks as form-encoded JSON, and that outgrows
+/// [`crate::http_body::MAX_INSPECT_BYTES`] long before it stops being a message.
+pub const MAX_REWRITTEN_BODY_BYTES: usize = crate::http_body::MAX_JUDGED_BODY_BYTES;
+
 /// Write every matching injection's body field into the request body.
 ///
 /// A body still on the socket is read here, since the bytes have to be in hand
@@ -26,7 +34,7 @@ pub struct BodyField {
 /// already does for a body a rule read. Returns the reason when the body cannot
 /// be read in full: a field the proxy could not reach is a placeholder that
 /// would go upstream, so the request is refused rather than sent as is.
-pub async fn inject_body_fields<C>(
+pub(crate) async fn inject_body_fields<C>(
     client: &mut C,
     head: &str,
     injections: &[&CredentialInjection],
@@ -49,7 +57,7 @@ where
         None => {
             crate::http_body::ensure_body_is_readable(head)?;
             crate::http_body::answer_continue_if_expected(client, head).await?;
-            crate::http_body::read_body(client, body_mode, crate::http_body::MAX_INSPECT_BYTES)
+            crate::http_body::read_body(client, body_mode, MAX_REWRITTEN_BODY_BYTES)
                 .await
                 .map_err(|err| err.to_string())?
         }
