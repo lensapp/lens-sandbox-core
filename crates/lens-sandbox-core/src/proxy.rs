@@ -267,6 +267,10 @@ pub struct ProxyState {
     /// the MITM call [`crate::gate::credential_gate_or_deny`] to hold the
     /// request and emit `credential_pending`. Updated atomically on every
     /// policy apply.
+    ///
+    /// This map is also what bounds [`Self::unarmed_credential_domains`]: a
+    /// credential that contributes no placeholder here can never trip the
+    /// scan, so its domain is not worth intercepting.
     pub placeholder_index: RwLock<HashMap<String, String>>,
     /// Domain patterns of credential injections that are still unarmed
     /// (empty `value`), sourced from [`crate::policy_schema::CredentialInjection::unarmed_domain`]
@@ -275,6 +279,14 @@ pub struct ProxyState {
     /// placeholder is decrypted and trips the credential gate instead of
     /// leaking. Scoped per-host via [`Self::intercept_for_unarmed`] rather
     /// than intercepting all egress; empties once every injection is armed.
+    ///
+    /// Narrower still: a domain lands here only when *this run* holds the
+    /// credential's placeholder. The gate fires on the placeholder appearing in
+    /// the request bytes, so a run without it can never raise the card, and the
+    /// interception would only cost — a client that carries compiled-in trust
+    /// anchors (rustls + webpki-roots) never trusts the boundary CA and fails
+    /// every request on the domain. The decision is made at policy apply, where
+    /// the run's credential state arrives; see `client::apply_policy`.
     pub unarmed_credential_domains: RwLock<Vec<String>>,
     /// How long the gate waits for a developer response before defaulting
     /// to a deny. Mutable for tests; production callers leave it at
@@ -2993,6 +3005,33 @@ pub(crate) fn emit_policy_deny_connect(
         "failure",
         403,
         Some(serde_json::json!({ "reason": reason })),
+        RequestFacts {
+            action: &format!("CONNECT {target_host}"),
+            method: "CONNECT",
+            host: &host,
+            path: None,
+        },
+        actor,
+    );
+}
+
+/// Audit a client that refused the boundary certificate on a host where a
+/// credential injection is armed. `error`, not `failure`: a `failure` is
+/// deduped per host, and this one names a client the boundary cannot serve at
+/// all — every occurrence of it should stay visible. `metadata.reason` is
+/// `boundary-ca-rejected` so the relay can tell this apart from a transport
+/// fault it would ask a developer to retry.
+pub(crate) fn emit_boundary_ca_rejection(
+    state: &Arc<ProxyState>,
+    target_host: &str,
+    actor: &crate::peer_process::ActorContext,
+) {
+    let host = extract_hostname(target_host);
+    emit_audit_action_with_metadata(
+        state,
+        "error",
+        502,
+        Some(serde_json::json!({ "reason": "boundary-ca-rejected" })),
         RequestFacts {
             action: &format!("CONNECT {target_host}"),
             method: "CONNECT",
