@@ -835,7 +835,10 @@ pub struct Credential {
 /// fields it actually needs, required at compile time.
 ///
 /// - **`header`**: replace an HTTP header on matching requests. The MITM
-///   substitutes [`value`] into [`header`].
+///   substitutes [`value`] into [`header`]. When `bodyField` and `bodyValue`
+///   are set, the same requests also get `bodyValue` written into that field
+///   of a `application/x-www-form-urlencoded` body — for an API that reads its
+///   token from the body before the header.
 /// - **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder
 ///   patterns in the request URI to the real credential value.
 /// - **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with
@@ -856,6 +859,13 @@ pub enum CredentialInjection {
         header: String,
         /// Resolved header value (e.g. `Bearer <token>`).
         value: String,
+        /// Urlencoded body field that also carries the credential. Set
+        /// together with `bodyValue`; one without the other drops the injection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body_field: Option<String>,
+        /// Bare value written into `bodyField` (e.g. `<token>`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body_value: Option<String>,
         /// Optional path rules. When empty, inject for all requests.
         #[serde(default)]
         rules: Vec<HttpRequestMatch>,
@@ -917,12 +927,16 @@ mod tests {
             domain: "api.github.com".into(),
             header: "Authorization".into(),
             value: "Bearer real".into(),
+            body_field: None,
+            body_value: None,
             rules: vec![],
         };
         let unarmed_header = CredentialInjection::Header {
             domain: "api.github.com".into(),
             header: "Authorization".into(),
             value: String::new(),
+            body_field: None,
+            body_value: None,
             rules: vec![],
         };
         let unarmed_uri = CredentialInjection::UriPlaceholder {
@@ -953,11 +967,15 @@ mod tests {
                 domain,
                 header,
                 value,
+                body_field,
+                body_value,
                 rules,
             } => {
                 assert_eq!(domain, "api.example.com");
                 assert_eq!(header, "Authorization");
                 assert_eq!(value, "Bearer x");
+                assert_eq!(body_field, None);
+                assert_eq!(body_value, None);
                 assert!(rules.is_empty());
             }
             _ => panic!("expected Header variant"),

@@ -198,6 +198,7 @@ async fn run(
         vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer real-vllm-key".to_string(),
+            body: None,
             rules: vec![],
         }],
     );
@@ -262,6 +263,7 @@ async fn run(
     let front_injections = vec![CredentialInjection {
         header: "x-api-key".to_string(),
         value: "sk-ant-sandbox-key".to_string(),
+        body: None,
         rules: vec![],
     }];
     let http_rules = vec![HttpRule {
