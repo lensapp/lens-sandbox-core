@@ -98,11 +98,25 @@
       ]
     },
     "CredentialInjection": {
-      "description": "How a credential applies to outbound requests on a specific domain.\nTagged at the JSON level by `injectionType` — each variant carries the\nfields it actually needs, required at compile time.\n\n- **`header`**: replace an HTTP header on matching requests. The MITM\n  substitutes [`value`] into [`header`].\n- **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder\n  patterns in the request URI to the real credential value.\n- **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with\n  `placeholder` on the parent [`Credential`]) and re-sign with the real\n  STS credentials below. Real creds live only in sandbox-core process\n  memory — they never touch the sandbox filesystem.",
+      "description": "How a credential applies to outbound requests on a specific domain.\nTagged at the JSON level by `injectionType` — each variant carries the\nfields it actually needs, required at compile time.\n\n- **`header`**: replace an HTTP header on matching requests. The MITM\n  substitutes [`value`] into [`header`]. When `bodyField` and `bodyValue`\n  are set, the same requests also get `bodyValue` written into that field\n  of a `application/x-www-form-urlencoded` body — for an API that reads its\n  token from the body before the header.\n- **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder\n  patterns in the request URI to the real credential value.\n- **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with\n  `placeholder` on the parent [`Credential`]) and re-sign with the real\n  STS credentials below. Real creds live only in sandbox-core process\n  memory — they never touch the sandbox filesystem.",
       "oneOf": [
         {
           "type": "object",
           "properties": {
+            "bodyField": {
+              "description": "Urlencoded body field that also carries the credential. Set\ntogether with `bodyValue`; one without the other drops the injection.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bodyValue": {
+              "description": "Bare value written into `bodyField` (e.g. `<token>`).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "domain": {
               "description": "Domain this injection applies to.",
               "type": "string"

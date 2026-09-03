@@ -178,6 +178,7 @@ impl Default for NetworkPolicy {
 pub struct CredentialInjection {
     pub header: String,
     pub value: String,
+    pub body: Option<crate::body_field::BodyField>,
     /// Optional path rules. When present, only inject for matching requests.
     /// When empty, inject for all requests to the domain.
     pub rules: Vec<crate::policy_schema::HttpRequestMatch>,
@@ -1092,6 +1093,20 @@ async fn handle_http_forward(
     // acts on the head it receives, so that is the one the agreement binds.
     if let Some(info) = &mcp_request
         && let Err(detail) = crate::mcp::check_headers_agree(&modified, info)
+    {
+        return refusal.deny(&mut client, &detail).await;
+    }
+
+    // A credential that also travels in a body field goes in now, after every
+    // rule has judged the request. The body is read here if no rule had to.
+    if let Err(detail) = crate::body_field::inject_body_fields(
+        &mut client,
+        &modified,
+        &crate::mitm::matching_injections(&header_injected, &injections),
+        crate::http_body::determine_body_framing(&header_str),
+        &mut buffered_body,
+    )
+    .await
     {
         return refusal.deny(&mut client, &detail).await;
     }
@@ -6583,6 +6598,7 @@ pub(crate) mod tests {
             vec![CredentialInjection {
                 header: "Authorization".to_string(),
                 value: "Bearer some-token".to_string(),
+                body: None,
                 rules: Vec::new(),
             }],
         );
@@ -6620,6 +6636,50 @@ pub(crate) mod tests {
         );
 
         handler.abort();
+    }
+
+    #[tokio::test]
+    async fn the_forward_door_refuses_a_body_field_it_cannot_write() {
+        // The plaintext door runs the same body-field injection as the MITM one.
+        // A body it cannot read is refused before the dial, so the answer comes
+        // from policy: an unreachable target that was dialed would time out.
+        let (state, _rx) = test_state();
+        install_catch_all_allow(&state);
+        state.credential_injections.write().unwrap().insert(
+            "api.example.com".to_string(),
+            vec![CredentialInjection {
+                header: "Authorization".to_string(),
+                value: "Bearer xoxb-real".to_string(),
+                body: Some(crate::body_field::BodyField {
+                    field: "token".to_string(),
+                    value: "xoxb-real".to_string(),
+                }),
+                rules: Vec::new(),
+            }],
+        );
+
+        let head = b"POST http://api.example.com/api/chat.postMessage HTTP/1.1\r\n\
+                     Host: api.example.com\r\n\
+                     Content-Type: application/x-www-form-urlencoded\r\n\
+                     Content-Encoding: gzip\r\nContent-Length: 4\r\n\r\n"
+            .to_vec();
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            handle_http_forward(
+                server,
+                "api.example.com:80",
+                head,
+                &state_for_handler,
+                &actor,
+            )
+            .await
+        });
+        client.write_all(b"abcd").await.unwrap();
+
+        let response = read_response(&mut client).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response:?}");
     }
 
     #[tokio::test]

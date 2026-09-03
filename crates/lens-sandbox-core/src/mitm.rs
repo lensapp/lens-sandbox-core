@@ -1078,6 +1078,7 @@ async fn mitm_inject_after_accept(
     // map than the one captured in `ctx.placeholder_map`. None = use ctx
     // (the common path, no gate hit). Some(_) = post-Allow refresh.
     let mut refreshed_uri_placeholders: Option<Vec<(String, String)>> = None;
+    let mut refreshed_injections: Option<Vec<CredentialInjection>> = None;
 
     // Credential gate: every registered placeholder still present in the
     // post-injection header block is a credential the host hasn't armed
@@ -1093,8 +1094,8 @@ async fn mitm_inject_after_accept(
     // short-circuits — 403 here, never reaching upstream — mirror of the
     // Ask-gate path.
     //
-    // Scope reminder: this scan inspects the request head only; bodies
-    // are streamed past unchanged. See `scan_for_unarmed_placeholders`.
+    // Scope reminder: this scan inspects the request head only; a body is
+    // not scanned for placeholders. See `scan_for_unarmed_placeholders`.
     //
     // Scan a copy with armed URI placeholders already substituted, mirroring
     // the header substitution `inject_headers` did above. The real URI rewrite
@@ -1139,6 +1140,7 @@ async fn mitm_inject_after_accept(
             } else {
                 header_injected = rebuilt;
                 refreshed_uri_placeholders = Some(fresh_uri);
+                refreshed_injections = Some(fresh_headers);
             }
         }
 
@@ -1326,6 +1328,24 @@ async fn mitm_inject_after_accept(
         && let Err(reason) = crate::mcp::check_headers_agree(&modified, info)
     {
         return Err(facts.deny(&mut tls_client, "mcp_denied", &reason).await);
+    }
+
+    // A credential that also travels in a body field goes in now, after every
+    // rule has judged the request. The body is read here if no rule had to.
+    let effective_injections: &[CredentialInjection] =
+        refreshed_injections.as_deref().unwrap_or(target.injections);
+    if let Err(reason) = crate::body_field::inject_body_fields(
+        &mut tls_client,
+        &modified,
+        &matching_injections(&header_injected, effective_injections),
+        body_mode,
+        &mut buffered_body,
+    )
+    .await
+    {
+        return Err(facts
+            .deny(&mut tls_client, "body_injection_denied", &reason)
+            .await);
     }
 
     // The body is in hand, so the head must describe it and the relay must not
@@ -1667,28 +1687,34 @@ pub(crate) fn scan_for_unarmed_placeholders(
     matches
 }
 
-pub(crate) fn inject_headers(header_block: &str, injections: &[CredentialInjection]) -> String {
-    let lines: Vec<&str> = header_block.split("\r\n").collect();
-    let request_line = lines.first().unwrap_or(&"");
-
-    // Parse method and path from request line (e.g. "GET /api/v1/foo HTTP/1.1").
-    // Strip query string and normalize the path (collapse `//`, resolve `..`) so rules
-    // are evaluated against the same canonical form as upstream HTTP rule enforcement
-    // (see line 137). Without this, a rule like `/repos/**` could be bypassed with
-    // `/repos/foo?x=y` or `/foo/../repos/bar`.
+/// The injections whose rules cover this request.
+///
+/// The path is taken from the request line without its query string and
+/// normalized (collapse `//`, resolve `..`) so rules are evaluated against the
+/// same canonical form as HTTP rule enforcement. Without this, a rule like
+/// `/repos/**` could be bypassed with `/repos/foo?x=y` or `/foo/../repos/bar`.
+pub(crate) fn matching_injections<'a>(
+    header_block: &str,
+    injections: &'a [CredentialInjection],
+) -> Vec<&'a CredentialInjection> {
+    let request_line = header_block.split("\r\n").next().unwrap_or("");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     let method = parts.first().unwrap_or(&"");
     let raw_path = parts.get(1).unwrap_or(&"/");
     let raw_no_query = raw_path.split('?').next().unwrap_or(raw_path);
     let normalized_path = crate::routing::normalize_path(raw_no_query);
-
-    // Filter injections by rules - only inject if rules match (or rules are empty)
-    let matching_injections: Vec<&CredentialInjection> = injections
+    injections
         .iter()
         .filter(|inj| {
             crate::routing::injection_covers_request(&inj.rules, method, &normalized_path)
         })
-        .collect();
+        .collect()
+}
+
+pub(crate) fn inject_headers(header_block: &str, injections: &[CredentialInjection]) -> String {
+    let lines: Vec<&str> = header_block.split("\r\n").collect();
+    let request_line = lines.first().unwrap_or(&"");
+    let matching_injections = matching_injections(header_block, injections);
 
     // Build a set of header names we're injecting (lowercased)
     let inject_names: HashSet<String> = matching_injections
@@ -1988,6 +2014,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "token ghp_new".to_string(),
+            body: None,
             rules: vec![],
         }];
         let result = inject_headers(headers, &injections);
@@ -2003,6 +2030,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer sk-xxx".to_string(),
+            body: None,
             rules: vec![],
         }];
         let result = inject_headers(headers, &injections);
@@ -2016,6 +2044,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "token abc\r\nEvil: injected".to_string(),
+            body: None,
             rules: vec![],
         }];
         let result = inject_headers(headers, &injections);
@@ -2039,11 +2068,13 @@ mod tests {
             CredentialInjection {
                 header: "Authorization".to_string(),
                 value: "Bearer sk-test".to_string(),
+                body: None,
                 rules: vec![],
             },
             CredentialInjection {
                 header: "X-Custom".to_string(),
                 value: "custom-value".to_string(),
+                body: None,
                 rules: vec![],
             },
         ];
@@ -2062,6 +2093,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
+            body: None,
             rules: vec![HttpRequestMatch {
                 method: None,
                 path: Some("/v1/projects/*/llm/**".to_string()),
@@ -2083,6 +2115,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
+            body: None,
             rules: vec![HttpRequestMatch {
                 method: None,
                 path: Some("/v1/projects/*/llm/**".to_string()),
@@ -2102,6 +2135,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
+            body: None,
             rules: vec![
                 HttpRequestMatch {
                     method: None,
@@ -2127,6 +2161,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
+            body: None,
             rules: vec![
                 HttpRequestMatch {
                     method: None,
@@ -2153,6 +2188,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer ghp_token".to_string(),
+            body: None,
             rules: vec![HttpRequestMatch {
                 method: None,
                 path: Some("/repos/foo".to_string()),
@@ -2175,6 +2211,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer ghp_token".to_string(),
+            body: None,
             rules: vec![HttpRequestMatch {
                 method: None,
                 path: Some("/repos/**".to_string()),
@@ -2193,6 +2230,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer new-value".to_string(),
+            body: None,
             rules: vec![],
         }];
         let result = inject_headers(headers, &injections);
@@ -2547,6 +2585,7 @@ mod tests {
             vec![CredentialInjection {
                 header: "x-api-key".to_string(),
                 value: "secret-injected-key".to_string(),
+                body: None,
                 rules: vec![],
             }],
             b"GET /api/user HTTP/1.1\r\nHost: test.example.com\r\nx-api-key: old-key\r\n\r\n",
@@ -2571,6 +2610,7 @@ mod tests {
             vec![CredentialInjection {
                 header: "Authorization".to_string(),
                 value: "Bearer sk-test".to_string(),
+                body: None,
                 rules: vec![],
             }],
             b"GET / HTTP/1.1\r\nHost: test.example.com\r\n\r\n",
@@ -2589,11 +2629,13 @@ mod tests {
                 CredentialInjection {
                     header: "x-api-key".to_string(),
                     value: "key-123".to_string(),
+                    body: None,
                     rules: vec![],
                 },
                 CredentialInjection {
                     header: "Authorization".to_string(),
                     value: "Bearer token-456".to_string(),
+                    body: None,
                     rules: vec![],
                 },
             ],
@@ -2612,6 +2654,123 @@ mod tests {
             headers.starts_with("POST /v1/query HTTP/1.1\r\n"),
             "{headers}"
         );
+    }
+
+    fn slack_injection(rules: Vec<crate::policy_schema::HttpRequestMatch>) -> CredentialInjection {
+        CredentialInjection {
+            header: "Authorization".to_string(),
+            value: "Bearer xoxb-real".to_string(),
+            body: Some(crate::body_field::BodyField {
+                field: "token".to_string(),
+                value: "xoxb-real".to_string(),
+            }),
+            rules,
+        }
+    }
+
+    #[tokio::test]
+    async fn mitm_body_field_replaces_the_token_in_a_urlencoded_body() {
+        let (upstream, response, _audits) = run_mitm_harness(
+            vec![slack_injection(vec![])],
+            b"POST /api/chat.postMessage HTTP/1.1\r\nHost: test.example.com\r\n\
+              Authorization: Bearer __lens_cred:slack__\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 40\r\n\r\n\
+              channel=C1&token=__lens_cred:slack__&a=1",
+            true,
+        )
+        .await;
+
+        assert!(response.contains("200 OK"), "{response}");
+        assert!(
+            upstream.contains("Authorization: Bearer xoxb-real"),
+            "{upstream}"
+        );
+        assert!(upstream.contains("Content-Length: 30\r\n"), "{upstream}");
+        assert!(
+            upstream.ends_with("\r\n\r\nchannel=C1&token=xoxb-real&a=1"),
+            "{upstream}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mitm_body_field_reframes_a_chunked_body() {
+        let (upstream, response, _audits) = run_mitm_harness(
+            vec![slack_injection(vec![])],
+            b"POST /api/chat.postMessage HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nTransfer-Encoding: chunked\r\n\r\n\
+              6\r\ntoken=\r\n13\r\n__lens_cred:slack__\r\n0\r\n\r\n",
+            false,
+        )
+        .await;
+
+        assert!(response.contains("200 OK"), "{response}");
+        assert!(
+            !upstream.to_ascii_lowercase().contains("transfer-encoding"),
+            "{upstream}"
+        );
+        assert!(upstream.contains("Content-Length: 15\r\n"), "{upstream}");
+        assert!(upstream.ends_with("\r\n\r\ntoken=xoxb-real"), "{upstream}");
+    }
+
+    #[tokio::test]
+    async fn mitm_body_field_leaves_a_json_body_alone() {
+        let (upstream, _response, _audits) = run_mitm_harness(
+            vec![slack_injection(vec![])],
+            b"POST /api/chat.postMessage HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/json\r\nContent-Length: 31\r\n\r\n\
+              {\"token\":\"__lens_cred:slack__\"}",
+            true,
+        )
+        .await;
+
+        assert!(
+            upstream.contains("Authorization: Bearer xoxb-real"),
+            "{upstream}"
+        );
+        assert!(
+            upstream.ends_with("\r\n\r\n{\"token\":\"__lens_cred:slack__\"}"),
+            "{upstream}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mitm_body_field_follows_the_path_rules() {
+        let (upstream, _response, _audits) = run_mitm_harness(
+            vec![slack_injection(vec![
+                crate::policy_schema::HttpRequestMatch {
+                    method: Some("POST".to_string()),
+                    path: Some("/api/chat.postMessage".to_string()),
+                },
+            ])],
+            b"POST /api/other HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 25\r\n\r\n\
+              token=__lens_cred:slack__",
+            true,
+        )
+        .await;
+
+        assert!(!upstream.contains("xoxb-real"), "{upstream}");
+        assert!(
+            upstream.ends_with("\r\n\r\ntoken=__lens_cred:slack__"),
+            "{upstream}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mitm_body_field_refuses_a_body_it_cannot_read() {
+        let (err, response, audits) = run_mitm_harness(
+            vec![slack_injection(vec![])],
+            b"POST /api/chat.postMessage HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nContent-Encoding: gzip\r\n\
+              Content-Length: 4\r\n\r\nabcd",
+            true,
+        )
+        .await;
+
+        assert!(err.contains("content-encoding gzip"), "{err}");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert_eq!(audits[0]["result"], "failure");
+        assert_eq!(audits[0]["metadata"]["body_injection_denied"], true);
     }
 
     #[tokio::test]
@@ -2721,6 +2880,7 @@ mod tests {
             vec![CredentialInjection {
                 header: "Authorization".to_string(),
                 value: "Bearer my-token".to_string(),
+                body: None,
                 rules: vec![],
             }],
             rules,
@@ -4545,6 +4705,7 @@ mod tests {
         let injections = vec![CredentialInjection {
             header: "Authorization".to_string(),
             value: "Bearer token-xyz".to_string(),
+            body: None,
             rules: vec![],
         }];
         let result = inject_headers(headers, &injections);
@@ -4846,6 +5007,7 @@ mod tests {
                 injection: CredentialInjection {
                     header: "Authorization".to_string(),
                     value: "Bearer real-secret".to_string(),
+                    body: None,
                     rules: vec![],
                 },
             },
@@ -4900,6 +5062,7 @@ mod tests {
                 injection: CredentialInjection {
                     header: "Authorization".to_string(),
                     value: "Bearer real-secret".to_string(),
+                    body: None,
                     rules: vec![],
                 },
             },
@@ -4942,6 +5105,7 @@ mod tests {
                 injection: CredentialInjection {
                     header: "Authorization".to_string(),
                     value: "Bearer real-secret".to_string(),
+                    body: None,
                     rules: vec![],
                 },
             },
@@ -5228,12 +5392,14 @@ mod tests {
                         CredentialInjection {
                             header: "Authorization".into(),
                             value: "Bearer real-github".into(),
+                            body: None,
                             rules: vec![],
                         }
                     } else {
                         CredentialInjection {
                             header: "X-OpenAI-Key".into(),
                             value: "real-openai".into(),
+                            body: None,
                             rules: vec![],
                         }
                     };

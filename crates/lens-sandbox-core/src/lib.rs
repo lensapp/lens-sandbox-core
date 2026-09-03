@@ -13,6 +13,7 @@
 pub mod activity;
 pub mod aws_resign;
 pub mod aws_sigv4;
+pub mod body_field;
 pub mod ca;
 pub mod ca_env;
 pub mod child_spawner;

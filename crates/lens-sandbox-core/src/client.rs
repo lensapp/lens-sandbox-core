@@ -494,8 +494,25 @@ fn apply_injection(
             domain,
             header,
             value,
+            body_field,
+            body_value,
             rules,
         } => {
+            let body = match (body_field, body_value) {
+                (None, None) => None,
+                (Some(field), Some(value)) => Some(crate::body_field::BodyField {
+                    field: field.clone(),
+                    value: value.clone(),
+                }),
+                _ => {
+                    tracing::error!(
+                        cred_id,
+                        domain = %domain,
+                        "dropping header injection: bodyField and bodyValue must be set together"
+                    );
+                    return;
+                }
+            };
             state
                 .injection_map
                 .entry(domain.to_lowercase())
@@ -503,6 +520,7 @@ fn apply_injection(
                 .push(crate::proxy::CredentialInjection {
                     header: header.clone(),
                     value: value.clone(),
+                    body,
                     rules: rules.clone(),
                 });
             *state.header_count += 1;
@@ -3558,6 +3576,64 @@ mod tests {
         assert!(
             uri_map.is_empty(),
             "header injection should not create URI placeholder entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_policy_header_injection_carries_its_body_field() {
+        let state = test_proxy_state();
+        let policy = serde_json::json!({
+            "type": "policy",
+            "credentials": [{
+                "id": "slack",
+                "placeholder": "__lens_cred:slack__",
+                "injections": [{
+                    "injectionType": "header",
+                    "domain": "slack.com",
+                    "header": "Authorization",
+                    "value": "Bearer xoxb-real",
+                    "bodyField": "token",
+                    "bodyValue": "xoxb-real"
+                }]
+            }]
+        });
+        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        assert!(matches!(result, PolicyResult::Ok(_)));
+
+        let header_map = state.credential_injections.read().unwrap();
+        assert_eq!(
+            header_map["slack.com"][0].body,
+            Some(crate::body_field::BodyField {
+                field: "token".into(),
+                value: "xoxb-real".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_policy_drops_a_header_injection_with_half_a_body_field() {
+        let state = test_proxy_state();
+        let policy = serde_json::json!({
+            "type": "policy",
+            "credentials": [{
+                "id": "slack",
+                "placeholder": "__lens_cred:slack__",
+                "injections": [{
+                    "injectionType": "header",
+                    "domain": "slack.com",
+                    "header": "Authorization",
+                    "value": "Bearer xoxb-real",
+                    "bodyField": "token"
+                }]
+            }]
+        });
+        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        assert!(matches!(result, PolicyResult::Ok(_)));
+
+        let header_map = state.credential_injections.read().unwrap();
+        assert!(
+            !header_map.contains_key("slack.com"),
+            "a bodyField without its bodyValue must not arm the header alone"
         );
     }
 
