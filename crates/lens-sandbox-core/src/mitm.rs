@@ -2757,6 +2757,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mitm_body_field_refuses_a_body_over_the_cap() {
+        // The declared length alone refuses it, before a byte of the body is read.
+        let head = format!(
+            "POST /api/chat.postMessage HTTP/1.1\r\nHost: test.example.com\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\ntoken=",
+            crate::body_field::MAX_REWRITTEN_BODY_BYTES + 1
+        );
+        let (err, response, audits) =
+            run_mitm_harness(vec![slack_injection(vec![])], head.leak().as_bytes(), true).await;
+
+        assert!(err.contains("exceeds"), "{err}");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert_eq!(audits[0]["result"], "failure");
+        assert_eq!(audits[0]["metadata"]["body_injection_denied"], true);
+    }
+
+    #[tokio::test]
     async fn mitm_body_field_refuses_a_body_it_cannot_read() {
         let (err, response, audits) = run_mitm_harness(
             vec![slack_injection(vec![])],
