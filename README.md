@@ -42,6 +42,7 @@ This project is licensed under Apache 2.0. See:
 - [SECURITY.md](SECURITY.md) for vulnerability reporting and security scope.
 - [CHANGELOG.md](CHANGELOG.md) for release notes.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
+- [crates/lens-sandbox-runtime/THIRD-PARTY.md](crates/lens-sandbox-runtime/THIRD-PARTY.md) for code copied from NVIDIA OpenShell.
 
 ## Local Setup
 

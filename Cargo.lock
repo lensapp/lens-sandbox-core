@@ -1274,6 +1274,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lens-sandbox-runtime"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
