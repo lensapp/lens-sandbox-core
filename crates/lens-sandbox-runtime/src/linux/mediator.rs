@@ -5,23 +5,19 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use bytes::Bytes;
 use lens_sandbox_core::channel::{
     self, ConnectReply, Open, WireProcess,
     boundary::isolation_boundary_client::IsolationBoundaryClient,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::Streaming;
 use tonic::transport::Channel;
 
 use crate::linux::broker::{NetworkBroker, PendingDnsQuery, PendingTcpOpen};
 use crate::linux::contract::{DnsTransport, TcpOpenDecision, TcpOpenDenial};
+use crate::linux::relay;
 use crate::linux::seccomp_notify::NotificationListener;
 
-const RELAY_CHUNK: usize = 64 * 1024;
-const RELAY_QUEUE: usize = 8;
 /// The broker gives up on a DNS query after this long, so a reply that comes
 /// later has nobody to go to.
 const DNS_ANSWER_WINDOW: Duration = Duration::from_secs(10);
@@ -69,7 +65,7 @@ async fn relay_tcp(pending: PendingTcpOpen, mut client: IsolationBoundaryClient<
             return;
         }
     };
-    let (outbound, outbound_rx) = mpsc::channel(RELAY_QUEUE);
+    let (outbound, outbound_rx) = mpsc::channel(relay::QUEUE);
     let open = Open::Connect {
         destination: pending.destination,
         process,
@@ -110,44 +106,13 @@ async fn relay_tcp(pending: PendingTcpOpen, mut client: IsolationBoundaryClient<
             return;
         }
     };
-    if let Err(error) = pump(relay, outbound, inbound).await {
+    let relayed = async {
+        relay.set_nonblocking(true)?;
+        relay::pump(tokio::net::TcpStream::from_std(relay)?, outbound, inbound).await
+    };
+    if let Err(error) = relayed.await {
         tracing::debug!(%error, "relay closed");
     }
-}
-
-/// Copies bytes both ways until each side has closed. The workload's end of
-/// its write half reaches the supervisor as the end of the client stream.
-async fn pump(
-    relay: std::net::TcpStream,
-    outbound: mpsc::Sender<Bytes>,
-    mut inbound: Streaming<Bytes>,
-) -> std::io::Result<()> {
-    relay.set_nonblocking(true)?;
-    let (mut from_workload, mut to_workload) = tokio::net::TcpStream::from_std(relay)?.into_split();
-    let upload = async move {
-        let mut buffer = vec![0_u8; RELAY_CHUNK];
-        loop {
-            let read = from_workload.read(&mut buffer).await?;
-            if read == 0 {
-                return Ok::<_, std::io::Error>(());
-            }
-            if outbound
-                .send(Bytes::copy_from_slice(&buffer[..read]))
-                .await
-                .is_err()
-            {
-                return Ok(());
-            }
-        }
-    };
-    let download = async move {
-        while let Some(chunk) = inbound.message().await.map_err(std::io::Error::other)? {
-            to_workload.write_all(&chunk).await?;
-        }
-        to_workload.shutdown().await
-    };
-    let (up, down) = tokio::join!(upload, download);
-    up.and(down)
 }
 
 /// Queries wait here for their reply, by frame id.
@@ -174,7 +139,7 @@ async fn mediate_dns(
     broker: &NetworkBroker,
     mut client: IsolationBoundaryClient<Channel>,
 ) -> Ended {
-    let (outbound, outbound_rx) = mpsc::channel(RELAY_QUEUE);
+    let (outbound, outbound_rx) = mpsc::channel(relay::QUEUE);
     let mut replies = match client.mediate(ReceiverStream::new(outbound_rx)).await {
         Ok(response) => response.into_inner(),
         Err(status) => {
@@ -255,6 +220,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use lens_sandbox_core::channel::boundary::isolation_boundary_server::{
         IsolationBoundary, IsolationBoundaryServer,
     };
@@ -262,6 +228,7 @@ mod tests {
     use std::net::{SocketAddr, TcpStream, UdpSocket};
     use std::pin::Pin;
     use tokio_stream::{Stream, StreamExt as _};
+    use tonic::Streaming;
     use tonic::{Request, Response, Status};
 
     type ChunkStream = Pin<Box<dyn Stream<Item = Result<Bytes, Status>> + Send>>;
