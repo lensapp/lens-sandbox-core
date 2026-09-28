@@ -3,12 +3,14 @@
 //!
 //! The runtime binds its resolver on `127.0.0.53:53`, so the test needs root
 //! and a network namespace where nothing else holds that address. CI runs it
-//! with `unshare -n`.
+//! with `unshare -n`. The runtime reads its key from `/.lens/channel`, so each
+//! runtime gets its own mount namespace with an empty `/.lens`.
 
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,18 +47,17 @@ async fn sandbox() -> Sandbox {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
     let pki = ChannelPki::generate(["agent"]).unwrap();
-    let channel_dir = dir.path().join("channel");
-    std::fs::create_dir(&channel_dir).unwrap();
+    let keys = dir.path().join("keys");
+    std::fs::create_dir(&keys).unwrap();
     let runtime_tls = &pki.runtimes["agent"];
-    std::fs::write(channel_dir.join("ca.pem"), &runtime_tls.ca).unwrap();
-    std::fs::write(channel_dir.join("cert.pem"), &runtime_tls.cert).unwrap();
-    std::fs::write(channel_dir.join("key.pem"), &runtime_tls.key).unwrap();
+    std::fs::write(keys.join("ca.pem"), &runtime_tls.ca).unwrap();
+    std::fs::write(keys.join("cert.pem"), &runtime_tls.cert).unwrap();
+    std::fs::write(keys.join("key.pem"), &runtime_tls.key).unwrap();
 
     let socket = dir.path().join("channel.sock");
     let ca_bundle = dir.path().join("trust/ca-bundle.pem");
-    let runtime = Command::new(env!("CARGO_BIN_EXE_lens-sandbox-runtime"))
+    let runtime = in_own_lens(&keys)
         .env("LENS_SANDBOX_LISTEN", format!("unix:{}", socket.display()))
-        .env("LENS_SANDBOX_CHANNEL_DIR", &channel_dir)
         .env("LENS_SANDBOX_CA_BUNDLE", &ca_bundle)
         .spawn()
         .unwrap();
@@ -73,6 +74,24 @@ async fn sandbox() -> Sandbox {
         _runtime: Runtime(runtime),
         _dir: dir,
     }
+}
+
+/// The runtime binary on a tmpfs `/.lens` that only its own mount namespace
+/// sees, with the keys copied into `/.lens/channel`. `unshare` and `sh` exec,
+/// so the child is the runtime itself. The host keeps only an empty `/.lens`
+/// as the mount point.
+fn in_own_lens(keys: &Path) -> Command {
+    std::fs::create_dir_all("/.lens").unwrap();
+    let mut command = Command::new("unshare");
+    command
+        .args(["--mount", "--propagation", "private", "--", "sh", "-c"])
+        .arg(
+            "mount -t tmpfs lens /.lens && mkdir /.lens/channel \
+             && cp \"$0\"/*.pem /.lens/channel && exec \"$1\"",
+        )
+        .arg(keys)
+        .arg(env!("CARGO_BIN_EXE_lens-sandbox-runtime"));
+    command
 }
 
 async fn exec(sandbox: &Sandbox, script: &str) -> String {
@@ -127,6 +146,9 @@ async fn a_workload_runs_under_the_supervisor() {
     let bundle = exec(&sandbox, "cat \"$SSL_CERT_FILE\"").await;
     assert!(bundle.ends_with(&format!("{PROXY_CA}\n")), "{bundle}");
     assert_eq!(std::fs::read_to_string(&sandbox.ca_bundle).unwrap(), bundle);
+
+    let hidden = exec(&sandbox, "cat /.lens/channel/key.pem").await;
+    assert!(hidden.contains("Permission denied"), "{hidden}");
 
     let refused = exec(&sandbox, &format!("exec 3<>/dev/tcp/{}/80", own_address())).await;
     assert!(refused.contains("Permission denied"), "{refused}");
