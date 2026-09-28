@@ -48,7 +48,10 @@ impl PeerProcess {
 /// event it produces.
 #[derive(Debug, Clone)]
 pub struct ActorContext {
-    peer: SocketAddr,
+    /// `None` when the connection reached the proxy through the runtime
+    /// channel: the workload socket's own address is then a loopback relay
+    /// port, which names nothing.
+    peer: Option<SocketAddr>,
     process: Option<PeerProcess>,
 }
 
@@ -58,8 +61,16 @@ impl ActorContext {
     /// so the walk never occupies a tokio worker thread.
     pub fn resolve(peer: SocketAddr) -> Self {
         Self {
-            peer,
+            peer: Some(peer),
             process: resolve(peer),
+        }
+    }
+
+    /// A caller the runtime already identified, from the pid its broker saw.
+    pub fn attributed(process: PeerProcess) -> Self {
+        Self {
+            peer: None,
+            process: Some(process),
         }
     }
 
@@ -74,7 +85,7 @@ impl ActorContext {
     /// That resolves to `None`, and a `binaries` rule then fails closed.
     pub fn resolve_udp(peer: SocketAddr) -> Self {
         Self {
-            peer,
+            peer: Some(peer),
             process: resolve_udp(peer),
         }
     }
@@ -89,7 +100,7 @@ impl ActorContext {
         tokio::task::spawn_blocking(move || Self::resolve(peer))
             .await
             .unwrap_or(Self {
-                peer,
+                peer: Some(peer),
                 process: None,
             })
     }
@@ -100,13 +111,16 @@ impl ActorContext {
         self.process.as_ref()
     }
 
-    /// Insert `src_endpoint` (always) and `actor.process` (when resolved) into
-    /// an audit-event object, ready for the host to copy into OCSF.
+    /// Insert `src_endpoint` (when the connection carries one) and
+    /// `actor.process` (when resolved) into an audit-event object, ready for
+    /// the host to copy into OCSF.
     pub fn augment(&self, event: &mut Map<String, Value>) {
-        event.insert(
-            "src_endpoint".into(),
-            json!({"ip": self.peer.ip().to_string(), "port": self.peer.port()}),
-        );
+        if let Some(peer) = self.peer {
+            event.insert(
+                "src_endpoint".into(),
+                json!({"ip": peer.ip().to_string(), "port": peer.port()}),
+            );
+        }
         if let Some(p) = &self.process {
             let mut process = json!({"name": p.name, "pid": p.pid});
             // OCSF `process.file.path`: the kernel-resolved image path the
@@ -209,15 +223,26 @@ pub(crate) async fn resolve_udp_offloaded(peer: SocketAddr) -> Option<PeerProces
         .unwrap_or(None)
 }
 
+/// Describe a process whose pid is already known, as the runtime's broker
+/// knows it from the syscall it intercepted. The target is parked in that
+/// syscall, so its `/proc/<pid>` entry exists while this reads it.
+pub fn resolve_pid(pid: i64) -> PeerProcess {
+    process_for(&RealProc, pid)
+}
+
 fn resolve_with<P: ProcReader>(proc: &P, peer: SocketAddr, proto: Proto) -> Option<PeerProcess> {
     let inode = socket_inode_for(proc, peer, proto)?;
     let pid = pid_owning_inode(proc, inode)?;
-    Some(PeerProcess {
+    Some(process_for(proc, pid))
+}
+
+fn process_for<P: ProcReader>(proc: &P, pid: i64) -> PeerProcess {
+    PeerProcess {
         name: process_name(proc, pid).unwrap_or_default(),
         exe: read_exe(proc, pid),
         ancestors: walk_ancestors(proc, pid),
         pid,
-    })
+    }
 }
 
 fn socket_inode_for<P: ProcReader>(proc: &P, peer: SocketAddr, proto: Proto) -> Option<u64> {
@@ -383,7 +408,7 @@ mod tests {
     #[test]
     fn augment_stamps_src_endpoint_and_actor_process_when_resolved() {
         let actor = ActorContext {
-            peer: "10.0.0.5:54321".parse().unwrap(),
+            peer: Some("10.0.0.5:54321".parse().unwrap()),
             process: Some(PeerProcess {
                 pid: 4242,
                 name: "wget".into(),
@@ -408,7 +433,7 @@ mod tests {
         // Process resolved but /proc/<pid>/exe unreadable: emit name+pid, but
         // no `file.path` — never a partial/empty path that reads as an identity.
         let actor = ActorContext {
-            peer: "10.0.0.5:54321".parse().unwrap(),
+            peer: Some("10.0.0.5:54321".parse().unwrap()),
             process: Some(PeerProcess {
                 pid: 4242,
                 name: "wget".into(),
@@ -434,7 +459,7 @@ mod tests {
         // `file` is omitted rather than emit a misleading path.
         let exe = PathBuf::from(OsStr::from_bytes(b"/usr/bin/\xff"));
         let actor = ActorContext {
-            peer: "10.0.0.5:54321".parse().unwrap(),
+            peer: Some("10.0.0.5:54321".parse().unwrap()),
             process: Some(PeerProcess {
                 pid: 4242,
                 name: "wget".into(),
@@ -453,7 +478,7 @@ mod tests {
     #[test]
     fn augment_omits_actor_when_the_process_is_unresolved() {
         let actor = ActorContext {
-            peer: "10.0.0.5:54321".parse().unwrap(),
+            peer: Some("10.0.0.5:54321".parse().unwrap()),
             process: None,
         };
         let mut event = Map::new();
@@ -463,6 +488,20 @@ mod tests {
             json!({"ip": "10.0.0.5", "port": 54321})
         );
         assert!(!event.contains_key("actor"));
+    }
+
+    #[test]
+    fn augment_omits_src_endpoint_for_an_attributed_caller() {
+        let actor = ActorContext::attributed(PeerProcess {
+            pid: 4242,
+            name: "wget".into(),
+            exe: Some("/usr/bin/wget".into()),
+            ancestors: vec![],
+        });
+        let mut event = Map::new();
+        actor.augment(&mut event);
+        assert!(!event.contains_key("src_endpoint"));
+        assert_eq!(event["actor"]["process"]["pid"], json!(4242));
     }
 
     const TCP_ROW: &str = "   3: 0100007F:1F90 0100007F:C1A2 01 00000000:00000000 00:00000000 00000000  1000        0 424242 1 ffff 100";
@@ -530,6 +569,19 @@ mod tests {
                 exe: Some("/usr/bin/wget".into()),
                 ancestors: vec!["/usr/bin/bash".into()],
             })
+        );
+    }
+
+    #[test]
+    fn process_for_describes_a_known_pid_without_a_socket_lookup() {
+        assert_eq!(
+            process_for(&owning_fixture(), 100),
+            PeerProcess {
+                pid: 100,
+                name: "wget".into(),
+                exe: Some("/usr/bin/wget".into()),
+                ancestors: vec!["/usr/bin/bash".into()],
+            }
         );
     }
 

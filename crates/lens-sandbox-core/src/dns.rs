@@ -186,8 +186,7 @@ fn caller_is_attributable(listen: Option<SocketAddr>) -> bool {
     listen.is_some_and(|addr| addr.ip().to_canonical().is_loopback())
 }
 
-/// Handle one received datagram. Decides allow/deny against the route
-/// allowlist, then either forwards upstream or synthesises NXDOMAIN.
+/// Handle one received datagram and send its answer, if it has one.
 async fn handle_query(
     packet: Vec<u8>,
     peer: SocketAddr,
@@ -196,9 +195,33 @@ async fn handle_query(
     upstream: SocketAddr,
     attributable: bool,
 ) {
-    let decision = resolve_decision(&packet, peer, state, attributable).await;
+    // `attributable` is false for a datagram from a nested namespace, whose
+    // sender no walk of this `/proc` can find. `classify_query` then applies
+    // every `binaries` rule against no caller, which denies — the honest answer
+    // when nothing here can say which binary sent the packet. Otherwise the
+    // caller is resolved once, off the worker thread, so DNS and the TCP layer
+    // judge the same binary; an unresolvable caller fails closed.
+    let caller = if attributable && has_binary_rule(state) {
+        resolve_udp_offloaded(peer).await
+    } else {
+        None
+    };
+    if let Some(response) = answer(&packet, caller.as_ref(), state, upstream).await {
+        let _ = socket.send_to(&response, peer).await;
+    }
+}
 
-    match decision {
+/// Decide one DNS query and produce the wire answer: the upstream reply for an
+/// allowed name, an empty answer for a denied or suppressed one, `None` when
+/// the query is dropped or the upstream fails. `caller` applies any `binaries`
+/// filter; `None` fails a binary-scoped name closed.
+pub async fn answer(
+    packet: &[u8],
+    caller: Option<&PeerProcess>,
+    state: &Arc<ProxyState>,
+    upstream: SocketAddr,
+) -> Option<Vec<u8>> {
+    match classify_query(packet, state, caller) {
         Decision::Allow {
             qname,
             should_pin,
@@ -206,30 +229,27 @@ async fn handle_query(
         } => {
             tracing::debug!(qname = %qname, "dns stub forwarding");
             let pin_qname = should_pin.then_some(qname.as_str());
-            if let Err(e) = forward_upstream(
-                &packet, upstream, socket, peer, state, pin_qname, generation,
-            )
-            .await
-            {
-                tracing::warn!(qname = %qname, "dns stub upstream error: {e}");
+            match forward_upstream(packet, upstream, state, pin_qname, generation).await {
+                Ok(response) => Some(response),
+                Err(e) => {
+                    tracing::warn!(qname = %qname, "dns stub upstream error: {e}");
+                    None
+                }
             }
         }
         Decision::Deny { qname, reason } => {
             emit_deny(state, &qname, reason);
-            if let Some(resp) = empty_response(&packet, ResponseCode::NXDomain) {
-                let _ = socket.send_to(&resp, peer).await;
-            }
+            empty_response(packet, ResponseCode::NXDomain)
         }
         Decision::SuppressNodata { qname } => {
             tracing::debug!(qname = %qname, "dns stub answering AAAA/HTTPS/SVCB with NODATA to force IPv4");
-            if let Some(resp) = empty_response(&packet, ResponseCode::NoError) {
-                let _ = socket.send_to(&resp, peer).await;
-            }
+            empty_response(packet, ResponseCode::NoError)
         }
         Decision::Malformed => {
             // Silently drop — replying FORMERR would leak that the stub
             // exists. The client's own retry logic handles timeouts.
             tracing::debug!("dns stub dropping malformed query");
+            None
         }
     }
 }
@@ -263,11 +283,8 @@ const DENY_REASON: &str = "dns-denied";
 /// other than the caller's — the DNS analogue of a `binary_filtered` TCP miss.
 const BINARY_DENY_REASON: &str = "dns-binary-not-allowed";
 
-/// Classify a query, resolving the querying process only when the policy has a
-/// binary-scoped rule — the one thing a caller can change. A no-`binaries`
-/// policy never walks `/proc`; otherwise we resolve once (offloaded) and
-/// classify with the real caller, so DNS and the TCP layer stay in lockstep.
-/// An unresolvable caller fails a binary-scoped name closed.
+/// Whether the policy has a binary-scoped rule that gates DNS — the one thing
+/// a caller can change. A no-`binaries` policy never walks `/proc`.
 ///
 /// We deliberately do NOT narrow this to "resolve only when the caller-less
 /// classification is `BinaryDenied`": once a binary rule excludes a missing
@@ -276,46 +293,27 @@ const BINARY_DENY_REASON: &str = "dns-binary-not-allowed";
 /// the TCP layer would allow (allow-for-binary, then deny-the-broader-domain)
 /// would be wrongly NXDOMAIN'd. The walk under a binary policy is bounded by
 /// the inflight semaphore.
-async fn resolve_decision(
-    packet: &[u8],
-    peer: SocketAddr,
-    state: &ProxyState,
-    attributable: bool,
-) -> Decision {
-    // Scoped so the policy read guard drops before the `.await` below — a
-    // std RwLock guard must never be held across an await point.
-    let has_binary_rule = {
-        // Only hostname rules from a raw table gate DNS, so a binary-scoped
-        // pure-IP rule shouldn't force a /proc walk on every lookup.
-        let gates_dns_by_binary = |rules: &[crate::routing::RouteRule]| {
-            rules.iter().any(|r| {
-                r.binaries.is_some()
-                    && matches!(
-                        r.matcher,
-                        crate::routing::RouteMatcher::Domain(_)
-                            | crate::routing::RouteMatcher::HostPort(..)
-                    )
-            })
-        };
-        let policy = state.policy.read().unwrap();
-        policy.routes.iter().any(|r| r.binaries.is_some())
-            || gates_dns_by_binary(&policy.tcp_egress)
-            || gates_dns_by_binary(&policy.udp_egress)
+fn has_binary_rule(state: &ProxyState) -> bool {
+    // Only hostname rules from a raw table gate DNS, so a binary-scoped
+    // pure-IP rule shouldn't force a /proc walk on every lookup.
+    let gates_dns_by_binary = |rules: &[crate::routing::RouteRule]| {
+        rules.iter().any(|r| {
+            r.binaries.is_some()
+                && matches!(
+                    r.matcher,
+                    crate::routing::RouteMatcher::Domain(_)
+                        | crate::routing::RouteMatcher::HostPort(..)
+                )
+        })
     };
-    // `attributable` is false for a datagram from a nested namespace, whose
-    // sender no walk of this `/proc` can find. `classify_query` then applies
-    // every `binaries` rule against no caller, which denies — the honest answer
-    // when nothing here can say which binary sent the packet.
-    let caller = if has_binary_rule && attributable {
-        resolve_udp_offloaded(peer).await
-    } else {
-        None
-    };
-    classify_query(packet, state, caller.as_ref())
+    let policy = state.policy.read().unwrap();
+    policy.routes.iter().any(|r| r.binaries.is_some())
+        || gates_dns_by_binary(&policy.tcp_egress)
+        || gates_dns_by_binary(&policy.udp_egress)
 }
 
 /// Parse the request and match its first question against the allowlist.
-/// `caller` is the resolved querying process (see [`resolve_decision`]), used
+/// `caller` is the resolved querying process (see [`handle_query`]), used
 /// to apply a route's `binaries` filter. Split out for direct unit testing —
 /// no I/O, no async.
 fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess>) -> Decision {
@@ -466,18 +464,16 @@ fn empty_response(packet: &[u8], code: ResponseCode) -> Option<Vec<u8>> {
     resp.to_vec().ok()
 }
 
-/// Forward the raw datagram to the upstream resolver and relay its response
-/// back to the client. One-shot UDP socket per query — simple, no
-/// connection tracking, upstream's own conntrack handles reply routing.
+/// Forward the raw datagram to the upstream resolver and return its response.
+/// One-shot UDP socket per query — simple, no connection tracking, upstream's
+/// own conntrack handles reply routing.
 async fn forward_upstream(
     packet: &[u8],
     upstream: SocketAddr,
-    client_socket: &UdpSocket,
-    client_peer: SocketAddr,
     state: &Arc<ProxyState>,
     pin_qname: Option<&str>,
     generation: u64,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     // SO_MARK on the upstream socket so the nftables NAT chain doesn't
     // redirect the stub's own query packet back at itself. The listening
     // stub socket (bound in `run`) is sandbox-facing and stays unmarked
@@ -511,12 +507,7 @@ async fn forward_upstream(
     if let Some(qname) = pin_qname {
         pin_answer_ips(&resp_buf[..n], state, qname, generation);
     }
-
-    client_socket
-        .send_to(&resp_buf[..n], client_peer)
-        .await
-        .map_err(|e| format!("client reply: {e}"))?;
-    Ok(())
+    Ok(resp_buf[..n].to_vec())
 }
 
 /// Parse an upstream response and pin its A-record IPs against `qname`, using
@@ -636,6 +627,37 @@ mod tests {
         // An address we could not read is not evidence either way, and
         // attributing on an assumption is the failure that matters.
         assert!(!caller_is_attributable(None));
+    }
+
+    #[tokio::test]
+    async fn answer_is_nxdomain_for_a_denied_name() {
+        let state = state_with_routes(vec![rule("allowed.example")]);
+        let packet = make_query("denied.example.", RecordType::A);
+        // The upstream is never dialled for a denied name.
+        let upstream = "127.0.0.1:9".parse().unwrap();
+
+        let response = answer(&packet, None, &state, upstream).await.unwrap();
+
+        let msg = Message::from_vec(&response).unwrap();
+        assert_eq!(msg.metadata.id, 0x1234);
+        assert_eq!(msg.metadata.response_code, ResponseCode::NXDomain);
+    }
+
+    #[tokio::test]
+    async fn answer_relays_the_upstream_reply_for_an_allowed_name() {
+        let state = state_with_routes(vec![rule("allowed.example")]);
+        let packet = make_query("allowed.example.", RecordType::A);
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            upstream.send_to(b"reply", peer).await.unwrap();
+        });
+
+        let response = answer(&packet, None, &state, upstream_addr).await;
+
+        assert_eq!(response.as_deref(), Some(&b"reply"[..]));
     }
 
     fn make_query(qname: &str, rtype: RecordType) -> Vec<u8> {
