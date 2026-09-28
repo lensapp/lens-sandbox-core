@@ -125,7 +125,7 @@ mod tests {
         let boundary = Boundary {
             exec: ExecManager::new(None, false, PidGuard::default()),
             broker,
-            mediation: Mediation::new(),
+            mediation: Mediation::default(),
             ca_bundle: ca_bundle.clone(),
             system_bundle: dir.path().join("system.pem"),
         };
