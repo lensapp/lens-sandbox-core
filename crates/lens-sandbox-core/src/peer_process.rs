@@ -217,6 +217,7 @@ fn resolve_udp(peer: SocketAddr) -> Option<PeerProcess> {
 /// [`resolve_udp`] on a blocking thread, for async callers (the DNS stub). The
 /// `/proc` walk is synchronous filesystem I/O, so offloading keeps the stub's
 /// tokio worker free. A panicking task degrades to `None` — fail closed.
+#[cfg(feature = "proxy")]
 pub(crate) async fn resolve_udp_offloaded(peer: SocketAddr) -> Option<PeerProcess> {
     tokio::task::spawn_blocking(move || resolve_udp(peer))
         .await
