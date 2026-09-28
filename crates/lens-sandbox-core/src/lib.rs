@@ -24,6 +24,8 @@ pub mod body_field;
 #[cfg(feature = "proxy")]
 pub mod ca;
 pub mod ca_env;
+#[cfg(feature = "channel")]
+pub mod channel;
 pub mod child_spawner;
 #[cfg(feature = "proxy")]
 pub mod client;
