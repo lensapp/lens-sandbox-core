@@ -1,43 +1,26 @@
-//! One loopback forward: an inbound stream of the supervisor to a port in
-//! the workload.
+//! One loopback forward: an `Exchange` of the supervisor to a port in the
+//! workload.
 
 use std::net::Ipv4Addr;
 
-use lens_sandbox_core::channel::{
-    self, Open, boundary::isolation_boundary_client::IsolationBoundaryClient,
-};
+use bytes::Bytes;
+use lens_sandbox_core::channel;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Channel;
+use tonic::{Status, Streaming};
 
-use crate::linux::relay;
+use crate::linux::boundary::ChunkStream;
 
-/// When nothing listens on the port, the `Exchange` opens and ends at once,
-/// so the supervisor learns of the failure without a timeout.
-pub(crate) async fn serve(id: u64, port: u16, mut client: IsolationBoundaryClient<Channel>) {
-    let local = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await;
-    let (outbound, outbound_rx) = mpsc::channel(relay::QUEUE);
-    if outbound
-        .send(channel::encode(&Open::Forward { id }))
+pub(crate) async fn serve(port: u16, inbound: Streaming<Bytes>) -> Result<ChunkStream, Status> {
+    let local = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
         .await
-        .is_err()
-    {
-        return;
-    }
-    let inbound = match client.exchange(ReceiverStream::new(outbound_rx)).await {
-        Ok(response) => response.into_inner(),
-        Err(status) => {
-            tracing::warn!(id, %status, "loopback forward failed to open");
-            return;
+        .map_err(|e| Status::unavailable(format!("nothing to forward to on port {port}: {e}")))?;
+    let (outbound, outbound_rx) = mpsc::channel(channel::RELAY_QUEUE);
+    tokio::spawn(async move {
+        if let Err(error) = channel::pump(local, outbound, inbound).await {
+            tracing::debug!(port, %error, "loopback forward closed");
         }
-    };
-    match local {
-        Ok(stream) => {
-            if let Err(error) = relay::pump(stream, outbound, inbound).await {
-                tracing::debug!(id, %error, "loopback forward closed");
-            }
-        }
-        Err(error) => tracing::warn!(id, port, %error, "nothing to forward to"),
-    }
+    });
+    Ok(Box::pin(ReceiverStream::new(outbound_rx)))
 }

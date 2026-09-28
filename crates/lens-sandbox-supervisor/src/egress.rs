@@ -5,14 +5,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use lens_sandbox_core::channel::{self, ConnectReply, WireProcess};
+use lens_sandbox_core::channel::{self, ConnectReply, Held};
 use lens_sandbox_core::peer_process::ActorContext;
 use lens_sandbox_core::proxy::{ProxyState, serve_egress};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tonic::{Status, Streaming};
-
-use crate::relay;
+use tonic::Streaming;
 
 /// The supervisor dials for the workload, so an address of the supervisor
 /// host would reach the supervisor's own services. Only a local address can
@@ -23,37 +21,53 @@ pub(crate) fn is_own_address(ip: IpAddr) -> bool {
     ip.is_loopback() || UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
 }
 
-/// The first reply is the decision. After `Allowed`, the chunks are the
+/// Replies with the decision. After `Allowed`, the exchange carries the
 /// bytes of the connection, and the proxy can still close it.
 pub(crate) async fn serve(
-    destination: SocketAddr,
-    process: WireProcess,
-    inbound: Streaming<Bytes>,
+    held: Held,
+    outbound: mpsc::Sender<Bytes>,
+    mut inbound: Streaming<Bytes>,
     state: Arc<ProxyState>,
     is_own: fn(IpAddr) -> bool,
-) -> Result<mpsc::Receiver<Result<Bytes, Status>>, Status> {
-    let (outbound, outbound_rx) = mpsc::channel(relay::QUEUE);
-    if is_own(destination.ip()) {
+) {
+    let destination = held.destination;
+    let relay_side = if is_own(destination.ip()) {
         tracing::warn!(%destination, "refused a workload connect to the supervisor itself");
-        let _ = outbound.try_send(Ok(channel::encode(&ConnectReply::Denied)));
-        return Ok(outbound_rx);
+        None
+    } else {
+        match loopback_pair().await {
+            Ok((proxy_side, relay_side)) => {
+                let actor = ActorContext::attributed(held.process.into());
+                tokio::spawn(async move {
+                    if let Err(error) = serve_egress(proxy_side, destination, actor, state).await {
+                        tracing::debug!(%destination, %error, "egress ended");
+                    }
+                });
+                Some(relay_side)
+            }
+            Err(error) => {
+                tracing::warn!(%destination, %error, "no loopback relay");
+                None
+            }
+        }
+    };
+    let reply = match relay_side {
+        Some(_) => ConnectReply::Allowed,
+        None => ConnectReply::Denied,
+    };
+    if outbound.send(channel::encode(&reply)).await.is_err() {
+        return;
     }
-    let (proxy_side, relay_side) = loopback_pair()
-        .await
-        .map_err(|e| Status::internal(format!("loopback relay: {e}")))?;
-    let _ = outbound.try_send(Ok(channel::encode(&ConnectReply::Allowed)));
-    let actor = ActorContext::attributed(process.into());
-    tokio::spawn(async move {
-        if let Err(error) = serve_egress(proxy_side, destination, actor, state).await {
-            tracing::debug!(%destination, %error, "egress ended");
-        }
-    });
-    tokio::spawn(async move {
-        if let Err(error) = relay::pump(relay_side, outbound, inbound).await {
-            tracing::debug!(%destination, %error, "relay closed");
-        }
-    });
-    Ok(outbound_rx)
+    let Some(relay_side) = relay_side else {
+        // The runtime ends the call after a denial; ending it here first
+        // would cancel the reply.
+        drop(outbound);
+        while let Ok(Some(_)) = inbound.message().await {}
+        return;
+    };
+    if let Err(error) = channel::pump(relay_side, outbound, inbound).await {
+        tracing::debug!(%destination, %error, "relay closed");
+    }
 }
 
 /// `serve_egress` takes a TCP stream, so the relay is the other end of a
