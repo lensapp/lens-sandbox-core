@@ -1277,8 +1277,15 @@ dependencies = [
 name = "lens-sandbox-runtime"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "lens-sandbox-core",
  "libc",
  "rustix",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

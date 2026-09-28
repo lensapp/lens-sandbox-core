@@ -10,7 +10,10 @@ Each copied file keeps its SPDX header. A file that we changed has a line under 
 
 | File in this crate | File in OpenShell |
 | --- | --- |
+| `src/linux/accept_interrupt.rs` | `crates/openshell-sandbox/src/accept_interrupt.rs` |
+| `src/linux/broker.rs` | `crates/openshell-sandbox/src/network_broker.rs` |
 | `src/linux/child_seccomp.rs` | `crates/openshell-isolation-interface/src/linux/child_seccomp.rs` |
+| `src/linux/contract.rs` | part of `crates/openshell-isolation-interface/src/contract.rs` |
 | `src/linux/proc_fd.rs` | `crates/openshell-isolation-interface/src/linux/proc_fd.rs` |
 | `src/linux/process_signal.rs` | `crates/openshell-isolation-interface/src/linux/process_signal.rs` |
 | `src/linux/seccomp_notify.rs` | `crates/openshell-isolation-interface/src/linux/seccomp_notify.rs` |
