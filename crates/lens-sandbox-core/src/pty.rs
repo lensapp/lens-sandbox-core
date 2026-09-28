@@ -178,9 +178,7 @@ pub(crate) fn spawn_spec(
         });
     }
 
-    let child = launcher
-        .spawn(&mut cmd)
-        .map_err(|e| format!("spawn: {e}"))?;
+    let child = launcher.spawn(cmd).map_err(|e| format!("spawn: {e}"))?;
     let pid = child.id().ok_or("failed to get child PID")?;
 
     // Close slave in parent — only master is needed
