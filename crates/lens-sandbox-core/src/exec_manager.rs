@@ -221,7 +221,7 @@ impl ExecManager {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = match self.inner.launcher.spawn(&mut cmd) {
+        let mut child = match self.inner.launcher.spawn(cmd) {
             Ok(c) => c,
             Err(e) => {
                 emit(
@@ -1015,7 +1015,7 @@ mod tests {
     struct MarkingLauncher;
 
     impl Launcher for MarkingLauncher {
-        fn spawn(&self, cmd: &mut tokio::process::Command) -> std::io::Result<Child> {
+        fn spawn(&self, mut cmd: tokio::process::Command) -> std::io::Result<Child> {
             cmd.env("LAUNCHED_BY", "marking");
             cmd.spawn()
         }
