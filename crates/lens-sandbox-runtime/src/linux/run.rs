@@ -26,11 +26,7 @@ pub async fn run(config: RuntimeConfig) -> io::Error {
         Ok(started) => started,
         Err(error) => return error,
     };
-    let mediation = boundary.mediation.clone();
-    tokio::select! {
-        error = listen::serve(incoming, &tls, boundary) => error,
-        error = mediation.expire() => error,
-    }
+    listen::serve(incoming, &tls, boundary).await
 }
 
 fn start(
@@ -59,7 +55,7 @@ fn start(
     let boundary = Boundary {
         exec,
         broker,
-        mediation: Mediation::new(),
+        mediation: Mediation::default(),
         ca_bundle: config.ca_bundle,
         system_bundle: PathBuf::from(CA_BUNDLE),
     };
