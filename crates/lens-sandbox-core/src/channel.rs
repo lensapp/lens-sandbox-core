@@ -75,8 +75,18 @@ pub enum Open {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "control", rename_all = "snake_case")]
 pub enum Control {
-    OpenExec { session: String },
-    OpenForward { id: u64, port: u16 },
+    /// The public CA of the proxy. The supervisor sends it before the first
+    /// [`Control::OpenExec`], so every workload process trusts the proxy.
+    Trust {
+        ca_pem: String,
+    },
+    OpenExec {
+        session: String,
+    },
+    OpenForward {
+        id: u64,
+        port: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -122,11 +122,11 @@ mod tests {
         assert_eq!(seccomp_filters(&status), own + 2, "{status}");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_exec_session_runs_through_the_runtime_launcher() {
+    /// The stdout of `script` in one exec session of the runtime launcher.
+    async fn exec_stdout(is_root: bool, script: &str) -> Vec<u8> {
         let manager = ExecManager::with_launcher(
             None,
-            false,
+            is_root,
             PidGuard::default(),
             Arc::new(runtime_launcher()),
         );
@@ -135,11 +135,7 @@ mod tests {
             .handle(
                 IncomingMessage::ExecAttach {
                     exec_id: "e".into(),
-                    argv: vec![
-                        "sh".into(),
-                        "-c".into(),
-                        "printf %s \"$SSL_CERT_FILE\"".into(),
-                    ],
+                    argv: vec!["sh".into(), "-c".into(), script.into()],
                     env: HashMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
                     cwd: None,
                     tty: false,
@@ -168,6 +164,37 @@ mod tests {
                 _ => {}
             }
         }
+        stdout
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exec_session_runs_through_the_runtime_launcher() {
+        let stdout = exec_stdout(false, "printf %s \"$SSL_CERT_FILE\"").await;
         assert_eq!(stdout, b"/tmp/lens-sandbox/ca-bundle.pem");
+    }
+
+    fn status_field<'a>(status: &'a str, field: &str) -> &'a str {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(field))
+            .unwrap()
+            .trim()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_root_exec_keeps_only_the_level_b_capabilities() {
+        // CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID.
+        const LEVEL_B: u64 = 0xfb;
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipping: needs uid 0");
+            return;
+        }
+        let own = std::fs::read_to_string("/proc/self/status").unwrap();
+        let permitted = u64::from_str_radix(status_field(&own, "CapPrm:"), 16).unwrap();
+        let stdout = exec_stdout(true, "cat /proc/self/status").await;
+        let status = String::from_utf8(stdout).unwrap();
+        let effective = u64::from_str_radix(status_field(&status, "CapEff:"), 16).unwrap();
+        assert_eq!(effective, LEVEL_B & permitted, "{status}");
+        assert_eq!(status_field(&status, "NoNewPrivs:"), "1", "{status}");
     }
 }
