@@ -5,8 +5,8 @@ Shared library for all sandbox types (shell, agent). Provides WebSocket client, 
 ## Crates
 
 - `lens-sandbox-core`: the library above, plus the runtime channel protocol (`channel` feature, off by default).
-- `lens-sandbox-runtime`: the non-root runtime binary inside the workload (Linux only): seccomp broker, Landlock, exec and forwarding. Many files in `src/linux/` are copied from NVIDIA OpenShell; see `crates/lens-sandbox-runtime/THIRD-PARTY.md` before you change one.
-- `lens-sandbox-supervisor`: the supervisor side of the channel: runtime identity, egress through the proxy, DNS, and certificate issuance.
+- `lens-sandbox-runtime`: the non-root runtime binary inside the workload (Linux only): the channel server, seccomp broker, Landlock, exec and forwarding. Many files in `src/linux/` are copied from NVIDIA OpenShell; see `crates/lens-sandbox-runtime/THIRD-PARTY.md` before you change one.
+- `lens-sandbox-supervisor`: the supervisor side of the channel: it dials each runtime, and holds egress through the proxy, DNS, and certificate issuance.
 
 ## Commands
 

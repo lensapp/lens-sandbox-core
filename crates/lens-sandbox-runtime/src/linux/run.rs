@@ -5,37 +5,46 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lens_sandbox_core::ca_env::CA_BUNDLE;
+use lens_sandbox_core::channel::ChannelTls;
 use lens_sandbox_core::exec_manager::ExecManager;
 use lens_sandbox_core::lifecycle::{OrphanReaper, PidGuard};
 use rustix::process::{DumpableBehavior, geteuid, set_dumpable_behavior};
 
-use crate::linux::attach::{self, Services};
+use crate::linux::boundary::Boundary;
 use crate::linux::broker::NetworkBroker;
 use crate::linux::config::RuntimeConfig;
 use crate::linux::launcher::RuntimeLauncher;
-use crate::linux::{connect, mediator, qualify, workload_launcher};
+use crate::linux::listen::{self, Incoming};
+use crate::linux::mediation::Mediation;
+use crate::linux::{qualify, workload_launcher};
 
 /// Returns only with the reason the runtime stops.
 pub async fn run(config: RuntimeConfig) -> io::Error {
     // A dropped reaper stops reaping, so it lives as long as the runtime.
     let reaper = OrphanReaper::spawn();
-    match start(config, reaper.guard()).await {
-        Ok((services, _broker)) => attach::serve(services).await,
-        Err(error) => error,
+    let (boundary, incoming, tls) = match start(config, reaper.guard()) {
+        Ok(started) => started,
+        Err(error) => return error,
+    };
+    let mediation = boundary.mediation.clone();
+    tokio::select! {
+        error = listen::serve(incoming, &tls, boundary) => error,
+        error = mediation.expire() => error,
     }
 }
 
-async fn start(
+fn start(
     config: RuntimeConfig,
     pid_guard: PidGuard,
-) -> io::Result<(Services, NetworkBroker)> {
+) -> io::Result<(Boundary, Incoming, ChannelTls)> {
     qualify::kernel()?;
     // The workload has the same uid, so only this keeps it out of the
     // runtime's memory.
     set_dumpable_behavior(DumpableBehavior::NotDumpable)?;
-    let client = connect::client(&config.supervisor, &config.channel_dir)?;
+    let tls = listen::read_tls(&config.channel_dir)?;
+    let incoming = listen::bind(&config.listen)?;
     let (launcher, listener) = workload_launcher::start()?;
-    let broker = mediator::start(listener, client.clone()).map_err(|e| {
+    let broker = NetworkBroker::start(listener, config.listen.protected_port()).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!("start the broker (the resolver binds port 53, so set net.ipv4.ip_unprivileged_port_start=0): {e}"),
@@ -47,11 +56,12 @@ async fn start(
         pid_guard,
         Arc::new(RuntimeLauncher::new(launcher, config.ca_bundle.clone())),
     );
-    let services = Services {
-        client,
+    let boundary = Boundary {
         exec,
+        broker,
+        mediation: Mediation::new(),
         ca_bundle: config.ca_bundle,
         system_bundle: PathBuf::from(CA_BUNDLE),
     };
-    Ok((services, broker))
+    Ok((boundary, incoming, tls))
 }

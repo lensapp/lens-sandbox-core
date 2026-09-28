@@ -6,6 +6,9 @@ async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    // A build can hold more than one rustls provider, and rustls then picks
+    // none.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let error = match lens_sandbox_runtime::linux::config::RuntimeConfig::from_env() {
         Ok(config) => lens_sandbox_runtime::linux::run(config).await,
         Err(error) => error,

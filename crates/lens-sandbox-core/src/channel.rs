@@ -1,12 +1,14 @@
-//! The channel between a runtime inside the workload and its supervisor.
+//! The channel between a supervisor and a runtime inside the workload.
 //!
-//! The runtime dials and the supervisor serves `IsolationBoundary` over mutual
-//! TLS. Each operation is its own `Exchange` call, so it is its own HTTP/2
-//! stream with its own flow-control window: a slow relay stalls only itself.
-//! The first chunk of an `Exchange` is an [`Open`], and the open says what the
-//! other chunks carry. `Mediate` is one persistent call for DNS.
+//! The runtime serves `IsolationBoundary` over mutual TLS, and the supervisor
+//! dials it, so the workload needs no egress at all. Each operation is its own
+//! `Exchange` call, so it is its own HTTP/2 stream with its own flow-control
+//! window: a slow relay stalls only itself. The first chunk of an `Exchange`
+//! is an [`Open`], and the open says what the other chunks carry. `Mediate` is
+//! one persistent call, on which the runtime sends its DNS queries.
 
 use std::ffi::OsString;
+use std::io;
 use std::net::SocketAddr;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -15,9 +17,11 @@ use std::time::Duration;
 use bytes::{Buf, BufMut, Bytes};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tonic::Status;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig};
+use tonic::{Status, Streaming};
 
 use crate::peer_process::PeerProcess;
 
@@ -30,63 +34,49 @@ pub mod boundary {
     ));
 }
 
-/// Bump when a message below changes shape. The supervisor refuses an
-/// [`Open::Attach`] that names another version.
+/// Bump when a message below changes shape. The runtime refuses an
+/// [`Open::Hello`] that names another version.
 pub const PROTOCOL: u32 = 1;
 
-/// The name the supervisor certificate holds and the runtime verifies. The
-/// channel can be a Unix socket, which has no host name to check.
+/// The name that the supervisor certificate holds.
 pub const SUPERVISOR_NAME: &str = "supervisor.lens-sandbox";
 
-const CONTAINER_URI_PREFIX: &str = "urn:lens-sandbox:container:";
-
-/// The URI subject alternative name of a runtime leaf certificate. The leaf is
-/// mounted only into its own container, so the name identifies the runtime.
-pub fn container_uri(container: &str) -> String {
-    format!("{CONTAINER_URI_PREFIX}{container}")
+/// The name that the certificate of a runtime holds and the supervisor
+/// verifies. The leaf is mounted only into its own container, so the name
+/// identifies the runtime; the channel can be a Unix socket, which has no
+/// host name to check.
+pub fn runtime_name(container: &str) -> String {
+    format!("{container}.runtime.lens-sandbox")
 }
 
-/// The container that a runtime certificate names; `None` for any other URI.
-pub fn container_from_uri(uri: &str) -> Option<&str> {
-    uri.strip_prefix(CONTAINER_URI_PREFIX)
-        .filter(|name| !name.is_empty())
-}
-
+/// What an `Exchange` carries. The supervisor opens every exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "open", rename_all = "snake_case")]
 pub enum Open {
-    /// The control stream of one runtime connection. The supervisor sends
-    /// [`Control`] messages on it; its end ends the connection.
-    Attach { protocol: u32 },
+    /// The first exchange on a connection. The runtime ends it at once, with
+    /// an error when it speaks another protocol or cannot mediate.
+    Hello { protocol: u32 },
+    /// The public CA of the proxy, for the trust bundle of the workload. The
+    /// runtime ends the exchange when the bundle is in place.
+    Trust { ca_pem: String },
     /// One exec session. Each chunk after the open is one `exec_protocol`
     /// JSON frame, in both directions.
-    Exec { session: String },
-    /// Raw bytes of the loopback forward that [`Control::OpenForward`] asked
-    /// for.
-    Forward { id: u64 },
-    /// A workload `connect()` that the runtime holds. The supervisor replies
-    /// with one [`ConnectReply`]; after `Allowed`, the chunks are raw bytes.
-    Connect {
-        destination: SocketAddr,
-        process: WireProcess,
-    },
+    Exec,
+    /// A [`pump`] to `127.0.0.1:port` in the workload. The runtime refuses
+    /// the exchange when nothing listens there.
+    Forward { port: u16 },
+    /// Waits for the next workload `connect()` that the runtime holds. The
+    /// runtime sends one [`Held`], the supervisor replies with one
+    /// [`ConnectReply`], and after `Allowed` the exchange is a [`pump`].
+    Accept,
 }
 
+/// A workload `connect()` that the runtime holds until the supervisor
+/// decides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "control", rename_all = "snake_case")]
-pub enum Control {
-    /// The public CA of the proxy. The supervisor sends it before the first
-    /// [`Control::OpenExec`], so every workload process trusts the proxy.
-    Trust {
-        ca_pem: String,
-    },
-    OpenExec {
-        session: String,
-    },
-    OpenForward {
-        id: u64,
-        port: u16,
-    },
+pub struct Held {
+    pub destination: SocketAddr,
+    pub process: WireProcess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +179,79 @@ pub fn parse_dns_reply(mut frame: &[u8]) -> Option<(u32, &[u8])> {
     (frame.len() >= 4).then(|| (frame.get_u32(), frame))
 }
 
+/// What one side of an exchange sends: a client sends bare chunks, and a
+/// server sends results.
+pub trait Outbound: Send + 'static {
+    /// Whether the end of the stream ends only its own direction. A client
+    /// can end its request stream and still read the response, but a server
+    /// that ends its response ends the call, so it sends an empty chunk.
+    const HALF_CLOSES: bool;
+
+    fn chunk(bytes: Bytes) -> Self;
+}
+
+impl Outbound for Bytes {
+    const HALF_CLOSES: bool = true;
+
+    fn chunk(bytes: Bytes) -> Self {
+        bytes
+    }
+}
+
+impl Outbound for Result<Bytes, Status> {
+    const HALF_CLOSES: bool = false;
+
+    fn chunk(bytes: Bytes) -> Self {
+        Ok(bytes)
+    }
+}
+
+pub const RELAY_QUEUE: usize = 8;
+const RELAY_CHUNK: usize = 64 * 1024;
+
+/// Copies raw bytes both ways until each side has closed. The end of the
+/// local read half reaches the other side as the end of the stream, or as an
+/// empty chunk from a server.
+pub async fn pump<T: Outbound>(
+    local: impl AsyncRead + AsyncWrite,
+    outbound: mpsc::Sender<T>,
+    mut inbound: Streaming<Bytes>,
+) -> io::Result<()> {
+    let (mut from_local, mut to_local) = tokio::io::split(local);
+    let upload = async move {
+        let mut buffer = vec![0_u8; RELAY_CHUNK];
+        loop {
+            let read = from_local.read(&mut buffer).await?;
+            if read == 0 && T::HALF_CLOSES {
+                return Ok(None);
+            }
+            let chunk = T::chunk(Bytes::copy_from_slice(&buffer[..read]));
+            if outbound.send(chunk).await.is_err() {
+                return Ok(None);
+            }
+            if read == 0 {
+                // The sender keeps the stream, and with it the call, open
+                // until the download has ended too.
+                return Ok(Some(outbound));
+            }
+        }
+    };
+    let download = async {
+        while let Some(chunk) = inbound.message().await.map_err(io::Error::other)? {
+            if chunk.is_empty() {
+                break;
+            }
+            to_local.write_all(&chunk).await?;
+        }
+        to_local.shutdown().await?;
+        // Dropping the inbound stream before its end cancels the call, and
+        // with it the other direction.
+        while inbound.message().await.map_err(io::Error::other)?.is_some() {}
+        Ok(())
+    };
+    tokio::try_join!(upload, download).map(drop)
+}
+
 const STREAM_WINDOW: u32 = 128 * 1024;
 /// Each held workload `connect()` is one stream, so this is also how many
 /// relays a runtime has open at once; a further open waits for a free stream.
@@ -230,11 +293,12 @@ impl ChannelTls {
             .client_ca_root(Certificate::from_pem(&self.ca))
     }
 
-    pub fn client(&self) -> ClientTlsConfig {
+    /// Accepts only the runtime of `container`.
+    pub fn client(&self, container: &str) -> ClientTlsConfig {
         ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(&self.ca))
             .identity(Identity::from_pem(&self.cert, &self.key))
-            .domain_name(SUPERVISOR_NAME)
+            .domain_name(runtime_name(container))
     }
 }
 
@@ -289,8 +353,8 @@ mod tests {
     use tonic::{Request, Response, Streaming};
 
     #[test]
-    fn open_round_trips_through_a_chunk() {
-        let open = Open::Connect {
+    fn a_held_connect_round_trips_through_a_chunk() {
+        let held = Held {
             destination: "93.184.216.34:443".parse().unwrap(),
             process: WireProcess {
                 pid: 7,
@@ -299,7 +363,11 @@ mod tests {
                 ancestors: vec![],
             },
         };
-        assert_eq!(decode::<Open>(&encode(&open)).unwrap(), open);
+        assert_eq!(decode::<Held>(&encode(&held)).unwrap(), held);
+        assert_eq!(
+            decode::<Open>(&encode(&Open::Accept)).unwrap(),
+            Open::Accept
+        );
     }
 
     #[test]
@@ -354,17 +422,10 @@ mod tests {
         assert_eq!(parse_dns_reply(b"abc"), None);
     }
 
-    #[test]
-    fn a_container_uri_names_its_container() {
-        assert_eq!(container_from_uri(&container_uri("agent")), Some("agent"));
-        assert_eq!(container_from_uri(&container_uri("")), None);
-        assert_eq!(container_from_uri("urn:other:agent"), None);
-    }
-
     type ChunkStream = Pin<Box<dyn Stream<Item = Result<Bytes, Status>> + Send>>;
 
-    /// Echoes each chunk, prefixed by whether the client showed a
-    /// certificate.
+    /// A runtime that echoes each chunk, prefixed by whether the supervisor
+    /// showed a certificate.
     struct Echo;
 
     #[tonic::async_trait]
@@ -397,6 +458,77 @@ mod tests {
         }
     }
 
+    /// Pumps each exchange to a workload that writes `pong`, closes its
+    /// write half, and reports what it reads after that.
+    struct HalfClosingWorkload {
+        read: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[tonic::async_trait]
+    impl IsolationBoundary for HalfClosingWorkload {
+        type ExchangeStream = ChunkStream;
+        type MediateStream = ChunkStream;
+
+        async fn exchange(
+            &self,
+            request: Request<Streaming<Bytes>>,
+        ) -> Result<Response<ChunkStream>, Status> {
+            let (local, mut workload) = tokio::io::duplex(64);
+            let read = self.read.clone();
+            tokio::spawn(async move {
+                workload.write_all(b"pong").await.unwrap();
+                workload.shutdown().await.unwrap();
+                let mut received = Vec::new();
+                workload.read_to_end(&mut received).await.unwrap();
+                let _ = read.send(received);
+            });
+            let (outbound, outbound_rx) = mpsc::channel(RELAY_QUEUE);
+            tokio::spawn(pump(local, outbound, request.into_inner()));
+            Ok(Response::new(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(outbound_rx),
+            )))
+        }
+
+        async fn mediate(
+            &self,
+            _: Request<Streaming<Bytes>>,
+        ) -> Result<Response<ChunkStream>, Status> {
+            Err(Status::unimplemented("mediate"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relay_carries_bytes_after_the_server_closed_its_half() {
+        let (read, mut workload_read) = mpsc::unbounded_channel();
+        let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = incoming.local_addr().unwrap();
+        tokio::spawn(
+            server()
+                .add_service(IsolationBoundaryServer::new(HalfClosingWorkload { read }))
+                .serve_with_incoming(incoming),
+        );
+        let channel = endpoint(Endpoint::from_shared(format!("http://{addr}")).unwrap())
+            .connect()
+            .await
+            .unwrap();
+        let (outbound, outbound_rx) = mpsc::channel(RELAY_QUEUE);
+        let inbound = IsolationBoundaryClient::new(channel)
+            .exchange(tokio_stream::wrappers::ReceiverStream::new(outbound_rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let (local, mut peer) = tokio::io::duplex(64);
+        let relay = tokio::spawn(pump(local, outbound, inbound));
+
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"pong");
+        peer.write_all(b"ping").await.unwrap();
+        peer.shutdown().await.unwrap();
+        assert_eq!(workload_read.recv().await.unwrap(), b"ping");
+        relay.await.unwrap().unwrap();
+    }
+
     struct TestPki {
         supervisor: ChannelTls,
         runtime: ChannelTls,
@@ -418,21 +550,16 @@ mod tests {
                 key: key.serialize_pem().into_bytes(),
             }
         };
-        let supervisor = leaf(rcgen::CertificateParams::new(vec![SUPERVISOR_NAME.into()]).unwrap());
-        let mut runtime_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        runtime_params.subject_alt_names = vec![rcgen::SanType::URI(
-            container_uri("agent").try_into().unwrap(),
-        )];
         TestPki {
-            supervisor,
-            runtime: leaf(runtime_params),
+            supervisor: leaf(rcgen::CertificateParams::new(vec![SUPERVISOR_NAME.into()]).unwrap()),
+            runtime: leaf(rcgen::CertificateParams::new(vec![runtime_name("agent")]).unwrap()),
         }
     }
 
-    async fn spawn_supervisor(pki: &TestPki) -> SocketAddr {
+    async fn spawn_runtime(pki: &TestPki) -> SocketAddr {
         let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
-        let server_tls = pki.supervisor.server();
+        let server_tls = pki.runtime.server();
         tokio::spawn(async move {
             server()
                 .tls_config(server_tls)
@@ -463,9 +590,9 @@ mod tests {
     #[tokio::test]
     async fn a_chunk_crosses_the_mutual_tls_channel_unchanged() {
         let pki = test_pki();
-        let addr = spawn_supervisor(&pki).await;
+        let addr = spawn_runtime(&pki).await;
         assert_eq!(
-            exchange_once(addr, pki.runtime.client(), b"\x00\xffraw")
+            exchange_once(addr, pki.supervisor.client("agent"), b"\x00\xffraw")
                 .await
                 .unwrap(),
             Bytes::from_static(b"mtls:\x00\xffraw")
@@ -473,18 +600,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_supervisor_refuses_a_runtime_without_a_certificate() {
+    async fn the_runtime_refuses_a_client_without_a_certificate() {
         let pki = test_pki();
-        let addr = spawn_supervisor(&pki).await;
+        let addr = spawn_runtime(&pki).await;
         let anonymous = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(&pki.supervisor.ca))
-            .domain_name(SUPERVISOR_NAME);
+            .ca_certificate(Certificate::from_pem(&pki.runtime.ca))
+            .domain_name(runtime_name("agent"));
         assert!(exchange_once(addr, anonymous, b"x").await.is_err());
         assert!(
-            exchange_once(addr, pki.runtime.client(), b"x")
+            exchange_once(addr, pki.supervisor.client("agent"), b"x")
                 .await
                 .is_ok(),
-            "the supervisor still serves a runtime with a certificate"
+            "the runtime still serves a supervisor with a certificate"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_refuses_a_runtime_of_another_container() {
+        let pki = test_pki();
+        let addr = spawn_runtime(&pki).await;
+        assert!(
+            exchange_once(addr, pki.supervisor.client("dockerd"), b"x")
+                .await
+                .is_err()
         );
     }
 }
