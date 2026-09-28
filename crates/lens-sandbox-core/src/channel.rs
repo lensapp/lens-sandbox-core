@@ -79,6 +79,9 @@ pub struct Held {
     pub process: WireProcess,
 }
 
+/// `Denied` means that the supervisor refused the `connect()` before the
+/// proxy saw it. The proxy judges an `Allowed` connection by its policy, and
+/// it closes and audits the connection when the policy denies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum ConnectReply {

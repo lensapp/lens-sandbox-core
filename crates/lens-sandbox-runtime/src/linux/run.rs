@@ -26,7 +26,13 @@ pub async fn run(config: RuntimeConfig) -> io::Error {
         Ok(started) => started,
         Err(error) => return error,
     };
-    listen::serve(incoming, &tls, boundary).await
+    // Without the broker, the workload's network calls get no answer, so the
+    // runtime stops and its orchestrator starts it again.
+    let broker = boundary.broker.clone();
+    tokio::select! {
+        error = listen::serve(incoming, &tls, boundary) => error,
+        () = broker.stopped() => io::Error::other("the network broker stopped"),
+    }
 }
 
 fn start(

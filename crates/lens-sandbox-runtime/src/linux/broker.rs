@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Changed for lens-sandbox-runtime: module paths, thread names, and the
 // identity of a caller, which comes from `crate::linux::identity`. A DNS
-// query names the process that holds its socket, not "unavailable". Two
-// denial reasons that nothing here gives are gone.
+// query names the process that holds its socket, not "unavailable", and a
+// UDP query finds it in its worker thread. Two denial reasons that nothing
+// here gives are gone. The broker reports when it stops.
 
 //! Seccomp-notification broker owned by the in-workload sandbox.
 
@@ -200,6 +201,7 @@ pub struct NetworkBroker {
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
     dns_address: SocketAddr,
     healthy: Arc<AtomicBool>,
+    stopped: Arc<tokio::sync::Notify>,
 }
 
 impl NetworkBroker {
@@ -263,6 +265,8 @@ impl NetworkBroker {
         };
         let healthy = Arc::new(AtomicBool::new(true));
         let broker_healthy = healthy.clone();
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let broker_stopped = stopped.clone();
         std::thread::Builder::new()
             .name("lens-sandbox-network-broker".to_string())
             .spawn(move || {
@@ -278,6 +282,7 @@ impl NetworkBroker {
                         Err(error) => {
                             tracing::error!(%error, "sandbox network broker listener failed");
                             broker_healthy.store(false, Ordering::Release);
+                            broker_stopped.notify_one();
                             break;
                         }
                     };
@@ -306,7 +311,13 @@ impl NetworkBroker {
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
             dns_address,
             healthy,
+            stopped,
         })
+    }
+
+    /// Resolves once the broker has stopped. Only one caller waits.
+    pub(crate) async fn stopped(&self) {
+        self.stopped.notified().await;
     }
 
     pub(crate) async fn accept(&self) -> io::Result<PendingTcpOpen> {
@@ -373,25 +384,30 @@ fn start_dns_relay(
                     tracing::warn!(%peer, "dropping DNS datagram because the worker quota is full");
                     continue;
                 };
-                let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
-                let query = PendingDnsQuery {
-                    request: request[..length].to_vec(),
-                    transport: DnsTransport::Udp,
-                    identity: crate::linux::identity::dns_sender(socket.inode),
-                    notification_to_queue: Duration::ZERO,
-                    queued_at: Instant::now(),
-                    response: response_tx,
-                };
-                if pending_try_send(&udp_pending, query).is_err() {
-                    continue;
-                }
                 let Ok(udp_response) = udp.try_clone() else {
                     continue;
                 };
+                let request = request[..length].to_vec();
+                let queued_at = Instant::now();
+                let pending = udp_pending.clone();
+                // The sender lookup walks `/proc`, so it runs in the worker
+                // and the receive loop never waits for it.
                 let _ = std::thread::Builder::new()
                     .name("lens-sandbox-dns-udp-query".to_string())
                     .spawn(move || {
                         let _worker_slot = worker_slot;
+                        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+                        let query = PendingDnsQuery {
+                            request,
+                            transport: DnsTransport::Udp,
+                            identity: crate::linux::identity::dns_sender(socket.inode),
+                            notification_to_queue: Duration::ZERO,
+                            queued_at,
+                            response: response_tx,
+                        };
+                        if pending_try_send(&pending, query).is_err() {
+                            return;
+                        }
                         if let Ok(Ok(response)) = response_rx.recv_timeout(DNS_QUERY_TIMEOUT) {
                             let _ = udp_response.send_to(&response, peer);
                         }
@@ -1910,6 +1926,24 @@ mod tests {
         assert!(!retry_notification_receive(&io::Error::from_raw_os_error(
             libc::EBADF
         )));
+    }
+
+    #[tokio::test]
+    async fn a_failed_listener_stops_the_broker() {
+        // SAFETY: dup returns a new descriptor or a negative error.
+        let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(dup >= 0, "dup stderr");
+        // Not a notification descriptor, so the first receive fails.
+        let listener = NotificationListener::from_fd_with_mode(
+            // SAFETY: successful dup returned a new owned descriptor.
+            unsafe { OwnedFd::from_raw_fd(dup) },
+            ListenerMode::LegacyReadOnly,
+        );
+        let broker = NetworkBroker::start_for_test(listener).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), broker.stopped())
+            .await
+            .unwrap();
+        assert!(broker.confirm_healthy().is_err());
     }
 
     #[test]

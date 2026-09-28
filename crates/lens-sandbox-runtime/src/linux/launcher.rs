@@ -182,13 +182,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs uid 0"]
     async fn a_root_exec_keeps_only_the_level_b_capabilities() {
         // CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID.
         const LEVEL_B: u64 = 0xfb;
-        if !rustix::process::geteuid().is_root() {
-            eprintln!("skipping: needs uid 0");
-            return;
-        }
         let own = std::fs::read_to_string("/proc/self/status").unwrap();
         let permitted = u64::from_str_radix(status_field(&own, "CapPrm:"), 16).unwrap();
         let stdout = exec_stdout(true, "cat /proc/self/status").await;
