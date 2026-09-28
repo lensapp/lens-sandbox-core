@@ -1731,11 +1731,8 @@ async fn handle_connect(
 }
 
 /// Entry point for connections redirected by nftables into the transparent
-/// listener. Recovers the pre-redirect destination, classifies the first
-/// bytes, and hands off to the TLS or HTTP handler. A connection it cannot
-/// classify is offered to the developer as a raw splice, unless the default
-/// verdict already denies what no rule names, or the destination is one this crate
-/// filters itself — see [`unclassified_splice_decision`].
+/// listener. Recovers the pre-redirect destination and the caller, then hands
+/// the connection to [`serve_egress`].
 async fn handle_transparent_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -1761,7 +1758,24 @@ async fn handle_transparent_connection(
     // the `egress.tcp` binary filter needs it, and one `/proc` read per
     // connection is the budget.
     let actor = crate::peer_process::ActorContext::resolve_offloaded(peer).await;
+    serve_egress(stream, orig_dst, actor, state).await
+}
 
+/// Judge and serve one workload connection whose destination and caller are
+/// already known: the transparent listener learns them from the redirect, the
+/// runtime channel from the syscall its broker intercepted.
+///
+/// Classifies the first bytes and hands off to the TLS or HTTP handler. A
+/// connection it cannot classify is offered to the developer as a raw splice,
+/// unless the default verdict already denies what no rule names, or the
+/// destination is one this crate filters itself — see
+/// [`unclassified_splice_decision`].
+pub async fn serve_egress(
+    stream: TcpStream,
+    orig_dst: SocketAddr,
+    actor: crate::peer_process::ActorContext,
+    state: Arc<ProxyState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Raw TCP egress: an `egress.tcp` rule matching the raw destination splices
     // bytes through untouched — no protocol peek, no TLS interception. Decided
     // before classification so TLS-speaking databases are not MITM'd.
