@@ -144,6 +144,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_runtime_shows_its_certificate_over_a_unix_socket() {
+        // The dev-dependency on the supervisor adds a second rustls provider,
+        // and the test server takes the default.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let pki = test_pki();
         let dir = tempfile::tempdir().unwrap();
         write_tls(dir.path(), &pki.runtime);

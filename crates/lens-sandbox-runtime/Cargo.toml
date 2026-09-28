@@ -25,7 +25,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 base64 = "0.22"
+lens-sandbox-supervisor = { path = "../lens-sandbox-supervisor" }
 rcgen = { version = "0.13", features = ["crypto"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
 [lints.rust]
