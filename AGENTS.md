@@ -2,6 +2,12 @@
 
 Shared library for all sandbox types (shell, agent). Provides WebSocket client, forward proxy, MITM TLS interception, nftables lockdown, privilege drop, and policy handling.
 
+## Crates
+
+- `lens-sandbox-core`: the library above, plus the runtime channel protocol (`channel` feature, off by default).
+- `lens-sandbox-runtime`: the non-root runtime binary inside the workload (Linux only): seccomp broker, Landlock, exec and forwarding. Many files in `src/linux/` are copied from NVIDIA OpenShell; see `crates/lens-sandbox-runtime/THIRD-PARTY.md` before you change one.
+- `lens-sandbox-supervisor`: the supervisor side of the channel: runtime identity, egress through the proxy, DNS, and certificate issuance.
+
 ## Commands
 
 ```bash
@@ -16,6 +22,14 @@ Integration tests (network.rs script-render tests are pure; integration tests re
 
 ```bash
 cargo test -p lens-sandbox-core -- --ignored
+```
+
+Runtime tests run on Linux, one at a time (a forked child of a sibling test can hold a copy of a socket). The end-to-end test needs root and a free `127.0.0.53:53`; CI runs it in its own network namespace:
+
+```bash
+cargo test -p lens-sandbox-runtime -- --test-threads=1
+cargo test -p lens-sandbox-supervisor
+cargo test -p lens-sandbox-runtime --test end_to_end -- --ignored --test-threads=1
 ```
 
 ## Conventions
