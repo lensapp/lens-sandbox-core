@@ -4,6 +4,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use nix::libc;
 
 use crate::ca_env::apply_ca_env;
+use crate::child_spawner::{ChildSpec, DirectLauncher, Launcher};
 use crate::privilege::SandboxCredentials;
 
 /// Owns a raw file descriptor and closes it on drop.
@@ -41,6 +42,24 @@ pub fn spawn_pty(
     is_root: bool,
     initial_size: Option<(u16, u16)>,
 ) -> Result<PtyProcess, String> {
+    let spec = ChildSpec {
+        argv: std::iter::once(command.to_string())
+            .chain(args.iter().cloned())
+            .collect(),
+        cwd: cwd.map(str::to_string),
+        env: env.cloned().unwrap_or_default(),
+        creds: creds.cloned(),
+        is_root,
+    };
+    spawn_spec(&spec, initial_size, &DirectLauncher)
+}
+
+pub(crate) fn spawn_spec(
+    spec: &ChildSpec,
+    initial_size: Option<(u16, u16)>,
+    launcher: &dyn Launcher,
+) -> Result<PtyProcess, String> {
+    assert!(!spec.argv.is_empty(), "ChildSpec::argv must not be empty");
     let pty = nix::pty::openpty(None, None).map_err(|e| format!("openpty: {e}"))?;
 
     let master_raw = pty.master.as_raw_fd();
@@ -63,8 +82,8 @@ pub fn spawn_pty(
         }
     }
 
-    let mut cmd = tokio::process::Command::new(command);
-    cmd.args(args);
+    let mut cmd = tokio::process::Command::new(&spec.argv[0]);
+    cmd.args(&spec.argv[1..]);
     cmd.kill_on_drop(true);
 
     // Stdio::null — we redirect to the PTY slave in pre_exec
@@ -72,21 +91,19 @@ pub fn spawn_pty(
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
-    if let Some(dir) = cwd {
+    if let Some(dir) = &spec.cwd {
         cmd.current_dir(dir);
     }
 
     // Env setup — clear parent env to avoid leaking LENS_SANDBOX_* etc.
     cmd.env_clear();
-    if let Some(e) = env {
-        cmd.envs(e);
-    }
+    cmd.envs(&spec.env);
     apply_ca_env(&mut cmd);
 
     // pre_exec: set up PTY as controlling terminal + privilege drop
     // Same rule as the piped path, from the same function: root reaches the
     // capability drop rather than a `setuid(0)` that would keep CAP_NET_ADMIN.
-    let privilege = crate::privilege::privilege_drop_for(creds, is_root);
+    let privilege = crate::privilege::privilege_drop_for(spec.creds.as_ref(), spec.is_root);
     let creds_info = match privilege {
         crate::privilege::PrivilegeDrop::Setuid(creds) => Some(creds.uid_gid()),
         _ => None,
@@ -161,7 +178,9 @@ pub fn spawn_pty(
         });
     }
 
-    let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let child = launcher
+        .spawn(&mut cmd)
+        .map_err(|e| format!("spawn: {e}"))?;
     let pid = child.id().ok_or("failed to get child PID")?;
 
     // Close slave in parent — only master is needed

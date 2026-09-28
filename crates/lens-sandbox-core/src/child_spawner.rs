@@ -11,10 +11,28 @@
 //! concern. This module takes the *final* env and hands it to the kernel.
 
 use std::collections::HashMap;
+use std::io;
 
 use crate::ca_env::apply_ca_env;
 use crate::privilege::SandboxCredentials;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+
+/// Forks a hardened `Command`. A runtime that confines its children further
+/// (a seccomp filter that only a thread's own children inherit, a Landlock
+/// ruleset) adds its `pre_exec` steps here and forks from the right thread.
+/// Steps it adds run after the privilege drop the command already carries.
+pub trait Launcher: Send + Sync {
+    fn spawn(&self, cmd: &mut Command) -> io::Result<Child>;
+}
+
+/// Forks on the calling thread with no further confinement.
+pub struct DirectLauncher;
+
+impl Launcher for DirectLauncher {
+    fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
+        cmd.spawn()
+    }
+}
 
 /// Everything needed to fork one hardened child inside the cage.
 ///
@@ -86,16 +104,16 @@ pub fn spawn_pty(
     spec: &ChildSpec,
     initial_size: (u16, u16),
 ) -> Result<crate::pty::PtyProcess, String> {
-    assert!(!spec.argv.is_empty(), "ChildSpec::argv must not be empty");
-    crate::pty::spawn_pty(
-        &spec.argv[0],
-        &spec.argv[1..],
-        spec.cwd.as_deref(),
-        Some(&spec.env),
-        spec.creds.as_ref(),
-        spec.is_root,
-        Some(initial_size),
-    )
+    spawn_pty_with(spec, initial_size, &DirectLauncher)
+}
+
+/// [`spawn_pty`] through `launcher`.
+pub fn spawn_pty_with(
+    spec: &ChildSpec,
+    initial_size: (u16, u16),
+    launcher: &dyn Launcher,
+) -> Result<crate::pty::PtyProcess, String> {
+    crate::pty::spawn_spec(spec, Some(initial_size), launcher)
 }
 
 #[cfg(test)]
