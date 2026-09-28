@@ -131,16 +131,51 @@ pub fn decode<T: DeserializeOwned>(chunk: &[u8]) -> Result<T, Status> {
         .map_err(|e| Status::invalid_argument(format!("malformed channel message: {e}")))
 }
 
-/// One DNS message on `Mediate`: a big-endian `u32` id, then the DNS wire
-/// bytes. The reply carries the id of its query, so queries can overlap.
-pub fn dns_frame(id: u32, packet: &[u8]) -> Bytes {
+/// A DNS query on `Mediate`: a big-endian `u32` id, the length of the sender
+/// as a big-endian `u32`, the sender as JSON (`null` when the runtime found
+/// none), then the DNS wire bytes. Queries overlap, so a reply names its query
+/// by the id.
+pub fn dns_query_frame(id: u32, sender: Option<&WireProcess>, packet: &[u8]) -> Bytes {
+    let sender = encode(&sender);
+    let mut frame = Vec::with_capacity(8 + sender.len() + packet.len());
+    frame.put_u32(id);
+    frame.put_u32(u32::try_from(sender.len()).unwrap_or(u32::MAX));
+    frame.extend_from_slice(&sender);
+    frame.extend_from_slice(packet);
+    Bytes::from(frame)
+}
+
+pub struct DnsQuery<'a> {
+    pub id: u32,
+    pub sender: Option<WireProcess>,
+    pub packet: &'a [u8],
+}
+
+pub fn parse_dns_query(mut frame: &[u8]) -> Result<DnsQuery<'_>, Status> {
+    let malformed = || Status::invalid_argument("malformed DNS query frame");
+    if frame.len() < 8 {
+        return Err(malformed());
+    }
+    let id = frame.get_u32();
+    let sender_len = usize::try_from(frame.get_u32()).map_err(|_| malformed())?;
+    let (sender, packet) = frame.split_at_checked(sender_len).ok_or_else(malformed)?;
+    Ok(DnsQuery {
+        id,
+        sender: decode(sender)?,
+        packet,
+    })
+}
+
+/// A DNS reply on `Mediate`: the big-endian `u32` id of its query, then the
+/// DNS wire bytes.
+pub fn dns_reply_frame(id: u32, packet: &[u8]) -> Bytes {
     let mut frame = Vec::with_capacity(4 + packet.len());
     frame.put_u32(id);
     frame.extend_from_slice(packet);
     Bytes::from(frame)
 }
 
-pub fn parse_dns_frame(mut frame: &[u8]) -> Option<(u32, &[u8])> {
+pub fn parse_dns_reply(mut frame: &[u8]) -> Option<(u32, &[u8])> {
     (frame.len() >= 4).then(|| (frame.get_u32(), frame))
 }
 
@@ -277,10 +312,36 @@ mod tests {
     }
 
     #[test]
-    fn a_dns_frame_carries_its_id() {
-        let frame = dns_frame(0xdead_beef, b"query");
-        assert_eq!(parse_dns_frame(&frame), Some((0xdead_beef, &b"query"[..])));
-        assert_eq!(parse_dns_frame(b"abc"), None);
+    fn a_dns_query_carries_its_id_and_sender() {
+        let sender = WireProcess {
+            pid: 3,
+            name: "dig".into(),
+            exe: Some(b"/usr/bin/dig".to_vec()),
+            ancestors: vec![],
+        };
+        let frame = dns_query_frame(0xdead_beef, Some(&sender), b"query");
+        let query = parse_dns_query(&frame).unwrap();
+        assert_eq!(query.id, 0xdead_beef);
+        assert_eq!(query.sender, Some(sender));
+        assert_eq!(query.packet, b"query");
+
+        let anonymous = dns_query_frame(1, None, b"q");
+        assert_eq!(parse_dns_query(&anonymous).unwrap().sender, None);
+    }
+
+    #[test]
+    fn a_dns_query_frame_that_lies_about_its_sender_is_refused() {
+        let mut frame = dns_query_frame(1, None, b"").to_vec();
+        frame[7] = 200;
+        assert!(parse_dns_query(&frame).is_err());
+        assert!(parse_dns_query(b"short").is_err());
+    }
+
+    #[test]
+    fn a_dns_reply_carries_its_id() {
+        let frame = dns_reply_frame(0xdead_beef, b"answer");
+        assert_eq!(parse_dns_reply(&frame), Some((0xdead_beef, &b"answer"[..])));
+        assert_eq!(parse_dns_reply(b"abc"), None);
     }
 
     #[test]
