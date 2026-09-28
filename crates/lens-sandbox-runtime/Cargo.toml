@@ -1,0 +1,15 @@
+[package]
+name = "lens-sandbox-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+license = "Apache-2.0"
+description = "Non-root runtime inside a Lens sandbox workload"
+repository = "https://github.com/lensapp/lens-sandbox-core"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rustix = { version = "1.1", features = ["fs", "process"] }
+
+[lints.rust]
+unsafe_code = "warn"
