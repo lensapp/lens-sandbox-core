@@ -29,7 +29,7 @@ Runtime tests run on Linux, one at a time (a forked child of a sibling test can 
 ```bash
 cargo test -p lens-sandbox-runtime -- --test-threads=1
 cargo test -p lens-sandbox-supervisor
-cargo test -p lens-sandbox-runtime --test end_to_end -- --ignored --test-threads=1
+cargo test -p lens-sandbox-runtime --lib --test end_to_end -- --ignored --test-threads=1
 ```
 
 ## Conventions

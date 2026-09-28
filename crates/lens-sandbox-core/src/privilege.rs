@@ -1234,13 +1234,10 @@ mod tests {
     /// still removes the rest. Needs root to start from a known set.
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "needs root for capset()"]
     fn the_capability_drop_keeps_only_what_the_process_holds() {
         use std::os::unix::process::CommandExt as _;
 
-        if !nix::unistd::geteuid().is_root() {
-            eprintln!("skipping: needs root for capset()");
-            return;
-        }
         const CAP_KILL: u64 = 1 << 5;
         const CAP_NET_RAW: u64 = 1 << 13;
         let mut cmd = std::process::Command::new("/bin/sh");

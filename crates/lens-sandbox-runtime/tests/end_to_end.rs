@@ -165,8 +165,15 @@ async fn a_workload_runs_under_the_supervisor() {
         .collect();
     assert_eq!(fields["NoNewPrivs"], "1", "{status}");
     let effective = u64::from_str_radix(fields["CapEff"], 16).unwrap();
+    // The runtime is a child of this test and has its permitted set.
+    let own = std::fs::read_to_string("/proc/self/status").unwrap();
+    let permitted = own
+        .lines()
+        .find_map(|line| line.strip_prefix("CapPrm:"))
+        .map(|value| u64::from_str_radix(value.trim(), 16).unwrap())
+        .unwrap();
     // CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID.
-    assert_eq!(effective & !0xfb, 0, "{status}");
+    assert_eq!(effective, 0xfb & permitted, "{status}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
