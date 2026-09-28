@@ -21,15 +21,16 @@ use tokio::process::{Child, Command};
 /// (a seccomp filter that only a thread's own children inherit, a Landlock
 /// ruleset) adds its `pre_exec` steps here and forks from the right thread.
 /// Steps it adds run after the privilege drop the command already carries.
+/// It owns the command, so it can move it to the thread that forks.
 pub trait Launcher: Send + Sync {
-    fn spawn(&self, cmd: &mut Command) -> io::Result<Child>;
+    fn spawn(&self, cmd: Command) -> io::Result<Child>;
 }
 
 /// Forks on the calling thread with no further confinement.
 pub struct DirectLauncher;
 
 impl Launcher for DirectLauncher {
-    fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
+    fn spawn(&self, mut cmd: Command) -> io::Result<Child> {
         cmd.spawn()
     }
 }
