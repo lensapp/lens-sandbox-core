@@ -6,6 +6,8 @@ pub mod broker;
 pub mod child_seccomp;
 pub(crate) mod contract;
 pub(crate) mod identity;
+pub(crate) mod landlock;
+pub mod launcher;
 pub mod mediator;
 pub mod proc_fd;
 pub mod process_signal;
