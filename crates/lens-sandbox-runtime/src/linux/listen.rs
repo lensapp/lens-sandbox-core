@@ -13,6 +13,11 @@ use tonic::transport::server::TcpIncoming;
 
 use crate::linux::config::Listen;
 
+/// Holds `ca.pem`, `cert.pem` and `key.pem` of the runtime. The key is safe
+/// only inside the private root, which Landlock hides from the workload, so
+/// the path is fixed.
+pub(crate) const CHANNEL_DIR: &str = "/.lens/channel";
+
 pub(crate) enum Incoming {
     Tcp(TcpIncoming),
     Unix(UnixListenerStream),
@@ -170,6 +175,12 @@ mod tests {
         let incoming = bind(&Listen::Unix(socket.clone())).unwrap();
         tokio::spawn(async move { serve(incoming, &runtime, Hello).await });
         assert_eq!(say_hello(socket, &supervisor).await, "hello");
+    }
+
+    #[test]
+    fn the_channel_key_is_inside_the_private_root() {
+        let private_root = Path::new("/").join(crate::linux::landlock::PRIVATE_ROOT);
+        assert!(Path::new(CHANNEL_DIR).starts_with(private_root));
     }
 
     #[test]
