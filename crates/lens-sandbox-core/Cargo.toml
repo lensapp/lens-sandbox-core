@@ -36,6 +36,8 @@ proxy = [
     "nix/net",
     "nix/socket",
 ]
+# The gRPC channel between a runtime inside the workload and its supervisor.
+channel = ["dep:tonic", "dep:bytes", "dep:tonic-build"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -65,6 +67,8 @@ hickory-proto = { version = "0.26", optional = true }
 hickory-resolver = { version = "0.26", optional = true }
 apollo-parser = { version = "0.8.6", optional = true }
 switchyard-translation = { version = "0.2", optional = true }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "transport", "tls-ring"], optional = true }
+bytes = { version = "1", optional = true }
 
 # AF_VSOCK and NFQUEUE are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -98,6 +102,12 @@ required-features = ["proxy"]
 name = "udp_egress_over_nfqueue"
 required-features = ["proxy"]
 
+[build-dependencies]
+tonic-build = { version = "0.14", default-features = false, optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+rcgen = { version = "0.13", features = ["crypto"] }
+tokio-stream = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
