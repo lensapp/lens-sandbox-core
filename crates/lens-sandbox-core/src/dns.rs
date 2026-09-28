@@ -553,9 +553,10 @@ fn pin_answer_ips(response: &[u8], state: &Arc<ProxyState>, qname: &str, generat
 /// trailing whitespace. Only the first token after `nameserver` is
 /// parsed — anything else on the line is ignored.
 ///
-/// Called once at stub startup. `/etc/resolv.conf` inside a container is
-/// fixed at container start, so there's no re-read path.
-fn discover_upstream() -> Option<SocketAddr> {
+/// Called once at start, by the stub or by a supervisor that answers for
+/// its runtimes. `/etc/resolv.conf` inside a container is fixed at container
+/// start, so there's no re-read path.
+pub fn discover_upstream() -> Option<SocketAddr> {
     let content = std::fs::read_to_string("/etc/resolv.conf").ok()?;
     parse_resolv_conf(&content)
 }
