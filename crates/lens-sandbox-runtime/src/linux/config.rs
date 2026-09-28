@@ -5,11 +5,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 const LISTEN: &str = "LENS_SANDBOX_LISTEN";
-const CHANNEL_DIR: &str = "LENS_SANDBOX_CHANNEL_DIR";
 const CA_BUNDLE: &str = "LENS_SANDBOX_CA_BUNDLE";
 
-/// Inside the private root, which Landlock hides from the workload.
-const DEFAULT_CHANNEL_DIR: &str = "/.lens/channel";
 /// Outside the private root, so that the workload can read it.
 const DEFAULT_CA_BUNDLE: &str = "/tmp/lens-sandbox/ca-bundle.pem";
 
@@ -34,8 +31,6 @@ impl Listen {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub listen: Listen,
-    /// Holds `ca.pem`, `cert.pem` and `key.pem` of the channel.
-    pub channel_dir: PathBuf,
     pub ca_bundle: PathBuf,
 }
 
@@ -50,7 +45,6 @@ impl RuntimeConfig {
             .and_then(|value| parse_listen(&value))?;
         Ok(Self {
             listen,
-            channel_dir: var(CHANNEL_DIR).map_or_else(|| DEFAULT_CHANNEL_DIR.into(), PathBuf::from),
             ca_bundle: var(CA_BUNDLE).map_or_else(|| DEFAULT_CA_BUNDLE.into(), PathBuf::from),
         })
     }
@@ -97,7 +91,6 @@ mod tests {
             config,
             RuntimeConfig {
                 listen: Listen::Tcp("0.0.0.0:7443".parse().unwrap()),
-                channel_dir: DEFAULT_CHANNEL_DIR.into(),
                 ca_bundle: DEFAULT_CA_BUNDLE.into(),
             }
         );
@@ -126,14 +119,8 @@ mod tests {
     }
 
     #[test]
-    fn the_paths_can_be_moved() {
-        let config = config(&[
-            (LISTEN, "[::]:7443"),
-            (CHANNEL_DIR, "/secrets/channel"),
-            (CA_BUNDLE, "/var/lens/ca.pem"),
-        ])
-        .unwrap();
-        assert_eq!(config.channel_dir, PathBuf::from("/secrets/channel"));
+    fn the_trust_bundle_can_be_moved() {
+        let config = config(&[(LISTEN, "[::]:7443"), (CA_BUNDLE, "/var/lens/ca.pem")]).unwrap();
         assert_eq!(config.ca_bundle, PathBuf::from("/var/lens/ca.pem"));
     }
 

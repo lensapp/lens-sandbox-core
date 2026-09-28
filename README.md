@@ -32,8 +32,9 @@ The runtime serves the channel over mutual TLS, so the workload needs no egress.
 | Variable | Default | Use |
 | --- | --- | --- |
 | `LENS_SANDBOX_LISTEN` | required | `address:port`, or `unix:/path` for a socket on a shared volume |
-| `LENS_SANDBOX_CHANNEL_DIR` | `/.lens/channel` | `ca.pem`, `cert.pem` and `key.pem` of the runtime |
 | `LENS_SANDBOX_CA_BUNDLE` | `/tmp/lens-sandbox/ca-bundle.pem` | where the runtime writes the trust bundle of the workload |
+
+Mount `ca.pem`, `cert.pem` and `key.pem` of the runtime at `/.lens/channel`. Landlock hides `/.lens` from the workload, so the path is fixed.
 
 The runtime exits when no supervisor is connected for 30 seconds. It binds its resolver on `127.0.0.53:53`. Without `CAP_NET_BIND_SERVICE`, set `net.ipv4.ip_unprivileged_port_start=0`, and point the workload's `resolv.conf` at `127.0.0.53`.
 

@@ -1,7 +1,7 @@
 //! The runtime from start to exit.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lens_sandbox_core::ca_env::CA_BUNDLE;
@@ -41,7 +41,7 @@ fn start(
     // The workload has the same uid, so only this keeps it out of the
     // runtime's memory.
     set_dumpable_behavior(DumpableBehavior::NotDumpable)?;
-    let tls = listen::read_tls(&config.channel_dir)?;
+    let tls = listen::read_tls(Path::new(listen::CHANNEL_DIR))?;
     let incoming = listen::bind(&config.listen)?;
     let (launcher, listener) = workload_launcher::start()?;
     let broker = NetworkBroker::start(listener, config.listen.protected_port()).map_err(|e| {
