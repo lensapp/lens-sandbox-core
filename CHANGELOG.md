@@ -7,3 +7,4 @@ This project will use versioned releases once public releases begin. Until then,
 ## [Unreleased]
 
 - Initial open-source repository hygiene and contribution documentation.
+- Add the `lens-sandbox-runtime` and `lens-sandbox-supervisor` crates, which run a sandbox with no root in the workload.
