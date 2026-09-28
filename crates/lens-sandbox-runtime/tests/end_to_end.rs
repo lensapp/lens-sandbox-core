@@ -1,4 +1,4 @@
-//! The runtime binary against the real supervisor, over mutual TLS on a Unix
+//! The real supervisor against the runtime binary, over mutual TLS on a Unix
 //! socket.
 //!
 //! The runtime binds its resolver on `127.0.0.53:53`, so the test needs root
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use lens_sandbox_core::proxy::{ProxyServer, ProxyState};
-use lens_sandbox_supervisor::{ChannelPki, ExecSession, Supervisor};
+use lens_sandbox_supervisor::{ChannelPki, ExecSession, RuntimeAddress, Supervisor};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PROXY_CA: &str = "-----BEGIN CERTIFICATE-----\nproxy\n-----END CERTIFICATE-----";
@@ -52,30 +52,20 @@ async fn sandbox() -> Sandbox {
     std::fs::write(channel_dir.join("cert.pem"), &runtime_tls.cert).unwrap();
     std::fs::write(channel_dir.join("key.pem"), &runtime_tls.key).unwrap();
 
-    let dns_upstream = "127.0.0.1:9".parse().unwrap();
-    let supervisor = Supervisor::new(state(), ["agent".to_string()], dns_upstream);
-    supervisor.trust(PROXY_CA.into());
     let socket = dir.path().join("channel.sock");
-    let incoming = tokio_stream::wrappers::UnixListenerStream::new(
-        tokio::net::UnixListener::bind(&socket).unwrap(),
-    );
-    tokio::spawn(
-        lens_sandbox_core::channel::server()
-            .tls_config(pki.supervisor.server())
-            .unwrap()
-            .add_service(supervisor.service())
-            .serve_with_incoming(incoming),
-    );
-
     let ca_bundle = dir.path().join("trust/ca-bundle.pem");
     let runtime = Command::new(env!("CARGO_BIN_EXE_lens-sandbox-runtime"))
-        .env(
-            "LENS_SANDBOX_SUPERVISOR",
-            format!("unix:{}", socket.display()),
-        )
+        .env("LENS_SANDBOX_LISTEN", format!("unix:{}", socket.display()))
         .env("LENS_SANDBOX_CHANNEL_DIR", &channel_dir)
         .env("LENS_SANDBOX_CA_BUNDLE", &ca_bundle)
         .spawn()
+        .unwrap();
+
+    let dns_upstream = "127.0.0.1:9".parse().unwrap();
+    let supervisor = Supervisor::new(state(), dns_upstream);
+    supervisor.trust(PROXY_CA.into());
+    supervisor
+        .attach("agent", RuntimeAddress::Unix(socket), &pki.supervisor)
         .unwrap();
     Sandbox {
         supervisor,
@@ -110,7 +100,7 @@ async fn exec(sandbox: &Sandbox, script: &str) -> String {
     String::from_utf8(output).unwrap()
 }
 
-/// Polls until the runtime has attached.
+/// Polls until the supervisor has connected to the runtime.
 async fn open_exec(supervisor: &Supervisor) -> ExecSession {
     for _ in 0..100 {
         if let Ok(session) = supervisor.open_exec("agent").await {
@@ -118,7 +108,7 @@ async fn open_exec(supervisor: &Supervisor) -> ExecSession {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("the runtime did not attach");
+    panic!("the supervisor did not connect to the runtime");
 }
 
 /// An address of this host that is not loopback: the supervisor refuses a

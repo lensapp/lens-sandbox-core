@@ -1,11 +1,10 @@
 //! What the runtime reads from its environment.
 
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use tonic::transport::Uri;
-
-const SUPERVISOR: &str = "LENS_SANDBOX_SUPERVISOR";
+const LISTEN: &str = "LENS_SANDBOX_LISTEN";
 const CHANNEL_DIR: &str = "LENS_SANDBOX_CHANNEL_DIR";
 const CA_BUNDLE: &str = "LENS_SANDBOX_CA_BUNDLE";
 
@@ -14,15 +13,27 @@ const DEFAULT_CHANNEL_DIR: &str = "/.lens/channel";
 /// Outside the private root, so that the workload can read it.
 const DEFAULT_CA_BUNDLE: &str = "/tmp/lens-sandbox/ca-bundle.pem";
 
+/// Where the runtime serves the channel for its supervisor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Supervisor {
-    Tcp(Uri),
+pub enum Listen {
+    Tcp(SocketAddr),
     Unix(PathBuf),
+}
+
+impl Listen {
+    /// The broker refuses a workload `connect()` to this port on any
+    /// address, so the workload cannot reach the channel.
+    pub fn protected_port(&self) -> Option<u16> {
+        match self {
+            Listen::Tcp(address) => Some(address.port()),
+            Listen::Unix(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
-    pub supervisor: Supervisor,
+    pub listen: Listen,
     /// Holds `ca.pem`, `cert.pem` and `key.pem` of the channel.
     pub channel_dir: PathBuf,
     pub ca_bundle: PathBuf,
@@ -34,37 +45,35 @@ impl RuntimeConfig {
     }
 
     fn from_vars(var: impl Fn(&str) -> Option<String>) -> io::Result<Self> {
-        let supervisor = var(SUPERVISOR)
-            .ok_or_else(|| invalid(format!("{SUPERVISOR} is not set")))
-            .and_then(|value| parse_supervisor(&value))?;
+        let listen = var(LISTEN)
+            .ok_or_else(|| invalid(format!("{LISTEN} is not set")))
+            .and_then(|value| parse_listen(&value))?;
         Ok(Self {
-            supervisor,
+            listen,
             channel_dir: var(CHANNEL_DIR).map_or_else(|| DEFAULT_CHANNEL_DIR.into(), PathBuf::from),
             ca_bundle: var(CA_BUNDLE).map_or_else(|| DEFAULT_CA_BUNDLE.into(), PathBuf::from),
         })
     }
 }
 
-/// `https://host:port`, or `unix:/path` for a socket on a shared volume. The
-/// channel is always TLS, so plain `http` is refused.
-fn parse_supervisor(value: &str) -> io::Result<Supervisor> {
+/// `address:port`, or `unix:/path` for a socket on a shared volume. The
+/// supervisor must know the port, so port 0 is refused.
+fn parse_listen(value: &str) -> io::Result<Listen> {
     if let Some(path) = value.strip_prefix("unix:") {
         let path = path.strip_prefix("//").unwrap_or(path);
         return if path.starts_with('/') {
-            Ok(Supervisor::Unix(path.into()))
+            Ok(Listen::Unix(path.into()))
         } else {
-            Err(invalid(format!(
-                "{SUPERVISOR} needs an absolute socket path"
-            )))
+            Err(invalid(format!("{LISTEN} needs an absolute socket path")))
         };
     }
-    let uri: Uri = value
+    let address: SocketAddr = value
         .parse()
-        .map_err(|e| invalid(format!("{SUPERVISOR} is not a URI: {e}")))?;
-    if uri.scheme_str() != Some("https") {
-        return Err(invalid(format!("{SUPERVISOR} must be https or unix")));
+        .map_err(|e| invalid(format!("{LISTEN} is not address:port or unix:/path: {e}")))?;
+    if address.port() == 0 {
+        return Err(invalid(format!("{LISTEN} needs a fixed port")));
     }
-    Ok(Supervisor::Tcp(uri))
+    Ok(Listen::Tcp(address))
 }
 
 fn invalid(message: String) -> io::Error {
@@ -82,43 +91,44 @@ mod tests {
     }
 
     #[test]
-    fn only_the_supervisor_is_required() {
-        let config = config(&[(SUPERVISOR, "https://supervisor:7443")]).unwrap();
+    fn only_the_listen_address_is_required() {
+        let config = config(&[(LISTEN, "0.0.0.0:7443")]).unwrap();
         assert_eq!(
             config,
             RuntimeConfig {
-                supervisor: Supervisor::Tcp("https://supervisor:7443".parse().unwrap()),
+                listen: Listen::Tcp("0.0.0.0:7443".parse().unwrap()),
                 channel_dir: DEFAULT_CHANNEL_DIR.into(),
                 ca_bundle: DEFAULT_CA_BUNDLE.into(),
             }
         );
-        assert!(config_error(&[]).contains(SUPERVISOR));
+        assert_eq!(config.listen.protected_port(), Some(7443));
+        assert!(config_error(&[]).contains(LISTEN));
     }
 
     #[test]
-    fn a_unix_supervisor_takes_both_spellings() {
+    fn a_unix_listener_takes_both_spellings() {
         for value in [
             "unix:/run/lens/channel.sock",
             "unix:///run/lens/channel.sock",
         ] {
             assert_eq!(
-                config(&[(SUPERVISOR, value)]).unwrap().supervisor,
-                Supervisor::Unix("/run/lens/channel.sock".into())
+                config(&[(LISTEN, value)]).unwrap().listen,
+                Listen::Unix("/run/lens/channel.sock".into())
             );
         }
     }
 
     #[test]
-    fn a_supervisor_without_tls_or_an_absolute_path_is_refused() {
-        for value in ["http://supervisor:7443", "unix:channel.sock", "not a uri"] {
-            assert!(config_error(&[(SUPERVISOR, value)]).contains(SUPERVISOR));
+    fn a_listener_without_a_fixed_port_or_an_absolute_path_is_refused() {
+        for value in ["0.0.0.0:0", "unix:channel.sock", "runtime:7443"] {
+            assert!(config_error(&[(LISTEN, value)]).contains(LISTEN));
         }
     }
 
     #[test]
     fn the_paths_can_be_moved() {
         let config = config(&[
-            (SUPERVISOR, "https://supervisor:7443"),
+            (LISTEN, "[::]:7443"),
             (CHANNEL_DIR, "/secrets/channel"),
             (CA_BUNDLE, "/var/lens/ca.pem"),
         ])

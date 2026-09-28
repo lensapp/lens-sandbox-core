@@ -25,17 +25,17 @@ It is core runtime plumbing, not an end-user product. Applications embed it to g
 Two more crates run the sandbox with no root in the workload. The supervisor holds the policy, the proxy and the credentials outside the workload. The runtime in the workload holds none of them.
 
 - `lens-sandbox-runtime` is the PID 1 of the workload container. It mediates the workload's sockets with seccomp user notification, hides its private root `/.lens` with Landlock, and sends each connect and DNS query to the supervisor. It needs Linux 6.2 or later, with Landlock enabled.
-- `lens-sandbox-supervisor` serves the channel to the runtimes of one sandbox. It gives each connect to the proxy of this crate.
+- `lens-sandbox-supervisor` dials the runtimes of one sandbox. It gives each connect to the proxy of this crate.
 
-The runtime dials the supervisor over mutual TLS. It reads its configuration from the environment:
+The runtime serves the channel over mutual TLS, so the workload needs no egress. It refuses a workload connect to its own port. It reads its configuration from the environment:
 
 | Variable | Default | Use |
 | --- | --- | --- |
-| `LENS_SANDBOX_SUPERVISOR` | required | `https://host:port`, or `unix:/path` for a socket on a shared volume |
+| `LENS_SANDBOX_LISTEN` | required | `address:port`, or `unix:/path` for a socket on a shared volume |
 | `LENS_SANDBOX_CHANNEL_DIR` | `/.lens/channel` | `ca.pem`, `cert.pem` and `key.pem` of the runtime |
 | `LENS_SANDBOX_CA_BUNDLE` | `/tmp/lens-sandbox/ca-bundle.pem` | where the runtime writes the trust bundle of the workload |
 
-The runtime binds its resolver on `127.0.0.53:53`. Without `CAP_NET_BIND_SERVICE`, set `net.ipv4.ip_unprivileged_port_start=0`, and point the workload's `resolv.conf` at `127.0.0.53`.
+The runtime exits when no supervisor is connected for 30 seconds. It binds its resolver on `127.0.0.53:53`. Without `CAP_NET_BIND_SERVICE`, set `net.ipv4.ip_unprivileged_port_start=0`, and point the workload's `resolv.conf` at `127.0.0.53`.
 
 ## What This Crate Is Not
 
