@@ -65,16 +65,16 @@ const KEEP_CAP_MASK: u64 = (1u64 << 0)  // CAP_CHOWN
 /// in the no-setuid path, where the child still has the supervisor's
 /// caps.
 ///
-/// Three syscalls cover the threat model:
+/// Three steps cover the threat model:
 ///   - `PR_SET_NO_NEW_PRIVS = 1` — closes the `execve` re-acquisition path
 ///     (file caps, setuid binaries).
 ///   - `PR_CAP_AMBIENT_CLEAR_ALL` — ambient caps survive `execve` even
 ///     under NO_NEW_PRIVS for non-setuid binaries, so they must be
 ///     cleared explicitly.
 ///   - `capset` to `KEEP_CAP_MASK` — narrows permitted+effective to the
-///     identity-management subset. Inheritable is zeroed; with
-///     NO_NEW_PRIVS pinned, nothing can promote caps across exec via
-///     the inheritable+bounding path either.
+///     identity-management subset the process holds. Inheritable is
+///     zeroed; with NO_NEW_PRIVS pinned, nothing can promote caps across
+///     exec via the inheritable+bounding path either.
 ///
 /// Bounding-set drop is intentionally omitted: with NO_NEW_PRIVS
 /// pinned and inheritable=0, nothing can promote bounding caps into
@@ -100,42 +100,70 @@ pub fn drop_capabilities_in_child() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    // capset v3 header (version 0x20080522) + two u32-per-set datums
-    // covering the 64-bit cap set.
-    #[repr(C)]
-    struct CapHeader {
-        version: u32,
-        pid: i32,
-    }
-    #[repr(C)]
-    struct CapData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-    let header = CapHeader {
-        version: 0x20080522,
-        pid: 0,
-    };
-    let keep_lo = (KEEP_CAP_MASK & 0xFFFF_FFFF) as u32;
-    let keep_hi = (KEEP_CAP_MASK >> 32) as u32;
-    let data = [
-        CapData {
-            effective: keep_lo,
-            permitted: keep_lo,
-            inheritable: 0,
-        },
-        CapData {
-            effective: keep_hi,
-            permitted: keep_hi,
-            inheritable: 0,
-        },
-    ];
-    let rc = unsafe { libc::syscall(libc::SYS_capset, &header as *const _, data.as_ptr()) };
+    set_capabilities(KEEP_CAP_MASK & permitted_capabilities()?)
+}
+
+// capset v3 header (version 0x20080522) + two u32-per-set datums covering
+// the 64-bit cap set.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+#[cfg(target_os = "linux")]
+const CAP_HEADER: CapHeader = CapHeader {
+    version: 0x20080522,
+    pid: 0,
+};
+
+/// A container can grant less than `KEEP_CAP_MASK`, and `capset` refuses to
+/// raise a capability, so the drop asks only for what the process holds.
+#[cfg(target_os = "linux")]
+fn permitted_capabilities() -> io::Result<u64> {
+    use nix::libc;
+
+    let mut data = [CapData::default(); 2];
+    let rc = unsafe { libc::syscall(libc::SYS_capget, &CAP_HEADER as *const _, data.as_mut_ptr()) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(u64::from(data[0].permitted) | (u64::from(data[1].permitted) << 32))
+}
 
+/// Set permitted and effective to `mask` and inheritable to nothing.
+#[cfg(target_os = "linux")]
+fn set_capabilities(mask: u64) -> io::Result<()> {
+    use nix::libc;
+
+    let lo = (mask & 0xFFFF_FFFF) as u32;
+    let hi = (mask >> 32) as u32;
+    let data = [
+        CapData {
+            effective: lo,
+            permitted: lo,
+            inheritable: 0,
+        },
+        CapData {
+            effective: hi,
+            permitted: hi,
+            inheritable: 0,
+        },
+    ];
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &CAP_HEADER as *const _, data.as_ptr()) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -1198,6 +1226,37 @@ mod tests {
         assert_eq!(
             text, "",
             "a drop that happened is not news, and a warning on every spawn teaches a reader to skip the one that matters"
+        );
+    }
+
+    /// A container can hold fewer capabilities than `KEEP_CAP_MASK`; the drop
+    /// then keeps what it has of the mask instead of failing the spawn, and
+    /// still removes the rest. Needs root to start from a known set.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_capability_drop_keeps_only_what_the_process_holds() {
+        use std::os::unix::process::CommandExt as _;
+
+        if !nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: needs root for capset()");
+            return;
+        }
+        const CAP_KILL: u64 = 1 << 5;
+        const CAP_NET_RAW: u64 = 1 << 13;
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "grep CapEff /proc/self/status"]);
+        unsafe {
+            cmd.pre_exec(|| {
+                set_capabilities(CAP_KILL | CAP_NET_RAW)?;
+                drop_capabilities_in_child()
+            });
+        }
+        let output = cmd
+            .output()
+            .expect("the drop must not refuse a smaller set");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("CapEff:\t{CAP_KILL:016x}")
         );
     }
 }
