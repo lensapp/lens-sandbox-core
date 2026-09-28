@@ -37,27 +37,41 @@ pub(crate) struct Link {
 }
 
 impl Link {
+    /// Warns once when the runtime becomes unreachable, and logs the retries
+    /// after that at debug until it answers a hello again.
     pub(crate) async fn run(mut self) {
+        let mut quiet = false;
         loop {
-            let container = self.container.clone();
-            match self.session().await {
-                Ok(()) => tracing::warn!(%container, "lost the runtime"),
-                Err(status) => tracing::warn!(%container, %status, "the runtime is unreachable"),
-            }
+            let result = match self.hello().await {
+                Ok(()) => {
+                    quiet = false;
+                    self.session().await
+                }
+                Err(status) => Err(status),
+            };
             self.ready.send_replace(false);
+            let container = self.container.as_str();
+            match result {
+                Ok(()) => tracing::warn!(%container, "lost the runtime"),
+                Err(status) if quiet => {
+                    tracing::debug!(%container, %status, "the runtime is still unreachable");
+                }
+                Err(status) => {
+                    tracing::warn!(%container, %status, "the runtime is unreachable; retrying");
+                    quiet = true;
+                }
+            }
             tokio::time::sleep(RETRY_DELAY).await;
         }
     }
 
+    async fn hello(&self) -> Result<(), Status> {
+        let protocol = channel::PROTOCOL;
+        call(self.client.clone(), &Open::Hello { protocol }).await
+    }
+
     /// Runs until the `Mediate` stream ends. The accepts end with it.
     async fn session(&mut self) -> Result<(), Status> {
-        call(
-            self.client.clone(),
-            &Open::Hello {
-                protocol: channel::PROTOCOL,
-            },
-        )
-        .await?;
         self.push_trust().await?;
         let (replies, replies_rx) = mpsc::channel(channel::RELAY_QUEUE);
         let queries = self

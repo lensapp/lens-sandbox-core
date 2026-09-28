@@ -27,7 +27,7 @@ Two more crates run the sandbox with no root in the workload. The supervisor hol
 - `lens-sandbox-runtime` is the PID 1 of the workload container. It mediates the workload's sockets with seccomp user notification, hides its private root `/.lens` with Landlock, and sends each connect and DNS query to the supervisor. It needs Linux 6.2 or later, with Landlock enabled.
 - `lens-sandbox-supervisor` dials the runtimes of one sandbox. It gives each connect to the proxy of this crate.
 
-The runtime serves the channel over mutual TLS, so the workload needs no egress. It refuses a workload connect to its own port. It reads its configuration from the environment:
+The runtime serves the channel over mutual TLS, so the workload needs no egress. The runtime refuses a workload connect to the channel port on every address, so use a port that the workload does not need. It reads its configuration from the environment:
 
 | Variable | Default | Use |
 | --- | --- | --- |

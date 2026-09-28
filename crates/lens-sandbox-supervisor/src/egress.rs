@@ -18,7 +18,7 @@ use tonic::Streaming;
 /// address that forwards to the supervisor is not local: the network policy
 /// of the consumer must close that one.
 pub(crate) fn is_own_address(ip: IpAddr) -> bool {
-    ip.is_loopback() || UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+    ip.to_canonical().is_loopback() || UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
 }
 
 /// Replies with the decision. After `Allowed`, the exchange carries the
@@ -92,6 +92,7 @@ mod tests {
     fn the_supervisor_host_is_its_own_address() {
         assert!(is_own_address("127.0.0.1".parse().unwrap()));
         assert!(is_own_address("::1".parse().unwrap()));
+        assert!(is_own_address("::ffff:127.0.0.1".parse().unwrap()));
         assert!(is_own_address("0.0.0.0".parse().unwrap()));
         assert!(!is_own_address("192.0.2.10".parse().unwrap()));
     }

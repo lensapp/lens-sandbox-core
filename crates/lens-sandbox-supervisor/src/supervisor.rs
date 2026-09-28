@@ -60,7 +60,11 @@ impl ExecSession {
     /// `None` when the session closed or broke.
     pub async fn recv(&mut self) -> Option<String> {
         let chunk = self.inbound.message().await.ok()??;
-        String::from_utf8(chunk.to_vec()).ok()
+        String::from_utf8(chunk.to_vec())
+            .inspect_err(
+                |error| tracing::warn!(%error, "the runtime sent an exec frame that is not UTF-8"),
+            )
+            .ok()
     }
 }
 
