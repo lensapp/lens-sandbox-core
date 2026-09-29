@@ -7,46 +7,107 @@ license = "Apache-2.0"
 description = "Core library for Lens sandbox runtime — proxy, MITM, nftables lockdown, policy handling"
 repository = "https://github.com/lensapp/lens-sandbox-core"
 
+[features]
+default = ["proxy"]
+# The forward proxy, MITM, DNS stub, nftables lockdown, policy and the
+# WebSocket client. The process modules (exec, PTY, privilege) do not need it.
+proxy = [
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "dep:socket2",
+    "dep:rand",
+    "dep:ipnet",
+    "dep:schemars",
+    "dep:async-trait",
+    "dep:rcgen",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:aws-sigv4",
+    "dep:aws-credential-types",
+    "dep:sha2",
+    "dep:hex",
+    "dep:hickory-proto",
+    "dep:hickory-resolver",
+    "dep:apollo-parser",
+    "dep:switchyard-translation",
+    "dep:tokio-vsock",
+    "dep:nfq",
+    "nix/net",
+    "nix/socket",
+]
+# The gRPC channel between a runtime inside the workload and its supervisor.
+channel = ["dep:tonic", "dep:bytes", "dep:tonic-build"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
-futures-util = "0.3"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"], optional = true }
+futures-util = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
-nix = { version = "0.30", features = ["signal", "process", "user", "fs", "term", "ioctl", "net", "socket"] }
+nix = { version = "0.30", features = ["signal", "process", "user", "fs", "term", "ioctl"] }
 base64 = "0.22"
 libc = "0.2"
 # Sets IP_FREEBIND before bind, which neither `std` nor `tokio` exposes.
-socket2 = "0.6"
-rand = "0.9"
-ipnet = "2"
-schemars = "1"
-async-trait = "0.1"
-rcgen = { version = "0.13", features = ["crypto"] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-webpki-roots = "1"
-aws-sigv4 = { version = "1", default-features = false, features = ["http1", "sign-http"] }
-aws-credential-types = "1"
-sha2 = "0.10"
-hex = "0.4"
-hickory-proto = "0.26"
-hickory-resolver = "0.26"
-apollo-parser = "0.8.6"
-switchyard-translation = "0.2"
+socket2 = { version = "0.6", optional = true }
+rand = { version = "0.9", optional = true }
+ipnet = { version = "2", optional = true }
+schemars = { version = "1", optional = true }
+async-trait = { version = "0.1", optional = true }
+rcgen = { version = "0.13", features = ["crypto"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+webpki-roots = { version = "1", optional = true }
+aws-sigv4 = { version = "1", default-features = false, features = ["http1", "sign-http"], optional = true }
+aws-credential-types = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+hickory-proto = { version = "0.26", optional = true }
+hickory-resolver = { version = "0.26", optional = true }
+apollo-parser = { version = "0.8.6", optional = true }
+switchyard-translation = { version = "0.2", optional = true }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "transport", "tls-ring"], optional = true }
+bytes = { version = "1", optional = true }
 
 # AF_VSOCK and NFQUEUE are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-vsock = "0.7"
+tokio-vsock = { version = "0.7", optional = true }
 # Pure Rust over netlink: no libnetfilter_queue, so nothing to link and no
 # GPL-2.0 C library beside an Apache-2.0 crate.
-nfq = "0.2"
+nfq = { version = "0.2", optional = true }
 
 [[bin]]
 name = "generate-policy-schema"
 path = "src/bin/generate_policy_schema.rs"
+required-features = ["proxy"]
+
+[[test]]
+name = "dns_stub_over_udp"
+required-features = ["proxy"]
+
+[[test]]
+name = "supervisor_lookup_over_the_cage"
+required-features = ["proxy"]
+
+[[test]]
+name = "transparent_classify_over_tcp"
+required-features = ["proxy"]
+
+[[test]]
+name = "transparent_so_original_dst"
+required-features = ["proxy"]
+
+[[test]]
+name = "udp_egress_over_nfqueue"
+required-features = ["proxy"]
+
+[build-dependencies]
+tonic-build = { version = "0.14", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = { version = "0.13", features = ["crypto"] }
+tokio-stream = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

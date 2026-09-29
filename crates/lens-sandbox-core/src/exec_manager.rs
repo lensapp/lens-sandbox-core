@@ -32,7 +32,7 @@ use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::child_spawner::{self, ChildSpec};
+use crate::child_spawner::{self, ChildSpec, DirectLauncher, Launcher};
 use crate::exec_protocol::{
     ActorIdentity, DetachReason, IncomingMessage, OutgoingMessage, TerminalSize,
 };
@@ -77,6 +77,7 @@ struct Inner {
     /// `ECHILD` — losing the exit code. Default (unwired) on hosts without
     /// a reaper, e.g. the short-lived shell sandbox, where it's a no-op.
     pid_guard: PidGuard,
+    launcher: Arc<dyn Launcher>,
 }
 
 /// Stdin frame sent from the manager to the writer task. Bytes are written
@@ -117,12 +118,22 @@ struct SessionHandle {
 
 impl ExecManager {
     pub fn new(creds: Option<SandboxCredentials>, is_root: bool, pid_guard: PidGuard) -> Self {
+        Self::with_launcher(creds, is_root, pid_guard, Arc::new(DirectLauncher))
+    }
+
+    pub fn with_launcher(
+        creds: Option<SandboxCredentials>,
+        is_root: bool,
+        pid_guard: PidGuard,
+        launcher: Arc<dyn Launcher>,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(Inner {
                 sessions: Mutex::new(HashMap::new()),
                 creds,
                 is_root,
                 pid_guard,
+                launcher,
             }),
         }
     }
@@ -210,7 +221,7 @@ impl ExecManager {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = match cmd.spawn() {
+        let mut child = match self.inner.launcher.spawn(cmd) {
             Ok(c) => c,
             Err(e) => {
                 emit(
@@ -330,7 +341,7 @@ impl ExecManager {
 
         let size = initial_size.map(|s| (s.cols, s.rows)).unwrap_or((80, 24));
 
-        let pty = match child_spawner::spawn_pty(&spec, size) {
+        let pty = match child_spawner::spawn_pty_with(&spec, size, &*self.inner.launcher) {
             Ok(p) => p,
             Err(e) => {
                 emit(
@@ -999,6 +1010,54 @@ mod tests {
 
         let exit = frames.last().unwrap();
         assert_eq!(exit["code"], 0);
+    }
+
+    struct MarkingLauncher;
+
+    impl Launcher for MarkingLauncher {
+        fn spawn(&self, mut cmd: tokio::process::Command) -> std::io::Result<Child> {
+            cmd.env("LAUNCHED_BY", "marking");
+            cmd.spawn()
+        }
+    }
+
+    async fn stdout_through_marking_launcher(tty: bool) -> String {
+        let mgr =
+            ExecManager::with_launcher(None, false, PidGuard::default(), Arc::new(MarkingLauncher));
+        let (tx, mut rx) = channel();
+        mgr.handle(
+            IncomingMessage::ExecAttach {
+                exec_id: "launched".into(),
+                argv: vec!["sh".into(), "-c".into(), "printf \"$LAUNCHED_BY\"".into()],
+                env: HashMap::new(),
+                cwd: None,
+                tty,
+                stdin: true,
+                stdout: true,
+                stderr: true,
+                initial_size: None,
+                actor: None,
+            },
+            &tx,
+        )
+        .await;
+        let stdout: Vec<u8> = drain_until_terminal(&mut rx, "launched")
+            .await
+            .iter()
+            .filter(|f| f["type"] == "exec_stdout")
+            .flat_map(decode_data)
+            .collect();
+        String::from_utf8(stdout).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_piped_exec_spawns_through_the_launcher() {
+        assert_eq!(stdout_through_marking_launcher(false).await, "marking");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tty_exec_spawns_through_the_launcher() {
+        assert_eq!(stdout_through_marking_launcher(true).await, "marking");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

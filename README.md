@@ -20,6 +20,26 @@ It is core runtime plumbing, not an end-user product. Applications embed it to g
 - WebSocket-driven policy lifecycle integration
 - Activity and audit event primitives
 
+## Split Supervisor
+
+Two more crates run the sandbox with no root in the workload. The supervisor holds the policy, the proxy and the credentials outside the workload. The runtime in the workload holds none of them.
+
+- `lens-sandbox-runtime` is the PID 1 of the workload container. It mediates the workload's sockets with seccomp user notification, hides its private root `/.lens` with Landlock, and sends each connect and DNS query to the supervisor. It needs Linux 6.2 or later, with Landlock enabled.
+- `lens-sandbox-supervisor` dials the runtimes of one sandbox. It gives each connect to the proxy of this crate.
+
+The runtime serves the channel over mutual TLS, so the workload needs no egress. The runtime refuses a workload connect to the channel port on every address, so use a port that the workload does not need. It reads its configuration from the environment:
+
+| Variable | Default | Use |
+| --- | --- | --- |
+| `LENS_SANDBOX_LISTEN` | required | `address:port`, or `unix:/path` for a socket on a shared volume |
+| `LENS_SANDBOX_CA_BUNDLE` | `/tmp/lens-sandbox/ca-bundle.pem` | where the runtime writes the trust bundle of the workload |
+
+Mount `ca.pem`, `cert.pem` and `key.pem` of the runtime at `/.lens/channel`. Landlock hides `/.lens` from the workload, so the path is fixed.
+
+The runtime relays only DNS over UDP. Every other UDP send fails with `EACCES`, so `egress.udp` rules of the policy have no effect, and the supervisor warns when a runtime connects under such a policy.
+
+While no supervisor is connected, the runtime waits and the workload has no network. The control plane removes an abandoned workload. The runtime binds its resolver on `127.0.0.53:53`. Without `CAP_NET_BIND_SERVICE`, set `net.ipv4.ip_unprivileged_port_start=0`, and point the workload's `resolv.conf` at `127.0.0.53`.
+
 ## What This Crate Is Not
 
 `lens-sandbox-core` is not a complete sandbox product by itself. It does not create the desktop app, enterprise platform, UI, packaging, distribution, or microVM lifecycle.
@@ -42,6 +62,7 @@ This project is licensed under Apache 2.0. See:
 - [SECURITY.md](SECURITY.md) for vulnerability reporting and security scope.
 - [CHANGELOG.md](CHANGELOG.md) for release notes.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
+- [crates/lens-sandbox-runtime/THIRD-PARTY.md](crates/lens-sandbox-runtime/THIRD-PARTY.md) for code copied from NVIDIA OpenShell.
 
 ## Local Setup
 
@@ -54,6 +75,8 @@ git config core.hooksPath .githooks
 ```bash
 cargo build -p lens-sandbox-core
 cargo test -p lens-sandbox-core
+cargo test -p lens-sandbox-supervisor
+cargo test -p lens-sandbox-runtime -- --test-threads=1   # Linux only
 ```
 
 Integration tests requiring Linux + nftables + `CAP_NET_ADMIN` are `#[ignore]`-gated. Run them with:

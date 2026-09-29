@@ -33,7 +33,12 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-      - run: cargo test --workspace
+      - run: cargo test --workspace --exclude lens-sandbox-runtime
+      # Upstream runs these tests one process each. In one process, a test
+      # that scans /proc/*/fd for its own socket can see a copy of it in a
+      # sibling test's forked child.
+      - run: cargo test -p lens-sandbox-runtime -- --test-threads=1
+      - run: cargo test -p lens-sandbox-core --lib --all-features channel
 
   cage:
     name: Cage tests
@@ -49,6 +54,7 @@ jobs:
       # Build as the runner user, so root owns nothing in `target/` for the
       # cache step that follows the tests to trip over.
       - run: cargo test -p lens-sandbox-core --tests --no-run
+      - run: cargo test -p lens-sandbox-runtime --lib --test end_to_end --no-run
       # `CAP_NET_ADMIN` for the nftables rules, and one thread because the cage
       # tests share one table and one queue reader (see
       # `udp_egress_over_nfqueue.rs`). These probe an address off the box, so
@@ -63,6 +69,17 @@ jobs:
           sudo -E env "PATH=$PATH" unshare -n -- sh -c
           'ip link set lo up && ip route add default dev lo &&
           cargo test -p lens-sandbox-core --test supervisor_lookup_over_the_cage -- --ignored'
+      # The runtime binds its resolver on 127.0.0.53:53, which systemd-resolved
+      # holds on the runner, so it gets a namespace of its own. The dummy link
+      # is an address of the host that is not loopback. One thread, because
+      # each test starts a runtime on that one resolver address. The ignored
+      # unit tests are the ones that need root.
+      - run: >
+          sudo -E env "PATH=$PATH" unshare -n -- sh -c
+          'ip link set lo up && ip link add probe type dummy &&
+          ip addr add 192.0.2.7/32 dev probe && ip link set probe up &&
+          ip route add default dev probe &&
+          cargo test -p lens-sandbox-runtime --lib --test end_to_end -- --ignored --test-threads=1'
       # A killed test binary never runs its drop guard, and a stranded table
       # confines the runner itself.
       - if: always()
@@ -79,6 +96,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p lens-sandbox-core --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy -p lens-sandbox-core --all-targets --all-features -- -D warnings
 
   fmt:
     name: Format

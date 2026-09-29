@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use tokio::process::Command;
 
 pub const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
@@ -6,11 +8,17 @@ pub const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 /// the system CA bundle. The proxy CA cert is appended to this file later via
 /// policy message, but the path is stable.
 pub fn apply_ca_env(cmd: &mut Command) {
-    cmd.env("SSL_CERT_FILE", CA_BUNDLE)
-        .env("REQUESTS_CA_BUNDLE", CA_BUNDLE)
-        .env("NODE_EXTRA_CA_CERTS", CA_BUNDLE)
-        .env("CURL_CA_BUNDLE", CA_BUNDLE)
-        .env("GIT_SSL_CAINFO", CA_BUNDLE);
+    apply_ca_env_at(cmd, Path::new(CA_BUNDLE));
+}
+
+/// [`apply_ca_env`] for a bundle at another path, for a parent that cannot
+/// write the system bundle.
+pub fn apply_ca_env_at(cmd: &mut Command, bundle: &Path) {
+    cmd.env("SSL_CERT_FILE", bundle)
+        .env("REQUESTS_CA_BUNDLE", bundle)
+        .env("NODE_EXTRA_CA_CERTS", bundle)
+        .env("CURL_CA_BUNDLE", bundle)
+        .env("GIT_SSL_CAINFO", bundle);
 }
 
 #[cfg(test)]
