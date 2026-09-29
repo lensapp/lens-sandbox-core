@@ -36,6 +36,8 @@ The runtime serves the channel over mutual TLS, so the workload needs no egress.
 
 Mount `ca.pem`, `cert.pem` and `key.pem` of the runtime at `/.lens/channel`. Landlock hides `/.lens` from the workload, so the path is fixed.
 
+The runtime relays only DNS over UDP. Every other UDP send fails with `EACCES`, so `egress.udp` rules of the policy have no effect, and the supervisor warns when a runtime connects under such a policy.
+
 While no supervisor is connected, the runtime waits and the workload has no network. The control plane removes an abandoned workload. The runtime binds its resolver on `127.0.0.53:53`. Without `CAP_NET_BIND_SERVICE`, set `net.ipv4.ip_unprivileged_port_start=0`, and point the workload's `resolv.conf` at `127.0.0.53`.
 
 ## What This Crate Is Not
