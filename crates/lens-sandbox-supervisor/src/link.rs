@@ -90,6 +90,12 @@ impl Link {
         }
         self.ready.send_replace(true);
         tracing::info!(container = %self.container, "runtime connected");
+        if has_udp_egress(&self.state) {
+            tracing::warn!(
+                container = %self.container,
+                "the runtime relays only DNS over UDP, so the egress.udp rules have no effect"
+            );
+        }
         let mediation = mediate::serve(queries, replies, self.state.clone(), self.dns_upstream);
         tokio::pin!(mediation);
         loop {
@@ -112,6 +118,13 @@ impl Link {
             None => Ok(()),
         }
     }
+}
+
+fn has_udp_egress(state: &ProxyState) -> bool {
+    state
+        .policy
+        .read()
+        .is_ok_and(|policy| !policy.udp_egress.is_empty())
 }
 
 /// Opens an exchange with `open` and returns its two directions.
@@ -172,4 +185,22 @@ async fn accept_one(
         is_own_address,
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use lens_sandbox_core::proxy::ProxyServer;
+    use lens_sandbox_core::routing::parse_udp_egress;
+
+    use super::*;
+
+    #[test]
+    fn only_a_policy_with_udp_rules_has_udp_egress() {
+        let any = "127.0.0.1:0".parse().unwrap();
+        let state = ProxyServer::new(any, any, any, None, Vec::new()).1;
+        assert!(!has_udp_egress(&state));
+        let syslog = serde_json::json!([{ "match": "192.0.2.10:514", "verdict": "allow" }]);
+        state.policy.write().unwrap().udp_egress = parse_udp_egress(&syslog).unwrap();
+        assert!(has_udp_egress(&state));
+    }
 }
