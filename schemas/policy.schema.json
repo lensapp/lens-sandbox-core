@@ -98,7 +98,7 @@
       ]
     },
     "CredentialInjection": {
-      "description": "How a credential applies to outbound requests on a specific domain.\nTagged at the JSON level by `injectionType` — each variant carries the\nfields it actually needs, required at compile time.\n\n- **`header`**: replace an HTTP header on matching requests. The MITM\n  substitutes [`value`] into [`header`]. When `bodyField` and `bodyValue`\n  are set, the same requests also get `bodyValue` written into that field\n  of a `application/x-www-form-urlencoded` body — for an API that reads its\n  token from the body before the header.\n- **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder\n  patterns in the request URI to the real credential value.\n- **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with\n  `placeholder` on the parent [`Credential`]) and re-sign with the real\n  STS credentials below. Real creds live only in sandbox-core process\n  memory — they never touch the sandbox filesystem.",
+      "description": "How a credential applies to outbound requests on a specific domain.\nTagged at the JSON level by `injectionType` — each variant carries the\nfields it actually needs, required at compile time.\n\n- **`header`**: replace an HTTP header on matching requests. The MITM\n  substitutes [`value`] into [`header`]. When `bodyField` and `bodyValue`\n  are set, the same requests also get `bodyValue` written into that field\n  of a `application/x-www-form-urlencoded` body — for an API that reads its\n  token from the body before the header.\n- **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder\n  patterns in the request URI to the real credential value.\n- **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with\n  `placeholder` on the parent [`Credential`]) and re-sign with the real\n  STS credentials below. Real creds live only in sandbox-core process\n  memory — they never touch the sandbox filesystem.\n- **`oauthTokenAnswer`**: answer an OAuth 2.0 client-credentials token\n  request (RFC 6749 §4.4) in the proxy with a placeholder access token, so\n  the request never leaves the sandbox. Paired with a `header` injection on\n  each API domain that replaces the placeholder with the real token.",
       "oneOf": [
         {
           "type": "object",
@@ -210,6 +210,51 @@
             "accessKeyId",
             "secretAccessKey",
             "sessionToken"
+          ]
+        },
+        {
+          "description": "Answers a `POST` to [`path`](Self::OauthTokenAnswer::path) on\n[`domain`](Self::OauthTokenAnswer::domain) whose urlencoded body asks for\n`grant_type=client_credentials` for\n[`clientId`](Self::OauthTokenAnswer::client_id) (in the body or in HTTP\nBasic authentication). A request for exactly\n[`scope`](Self::OauthTokenAnswer::scope) gets\n[`accessToken`](Self::OauthTokenAnswer::access_token); a request for a\nscope no answer names gets `invalid_scope`. Every other request to the\ndomain is forwarded unchanged.",
+          "type": "object",
+          "properties": {
+            "accessToken": {
+              "description": "Placeholder returned as `access_token`. It grants nothing outside\nthe proxy.",
+              "type": "string"
+            },
+            "clientId": {
+              "description": "The client whose token requests are answered.",
+              "type": "string"
+            },
+            "domain": {
+              "description": "Host of the token endpoint.",
+              "type": "string"
+            },
+            "expiresIn": {
+              "description": "Lifetime in seconds returned as `expires_in`.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "injectionType": {
+              "type": "string",
+              "const": "oauthTokenAnswer"
+            },
+            "path": {
+              "description": "Path of the token endpoint (e.g. `/oauth2/v2.0/token`).",
+              "type": "string"
+            },
+            "scope": {
+              "description": "Space-separated scope this answer covers, compared as a set. Empty\nanswers a request that names no scope.",
+              "type": "string",
+              "default": ""
+            }
+          },
+          "required": [
+            "injectionType",
+            "domain",
+            "path",
+            "clientId",
+            "accessToken",
+            "expiresIn"
           ]
         }
       ]
