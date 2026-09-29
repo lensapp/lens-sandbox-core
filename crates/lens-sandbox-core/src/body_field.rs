@@ -69,7 +69,7 @@ where
     Ok(())
 }
 
-fn is_urlencoded(head: &str) -> bool {
+pub(crate) fn is_urlencoded(head: &str) -> bool {
     head.split("\r\n").skip(1).any(|line| {
         let lower = line.to_ascii_lowercase();
         lower
@@ -104,7 +104,7 @@ fn rewrite_urlencoded_field(body: &[u8], field: &str, value: &str) -> Vec<u8> {
     pairs.join(&b'&')
 }
 
-fn form_decode(key: &[u8]) -> Vec<u8> {
+pub(crate) fn form_decode(key: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(key.len());
     let mut bytes = key.iter();
     while let Some(byte) = bytes.next() {

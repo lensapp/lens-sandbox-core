@@ -545,6 +545,26 @@ pub fn ensure_body_is_readable(header_block: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Read a request body a door judges before it forwards anything.
+///
+/// A body the proxy cannot read is refused, a client waiting on
+/// `Expect: 100-continue` is told to send, and at most `max` bytes are read.
+pub async fn read_for_inspection<C>(
+    client: &mut C,
+    header_block: &str,
+    framing: BodyFraming,
+    max: usize,
+) -> Result<Vec<u8>, String>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    ensure_body_is_readable(header_block)?;
+    answer_continue_if_expected(client, header_block).await?;
+    read_body(client, framing, max)
+        .await
+        .map_err(|err| err.to_string())
+}
+
 /// Parse a JSON body, refusing a duplicate object key at any depth.
 ///
 /// `serde_json` keeps the last of two same-named keys without complaint, and a

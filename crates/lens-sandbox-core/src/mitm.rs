@@ -25,6 +25,10 @@ pub enum UpstreamMode {
     /// The inner stream is type-erased so plain TCP and TLS-wrapped tunnels
     /// (when the Lens Sandbox HTTPS port fronts the proxy) share the same path.
     TunnelTls(crate::proxy::BoxedSandboxStream),
+    /// A tunnel to `target` opened only when a request is forwarded. A host
+    /// with token answers gets one: the proxy answers its token requests
+    /// itself, and an upstream that refuses the host must not fail them.
+    TunnelOnDemand { target: String },
 }
 
 /// Policy-derived context for a MITM connection.
@@ -221,14 +225,32 @@ pub async fn handle_mitm_pre_accepted(
             }
         }
         UpstreamMode::TunnelTls(upstream) => {
-            let mut tls_upstream =
-                connect_upstream_tls(upstream, target_host, None, None, ctx.extra_ca_certs).await?;
-            write_request_head_and_body(&mut tls_upstream, &modified, &meta).await?;
-            let denial = forward_or_bridge(tls_client, tls_upstream, &meta).await?;
-            audit_frame_denial(ctx, target_host, is_tunnel, &meta, denial);
+            relay_through_tunnel(tls_client, upstream, target_host, &modified, &meta, ctx).await?;
+        }
+        UpstreamMode::TunnelOnDemand { target } => {
+            let upstream =
+                crate::proxy::open_upstream_tunnel(ctx.state, &target, ctx.actor).await?;
+            relay_through_tunnel(tls_client, upstream, target_host, &modified, &meta, ctx).await?;
         }
     }
 
+    Ok(())
+}
+
+/// Forward the request through an open tunnel and relay what comes back.
+async fn relay_through_tunnel(
+    tls_client: tokio_rustls::server::TlsStream<TcpStream>,
+    upstream: crate::proxy::BoxedSandboxStream,
+    target_host: &str,
+    modified: &str,
+    meta: &RequestMeta,
+    ctx: &MitmContext<'_>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut tls_upstream =
+        connect_upstream_tls(upstream, target_host, None, None, ctx.extra_ca_certs).await?;
+    write_request_head_and_body(&mut tls_upstream, modified, meta).await?;
+    let denial = forward_or_bridge(tls_client, tls_upstream, meta).await?;
+    audit_frame_denial(ctx, target_host, true, meta, denial);
     Ok(())
 }
 
@@ -734,6 +756,48 @@ impl RequestFacts<'_, '_> {
         tls_client.shutdown().await.ok();
         reason.into()
     }
+
+    /// Answer an OAuth token request in place of its token endpoint (see
+    /// [`crate::token_answer`]): record the answer, send it, and end the session.
+    /// Returns the value the caller hands back, so nothing is forwarded.
+    async fn answer_token_request<C>(
+        &self,
+        tls_client: &mut C,
+        response: &[u8],
+        status: u16,
+    ) -> Box<dyn std::error::Error + Send + Sync>
+    where
+        C: AsyncWrite + Unpin,
+    {
+        tracing::info!(
+            target_host = %self.target_host,
+            path = %self.path,
+            status,
+            "OAuth token request answered by the proxy"
+        );
+        if let Some(tx) = self.ctx.audit_tx {
+            let event = serde_json::json!({
+                "type": "audit_event",
+                "source": "sandbox-proxy",
+                "action": format!("{} {}{}", self.method, self.target_host, self.path),
+                "method": self.method,
+                "host": self.target_host,
+                "path": self.path,
+                "result": if status == 200 { "success" } else { "failure" },
+                "status_code": status,
+                "metadata": {
+                    "host": self.target_host,
+                    "mitm": true,
+                    "tunnel": self.is_tunnel,
+                    "token_answered": true,
+                }
+            });
+            send_audit(tx, event, self.ctx.actor);
+        }
+        tls_client.write_all(response).await.ok();
+        tls_client.shutdown().await.ok();
+        "OAuth token request answered by the proxy".into()
+    }
 }
 
 /// Send this request to the backend an `llm` route names, if one claims it.
@@ -1042,6 +1106,47 @@ async fn mitm_inject_after_accept(
                 }
             };
             mcp_request = Some(info);
+            buffered_body = Some(body);
+        }
+    }
+
+    // A client-credentials request the policy holds a token for is answered here
+    // with a placeholder, and nothing of it is forwarded. See `crate::token_answer`.
+    let token_answers = crate::proxy::collect_token_answers(ctx.state, ctx.match_host);
+    if !is_upgrade && crate::token_answer::may_answer(&token_answers, method, path, &header_str) {
+        let body = match buffered_body.take() {
+            Some(body) => body,
+            None if body_mode == BodyFraming::None => Vec::new(),
+            None => {
+                let read = crate::http_body::read_for_inspection(
+                    &mut tls_client,
+                    &header_str,
+                    body_mode,
+                    crate::http_body::MAX_INSPECT_BYTES,
+                )
+                .await;
+                match read {
+                    Ok(body) => body,
+                    Err(reason) => {
+                        return Err(facts
+                            .deny(&mut tls_client, "token_answer_denied", &reason)
+                            .await);
+                    }
+                }
+            }
+        };
+        let decision =
+            crate::token_answer::decide(&token_answers, method, path, &header_str, &body);
+        if let Some(response) = crate::token_answer::response(&decision) {
+            let status = match decision {
+                crate::token_answer::Decision::Answer(_) => 200,
+                _ => 400,
+            };
+            return Err(facts
+                .answer_token_request(&mut tls_client, &response, status)
+                .await);
+        }
+        if body_mode != BodyFraming::None {
             buffered_body = Some(body);
         }
     }
@@ -2788,6 +2893,190 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert_eq!(audits[0]["result"], "failure");
         assert_eq!(audits[0]["metadata"]["body_injection_denied"], true);
+    }
+
+    /// Drives one request through the MITM with `answers` installed for the
+    /// harness host. Returns the head and buffered body the proxy would forward,
+    /// or its error when it answered or refused the request itself, together
+    /// with what the client read back and the audit events.
+    async fn run_token_answer_harness(
+        answers: Vec<crate::token_answer::TokenAnswer>,
+        request: &'static [u8],
+    ) -> (
+        Result<(String, Option<Vec<u8>>), String>,
+        String,
+        Vec<serde_json::Value>,
+    ) {
+        use tokio::net::TcpListener;
+
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let ca = EphemeralCa::new().unwrap();
+        let hostname = "test.example.com";
+        let (state, mut audit_rx) = crate::proxy::tests::test_state();
+        state
+            .token_answers
+            .write()
+            .unwrap()
+            .insert(hostname.to_string(), answers);
+        let audit_tx_opt = state.audit_tx.lock().unwrap().clone();
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let root_store = ca_root_store(&ca);
+        let client_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(client_addr).await.unwrap();
+            let client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let server_name = ServerName::try_from(hostname.to_string()).unwrap();
+            let mut tls = connector.connect(server_name, stream).await.unwrap();
+            tls.write_all(request).await.unwrap();
+            let mut response = Vec::new();
+            let _ = tls.read_to_end(&mut response).await;
+            String::from_utf8(response).unwrap()
+        });
+
+        let (client_stream, _) = client_listener.accept().await.unwrap();
+        let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+        let ctx = MitmContext {
+            injections: &[],
+            http_rules: &[],
+            ca: &ca,
+            audit_tx: &audit_tx_opt,
+            extra_ca_certs: &[],
+            placeholder_map: &[],
+            state: &state,
+            match_host: hostname,
+            actor: &actor,
+        };
+        let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, hostname).unwrap());
+        let tls_client = acceptor.accept(client_stream).await.unwrap();
+        let outcome = match mitm_inject_after_accept(tls_client, hostname, &ctx, true).await {
+            Ok((mut tls_client, head, meta)) => {
+                tls_client.shutdown().await.ok();
+                Ok((head, meta.buffered_body))
+            }
+            Err(err) => Err(err.to_string()),
+        };
+        let response = client_handle.await.unwrap();
+        let mut audits = Vec::new();
+        while let Ok(msg) = audit_rx.try_recv() {
+            audits.push(serde_json::from_str(&msg).unwrap());
+        }
+        (outcome, response, audits)
+    }
+
+    fn token_answer(scope: &str) -> crate::token_answer::TokenAnswer {
+        crate::token_answer::TokenAnswer::new(
+            "/oauth2/token",
+            "client-1",
+            scope,
+            "placeholder-token",
+            3600,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mitm_answers_a_client_credentials_request_without_forwarding_it() {
+        let (outcome, response, audits) = run_token_answer_harness(
+            vec![token_answer("api.default")],
+            b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 96\r\n\r\n\
+              grant_type=client_credentials&client_id=client-1&client_secret=__lens_cred:x__&scope=api.default",
+        )
+        .await;
+
+        assert!(outcome.is_err(), "the request must not be forwarded");
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(head.contains("Cache-Control: no-store"), "{head}");
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["access_token"], "placeholder-token");
+        assert_eq!(json["token_type"], "Bearer");
+        assert_eq!(audits[0]["result"], "success");
+        assert_eq!(audits[0]["metadata"]["token_answered"], true);
+    }
+
+    #[tokio::test]
+    async fn mitm_refuses_a_scope_it_holds_no_token_for() {
+        let (outcome, response, audits) = run_token_answer_harness(
+            vec![token_answer("api.default")],
+            b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 66\r\n\r\n\
+              grant_type=client_credentials&client_id=client-1&scope=other.scope",
+        )
+        .await;
+
+        assert!(outcome.is_err(), "the request must not be forwarded");
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains(r#""error":"invalid_scope""#),
+            "{response}"
+        );
+        assert_eq!(audits[0]["result"], "failure");
+        assert_eq!(audits[0]["status_code"], 400);
+    }
+
+    #[tokio::test]
+    async fn mitm_forwards_a_token_request_for_another_client_with_its_body() {
+        let (outcome, _response, _audits) = run_token_answer_harness(
+            vec![token_answer("api.default")],
+            b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 66\r\n\r\n\
+              grant_type=client_credentials&client_id=client-2&scope=api.default",
+        )
+        .await;
+
+        let (head, body) = outcome.expect("forwarded");
+        assert!(
+            head.starts_with("POST /oauth2/token HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert_eq!(
+            body.as_deref(),
+            Some(&b"grant_type=client_credentials&client_id=client-2&scope=api.default"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn mitm_reads_no_body_on_a_path_with_no_token_answer() {
+        let (outcome, _response, _audits) = run_token_answer_harness(
+            vec![token_answer("api.default")],
+            b"POST /v1/items HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\na=1",
+        )
+        .await;
+
+        let (head, body) = outcome.expect("forwarded");
+        assert!(head.starts_with("POST /v1/items HTTP/1.1\r\n"), "{head}");
+        assert_eq!(body, None, "the relay streams a body no answer needed");
+    }
+
+    #[tokio::test]
+    async fn mitm_forwards_a_non_urlencoded_post_to_the_token_path_unread() {
+        // A body the answer could never apply to is not read, so framing the
+        // inspection refuses, and a size past its cap, pass as they came.
+        let (outcome, _response, _audits) = run_token_answer_harness(
+            vec![token_answer("api.default")],
+            b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc",
+        )
+        .await;
+
+        let (head, body) = outcome.expect("forwarded");
+        assert!(
+            head.starts_with("POST /oauth2/token HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert_eq!(body, None, "the relay streams a body no answer needed");
     }
 
     #[tokio::test]

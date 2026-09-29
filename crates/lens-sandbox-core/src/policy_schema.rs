@@ -845,6 +845,10 @@ pub struct Credential {
 ///   `placeholder` on the parent [`Credential`]) and re-sign with the real
 ///   STS credentials below. Real creds live only in sandbox-core process
 ///   memory — they never touch the sandbox filesystem.
+/// - **`oauthTokenAnswer`**: answer an OAuth 2.0 client-credentials token
+///   request (RFC 6749 §4.4) in the proxy with a placeholder access token, so
+///   the request never leaves the sandbox. Paired with a `header` injection on
+///   each API domain that replaces the placeholder with the real token.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "injectionType",
@@ -891,6 +895,32 @@ pub enum CredentialInjection {
         secret_access_key: String,
         /// Real STS session token.
         session_token: String,
+    },
+    /// Answers a `POST` to [`path`](Self::OauthTokenAnswer::path) on
+    /// [`domain`](Self::OauthTokenAnswer::domain) whose urlencoded body asks for
+    /// `grant_type=client_credentials` for
+    /// [`clientId`](Self::OauthTokenAnswer::client_id) (in the body or in HTTP
+    /// Basic authentication). A request for exactly
+    /// [`scope`](Self::OauthTokenAnswer::scope) gets
+    /// [`accessToken`](Self::OauthTokenAnswer::access_token); a request for a
+    /// scope no answer names gets `invalid_scope`. Every other request to the
+    /// domain is forwarded unchanged.
+    OauthTokenAnswer {
+        /// Host of the token endpoint.
+        domain: String,
+        /// Path of the token endpoint (e.g. `/oauth2/v2.0/token`).
+        path: String,
+        /// The client whose token requests are answered.
+        client_id: String,
+        /// Space-separated scope this answer covers, compared as a set. Empty
+        /// answers a request that names no scope.
+        #[serde(default)]
+        scope: String,
+        /// Placeholder returned as `access_token`. It grants nothing outside
+        /// the proxy.
+        access_token: String,
+        /// Lifetime in seconds returned as `expires_in`.
+        expires_in: u64,
     },
 }
 
@@ -956,6 +986,32 @@ mod tests {
         assert_eq!(unarmed_uri.unarmed_domain(), Some("api.telegram.org"));
         // awsSigv4 is resolved out-of-band; empty fields are not a gate trigger.
         assert_eq!(aws.unarmed_domain(), None);
+    }
+
+    #[test]
+    fn credential_injection_deserializes_oauth_token_answer_variant() {
+        let json = r#"{"injectionType":"oauthTokenAnswer","domain":"login.example.com","path":"/oauth2/token","clientId":"client-1","scope":"api://x/.default","accessToken":"placeholder","expiresIn":3600}"#;
+        let inj: CredentialInjection = serde_json::from_str(json).unwrap();
+        match &inj {
+            CredentialInjection::OauthTokenAnswer {
+                domain,
+                path,
+                client_id,
+                scope,
+                access_token,
+                expires_in,
+            } => {
+                assert_eq!(domain, "login.example.com");
+                assert_eq!(path, "/oauth2/token");
+                assert_eq!(client_id, "client-1");
+                assert_eq!(scope, "api://x/.default");
+                assert_eq!(access_token, "placeholder");
+                assert_eq!(*expires_in, 3600);
+            }
+            _ => panic!("expected OauthTokenAnswer variant"),
+        }
+        // The placeholder token is never a gate trigger.
+        assert_eq!(inj.unarmed_domain(), None);
     }
 
     #[test]

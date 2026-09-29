@@ -907,8 +907,6 @@ pub async fn read_body_for_inspection<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    crate::http_body::ensure_body_is_readable(header_str)?;
-
     // A GraphQL GET puts its document in the query string. A body on one is a
     // second account of the request that the origin might read instead, and
     // this door would have judged the wrong one.
@@ -918,14 +916,13 @@ where
         );
     }
 
-    // A client that was told to wait is waiting on us, and we hold the body it
-    // has not sent yet. Answer so it sends. Clients must accept more than one
-    // 1xx, so a later `100 Continue` from upstream is forwarded harmlessly.
-    crate::http_body::answer_continue_if_expected(tls_client, header_str).await?;
-
-    crate::http_body::read_body(tls_client, framing, crate::http_body::MAX_INSPECT_BYTES)
-        .await
-        .map_err(|err| err.to_string())
+    crate::http_body::read_for_inspection(
+        tls_client,
+        header_str,
+        framing,
+        crate::http_body::MAX_INSPECT_BYTES,
+    )
+    .await
 }
 
 #[cfg(test)]

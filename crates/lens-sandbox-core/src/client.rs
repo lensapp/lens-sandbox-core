@@ -475,6 +475,7 @@ enum PolicyResult {
 struct CredentialApply<'a> {
     injection_map: &'a mut HashMap<String, Vec<crate::proxy::CredentialInjection>>,
     uri_placeholder_map: &'a mut HashMap<String, Vec<(String, String)>>,
+    token_answer_map: &'a mut HashMap<String, Vec<crate::token_answer::TokenAnswer>>,
     aws_config_map: &'a mut HashMap<String, crate::aws_sigv4::AwsSigv4Config>,
     aws_domains: &'a mut Vec<String>,
     header_count: &'a mut usize,
@@ -548,6 +549,34 @@ fn apply_injection(
                 .entry(domain)
                 .or_default()
                 .push((placeholder.to_string(), value.clone()));
+        }
+        crate::policy_schema::CredentialInjection::OauthTokenAnswer {
+            domain,
+            path,
+            client_id,
+            scope,
+            access_token,
+            expires_in,
+        } => {
+            match crate::token_answer::TokenAnswer::new(
+                path,
+                client_id,
+                scope,
+                access_token,
+                *expires_in,
+            ) {
+                Ok(answer) => state
+                    .token_answer_map
+                    .entry(domain.to_lowercase())
+                    .or_default()
+                    .push(answer),
+                Err(reason) => tracing::error!(
+                    cred_id,
+                    domain = %domain,
+                    reason,
+                    "dropping oauthTokenAnswer injection"
+                ),
+            }
         }
         crate::policy_schema::CredentialInjection::AwsSigv4 {
             domain,
@@ -1089,6 +1118,8 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         let mut injection_map: HashMap<String, Vec<crate::proxy::CredentialInjection>> =
             HashMap::new();
         let mut uri_placeholder_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut token_answer_map: HashMap<String, Vec<crate::token_answer::TokenAnswer>> =
+            HashMap::new();
         let mut aws_config_map: HashMap<String, crate::aws_sigv4::AwsSigv4Config> = HashMap::new();
         let mut aws_domains: Vec<String> = Vec::new();
         let mut placeholder_index: HashMap<String, String> = HashMap::new();
@@ -1099,6 +1130,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             let mut apply = CredentialApply {
                 injection_map: &mut injection_map,
                 uri_placeholder_map: &mut uri_placeholder_map,
+                token_answer_map: &mut token_answer_map,
                 aws_config_map: &mut aws_config_map,
                 aws_domains: &mut aws_domains,
                 header_count: &mut header_count,
@@ -1127,15 +1159,26 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             // credential is unarmed. Indexed regardless of `env_var`: future
             // credential types may surface placeholders through means other
             // than env (config files, MCP, etc). Last-write-wins on duplicates.
-            if let Some(placeholder) = &cred.placeholder
-                && let Some(prior) = placeholder_index.insert(placeholder.clone(), cred.id.clone())
-            {
-                tracing::warn!(
-                    placeholder,
-                    prior_credential = prior,
-                    next_credential = cred.id,
-                    "duplicate placeholder across credentials; later credential wins"
-                );
+            //
+            // The token a token answer hands out is one too: the sandbox sends
+            // it where the credential's real token belongs.
+            let answered_tokens = cred.injections.iter().filter_map(|inj| match inj {
+                crate::policy_schema::CredentialInjection::OauthTokenAnswer {
+                    access_token,
+                    ..
+                } => Some(access_token),
+                _ => None,
+            });
+            for placeholder in cred.placeholder.iter().chain(answered_tokens) {
+                if let Some(prior) = placeholder_index.insert(placeholder.clone(), cred.id.clone())
+                {
+                    tracing::warn!(
+                        placeholder,
+                        prior_credential = prior,
+                        next_credential = cred.id,
+                        "duplicate placeholder across credentials; later credential wins"
+                    );
+                }
             }
         }
 
@@ -1155,6 +1198,15 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             );
         }
         *state.uri_placeholder_injections.write().unwrap() = uri_placeholder_map;
+
+        if !token_answer_map.is_empty() {
+            tracing::info!(
+                count = token_answer_map.values().map(|v| v.len()).sum::<usize>(),
+                domains = token_answer_map.len(),
+                "OAuth token answers updated from policy"
+            );
+        }
+        *state.token_answers.write().unwrap() = token_answer_map;
 
         tracing::info!(
             count = aws_config_map.len(),
@@ -1862,6 +1914,79 @@ mod tests {
                 .read()
                 .unwrap()
                 .contains_key("__lens_cred:cred-unarmed__")
+        );
+    }
+
+    // The token a token answer hands out stands in for the credential's real
+    // token, so an unarmed API domain gates it like the credential's own
+    // placeholder rather than forwarding it.
+    #[tokio::test]
+    async fn policy_indexes_an_answered_token_under_its_credential() {
+        let (listener, addr) = bind_server().await;
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            Vec::new(),
+        );
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut write, _read) = ws.split();
+
+            let policy = serde_json::json!({
+                "type": "policy",
+                "credentials": [
+                    {
+                        "id": "api-client",
+                        "envVar": "CLIENT_SECRET",
+                        "placeholder": "__lens_cred:api-client__",
+                        "injections": [
+                            {
+                                "injectionType": "header",
+                                "domain": "api.example.com",
+                                "header": "Authorization",
+                                "value": ""
+                            },
+                            {
+                                "injectionType": "oauthTokenAnswer",
+                                "domain": "login.example.com",
+                                "path": "/oauth2/token",
+                                "clientId": "client-1",
+                                "scope": "api.default",
+                                "accessToken": "placeholder-token",
+                                "expiresIn": 3600
+                            }
+                        ]
+                    }
+                ]
+            });
+            write
+                .send(Message::Text(policy.to_string().into()))
+                .await
+                .unwrap();
+
+            write.send(Message::Close(None)).await.ok();
+        });
+
+        let (ws_url, token) = make_config(addr);
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let session = TestDispatcher.new_session();
+        let proxy_state = Some(state.clone());
+
+        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+
+        let head = "POST /v3/conversations HTTP/1.1\r\nHost: api.example.com\r\n\
+                    Authorization: Bearer placeholder-token\r\n\r\n";
+        let matches = crate::mitm::scan_for_unarmed_placeholders(&state, head);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|m| m.credential_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["api-client"]
         );
     }
 
@@ -3545,6 +3670,74 @@ mod tests {
             header_map.is_empty(),
             "uriPlaceholder should not create header injections"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_policy_oauth_token_answer_populates_the_token_endpoint_map() {
+        let state = test_proxy_state();
+        let policy = serde_json::json!({
+            "type": "policy",
+            "credentials": [{
+                "id": "api-client",
+                "envVar": "API_CLIENT_SECRET",
+                "placeholder": "__lens_cred:api-client__",
+                "injections": [
+                    {
+                        "injectionType": "oauthTokenAnswer",
+                        "domain": "Login.Example.com",
+                        "path": "/oauth2/token",
+                        "clientId": "client-1",
+                        "scope": "api.default",
+                        "accessToken": "placeholder-token",
+                        "expiresIn": 3600
+                    },
+                    {
+                        "injectionType": "oauthTokenAnswer",
+                        "domain": "login.example.com",
+                        "path": "/oauth2/token",
+                        "clientId": "client-1",
+                        "scope": "dropped",
+                        "accessToken": "",
+                        "expiresIn": 3600
+                    },
+                    {
+                        "injectionType": "header",
+                        "domain": "api.example.com",
+                        "header": "Authorization",
+                        "value": "Bearer real-token"
+                    }
+                ]
+            }]
+        });
+        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        assert!(matches!(result, PolicyResult::Ok(_)));
+
+        {
+            let answers = state.token_answers.read().unwrap();
+            let entries = answers
+                .get("login.example.com")
+                .expect("expected domain entry");
+            // The answer with no access token is dropped, not installed.
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].client_id, "client-1");
+            assert_eq!(entries[0].access_token, "placeholder-token");
+            assert!(entries[0].scope.contains("api.default"));
+        }
+        assert!(state.intercept_for_token_answer("login.example.com"));
+        assert!(!state.intercept_for_token_answer("api.example.com"));
+        assert!(
+            state
+                .credential_injections
+                .read()
+                .unwrap()
+                .contains_key("api.example.com")
+        );
+
+        // The next policy replaces the answers like every other injection.
+        let cleared = serde_json::json!({ "type": "policy", "credentials": [] });
+        handle_policy(&cleared.to_string(), &Some(state.clone())).await;
+        assert!(state.token_answers.read().unwrap().is_empty());
+        assert!(!state.intercept_for_token_answer("login.example.com"));
     }
 
     #[tokio::test]

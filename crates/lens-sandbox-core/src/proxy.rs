@@ -238,6 +238,9 @@ pub struct ProxyState {
     /// Keyed by domain (lowercase). Only domains with `uriPlaceholder` injections
     /// trigger MITM for URI rewriting (not globally).
     pub uri_placeholder_injections: RwLock<HashMap<String, Vec<(String, String)>>>,
+    /// OAuth token requests the proxy answers itself, keyed by the token
+    /// endpoint's domain pattern (lowercase). See [`crate::token_answer`].
+    pub token_answers: RwLock<HashMap<String, Vec<crate::token_answer::TokenAnswer>>>,
     /// Extra CA certs to trust for upstream TLS (e.g. proxy CA for self-signed Lens Sandbox).
     pub extra_ca_certs: RwLock<Vec<rustls::pki_types::CertificateDer<'static>>>,
     /// Cached `TlsConnector` for the Lens Sandbox upstream, built from webpki
@@ -323,6 +326,16 @@ impl ProxyState {
         self.policy.read().unwrap().llm.claims_host(target_host)
     }
 
+    /// Whether a token request to this host may be one the proxy answers, so
+    /// the connection has to be intercepted for it to be answered.
+    pub(crate) fn intercept_for_token_answer(&self, target_host: &str) -> bool {
+        self.token_answers
+            .read()
+            .unwrap()
+            .keys()
+            .any(|pattern| crate::routing::injection_matches(pattern, target_host))
+    }
+
     /// Override the gate timeout. Test-only seam; production keeps the
     /// `gate::DECISION_TIMEOUT` default set at construction.
     #[cfg(test)]
@@ -342,6 +355,22 @@ pub(crate) fn collect_uri_placeholders(
     for (pattern, pairs) in map.iter() {
         if crate::routing::injection_matches(pattern, target_host) {
             matched.extend(pairs.iter().cloned());
+        }
+    }
+    matched
+}
+
+/// Collect the token answers whose domain pattern matches the given target
+/// host. Returns an empty vec if no domains match.
+pub(crate) fn collect_token_answers(
+    state: &ProxyState,
+    target_host: &str,
+) -> Vec<crate::token_answer::TokenAnswer> {
+    let map = state.token_answers.read().unwrap();
+    let mut matched = Vec::new();
+    for (pattern, answers) in map.iter() {
+        if crate::routing::injection_matches(pattern, target_host) {
+            matched.extend(answers.iter().cloned());
         }
     }
     matched
@@ -584,6 +613,7 @@ impl ProxyServer {
             ephemeral_ca: std::sync::OnceLock::new(),
             client_certs: RwLock::new(HashMap::new()),
             uri_placeholder_injections: RwLock::new(HashMap::new()),
+            token_answers: RwLock::new(HashMap::new()),
             extra_ca_certs: RwLock::new(Vec::new()),
             sandbox_tls_connector: RwLock::new(None),
             previous_policy_files: RwLock::new(Vec::new()),
@@ -1482,7 +1512,8 @@ async fn handle_connect(
                 || !domain_http_rules.is_empty()
                 || !uri_placeholders.is_empty()
                 || state.intercept_for_unarmed(target_host)
-                || state.intercept_for_llm(target_host);
+                || state.intercept_for_llm(target_host)
+                || state.intercept_for_token_answer(target_host);
             if needs_aws_resign {
                 // AWS-resign path owns the MITM for this connection; any
                 // other injections configured for the same host would be
@@ -1567,6 +1598,37 @@ async fn handle_connect(
             }
         }
         Transport::Upstream => {
+            // The proxy answers this host's token requests itself, so its tunnel
+            // opens only for a request that is forwarded, and an upstream that
+            // refuses the host cannot fail an answer. The CA is made here if it
+            // has to be, since an answer cannot survive a splice.
+            if state.intercept_for_token_answer(target_host) {
+                let ca = get_or_init_ca(state)?;
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
+                let audit_tx = state.audit_tx.lock().unwrap().clone();
+                let placeholders = collect_uri_placeholders(state, target_host);
+                let extra_certs = state.extra_ca_certs.read().unwrap().clone();
+                tracing::debug!(target = %target_host, "proxy LENS+MITM (tunnel on demand)");
+                let ctx = crate::mitm::MitmContext {
+                    injections: injections.as_deref().unwrap_or(&[]),
+                    http_rules: &domain_http_rules,
+                    ca,
+                    audit_tx: &audit_tx,
+                    extra_ca_certs: &extra_certs,
+                    placeholder_map: &placeholders,
+                    state,
+                    match_host: target_host,
+                    actor,
+                };
+                let mode = crate::mitm::UpstreamMode::TunnelOnDemand {
+                    target: target_host.to_string(),
+                };
+                crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
+                return Ok(());
+            }
+
             // Every branch below terminates the connection only where a CA
             // already exists and splices it otherwise, and a redirect cannot
             // survive a splice: it reaches the API the route exists to keep it
@@ -1688,6 +1750,7 @@ async fn handle_connect(
                 || !placeholders.is_empty()
                 || state.intercept_for_unarmed(target_host)
                 || state.intercept_for_llm(target_host)
+                || state.intercept_for_token_answer(target_host)
             {
                 if let Some(ca) = state.ephemeral_ca.get() {
                     // HTTPS upstream via Lens Sandbox tunnel — MITM to inject credentials,
@@ -2179,7 +2242,7 @@ pub(crate) fn pin_dns_answers(
 ///
 /// The explicit-CONNECT path deliberately does NOT use this: it must write HTTP
 /// status lines back to its own client on failure, which this helper can't do.
-async fn open_upstream_tunnel(
+pub(crate) async fn open_upstream_tunnel(
     state: &Arc<ProxyState>,
     target: &str,
     actor: &crate::peer_process::ActorContext,
@@ -2701,11 +2764,19 @@ async fn handle_transparent_tls(
         }
         Transport::Upstream => {
             // Open a CONNECT tunnel through Lens Sandbox before handing the
-            // pre-accepted TLS stream to the MITM pipeline. No success audit
+            // pre-accepted TLS stream to the MITM pipeline, unless the proxy
+            // answers this host's token requests itself. No success audit
             // here — the MITM pipeline audits per request.
-            let upstream_stream = open_upstream_tunnel(state, &target_host, &actor).await?;
+            let mode = if state.intercept_for_token_answer(&target_host) {
+                crate::mitm::UpstreamMode::TunnelOnDemand {
+                    target: target_host.clone(),
+                }
+            } else {
+                crate::mitm::UpstreamMode::TunnelTls(
+                    open_upstream_tunnel(state, &target_host, &actor).await?,
+                )
+            };
             tracing::debug!(target = %target_host, "transparent TLS LENS+MITM");
-            let mode = crate::mitm::UpstreamMode::TunnelTls(upstream_stream);
             crate::mitm::handle_mitm_pre_accepted(tls_client, &hostname, mode, &ctx).await?;
         }
     }
@@ -3756,6 +3827,7 @@ pub(crate) mod tests {
             ephemeral_ca: std::sync::OnceLock::new(),
             client_certs: RwLock::new(HashMap::new()),
             uri_placeholder_injections: RwLock::new(HashMap::new()),
+            token_answers: RwLock::new(HashMap::new()),
             extra_ca_certs: RwLock::new(Vec::new()),
             sandbox_tls_connector: RwLock::new(None),
             previous_policy_files: RwLock::new(Vec::new()),
@@ -5369,6 +5441,91 @@ pub(crate) mod tests {
         // door has decided what this route needs.
         let _ = connect_answer(&state, "api.anthropic.com:443").await;
         assert!(state.ephemeral_ca.get().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_tunnelled_token_request_is_answered_without_an_upstream() {
+        // The proxy holds everything the answer needs, so it answers with no
+        // upstream configured and no CA made before the connection.
+        use rustls::pki_types::pem::PemObject;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (state, _rx) = test_state();
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                default_verdict: Verdict::Allow,
+                default_transport: Transport::Upstream,
+                ..Default::default()
+            },
+        );
+        state.token_answers.write().unwrap().insert(
+            "login.example.com".into(),
+            vec![
+                crate::token_answer::TokenAnswer::new(
+                    "/oauth2/token",
+                    "client-1",
+                    "api.default",
+                    "placeholder-token",
+                    3600,
+                )
+                .unwrap(),
+            ],
+        );
+        assert!(state.upstream.lock().await.is_none());
+        assert!(state.ephemeral_ca.get().is_none());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let handler_state = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_connect(
+                server,
+                "login.example.com:443",
+                &test_actor(),
+                &handler_state,
+            )
+            .await
+        });
+
+        let mut established = [0u8; 39];
+        client.read_exact(&mut established).await.unwrap();
+        assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+
+        let mut roots = rustls::RootCertStore::empty();
+        let pem = state.ephemeral_ca.get().unwrap().ca_cert_pem();
+        for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                rustls::pki_types::ServerName::try_from("login.example.com").unwrap(),
+                client,
+            )
+            .await
+            .unwrap();
+        tls.write_all(
+            b"POST /oauth2/token HTTP/1.1\r\nHost: login.example.com\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 96\r\n\r\n\
+              grant_type=client_credentials&client_id=client-1&client_secret=__lens_cred:x__&scope=api.default",
+        )
+        .await
+        .unwrap();
+        let mut response = Vec::new();
+        let _ = tls.read_to_end(&mut response).await;
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("placeholder-token"), "{response}");
+        let _ = handler.await;
     }
 
     /// Drain everything currently on `rx` and decode as JSON, ignoring any

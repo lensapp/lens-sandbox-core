@@ -437,15 +437,13 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
 {
     ensure_carries_an_mcp_message(method)?;
-    crate::http_body::ensure_body_is_readable(header_str)?;
-
-    // A client that was told to wait is waiting on us, and we hold the body it
-    // has not sent yet. Answer so it sends.
-    crate::http_body::answer_continue_if_expected(tls_client, header_str).await?;
-
-    crate::http_body::read_body(tls_client, framing, crate::http_body::MAX_JUDGED_BODY_BYTES)
-        .await
-        .map_err(|err| err.to_string())
+    crate::http_body::read_for_inspection(
+        tls_client,
+        header_str,
+        framing,
+        crate::http_body::MAX_JUDGED_BODY_BYTES,
+    )
+    .await
 }
 
 #[cfg(test)]
