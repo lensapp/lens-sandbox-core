@@ -24,6 +24,18 @@
 //! Gating queries by the same allowlist that already protects TCP closes
 //! that door without adding any new policy surface.
 //!
+//! A name no rule matched falls to the policy's `default_verdict`. Under
+//! `ask` that means a person decides, so the stub raises the same approval card
+//! the TCP door would and answers SERVFAIL in the meantime — it never holds the
+//! query, because a resolver waits about five seconds and a developer does not.
+//! SERVFAIL rather than NXDOMAIN because a negative answer is cached (RFC 2308)
+//! and the retry after the click has to reach the stub again. An approval lands
+//! in `gate_resolved_hosts`, which is what makes that retry resolve. Under any
+//! other default the name is refused, unchanged. This is the DNS half of the
+//! reasoning already recorded on `HostnameMatch::Allowed`: NXDOMAIN preempts the
+//! dialog, and almost every client resolves before it dials, so without this the
+//! TCP gate is never reached and `ask` degrades into `deny`.
+//!
 //! Allowed `AAAA`, `HTTPS` (type 65), and `SVCB` (type 64) queries are
 //! answered with NODATA (NOERROR + empty answer) rather than forwarded: the
 //! transparent interceptor binds IPv4 loopback only, and all three record
@@ -52,8 +64,9 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 use crate::peer_process::{PeerProcess, resolve_udp_offloaded};
+use crate::protocol::Treatment;
 use crate::proxy::{ProxyState, emit_deny_event, pin_dns_answers};
-use crate::routing::{HostnameMatch, PortScope, hostname_match_for_caller};
+use crate::routing::{HostnameMatch, PortScope, Verdict, hostname_match_for_caller};
 use crate::sock_mark;
 
 /// Receive buffer for incoming DNS *queries*. 1232 is the EDNS0-recommended
@@ -214,6 +227,18 @@ async fn handle_query(
                 tracing::warn!(qname = %qname, "dns stub upstream error: {e}");
             }
         }
+        Decision::Ask { qname } => {
+            // Answered before the card is even raised: a resolver waits about
+            // five seconds and a developer does not. SERVFAIL rather than
+            // NXDOMAIN because a negative answer is cached (RFC 2308) and the
+            // retry after the click would be answered from that cache instead
+            // of reaching the stub again.
+            tracing::debug!(qname = %qname, "dns stub asking about an unmatched name");
+            if let Some(resp) = empty_response(&packet, ResponseCode::ServFail) {
+                let _ = socket.send_to(&resp, peer).await;
+            }
+            ask_in_background(state, qname);
+        }
         Decision::Deny { qname, reason } => {
             emit_deny(state, &qname, reason);
             if let Some(resp) = empty_response(&packet, ResponseCode::NXDomain) {
@@ -246,6 +271,12 @@ enum Decision {
         should_pin: bool,
         generation: u64,
     },
+    /// No rule named this host and the policy's default verdict is `Ask`. Put
+    /// the name to the developer and answer SERVFAIL meanwhile — see
+    /// [`ask_in_background`] for why the query is not held.
+    Ask {
+        qname: String,
+    },
     Deny {
         qname: String,
         reason: &'static str,
@@ -254,6 +285,46 @@ enum Decision {
         qname: String,
     },
     Malformed,
+}
+
+/// The action a DNS card names. No port: a query names none, and the approval
+/// is keyed on the host either way.
+fn ask_action(qname: &str) -> String {
+    format!("DNS {qname}")
+}
+
+/// Why a DNS card is being raised — the same reason the L7 door gives when the
+/// default verdict is what decided.
+const ASK_REASON: &str = "policy-ambiguous";
+
+/// Raise the card for `qname` without holding anything.
+///
+/// The query has already been answered SERVFAIL by the time this runs: waiting
+/// for a person with a datagram in hand is what the DNS path cannot do, so the
+/// answer a click buys is the *next* lookup's, resolved through
+/// `gate_resolved_hosts` (which [`crate::gate::gate_or_deny`] writes on an
+/// allow). A resolver retries, so that next lookup arrives on its own.
+///
+/// Retries in the meantime would each join the open dialog and wait out the
+/// decision timeout for nothing, so a name already on screen is skipped here
+/// rather than at the gate.
+fn ask_in_background(state: &Arc<ProxyState>, qname: String) {
+    let action = ask_action(&qname);
+    if crate::gate::dialog_is_open(state, &action, Treatment::Datagram) {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let answer =
+            crate::gate::gate_or_deny(&state, &qname, &action, ASK_REASON, Treatment::Datagram)
+                .await;
+        if answer.is_allow() {
+            crate::proxy::emit_gate_resolved(&state, &action, answer);
+            tracing::info!(qname = %qname, reason = answer.audit_reason(), "dns stub ALLOWED (gated)");
+        } else {
+            crate::proxy::emit_gate_denied(&state, &action, answer);
+        }
+    });
 }
 
 /// Audit reason for a name blocked because no route allows it (or an explicit
@@ -364,6 +435,9 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
     // whether the name resolves and whether to pin, so those two cannot disagree.
     let policy = state.policy.read().unwrap();
     let generation = policy.generation;
+    // Read here, with the tables, and not again later: the verdict a name falls
+    // to and the pin that verdict implies have to belong to one policy.
+    let default_verdict = policy.default_verdict;
     let tcp_match =
         hostname_match_for_caller(&policy.tcp_egress, &normalized, caller, PortScope::PerPort);
     // The udp table is read the same way and for the same reason: its hostname
@@ -377,7 +451,7 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
     // verdict — the connect or the datagram re-evaluates.
     let should_pin = tcp_match != HostnameMatch::Unmatched || udp_match != HostnameMatch::Unmatched;
 
-    let allow = |qname| {
+    let allow_pinned_as = |qname, should_pin| {
         if should_suppress {
             Decision::SuppressNodata { qname }
         } else {
@@ -388,6 +462,7 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
             }
         }
     };
+    let allow = |qname| allow_pinned_as(qname, should_pin);
 
     // Supervisor bootstrap hosts (set once at startup, never updated) need
     // to resolve before any policy has arrived — otherwise the supervisor
@@ -441,7 +516,18 @@ fn classify_query(packet: &[u8], state: &ProxyState, caller: Option<&PeerProcess
         .unwrap()
         .contains(&normalized)
     {
-        return allow(normalized);
+        // Pin it, whatever the tables say. Nothing else can: the approval names
+        // a host and persists no rule, so without a pin here the address the
+        // developer approved arrives at the raw doors bound to no name at all.
+        return allow_pinned_as(normalized, true);
+    }
+
+    // No rule claimed the name and no approval covers it, so the default
+    // verdict answers. `Ask` means a person decides — and they cannot, if the
+    // lookup NXDOMAINs before anything dials the address the card would be
+    // about. Every other default fails the name closed.
+    if default_verdict == Verdict::Ask {
+        return Decision::Ask { qname: normalized };
     }
 
     Decision::Deny {
@@ -1329,15 +1415,116 @@ mod tests {
         }
     }
 
+    /// Set the verdict a name no rule matched falls to.
+    fn with_default_verdict(state: &Arc<ProxyState>, verdict: Verdict) {
+        state.policy.write().unwrap().default_verdict = verdict;
+    }
+
     #[test]
-    fn deny_empty_policy() {
-        // Zero routes: no name can ever resolve. Correct fail-closed behaviour.
+    fn deny_empty_policy_under_a_deny_default() {
+        // Zero routes under `defaultVerdict: deny`: no name can ever resolve.
+        // Correct fail-closed behaviour, and the only default that may NXDOMAIN
+        // an unmatched name — `ask` has a developer to consult first.
         let state = state_with_routes(vec![]);
+        with_default_verdict(&state, Verdict::Deny);
         let packet = make_query("example.com", RecordType::A);
         assert!(matches!(
             classify_query(&packet, &state, None),
             Decision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn an_unmatched_name_under_an_ask_default_is_put_to_the_developer() {
+        // The bug this test exists for: the stub read no default verdict at all,
+        // so `defaultVerdict: ask` NXDOMAIN'd every unmatched name. Nearly every
+        // client resolves before it dials, so the TCP gate that was supposed to
+        // raise the card was never reached and `ask` silently became `deny`.
+        let state = state_with_routes(vec![]);
+        with_default_verdict(&state, Verdict::Ask);
+        let packet = make_query("example.com", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Ask { qname } => assert_eq!(qname, "example.com"),
+            other => panic!(
+                "an unmatched name under ask must be asked about, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn an_unmatched_aaaa_under_an_ask_default_is_asked_not_suppressed() {
+        // NODATA for AAAA while the A record is still pending a decision tells a
+        // happy-eyeballs client "no IPv6 here" and nothing at all about IPv4 —
+        // the pair must move together, and both are pending the same card.
+        let state = state_with_routes(vec![]);
+        with_default_verdict(&state, Verdict::Ask);
+        for rtype in [RecordType::AAAA, RecordType::HTTPS, RecordType::SVCB] {
+            let packet = make_query("example.com", rtype);
+            match classify_query(&packet, &state, None) {
+                Decision::Ask { qname } => assert_eq!(qname, "example.com"),
+                other => panic!(
+                    "{rtype} under ask must join the A record's card, got: {}",
+                    describe(&other)
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_deny_is_never_asked_about_under_an_ask_default() {
+        // The default verdict answers for names no rule claimed. A rule that
+        // denied the name has already answered, and a card would offer to undo
+        // it.
+        let state = state_with_routes(vec![deny_rule("evil.example")]);
+        with_default_verdict(&state, Verdict::Ask);
+        let packet = make_query("evil.example", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Deny { reason, .. } => assert_eq!(reason, DENY_REASON),
+            other => panic!("an explicit deny must stand, got: {}", describe(&other)),
+        }
+    }
+
+    #[test]
+    fn a_binary_scoped_exclusion_is_never_asked_about_under_an_ask_default() {
+        // A host-keyed approval cannot re-open a binary-scoped name (see
+        // `a_gate_approved_host_cannot_reopen_a_binary_scoped_name`), so asking
+        // would raise a card whose approval the excluded caller must not get.
+        let state = state_with_routes(vec![binary_rule("api.example.com", &["/usr/bin/curl"])]);
+        with_default_verdict(&state, Verdict::Ask);
+        let packet = make_query("api.example.com", RecordType::A);
+        let wget = caller("/usr/bin/wget");
+        match classify_query(&packet, &state, Some(&wget)) {
+            Decision::Deny { reason, .. } => assert_eq!(reason, BINARY_DENY_REASON),
+            other => panic!(
+                "an excluded caller must fail closed, got: {}",
+                describe(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn an_approved_name_resolves_and_pins_though_no_rule_names_it() {
+        // What the developer's click buys: the next lookup resolves, and its
+        // answer is pinned. Without the pin the raw doors see an address no name
+        // is bound to, so the dial the approval was for is attributed to nothing
+        // — and the approval is host-keyed, so there is nothing else to key on.
+        let state = state_with_routes(vec![]);
+        with_default_verdict(&state, Verdict::Ask);
+        state
+            .gate_resolved_hosts
+            .write()
+            .unwrap()
+            .insert("example.com".to_string());
+
+        let packet = make_query("example.com", RecordType::A);
+        match classify_query(&packet, &state, None) {
+            Decision::Allow { should_pin, .. } => assert!(
+                should_pin,
+                "an approved name has no rule to pin it, so the approval must"
+            ),
+            other => panic!("an approved name must resolve, got: {}", describe(&other)),
+        }
     }
 
     #[test]
@@ -1683,6 +1870,7 @@ mod tests {
     fn describe(d: &Decision) -> &'static str {
         match d {
             Decision::Allow { .. } => "Allow",
+            Decision::Ask { .. } => "Ask",
             Decision::Deny { .. } => "Deny",
             Decision::SuppressNodata { .. } => "SuppressNodata",
             Decision::Malformed => "Malformed",

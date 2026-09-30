@@ -22,6 +22,7 @@ use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use lens_sandbox_core::proxy::{ProxyServer, ProxyState};
 use lens_sandbox_core::routing::{RouteMatcher, RouteRule, Transport, Verdict};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 fn build_query(qname: &str, qtype: RecordType, id: u16) -> Vec<u8> {
     let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
@@ -281,6 +282,164 @@ async fn answer_for_unlisted_host_is_not_pinned() {
         state.policy.read().unwrap().pins.is_empty(),
         "an L7-only host must not create a raw-TCP pin"
     );
+}
+
+/// Fresh `ProxyState` with no rules at all and `defaultVerdict: ask`, plus the
+/// audit channel the gate needs to raise a card on. Without a wired channel the
+/// gate fails closed at once and no dialog is ever emitted.
+fn state_asking_about_everything() -> (Arc<ProxyState>, mpsc::UnboundedReceiver<String>) {
+    let (_srv, state) = ProxyServer::new(
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        Vec::new(),
+    );
+    state.policy.write().unwrap().default_verdict = Verdict::Ask;
+    let (tx, rx) = mpsc::unbounded_channel();
+    *state.audit_tx.lock().unwrap() = Some(tx);
+    (state, rx)
+}
+
+/// The next frame on the audit channel, or a panic if none arrives.
+async fn next_frame(rx: &mut mpsc::UnboundedReceiver<String>) -> serde_json::Value {
+    let raw = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("a frame before timeout")
+        .expect("channel open");
+    serde_json::from_str(&raw).expect("a json frame")
+}
+
+async fn ask_and_read(client: &UdpSocket, query: &[u8]) -> Message {
+    client.send(query).await.unwrap();
+    let mut buf = [0u8; 1500];
+    let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+        .await
+        .expect("reply before timeout")
+        .expect("recv ok");
+    Message::from_vec(&buf[..n]).unwrap()
+}
+
+#[tokio::test]
+async fn an_unmatched_name_under_an_ask_default_raises_a_card_and_servfails() {
+    // Point the "upstream" at an unreachable port: a name nobody has approved
+    // must not be forwarded, and SERVFAIL has to come from the stub itself.
+    let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let (state, mut rx) = state_asking_about_everything();
+    let stub_addr = spawn_stub_with_upstream(state, unreachable).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(stub_addr).await.unwrap();
+    let resp = ask_and_read(&client, &build_query("example.com", RecordType::A, 0x1111)).await;
+
+    // SERVFAIL, not NXDOMAIN: a negative answer is cached (RFC 2308), and the
+    // retry after the developer clicks allow would then never reach the stub.
+    assert_eq!(resp.metadata.id, 0x1111);
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+
+    let frame = next_frame(&mut rx).await;
+    assert_eq!(frame["type"], "request_pending");
+    assert_eq!(frame["host"], "example.com");
+    assert_eq!(frame["action"], "DNS example.com");
+}
+
+#[tokio::test]
+async fn the_a_and_aaaa_lookups_of_one_name_raise_one_card() {
+    // A client resolving both families asks twice for one destination. Two
+    // cards for one `curl` is not a policy decision the developer can answer.
+    let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let (state, mut rx) = state_asking_about_everything();
+    let stub_addr = spawn_stub_with_upstream(state, unreachable).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(stub_addr).await.unwrap();
+    for (rtype, id) in [(RecordType::A, 0x2222), (RecordType::AAAA, 0x2223)] {
+        let resp = ask_and_read(&client, &build_query("example.com", rtype, id)).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::ServFail,
+            "{rtype} must stay pending with the A record, not answer NODATA"
+        );
+    }
+
+    let frame = next_frame(&mut rx).await;
+    assert_eq!(frame["type"], "request_pending");
+    // Give a second card every chance to appear before calling its absence.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "the second family must join the open card, not raise its own"
+    );
+}
+
+#[tokio::test]
+async fn an_approved_name_resolves_on_the_retry_and_is_pinned() {
+    // What the click has to buy. The lookup that raised the card is already
+    // answered and gone; the resolver's own retry is what must succeed.
+    let resolved = Ipv4Addr::new(203, 0, 113, 7);
+    let upstream = spawn_mock_upstream_with_a(resolved).await;
+    let (state, mut rx) = state_asking_about_everything();
+    let stub_addr = spawn_stub_with_upstream(state.clone(), upstream).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(stub_addr).await.unwrap();
+    let resp = ask_and_read(&client, &build_query("example.com", RecordType::A, 0x3333)).await;
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+
+    let frame = next_frame(&mut rx).await;
+    let id = frame["id"].as_str().expect("a correlation id").to_string();
+    assert!(lens_sandbox_core::gate::resolve_pending(
+        &state,
+        &id,
+        lens_sandbox_core::protocol::Decision::AllowOnce
+    ));
+
+    // The gate records the approval after it wakes, so retry the way a resolver
+    // would rather than assume the click has landed.
+    let mut code = ResponseCode::ServFail;
+    for attempt in 0..40u16 {
+        let resp = ask_and_read(&client, &build_query("example.com", RecordType::A, attempt)).await;
+        code = resp.metadata.response_code;
+        if code == ResponseCode::NoError {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        code,
+        ResponseCode::NoError,
+        "the retry after an approval must resolve"
+    );
+
+    // Pinned under the approved name: no rule names it, so nothing else can
+    // bind the address the developer just approved to what they approved.
+    let policy = state.policy.read().unwrap();
+    let entry = policy
+        .pins
+        .get(&IpAddr::V4(resolved))
+        .expect("an approved name's answer must be pinned");
+    assert!(entry.iter().any(|p| p.qname == "example.com"));
+}
+
+#[tokio::test]
+async fn an_unmatched_name_under_a_deny_default_still_nxdomains() {
+    // The other default is unchanged: no card, no SERVFAIL, no forward.
+    let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let (state, mut rx) = state_asking_about_everything();
+    state.policy.write().unwrap().default_verdict = Verdict::Deny;
+    let stub_addr = spawn_stub_with_upstream(state, unreachable).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(stub_addr).await.unwrap();
+    let resp = ask_and_read(&client, &build_query("example.com", RecordType::A, 0x4444)).await;
+    assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
+
+    let frame = next_frame(&mut rx).await;
+    assert_eq!(
+        frame["type"], "audit_event",
+        "a deny default records the refusal and asks nobody"
+    );
+    assert_eq!(frame["metadata"]["reason"], "dns-denied");
 }
 
 #[tokio::test]

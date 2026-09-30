@@ -184,6 +184,19 @@ fn resolve<V: Copy>(table: &std::sync::Mutex<PendingTable<V>>, id: &str, decisio
 ///
 /// Returns the resolved `Decision` so callers can record the appropriate
 /// audit event with `Decision::audit_reason()`.
+fn pending_key(action: &str, treatment: Treatment) -> String {
+    format!("{treatment:?}|{action}")
+}
+
+/// Whether a dialog for this action is already on screen. For a caller that
+/// holds nothing while it asks — the DNS stub answers at once — and so would
+/// otherwise pile up one joiner per retry behind a card the developer is
+/// already looking at.
+pub(crate) fn dialog_is_open(state: &ProxyState, action: &str, treatment: Treatment) -> bool {
+    let key = pending_key(action, treatment);
+    state.pending.lock().unwrap().by_key.contains_key(&key)
+}
+
 pub async fn gate_or_deny(
     state: &ProxyState,
     host: &str,
@@ -191,7 +204,7 @@ pub async fn gate_or_deny(
     reason: &str,
     treatment: Treatment,
 ) -> Decision {
-    let key = format!("{treatment:?}|{action}");
+    let key = pending_key(action, treatment);
     let (rx, id, emitted) = match subscribe_or_open(&state.pending, &key, "gate", |id| {
         emit_pending_frame(
             state,
