@@ -98,7 +98,7 @@
       ]
     },
     "CredentialInjection": {
-      "description": "How a credential applies to outbound requests on a specific domain.\nTagged at the JSON level by `injectionType` — each variant carries the\nfields it actually needs, required at compile time.\n\n- **`header`**: replace an HTTP header on matching requests. The MITM\n  substitutes [`value`] into [`header`]. When `bodyField` and `bodyValue`\n  are set, the same requests also get `bodyValue` written into that field\n  of a `application/x-www-form-urlencoded` body — for an API that reads its\n  token from the body before the header.\n- **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder\n  patterns in the request URI to the real credential value.\n- **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with\n  `placeholder` on the parent [`Credential`]) and re-sign with the real\n  STS credentials below. Real creds live only in sandbox-core process\n  memory — they never touch the sandbox filesystem.\n- **`oauthTokenAnswer`**: answer an OAuth 2.0 client-credentials token\n  request (RFC 6749 §4.4) in the proxy with a placeholder access token, so\n  the request never leaves the sandbox. Paired with a `header` injection on\n  each API domain that replaces the placeholder with the real token.",
+      "description": "How a credential applies to outbound requests on a specific domain.\nTagged at the JSON level by `injectionType` — each variant carries the\nfields it actually needs, required at compile time.\n\n- **`header`**: replace an HTTP header on matching requests. The MITM\n  substitutes [`value`] into [`header`]. When `bodyField` and `bodyValue`\n  are set, the same requests also get `bodyValue` written into that field\n  of a `application/x-www-form-urlencoded` body — for an API that reads its\n  token from the body before the header.\n- **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder\n  patterns in the request URI to the real credential value.\n- **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with\n  `placeholder` on the parent [`Credential`]) and re-sign with the real\n  STS credentials below. Real creds live only in sandbox-core process\n  memory — they never touch the sandbox filesystem.\n- **`oauthTokenAnswer`**: answer an OAuth 2.0 client-credentials token\n  request (RFC 6749 §4.4) in the proxy with a placeholder access token, so\n  the request never leaves the sandbox. Paired with a `header` injection on\n  each API domain that replaces the placeholder with the real token.\n- **`oauthRefreshAnswer`**: the same answer for an OAuth 2.0 refresh-token\n  request (RFC 6749 §6) that carries a placeholder refresh token.",
       "oneOf": [
         {
           "type": "object",
@@ -253,6 +253,46 @@
             "domain",
             "path",
             "clientId",
+            "accessToken",
+            "expiresIn"
+          ]
+        },
+        {
+          "description": "Answers a `POST` to [`path`](Self::OauthRefreshAnswer::path) on\n[`domain`](Self::OauthRefreshAnswer::domain) whose urlencoded body asks\nfor `grant_type=refresh_token` with\n[`refreshToken`](Self::OauthRefreshAnswer::refresh_token), whatever\nclient and scope it names. Every other request to the domain, including\none with another refresh token, is forwarded unchanged.",
+          "type": "object",
+          "properties": {
+            "accessToken": {
+              "description": "Placeholder returned as `access_token`. It grants nothing outside\nthe proxy.",
+              "type": "string"
+            },
+            "domain": {
+              "description": "Host of the token endpoint.",
+              "type": "string"
+            },
+            "expiresIn": {
+              "description": "Lifetime in seconds returned as `expires_in`.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "injectionType": {
+              "type": "string",
+              "const": "oauthRefreshAnswer"
+            },
+            "path": {
+              "description": "Path of the token endpoint (e.g. `/oauth2/token`).",
+              "type": "string"
+            },
+            "refreshToken": {
+              "description": "Placeholder the sandbox holds as its refresh token, and returned\nas `refresh_token`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "injectionType",
+            "domain",
+            "path",
+            "refreshToken",
             "accessToken",
             "expiresIn"
           ]

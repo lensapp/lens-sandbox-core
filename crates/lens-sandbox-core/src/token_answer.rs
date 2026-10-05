@@ -1,58 +1,98 @@
-//! The `oauthTokenAnswer` credential injection: an OAuth 2.0 client-credentials
-//! token request (RFC 6749 §4.4) answered by the proxy instead of forwarded.
+//! The `oauthTokenAnswer` and `oauthRefreshAnswer` credential injections: an
+//! OAuth 2.0 client-credentials (RFC 6749 §4.4) or refresh-token (§6) request
+//! answered by the proxy instead of forwarded.
 //!
 //! The sandbox's SDK runs its usual grant against the token endpoint, with a
-//! placeholder where the client secret goes. The proxy answers that request
+//! placeholder where the client secret or the refresh token goes. The proxy answers that request
 //! with a placeholder access token, so neither the request nor anything in it
 //! leaves the sandbox. A `header` injection on each API domain then replaces
 //! the placeholder token with the real one on the way out. The real secret and
 //! the real token stay with the host that sends the policy.
 //!
 //! A request is answered only when it is a `POST` to a configured path whose
-//! form body asks for `grant_type=client_credentials` for a configured client.
-//! Any other request to the host is forwarded as the sandbox sent it, so a
-//! client the sandbox holds its own secret for keeps working.
+//! form body asks for `grant_type=client_credentials` for a configured client,
+//! or for `grant_type=refresh_token` with a configured placeholder refresh
+//! token. Any other request to the host is forwarded as the sandbox sent it, so
+//! a client the sandbox holds its own secret or refresh token for keeps working.
 
 use std::collections::BTreeSet;
 
 use base64::Engine;
 
-/// A token request the proxy answers for one client and one scope.
+/// A token request the proxy answers at one token endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenAnswer {
     /// Token endpoint path, normalized as request paths are.
     pub path: String,
-    pub client_id: String,
-    /// The requested scope must equal this set; an empty set answers a request
-    /// that names no scope.
-    pub scope: BTreeSet<String>,
+    pub grant: Grant,
     /// The placeholder handed to the sandbox as `access_token`.
     pub access_token: String,
     /// Seconds reported as `expires_in`.
     pub expires_in: u64,
 }
 
+/// The grant a [`TokenAnswer`] answers, and what identifies a request for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Grant {
+    ClientCredentials {
+        client_id: String,
+        /// The requested scope must equal this set; an empty set answers a
+        /// request that names no scope.
+        scope: BTreeSet<String>,
+    },
+    /// Identified by the placeholder alone, because public clients share one
+    /// client id across every user and a refresh may narrow its scope.
+    RefreshToken { refresh_token: String },
+}
+
 impl TokenAnswer {
-    pub(crate) fn new(
+    pub(crate) fn client_credentials(
         path: &str,
         client_id: &str,
         scope: &str,
         access_token: &str,
         expires_in: u64,
     ) -> Result<Self, &'static str> {
-        if !path.starts_with('/') {
-            return Err("path must start with '/'");
-        }
         if client_id.is_empty() {
             return Err("clientId is empty");
+        }
+        let grant = Grant::ClientCredentials {
+            client_id: client_id.to_string(),
+            scope: scope_set(scope),
+        };
+        Self::new(path, grant, access_token, expires_in)
+    }
+
+    pub(crate) fn refresh_token(
+        path: &str,
+        refresh_token: &str,
+        access_token: &str,
+        expires_in: u64,
+    ) -> Result<Self, &'static str> {
+        if refresh_token.is_empty() {
+            return Err("refreshToken is empty");
+        }
+        let grant = Grant::RefreshToken {
+            refresh_token: refresh_token.to_string(),
+        };
+        Self::new(path, grant, access_token, expires_in)
+    }
+
+    fn new(
+        path: &str,
+        grant: Grant,
+        access_token: &str,
+        expires_in: u64,
+    ) -> Result<Self, &'static str> {
+        if !path.starts_with('/') {
+            return Err("path must start with '/'");
         }
         if access_token.is_empty() {
             return Err("accessToken is empty");
         }
         Ok(Self {
             path: crate::routing::normalize_path(path),
-            client_id: client_id.to_string(),
-            scope: scope_set(scope),
+            grant,
             access_token: access_token.to_string(),
             expires_in,
         })
@@ -62,7 +102,7 @@ impl TokenAnswer {
 /// What the proxy does with a request to a host that has token answers.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Decision<'a> {
-    /// Not a client-credentials request for a configured client: forward it.
+    /// Not a request any answer covers: forward it.
     NotOurs,
     /// Answer with this placeholder token.
     Answer(&'a TokenAnswer),
@@ -96,40 +136,71 @@ pub(crate) fn decide<'a>(
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
     };
-    if field("grant_type") != Some("client_credentials") {
-        return Decision::NotOurs;
+    let mut at_path = answers.iter().filter(|answer| answer.path == path);
+    match field("grant_type") {
+        Some("client_credentials") => {
+            let Some(client_id) = field("client_id")
+                .map(str::to_string)
+                .or_else(|| basic_auth_client_id(head))
+            else {
+                return Decision::NotOurs;
+            };
+            let requested = scope_set(field("scope").unwrap_or(""));
+            decide_client_credentials(at_path, &client_id, &requested)
+        }
+        Some("refresh_token") => {
+            let Some(sent) = field("refresh_token") else {
+                return Decision::NotOurs;
+            };
+            at_path
+                .find(|answer| {
+                    matches!(&answer.grant, Grant::RefreshToken { refresh_token } if refresh_token == sent)
+                })
+                .map_or(Decision::NotOurs, Decision::Answer)
+        }
+        _ => Decision::NotOurs,
     }
-    let Some(client_id) = field("client_id")
-        .map(str::to_string)
-        .or_else(|| basic_auth_client_id(head))
-    else {
-        return Decision::NotOurs;
-    };
-    let mut for_client = answers
-        .iter()
-        .filter(|answer| answer.path == path && answer.client_id == client_id)
+}
+
+fn decide_client_credentials<'a>(
+    at_path: impl Iterator<Item = &'a TokenAnswer>,
+    client_id: &str,
+    requested: &BTreeSet<String>,
+) -> Decision<'a> {
+    let mut for_client = at_path
+        .filter_map(|answer| match &answer.grant {
+            Grant::ClientCredentials {
+                client_id: id,
+                scope,
+            } if id == client_id => Some((answer, scope)),
+            _ => None,
+        })
         .peekable();
     if for_client.peek().is_none() {
         return Decision::NotOurs;
     }
-    let requested = scope_set(field("scope").unwrap_or(""));
     for_client
-        .find(|answer| answer.scope == requested)
-        .map_or(Decision::InvalidScope, Decision::Answer)
+        .find(|(_, scope)| *scope == requested)
+        .map_or(Decision::InvalidScope, |(answer, _)| {
+            Decision::Answer(answer)
+        })
 }
 
 /// The response for a decision the proxy answers itself.
 pub(crate) fn response(decision: &Decision<'_>) -> Option<Vec<u8>> {
     let (status, body) = match decision {
         Decision::NotOurs => return None,
-        Decision::Answer(answer) => (
-            "200 OK",
-            serde_json::json!({
+        Decision::Answer(answer) => {
+            let mut body = serde_json::json!({
                 "token_type": "Bearer",
                 "access_token": answer.access_token,
                 "expires_in": answer.expires_in,
-            }),
-        ),
+            });
+            if let Grant::RefreshToken { refresh_token } = &answer.grant {
+                body["refresh_token"] = refresh_token.as_str().into();
+            }
+            ("200 OK", body)
+        }
         Decision::InvalidScope => (
             "400 Bad Request",
             serde_json::json!({
@@ -195,7 +266,7 @@ mod tests {
     const FORM: &str = "Content-Type: application/x-www-form-urlencoded";
 
     fn answer(scope: &str) -> TokenAnswer {
-        TokenAnswer::new(
+        TokenAnswer::client_credentials(
             "/oauth2/token",
             "client-1",
             scope,
@@ -325,10 +396,102 @@ mod tests {
         assert!(response(&Decision::NotOurs).is_none());
     }
 
+    fn refresh_answer() -> TokenAnswer {
+        TokenAnswer::refresh_token(
+            "/oauth2/token",
+            "placeholder-refresh",
+            "placeholder-token",
+            3600,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_refresh_request_with_the_placeholder_is_answered_for_any_client_and_scope() {
+        let answers = [refresh_answer()];
+        let body = b"grant_type=refresh_token&refresh_token=placeholder-refresh\
+                     &client_id=shared-public-client&scope=narrower";
+
+        assert_eq!(
+            decide(&answers, "POST", "/oauth2/token", &head(""), body),
+            Decision::Answer(&answers[0])
+        );
+    }
+
+    #[test]
+    fn a_refresh_request_with_another_refresh_token_is_forwarded() {
+        let answers = [refresh_answer()];
+        let real = b"grant_type=refresh_token&refresh_token=a-real-token-the-sandbox-holds";
+        let missing = b"grant_type=refresh_token&client_id=shared-public-client";
+
+        assert_eq!(
+            decide(&answers, "POST", "/oauth2/token", &head(""), real),
+            Decision::NotOurs
+        );
+        assert_eq!(
+            decide(&answers, "POST", "/oauth2/token", &head(""), missing),
+            Decision::NotOurs
+        );
+    }
+
+    #[test]
+    fn a_client_credentials_answer_does_not_answer_a_refresh_request() {
+        let answers = [answer("")];
+        let body = b"grant_type=refresh_token&refresh_token=placeholder-token&client_id=client-1";
+
+        assert_eq!(
+            decide(&answers, "POST", "/oauth2/token", &head(""), body),
+            Decision::NotOurs
+        );
+    }
+
+    #[test]
+    fn a_refresh_answer_does_not_answer_a_client_credentials_request() {
+        let answers = [refresh_answer()];
+        let body = b"grant_type=client_credentials&client_id=placeholder-refresh";
+
+        assert_eq!(
+            decide(&answers, "POST", "/oauth2/token", &head(""), body),
+            Decision::NotOurs
+        );
+    }
+
+    #[test]
+    fn the_refresh_answer_hands_back_the_placeholder_refresh_token() {
+        let answers = [refresh_answer()];
+        let answered =
+            String::from_utf8(response(&Decision::Answer(&answers[0])).unwrap()).unwrap();
+        let (_, body) = answered.split_once("\r\n\r\n").unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+
+        assert_eq!(json["token_type"], "Bearer");
+        assert_eq!(json["access_token"], "placeholder-token");
+        assert_eq!(json["refresh_token"], "placeholder-refresh");
+        assert_eq!(json["expires_in"], 3600);
+    }
+
+    #[test]
+    fn a_client_credentials_answer_hands_back_no_refresh_token() {
+        let answers = [answer("")];
+        let answered =
+            String::from_utf8(response(&Decision::Answer(&answers[0])).unwrap()).unwrap();
+        let (_, body) = answered.split_once("\r\n\r\n").unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+
+        assert!(json.get("refresh_token").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_refresh_answer_needs_a_path_a_refresh_token_and_a_token() {
+        assert!(TokenAnswer::refresh_token("oauth2/token", "r", "t", 1).is_err());
+        assert!(TokenAnswer::refresh_token("/oauth2/token", "", "t", 1).is_err());
+        assert!(TokenAnswer::refresh_token("/oauth2/token", "r", "", 1).is_err());
+    }
+
     #[test]
     fn an_answer_needs_a_path_a_client_and_a_token() {
-        assert!(TokenAnswer::new("oauth2/token", "c", "", "t", 1).is_err());
-        assert!(TokenAnswer::new("/oauth2/token", "", "", "t", 1).is_err());
-        assert!(TokenAnswer::new("/oauth2/token", "c", "", "", 1).is_err());
+        assert!(TokenAnswer::client_credentials("oauth2/token", "c", "", "t", 1).is_err());
+        assert!(TokenAnswer::client_credentials("/oauth2/token", "", "", "t", 1).is_err());
+        assert!(TokenAnswer::client_credentials("/oauth2/token", "c", "", "", 1).is_err());
     }
 }

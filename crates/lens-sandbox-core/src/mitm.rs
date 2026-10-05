@@ -1110,8 +1110,8 @@ async fn mitm_inject_after_accept(
         }
     }
 
-    // A client-credentials request the policy holds a token for is answered here
-    // with a placeholder, and nothing of it is forwarded. See `crate::token_answer`.
+    // A token request the policy holds an answer for is answered here with a
+    // placeholder, and nothing of it is forwarded. See `crate::token_answer`.
     let token_answers = crate::proxy::collect_token_answers(ctx.state, ctx.match_host);
     if !is_upgrade && crate::token_answer::may_answer(&token_answers, method, path, &header_str) {
         let body = match buffered_body.take() {
@@ -2971,7 +2971,7 @@ mod tests {
     }
 
     fn token_answer(scope: &str) -> crate::token_answer::TokenAnswer {
-        crate::token_answer::TokenAnswer::new(
+        crate::token_answer::TokenAnswer::client_credentials(
             "/oauth2/token",
             "client-1",
             scope,
