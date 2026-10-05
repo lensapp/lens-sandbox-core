@@ -5479,7 +5479,7 @@ pub(crate) mod tests {
         state.token_answers.write().unwrap().insert(
             "login.example.com".into(),
             vec![
-                crate::token_answer::TokenAnswer::new(
+                crate::token_answer::TokenAnswer::client_credentials(
                     "/oauth2/token",
                     "client-1",
                     "api.default",

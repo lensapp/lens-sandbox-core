@@ -469,6 +469,29 @@ enum PolicyResult {
     VersionMismatch { server_min: String, client: String },
 }
 
+/// Every placeholder the sandbox may send for this credential, once each: its
+/// own, and the tokens its token answers hand out where the real ones belong.
+fn credential_placeholders(
+    cred: &crate::policy_schema::Credential,
+) -> std::collections::BTreeSet<&str> {
+    let answered = cred.injections.iter().flat_map(|inj| match inj {
+        crate::policy_schema::CredentialInjection::OauthTokenAnswer { access_token, .. } => {
+            vec![access_token.as_str()]
+        }
+        crate::policy_schema::CredentialInjection::OauthRefreshAnswer {
+            refresh_token,
+            access_token,
+            ..
+        } => vec![access_token.as_str(), refresh_token.as_str()],
+        _ => vec![],
+    });
+    cred.placeholder
+        .as_deref()
+        .into_iter()
+        .chain(answered)
+        .collect()
+}
+
 /// Per-credential state that injections mutate. Keeps `apply_injection`
 /// free of the orchestration noise and makes testing individual injection
 /// kinds easier.
@@ -558,7 +581,7 @@ fn apply_injection(
             access_token,
             expires_in,
         } => {
-            match crate::token_answer::TokenAnswer::new(
+            match crate::token_answer::TokenAnswer::client_credentials(
                 path,
                 client_id,
                 scope,
@@ -575,6 +598,32 @@ fn apply_injection(
                     domain = %domain,
                     reason,
                     "dropping oauthTokenAnswer injection"
+                ),
+            }
+        }
+        crate::policy_schema::CredentialInjection::OauthRefreshAnswer {
+            domain,
+            path,
+            refresh_token,
+            access_token,
+            expires_in,
+        } => {
+            match crate::token_answer::TokenAnswer::refresh_token(
+                path,
+                refresh_token,
+                access_token,
+                *expires_in,
+            ) {
+                Ok(answer) => state
+                    .token_answer_map
+                    .entry(domain.to_lowercase())
+                    .or_default()
+                    .push(answer),
+                Err(reason) => tracing::error!(
+                    cred_id,
+                    domain = %domain,
+                    reason,
+                    "dropping oauthRefreshAnswer injection"
                 ),
             }
         }
@@ -1160,17 +1209,9 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             // credential types may surface placeholders through means other
             // than env (config files, MCP, etc). Last-write-wins on duplicates.
             //
-            // The token a token answer hands out is one too: the sandbox sends
-            // it where the credential's real token belongs.
-            let answered_tokens = cred.injections.iter().filter_map(|inj| match inj {
-                crate::policy_schema::CredentialInjection::OauthTokenAnswer {
-                    access_token,
-                    ..
-                } => Some(access_token),
-                _ => None,
-            });
-            for placeholder in cred.placeholder.iter().chain(answered_tokens) {
-                if let Some(prior) = placeholder_index.insert(placeholder.clone(), cred.id.clone())
+            for placeholder in credential_placeholders(cred) {
+                if let Some(prior) =
+                    placeholder_index.insert(placeholder.to_string(), cred.id.clone())
                 {
                     tracing::warn!(
                         placeholder,
@@ -3719,9 +3760,14 @@ mod tests {
                 .expect("expected domain entry");
             // The answer with no access token is dropped, not installed.
             assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].client_id, "client-1");
             assert_eq!(entries[0].access_token, "placeholder-token");
-            assert!(entries[0].scope.contains("api.default"));
+            let crate::token_answer::Grant::ClientCredentials { client_id, scope } =
+                &entries[0].grant
+            else {
+                panic!("expected a client-credentials answer");
+            };
+            assert_eq!(client_id, "client-1");
+            assert!(scope.contains("api.default"));
         }
         assert!(state.intercept_for_token_answer("login.example.com"));
         assert!(!state.intercept_for_token_answer("api.example.com"));
@@ -3738,6 +3784,117 @@ mod tests {
         handle_policy(&cleared.to_string(), &Some(state.clone())).await;
         assert!(state.token_answers.read().unwrap().is_empty());
         assert!(!state.intercept_for_token_answer("login.example.com"));
+    }
+
+    #[tokio::test]
+    async fn handle_policy_oauth_refresh_answer_populates_the_map_and_indexes_both_placeholders() {
+        let state = test_proxy_state();
+        let policy = serde_json::json!({
+            "type": "policy",
+            "credentials": [{
+                "id": "some-provider",
+                "envVar": "SOME_PROVIDER_KEY",
+                "placeholder": "placeholder-refresh",
+                "injections": [
+                    {
+                        "injectionType": "oauthRefreshAnswer",
+                        "domain": "Login.Example.com",
+                        "path": "/oauth2/token",
+                        "refreshToken": "placeholder-refresh",
+                        "accessToken": "placeholder-token",
+                        "expiresIn": 3600
+                    },
+                    {
+                        "injectionType": "oauthRefreshAnswer",
+                        "domain": "login.example.com",
+                        "path": "/oauth2/token",
+                        "refreshToken": "",
+                        "accessToken": "dropped-token",
+                        "expiresIn": 3600
+                    }
+                ]
+            }]
+        });
+        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        assert!(matches!(result, PolicyResult::Ok(_)));
+
+        {
+            let answers = state.token_answers.read().unwrap();
+            let entries = answers
+                .get("login.example.com")
+                .expect("expected domain entry");
+            // The answer with no refresh token is dropped, not installed.
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].access_token, "placeholder-token");
+            assert_eq!(
+                entries[0].grant,
+                crate::token_answer::Grant::RefreshToken {
+                    refresh_token: "placeholder-refresh".into()
+                }
+            );
+        }
+        assert!(state.intercept_for_token_answer("login.example.com"));
+        let index = state.placeholder_index.read().unwrap();
+        assert_eq!(
+            index.get("placeholder-token").map(String::as_str),
+            Some("some-provider")
+        );
+        assert_eq!(
+            index.get("placeholder-refresh").map(String::as_str),
+            Some("some-provider")
+        );
+    }
+
+    #[test]
+    fn a_placeholder_a_credential_uses_twice_is_listed_once() {
+        let cred: crate::policy_schema::Credential = serde_json::from_value(serde_json::json!({
+            "id": "some-provider",
+            "placeholder": "placeholder-refresh",
+            "injections": [{
+                "injectionType": "oauthRefreshAnswer",
+                "domain": "login.example.com",
+                "path": "/oauth2/token",
+                "refreshToken": "placeholder-refresh",
+                "accessToken": "placeholder-token",
+                "expiresIn": 3600
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            credential_placeholders(&cred),
+            std::collections::BTreeSet::from(["placeholder-refresh", "placeholder-token"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_placeholder_without_a_parent_placeholder_is_still_indexed() {
+        let state = test_proxy_state();
+        let policy = serde_json::json!({
+            "type": "policy",
+            "credentials": [{
+                "id": "some-provider",
+                "injections": [{
+                    "injectionType": "oauthRefreshAnswer",
+                    "domain": "login.example.com",
+                    "path": "/oauth2/token",
+                    "refreshToken": "placeholder-refresh",
+                    "accessToken": "placeholder-token",
+                    "expiresIn": 3600
+                }]
+            }]
+        });
+        handle_policy(&policy.to_string(), &Some(state.clone())).await;
+
+        assert_eq!(
+            state
+                .placeholder_index
+                .read()
+                .unwrap()
+                .get("placeholder-refresh")
+                .map(String::as_str),
+            Some("some-provider")
+        );
     }
 
     #[tokio::test]

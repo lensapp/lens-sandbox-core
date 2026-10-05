@@ -849,6 +849,8 @@ pub struct Credential {
 ///   request (RFC 6749 §4.4) in the proxy with a placeholder access token, so
 ///   the request never leaves the sandbox. Paired with a `header` injection on
 ///   each API domain that replaces the placeholder with the real token.
+/// - **`oauthRefreshAnswer`**: the same answer for an OAuth 2.0 refresh-token
+///   request (RFC 6749 §6) that carries a placeholder refresh token.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "injectionType",
@@ -916,6 +918,26 @@ pub enum CredentialInjection {
         /// answers a request that names no scope.
         #[serde(default)]
         scope: String,
+        /// Placeholder returned as `access_token`. It grants nothing outside
+        /// the proxy.
+        access_token: String,
+        /// Lifetime in seconds returned as `expires_in`.
+        expires_in: u64,
+    },
+    /// Answers a `POST` to [`path`](Self::OauthRefreshAnswer::path) on
+    /// [`domain`](Self::OauthRefreshAnswer::domain) whose urlencoded body asks
+    /// for `grant_type=refresh_token` with
+    /// [`refreshToken`](Self::OauthRefreshAnswer::refresh_token), whatever
+    /// client and scope it names. Every other request to the domain, including
+    /// one with another refresh token, is forwarded unchanged.
+    OauthRefreshAnswer {
+        /// Host of the token endpoint.
+        domain: String,
+        /// Path of the token endpoint (e.g. `/oauth2/token`).
+        path: String,
+        /// Placeholder the sandbox holds as its refresh token, and returned
+        /// as `refresh_token`.
+        refresh_token: String,
         /// Placeholder returned as `access_token`. It grants nothing outside
         /// the proxy.
         access_token: String,
@@ -1011,6 +1033,30 @@ mod tests {
             _ => panic!("expected OauthTokenAnswer variant"),
         }
         // The placeholder token is never a gate trigger.
+        assert_eq!(inj.unarmed_domain(), None);
+    }
+
+    #[test]
+    fn credential_injection_deserializes_oauth_refresh_answer_variant() {
+        let json = r#"{"injectionType":"oauthRefreshAnswer","domain":"login.example.com","path":"/oauth2/token","refreshToken":"placeholder-refresh","accessToken":"placeholder","expiresIn":3600}"#;
+        let inj: CredentialInjection = serde_json::from_str(json).unwrap();
+        match &inj {
+            CredentialInjection::OauthRefreshAnswer {
+                domain,
+                path,
+                refresh_token,
+                access_token,
+                expires_in,
+            } => {
+                assert_eq!(domain, "login.example.com");
+                assert_eq!(path, "/oauth2/token");
+                assert_eq!(refresh_token, "placeholder-refresh");
+                assert_eq!(access_token, "placeholder");
+                assert_eq!(*expires_in, 3600);
+            }
+            _ => panic!("expected OauthRefreshAnswer variant"),
+        }
+        // Neither placeholder is ever a gate trigger.
         assert_eq!(inj.unarmed_domain(), None);
     }
 
