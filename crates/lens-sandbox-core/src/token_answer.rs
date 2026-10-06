@@ -3,17 +3,19 @@
 //! answered by the proxy instead of forwarded.
 //!
 //! The sandbox's SDK runs its usual grant against the token endpoint, with a
-//! placeholder where the client secret or the refresh token goes. The proxy answers that request
-//! with a placeholder access token, so neither the request nor anything in it
-//! leaves the sandbox. A `header` injection on each API domain then replaces
-//! the placeholder token with the real one on the way out. The real secret and
-//! the real token stay with the host that sends the policy.
+//! placeholder where the client secret or the refresh token goes. The proxy
+//! answers that request with a placeholder access token, so neither the request
+//! nor anything in it leaves the sandbox. A `header` injection on each API
+//! domain then replaces the placeholder token with the real one on the way
+//! out. The real secret and the real token stay with the host that sends the
+//! policy.
 //!
 //! A request is answered only when it is a `POST` to a configured path whose
 //! form body asks for `grant_type=client_credentials` for a configured client,
 //! or for `grant_type=refresh_token` with a configured placeholder refresh
-//! token. Any other request to the host is forwarded as the sandbox sent it, so
-//! a client the sandbox holds its own secret or refresh token for keeps working.
+//! token. Any other request to the host is forwarded as the sandbox sent it,
+//! so a client the sandbox holds its own secret or refresh token for keeps
+//! working.
 
 use std::collections::BTreeSet;
 
