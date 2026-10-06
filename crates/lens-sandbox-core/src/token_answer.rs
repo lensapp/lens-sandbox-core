@@ -213,7 +213,13 @@ fn answered(answer: &TokenAnswer) -> Decision<'_> {
 }
 
 /// The response for a decision the proxy answers itself.
-pub(crate) fn response(decision: &Decision<'_>) -> Option<Vec<u8>> {
+/// A response the proxy writes itself, with the status its head states.
+pub(crate) struct TokenResponse {
+    pub(crate) status: u16,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) fn response(decision: &Decision<'_>) -> Option<TokenResponse> {
     let (status, body) = match decision {
         Decision::NotOurs | Decision::Unarmed(_) => return None,
         Decision::Answer(answer) => {
@@ -225,10 +231,10 @@ pub(crate) fn response(decision: &Decision<'_>) -> Option<Vec<u8>> {
             if let Grant::RefreshToken { refresh_token } = &answer.grant {
                 body["refresh_token"] = refresh_token.as_str().into();
             }
-            ("200 OK", body)
+            ((200, "OK"), body)
         }
         Decision::InvalidScope => (
-            "400 Bad Request",
+            (400, "Bad Request"),
             serde_json::json!({
                 "error": "invalid_scope",
                 "error_description": "the sandbox holds no token for this scope",
@@ -237,12 +243,16 @@ pub(crate) fn response(decision: &Decision<'_>) -> Option<Vec<u8>> {
     };
     let body = body.to_string();
     // RFC 6749 §5.1: a token response must not be cached.
+    let (code, reason) = status;
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\
          Pragma: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    Some([head.as_bytes(), body.as_bytes()].concat())
+    Some(TokenResponse {
+        status: code,
+        bytes: [head.as_bytes(), body.as_bytes()].concat(),
+    })
 }
 
 fn scope_set(scope: &str) -> BTreeSet<String> {
@@ -396,7 +406,7 @@ mod tests {
     fn the_answer_is_an_uncached_bearer_token_response() {
         let answers = [answer("scope-a")];
         let answered =
-            String::from_utf8(response(&Decision::Answer(&answers[0])).unwrap()).unwrap();
+            String::from_utf8(response(&Decision::Answer(&answers[0])).unwrap().bytes).unwrap();
         let (head, body) = answered.split_once("\r\n\r\n").unwrap();
 
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
@@ -413,7 +423,7 @@ mod tests {
 
     #[test]
     fn a_refused_scope_answers_invalid_scope() {
-        let refused = String::from_utf8(response(&Decision::InvalidScope).unwrap()).unwrap();
+        let refused = String::from_utf8(response(&Decision::InvalidScope).unwrap().bytes).unwrap();
 
         assert!(
             refused.starts_with("HTTP/1.1 400 Bad Request\r\n"),
@@ -421,6 +431,16 @@ mod tests {
         );
         assert!(refused.contains(r#""error":"invalid_scope""#), "{refused}");
         assert!(response(&Decision::NotOurs).is_none());
+    }
+
+    #[test]
+    fn an_answer_carries_the_status_its_head_states() {
+        let answers = [answer("scope-a")];
+        assert_eq!(
+            response(&Decision::Answer(&answers[0])).unwrap().status,
+            200
+        );
+        assert_eq!(response(&Decision::InvalidScope).unwrap().status, 400);
     }
 
     fn refresh_answer() -> TokenAnswer {
@@ -488,7 +508,7 @@ mod tests {
     fn the_refresh_answer_hands_back_the_placeholder_refresh_token() {
         let answers = [refresh_answer()];
         let answered =
-            String::from_utf8(response(&Decision::Answer(&answers[0])).unwrap()).unwrap();
+            String::from_utf8(response(&Decision::Answer(&answers[0])).unwrap().bytes).unwrap();
         let (_, body) = answered.split_once("\r\n\r\n").unwrap();
         let json: serde_json::Value = serde_json::from_str(body).unwrap();
 
@@ -502,7 +522,7 @@ mod tests {
     fn a_client_credentials_answer_hands_back_no_refresh_token() {
         let answers = [answer("")];
         let answered =
-            String::from_utf8(response(&Decision::Answer(&answers[0])).unwrap()).unwrap();
+            String::from_utf8(response(&Decision::Answer(&answers[0])).unwrap().bytes).unwrap();
         let (_, body) = answered.split_once("\r\n\r\n").unwrap();
         let json: serde_json::Value = serde_json::from_str(body).unwrap();
 
