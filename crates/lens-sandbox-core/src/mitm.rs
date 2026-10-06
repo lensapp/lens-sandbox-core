@@ -158,16 +158,15 @@ fn gate_action(
 async fn hold_token_request<C>(
     tls_client: &mut C,
     facts: &RequestFacts<'_, '_>,
-    ctx: &MitmContext<'_>,
     credential_id: &str,
-    head: &str,
     body: &[u8],
 ) -> Box<dyn std::error::Error + Send + Sync>
 where
     C: AsyncWrite + Unpin,
 {
     let action = gate_action(facts.method, facts.target_host, facts.path, None);
-    let decision = crate::gate::credential_gate_or_deny(ctx.state, credential_id, &action).await;
+    let decision =
+        crate::gate::credential_gate_or_deny(facts.ctx.state, credential_id, &action).await;
     if !decision.is_allow() {
         return facts
             .deny(
@@ -177,16 +176,12 @@ where
             )
             .await;
     }
-    let armed = crate::proxy::collect_token_answers(ctx.state, ctx.match_host);
-    let decision = crate::token_answer::decide(&armed, facts.method, facts.path, head, body);
+    let armed = crate::proxy::collect_token_answers(facts.ctx.state, facts.ctx.match_host);
+    let decision = crate::token_answer::decide(&armed, facts.method, facts.path, facts.head, body);
     match crate::token_answer::response(&decision) {
         Some(response) => {
-            let status = match decision {
-                crate::token_answer::Decision::Answer(_) => 200,
-                _ => 400,
-            };
             facts
-                .answer_token_request(tls_client, &response, status)
+                .answer_token_request(tls_client, &response.bytes, response.status)
                 .await
         }
         None => {
@@ -1188,23 +1183,13 @@ async fn mitm_inject_after_accept(
         let decision =
             crate::token_answer::decide(&token_answers, method, path, &header_str, &body);
         if let crate::token_answer::Decision::Unarmed(answer) = decision {
-            return Err(hold_token_request(
-                &mut tls_client,
-                &facts,
-                ctx,
-                &answer.credential_id,
-                &header_str,
-                &body,
-            )
-            .await);
+            return Err(
+                hold_token_request(&mut tls_client, &facts, &answer.credential_id, &body).await,
+            );
         }
         if let Some(response) = crate::token_answer::response(&decision) {
-            let status = match decision {
-                crate::token_answer::Decision::Answer(_) => 200,
-                _ => 400,
-            };
             return Err(facts
-                .answer_token_request(&mut tls_client, &response, status)
+                .answer_token_request(&mut tls_client, &response.bytes, response.status)
                 .await);
         }
         if body_mode != BodyFraming::None {
