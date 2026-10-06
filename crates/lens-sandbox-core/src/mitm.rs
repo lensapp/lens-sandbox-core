@@ -152,6 +152,56 @@ fn gate_action(
     }
 }
 
+/// Hold a token request that an unarmed answer covers at its credential's gate.
+/// On `Allow` the host has armed the answer, so the request is answered as it
+/// would have been; anything else refuses it, and nothing of it goes upstream.
+async fn hold_token_request<C>(
+    tls_client: &mut C,
+    facts: &RequestFacts<'_, '_>,
+    ctx: &MitmContext<'_>,
+    credential_id: &str,
+    head: &str,
+    body: &[u8],
+) -> Box<dyn std::error::Error + Send + Sync>
+where
+    C: AsyncWrite + Unpin,
+{
+    let action = gate_action(facts.method, facts.target_host, facts.path, None);
+    let decision = crate::gate::credential_gate_or_deny(ctx.state, credential_id, &action).await;
+    if !decision.is_allow() {
+        return facts
+            .deny(
+                tls_client,
+                "credential_gate_denied",
+                decision.audit_reason(),
+            )
+            .await;
+    }
+    let armed = crate::proxy::collect_token_answers(ctx.state, ctx.match_host);
+    let decision = crate::token_answer::decide(&armed, facts.method, facts.path, head, body);
+    match crate::token_answer::response(&decision) {
+        Some(response) => {
+            let status = match decision {
+                crate::token_answer::Decision::Answer(_) => 200,
+                _ => 400,
+            };
+            facts
+                .answer_token_request(tls_client, &response, status)
+                .await
+        }
+        None => {
+            tracing::warn!(
+                target_host = %facts.target_host,
+                credential_id,
+                "credential gate allowed but follow-up policy did not arm the token answer — failing closed"
+            );
+            facts
+                .deny(tls_client, "credential_gate_denied", "policy-frame-missing")
+                .await
+        }
+    }
+}
+
 /// Handle a MITM connection: terminate TLS from the client,
 /// inject credential headers into the first HTTP request,
 /// and forward to the upstream using the specified `UpstreamMode`.
@@ -1137,6 +1187,17 @@ async fn mitm_inject_after_accept(
         };
         let decision =
             crate::token_answer::decide(&token_answers, method, path, &header_str, &body);
+        if let crate::token_answer::Decision::Unarmed(answer) = decision {
+            return Err(hold_token_request(
+                &mut tls_client,
+                &facts,
+                ctx,
+                &answer.credential_id,
+                &header_str,
+                &body,
+            )
+            .await);
+        }
         if let Some(response) = crate::token_answer::response(&decision) {
             let status = match decision {
                 crate::token_answer::Decision::Answer(_) => 200,
@@ -2972,6 +3033,7 @@ mod tests {
 
     fn token_answer(scope: &str) -> crate::token_answer::TokenAnswer {
         crate::token_answer::TokenAnswer::client_credentials(
+            "some-credential",
             "/oauth2/token",
             "client-1",
             scope,
@@ -2979,6 +3041,218 @@ mod tests {
             3600,
         )
         .unwrap()
+    }
+
+    /// What a simulated host does with the `credential_pending` a held token
+    /// request raises.
+    enum HeldTokenHost {
+        /// Arm the answer, as a follow-up policy frame would, then allow.
+        ArmAndAllow,
+        AllowWithoutArming,
+        Deny,
+    }
+
+    const HELD_REFRESH: &[u8] = b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
+        Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 58\r\n\r\n\
+        grant_type=refresh_token&refresh_token=placeholder-refresh";
+
+    fn refresh_answer(access_token: &str) -> crate::token_answer::TokenAnswer {
+        crate::token_answer::TokenAnswer::refresh_token(
+            "some-credential",
+            "/oauth2/token",
+            "placeholder-refresh",
+            access_token,
+            3600,
+        )
+        .unwrap()
+    }
+
+    /// Drives a refresh request to an unarmed answer through the MITM while a
+    /// host task answers the credential gate. Returns whether the MITM
+    /// forwarded, what the client read, and every event the host saw.
+    async fn run_held_token_harness(host: HeldTokenHost) -> (bool, String, Vec<serde_json::Value>) {
+        run_held_token_harness_with(
+            host,
+            refresh_answer(""),
+            refresh_answer("placeholder-token"),
+            HELD_REFRESH,
+        )
+        .await
+    }
+
+    async fn run_held_token_harness_with(
+        host: HeldTokenHost,
+        unarmed: crate::token_answer::TokenAnswer,
+        armed: crate::token_answer::TokenAnswer,
+        request: &'static [u8],
+    ) -> (bool, String, Vec<serde_json::Value>) {
+        use tokio::net::TcpListener;
+
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let ca = EphemeralCa::new().unwrap();
+        let hostname = "test.example.com";
+        let (state, mut audit_rx) = crate::proxy::tests::test_state();
+        state
+            .token_answers
+            .write()
+            .unwrap()
+            .insert(hostname.to_string(), vec![unarmed]);
+        state.decision_timeout_override(Duration::from_secs(1));
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host_state = state.clone();
+        let host_events = events.clone();
+        let host_handle = tokio::spawn(async move {
+            let mut host = Some(host);
+            let mut armed = Some(armed);
+            while let Some(raw) = audit_rx.recv().await {
+                let event: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                host_events.lock().unwrap().push(event.clone());
+                if event["type"] != "credential_pending" {
+                    continue;
+                }
+                let Some(host) = host.take() else { continue };
+                let id = event["id"].as_str().unwrap().to_string();
+                let decision = match host {
+                    HeldTokenHost::ArmAndAllow => {
+                        host_state.token_answers.write().unwrap().insert(
+                            "test.example.com".to_string(),
+                            armed.take().into_iter().collect(),
+                        );
+                        crate::protocol::CredentialDecisionKind::Allow
+                    }
+                    HeldTokenHost::AllowWithoutArming => {
+                        crate::protocol::CredentialDecisionKind::Allow
+                    }
+                    HeldTokenHost::Deny => crate::protocol::CredentialDecisionKind::Deny,
+                };
+                crate::gate::resolve_credential_pending(&host_state, &id, decision);
+            }
+        });
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let root_store = ca_root_store(&ca);
+        let client_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(client_addr).await.unwrap();
+            let client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let server_name = ServerName::try_from(hostname.to_string()).unwrap();
+            let mut tls = connector.connect(server_name, stream).await.unwrap();
+            tls.write_all(request).await.unwrap();
+            let mut response = Vec::new();
+            let _ = tls.read_to_end(&mut response).await;
+            String::from_utf8(response).unwrap()
+        });
+
+        let (client_stream, _) = client_listener.accept().await.unwrap();
+        let forwarded = {
+            let audit_tx = state.audit_tx.lock().unwrap().clone();
+            let actor =
+                crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+            let ctx = MitmContext {
+                injections: &[],
+                http_rules: &[],
+                ca: &ca,
+                audit_tx: &audit_tx,
+                extra_ca_certs: &[],
+                placeholder_map: &[],
+                state: &state,
+                match_host: hostname,
+                actor: &actor,
+            };
+            let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, hostname).unwrap());
+            let tls_client = acceptor.accept(client_stream).await.unwrap();
+            match mitm_inject_after_accept(tls_client, hostname, &ctx, true).await {
+                Ok((mut tls_client, _, _)) => {
+                    tls_client.shutdown().await.ok();
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+        let response = client_handle.await.unwrap();
+        *state.audit_tx.lock().unwrap() = None;
+        drop(state);
+        host_handle.await.unwrap();
+        let events = events.lock().unwrap().clone();
+        (forwarded, response, events)
+    }
+
+    #[tokio::test]
+    async fn mitm_holds_a_request_to_an_unarmed_answer_and_answers_once_armed() {
+        let (forwarded, response, events) =
+            run_held_token_harness(HeldTokenHost::ArmAndAllow).await;
+
+        assert!(!forwarded, "the request must not be forwarded");
+        let pending: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "credential_pending")
+            .collect();
+        assert_eq!(pending.len(), 1, "{events:?}");
+        assert_eq!(pending[0]["credentialId"], "some-credential");
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["access_token"], "placeholder-token");
+        assert_eq!(json["refresh_token"], "placeholder-refresh");
+    }
+
+    #[tokio::test]
+    async fn mitm_answers_a_held_request_for_another_scope_with_invalid_scope_once_armed() {
+        let answer = |access_token: &str| {
+            crate::token_answer::TokenAnswer::client_credentials(
+                "some-credential",
+                "/oauth2/token",
+                "client-1",
+                "api.default",
+                access_token,
+                3600,
+            )
+            .unwrap()
+        };
+        let (forwarded, response, _) = run_held_token_harness_with(
+            HeldTokenHost::ArmAndAllow,
+            answer(""),
+            answer("placeholder-token"),
+            b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
+              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 66\r\n\r\n\
+              grant_type=client_credentials&client_id=client-1&scope=other.scope",
+        )
+        .await;
+
+        assert!(!forwarded);
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mitm_refuses_a_held_token_request_the_developer_denies() {
+        let (forwarded, response, _) = run_held_token_harness(HeldTokenHost::Deny).await;
+
+        assert!(!forwarded);
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn mitm_refuses_a_held_token_request_the_policy_never_armed() {
+        let (forwarded, response, events) =
+            run_held_token_harness(HeldTokenHost::AllowWithoutArming).await;
+
+        assert!(!forwarded);
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        let denied = events
+            .iter()
+            .find(|e| e["type"] == "audit_event" && e["result"] == "failure")
+            .expect("a failure audit event");
+        assert_eq!(denied["metadata"]["reason"], "policy-frame-missing");
     }
 
     #[tokio::test]

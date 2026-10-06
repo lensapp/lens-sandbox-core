@@ -217,7 +217,7 @@
           "type": "object",
           "properties": {
             "accessToken": {
-              "description": "Placeholder returned as `access_token`. It grants nothing outside\nthe proxy.",
+              "description": "Placeholder returned as `access_token`. It grants nothing outside\nthe proxy. Empty leaves the answer unarmed: a request it would\nanswer is held at the credential's gate until a policy arms it.",
               "type": "string"
             },
             "clientId": {
@@ -262,7 +262,7 @@
           "type": "object",
           "properties": {
             "accessToken": {
-              "description": "Placeholder returned as `access_token`. It grants nothing outside\nthe proxy.",
+              "description": "Placeholder returned as `access_token`. It grants nothing outside\nthe proxy. Empty leaves the answer unarmed: a request it would\nanswer is held at the credential's gate until a policy arms it.",
               "type": "string"
             },
             "domain": {

@@ -919,7 +919,8 @@ pub enum CredentialInjection {
         #[serde(default)]
         scope: String,
         /// Placeholder returned as `access_token`. It grants nothing outside
-        /// the proxy.
+        /// the proxy. Empty leaves the answer unarmed: a request it would
+        /// answer is held at the credential's gate until a policy arms it.
         access_token: String,
         /// Lifetime in seconds returned as `expires_in`.
         expires_in: u64,
@@ -939,7 +940,8 @@ pub enum CredentialInjection {
         /// as `refresh_token`.
         refresh_token: String,
         /// Placeholder returned as `access_token`. It grants nothing outside
-        /// the proxy.
+        /// the proxy. Empty leaves the answer unarmed: a request it would
+        /// answer is held at the credential's gate until a policy arms it.
         access_token: String,
         /// Lifetime in seconds returned as `expires_in`.
         expires_in: u64,

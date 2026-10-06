@@ -487,10 +487,13 @@ fn credential_placeholders(
         | crate::policy_schema::CredentialInjection::UriPlaceholder { .. }
         | crate::policy_schema::CredentialInjection::AwsSigv4 { .. } => vec![],
     });
+    // An unarmed answer has no access token yet, and an empty string is no
+    // placeholder.
     cred.placeholder
         .as_deref()
         .into_iter()
         .chain(answered)
+        .filter(|placeholder| !placeholder.is_empty())
         .collect()
 }
 
@@ -584,6 +587,7 @@ fn apply_injection(
             expires_in,
         } => {
             match crate::token_answer::TokenAnswer::client_credentials(
+                cred_id,
                 path,
                 client_id,
                 scope,
@@ -611,6 +615,7 @@ fn apply_injection(
             expires_in,
         } => {
             match crate::token_answer::TokenAnswer::refresh_token(
+                cred_id,
                 path,
                 refresh_token,
                 access_token,
@@ -3739,7 +3744,7 @@ mod tests {
                         "domain": "login.example.com",
                         "path": "/oauth2/token",
                         "clientId": "client-1",
-                        "scope": "dropped",
+                        "scope": "not.yet.connected",
                         "accessToken": "",
                         "expiresIn": 3600
                     },
@@ -3760,8 +3765,11 @@ mod tests {
             let entries = answers
                 .get("login.example.com")
                 .expect("expected domain entry");
-            // The answer with no access token is dropped, not installed.
-            assert_eq!(entries.len(), 1);
+            // The answer with no access token is installed unarmed, to hold
+            // what it would answer until a connection backs it.
+            assert_eq!(entries.len(), 2);
+            assert!(!entries[1].is_armed());
+            assert_eq!(entries[1].credential_id, "api-client");
             assert_eq!(entries[0].access_token, "placeholder-token");
             let crate::token_answer::Grant::ClientCredentials { client_id, scope } =
                 &entries[0].grant
@@ -3841,6 +3849,42 @@ mod tests {
             index.get("placeholder-token").map(String::as_str),
             Some("some-provider")
         );
+        assert_eq!(
+            index.get("placeholder-refresh").map(String::as_str),
+            Some("some-provider")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unarmed_refresh_answer_is_installed_and_indexes_no_empty_placeholder() {
+        let state = test_proxy_state();
+        let policy = serde_json::json!({
+            "type": "policy",
+            "credentials": [{
+                "id": "some-provider",
+                "envVar": "SOME_PROVIDER_KEY",
+                "placeholder": "placeholder-refresh",
+                "injections": [{
+                    "injectionType": "oauthRefreshAnswer",
+                    "domain": "login.example.com",
+                    "path": "/oauth2/token",
+                    "refreshToken": "placeholder-refresh",
+                    "accessToken": "",
+                    "expiresIn": 0
+                }]
+            }]
+        });
+        handle_policy(&policy.to_string(), &Some(state.clone())).await;
+
+        {
+            let answers = state.token_answers.read().unwrap();
+            let entries = answers.get("login.example.com").expect("installed");
+            assert_eq!(entries.len(), 1);
+            assert!(!entries[0].is_armed());
+        }
+        assert!(state.intercept_for_token_answer("login.example.com"));
+        let index = state.placeholder_index.read().unwrap();
+        assert!(!index.contains_key(""), "{index:?}");
         assert_eq!(
             index.get("placeholder-refresh").map(String::as_str),
             Some("some-provider")

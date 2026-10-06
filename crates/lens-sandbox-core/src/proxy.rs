@@ -5480,6 +5480,7 @@ pub(crate) mod tests {
             "login.example.com".into(),
             vec![
                 crate::token_answer::TokenAnswer::client_credentials(
+                    "some-credential",
                     "/oauth2/token",
                     "client-1",
                     "api.default",
