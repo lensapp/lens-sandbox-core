@@ -483,7 +483,9 @@ fn credential_placeholders(
             access_token,
             ..
         } => vec![access_token.as_str(), refresh_token.as_str()],
-        _ => vec![],
+        crate::policy_schema::CredentialInjection::Header { .. }
+        | crate::policy_schema::CredentialInjection::UriPlaceholder { .. }
+        | crate::policy_schema::CredentialInjection::AwsSigv4 { .. } => vec![],
     });
     cred.placeholder
         .as_deref()
@@ -3884,7 +3886,8 @@ mod tests {
                 }]
             }]
         });
-        handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        assert!(matches!(result, PolicyResult::Ok(_)));
 
         assert_eq!(
             state
