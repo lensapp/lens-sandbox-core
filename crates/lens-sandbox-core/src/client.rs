@@ -469,9 +469,10 @@ enum PolicyResult {
     VersionMismatch { server_min: String, client: String },
 }
 
-/// Every placeholder the sandbox may send for this credential, once each: its
-/// own, and the tokens its token answers hand out where the real ones belong.
-fn credential_placeholders(
+/// The placeholders this credential's token answers hand out or match, once
+/// each, other than its own: another credential may own one of them, and then
+/// that credential gates it.
+fn answered_placeholders(
     cred: &crate::policy_schema::Credential,
 ) -> std::collections::BTreeSet<&str> {
     let answered = cred.injections.iter().flat_map(|inj| match inj {
@@ -489,11 +490,10 @@ fn credential_placeholders(
     });
     // An unarmed answer has no access token yet, and an empty string is no
     // placeholder.
-    cred.placeholder
-        .as_deref()
-        .into_iter()
-        .chain(answered)
-        .filter(|placeholder| !placeholder.is_empty())
+    answered
+        .filter(|placeholder| {
+            !placeholder.is_empty() && Some(*placeholder) != cred.placeholder.as_deref()
+        })
         .collect()
 }
 
@@ -1179,6 +1179,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         let mut aws_config_map: HashMap<String, crate::aws_sigv4::AwsSigv4Config> = HashMap::new();
         let mut aws_domains: Vec<String> = Vec::new();
         let mut placeholder_index: HashMap<String, String> = HashMap::new();
+        let mut answered: Vec<(String, String)> = Vec::new();
         let mut unarmed_domains: Vec<String> = Vec::new();
         let mut header_count = 0;
 
@@ -1216,18 +1217,26 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             // credential types may surface placeholders through means other
             // than env (config files, MCP, etc). Last-write-wins on duplicates.
             //
-            for placeholder in credential_placeholders(cred) {
-                if let Some(prior) =
+            if let Some(placeholder) = cred.placeholder.as_deref().filter(|p| !p.is_empty())
+                && let Some(prior) =
                     placeholder_index.insert(placeholder.to_string(), cred.id.clone())
-                {
-                    tracing::warn!(
-                        placeholder,
-                        prior_credential = prior,
-                        next_credential = cred.id,
-                        "duplicate placeholder across credentials; later credential wins"
-                    );
-                }
+            {
+                tracing::warn!(
+                    placeholder,
+                    prior_credential = prior,
+                    next_credential = cred.id,
+                    "duplicate placeholder across credentials; later credential wins"
+                );
             }
+            answered.extend(
+                answered_placeholders(cred)
+                    .into_iter()
+                    .map(|placeholder| (placeholder.to_string(), cred.id.clone())),
+            );
+        }
+        // A placeholder an answer hands out belongs to the credential that owns it, when one does.
+        for (placeholder, id) in answered {
+            placeholder_index.entry(placeholder).or_insert(id);
         }
 
         *state.credential_injections.write().unwrap() = injection_map;
@@ -3908,8 +3917,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            credential_placeholders(&cred),
-            std::collections::BTreeSet::from(["placeholder-refresh", "placeholder-token"])
+            answered_placeholders(&cred),
+            std::collections::BTreeSet::from(["placeholder-token"]),
+            "the refresh placeholder is the credential's own, so the answer does not list it again"
         );
     }
 
@@ -3942,6 +3952,49 @@ mod tests {
                 .map(String::as_str),
             Some("some-provider")
         );
+    }
+
+    #[tokio::test]
+    async fn an_access_token_placeholder_belongs_to_the_credential_that_owns_it_in_either_order() {
+        let answer = serde_json::json!({
+            "id": "SOME_PROVIDER_API_KEY",
+            "placeholder": "placeholder-refresh",
+            "injections": [{
+                "injectionType": "oauthRefreshAnswer",
+                "domain": "login.example.com",
+                "path": "/oauth2/token",
+                "refreshToken": "placeholder-refresh",
+                "accessToken": "placeholder-access",
+                "expiresIn": 3600
+            }]
+        });
+        let access = serde_json::json!({
+            "id": "placeholder-access",
+            "placeholder": "placeholder-access",
+            "injections": [{
+                "injectionType": "header",
+                "domain": "api.example.com",
+                "header": "Authorization",
+                "value": "Bearer real-access"
+            }]
+        });
+        for credentials in [vec![answer.clone(), access.clone()], vec![access, answer]] {
+            let state = test_proxy_state();
+            let policy = serde_json::json!({"type": "policy", "credentials": credentials});
+            let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+            assert!(matches!(result, PolicyResult::Ok(_)));
+
+            let index = state.placeholder_index.read().unwrap();
+            assert_eq!(
+                index.get("placeholder-access").map(String::as_str),
+                Some("placeholder-access"),
+                "the credential whose own placeholder it is gates it, wherever the answer sits in the list"
+            );
+            assert_eq!(
+                index.get("placeholder-refresh").map(String::as_str),
+                Some("SOME_PROVIDER_API_KEY")
+            );
+        }
     }
 
     #[tokio::test]
