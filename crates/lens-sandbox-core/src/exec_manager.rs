@@ -67,7 +67,7 @@ const DEFAULT_KILL_SIGNAL: i32 = libc::SIGTERM;
 const SCROLLBACK_CAPACITY_BYTES: usize = 64 * 1024;
 
 /// How long an exited exec waits for `exec_ack` before it is dropped. It
-/// bounds the memory a gateway that never acknowledges can make us hold,
+/// bounds the memory a client that never acknowledges can make us hold,
 /// and it is long enough for a client to come back through the
 /// supervisor's WebSocket reconnect backoff.
 const FINISHED_EXEC_RETENTION: Duration = Duration::from_secs(5 * 60);
