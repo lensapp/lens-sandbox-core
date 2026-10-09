@@ -4,7 +4,7 @@
 //! two responsibilities the OS expects of an init process:
 //!
 //! 1. Translate `docker stop` (SIGTERM to PID 1) into a graceful agent
-//!    shutdown — handled by [`wait_with_signal_forwarding`].
+//!    shutdown — handled by [`wait_for_child_exit`].
 //! 2. Reap any orphan grandchild whose parent died while it was still
 //!    running, so it doesn't accumulate as a zombie — handled by
 //!    [`OrphanReaper`].
@@ -31,21 +31,56 @@ use tokio::process::Child;
 /// by Docker's SIGKILL.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(8);
 
+/// How a child awaited by [`wait_for_child_exit`] ended.
+///
+/// The split is what lets a caller report a workload's result only when
+/// the workload really finished: a child that the supervisor stopped
+/// because the supervisor itself was told to stop has no result of its
+/// own, whatever status the forwarded signal left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildExit {
+    /// The child exited before the supervisor received a shutdown signal.
+    Finished(ExitStatus),
+    /// The supervisor received a shutdown signal first and stopped the child.
+    Stopped(ExitStatus),
+}
+
+impl ChildExit {
+    pub fn status(self) -> ExitStatus {
+        match self {
+            Self::Finished(status) | Self::Stopped(status) => status,
+        }
+    }
+}
+
 /// Await the child's exit, forwarding shutdown signals to it.
 ///
+/// The same as [`wait_for_child_exit`] for a caller that does not need to
+/// know why the child ended.
+pub async fn wait_with_signal_forwarding(
+    child: &mut Child,
+    grace: Duration,
+) -> std::io::Result<ExitStatus> {
+    wait_for_child_exit(child, grace)
+        .await
+        .map(ChildExit::status)
+}
+
+/// Await the child's exit, forwarding shutdown signals to it, and say
+/// whether the child finished or was stopped.
+///
 /// Behaviour:
-///   * If the child exits before any signal arrives, returns its exit
-///     status unchanged.
+///   * If the child exits before any signal arrives, returns
+///     [`ChildExit::Finished`] with its exit status unchanged.
 ///   * If the supervisor receives SIGTERM / SIGINT / SIGHUP, forwards
 ///     SIGTERM to the child and waits up to `grace` for it to exit.
 ///   * If a *second* signal arrives during the grace window, escalates
 ///     to SIGKILL immediately — operator intent overrides graciousness.
 ///   * Otherwise, on grace expiry, escalates to SIGKILL.
+///
+/// Every path after a signal returns [`ChildExit::Stopped`].
 #[cfg(unix)]
-pub async fn wait_with_signal_forwarding(
-    child: &mut Child,
-    grace: Duration,
-) -> std::io::Result<ExitStatus> {
+pub async fn wait_for_child_exit(child: &mut Child, grace: Duration) -> std::io::Result<ChildExit> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut term = signal(SignalKind::terminate())?;
@@ -53,7 +88,7 @@ pub async fn wait_with_signal_forwarding(
     let mut hup = signal(SignalKind::hangup())?;
 
     let trigger = tokio::select! {
-        status = child.wait() => return status,
+        status = child.wait() => return status.map(ChildExit::Finished),
         _ = term.recv() => "SIGTERM",
         _ = intr.recv() => "SIGINT",
         _ = hup.recv() => "SIGHUP",
@@ -68,7 +103,7 @@ pub async fn wait_with_signal_forwarding(
     // Wait for the child to exit, the grace period to expire, or a
     // second signal to short-circuit straight to SIGKILL.
     let kill_reason = tokio::select! {
-        status = child.wait() => return status,
+        status = child.wait() => return status.map(ChildExit::Stopped),
         _ = tokio::time::sleep(grace) => "grace expired",
         _ = term.recv() => "second SIGTERM during grace",
         _ = intr.recv() => "second SIGINT during grace",
@@ -82,15 +117,15 @@ pub async fn wait_with_signal_forwarding(
     if let Err(e) = child.start_kill() {
         tracing::warn!(error = %e, "SIGKILL on agent failed");
     }
-    child.wait().await
+    child.wait().await.map(ChildExit::Stopped)
 }
 
 #[cfg(not(unix))]
-pub async fn wait_with_signal_forwarding(
+pub async fn wait_for_child_exit(
     child: &mut Child,
     _grace: Duration,
-) -> std::io::Result<ExitStatus> {
-    child.wait().await
+) -> std::io::Result<ChildExit> {
+    child.wait().await.map(ChildExit::Finished)
 }
 
 /// The status a caller reports for a child that has been waited on.
@@ -389,7 +424,7 @@ mod tests {
     /// child's death; a value of `Some(15)` (SIGTERM) confirms the
     /// forward, not just that the child happens to have exited.
     #[tokio::test]
-    async fn wait_with_signal_forwarding_propagates_sigterm() {
+    async fn a_forwarded_sigterm_stops_the_child() {
         use nix::libc;
         use std::os::unix::process::ExitStatusExt;
         use std::time::Duration;
@@ -419,14 +454,17 @@ mod tests {
             .expect("raise SIGTERM on self");
         });
 
-        let status = tokio::time::timeout(
+        let exit = tokio::time::timeout(
             Duration::from_secs(5),
-            wait_with_signal_forwarding(&mut child, Duration::from_secs(2)),
+            wait_for_child_exit(&mut child, Duration::from_secs(2)),
         )
         .await
         .expect("helper did not return in time")
         .expect("wait result");
 
+        let ChildExit::Stopped(status) = exit else {
+            panic!("a child ended by a forwarded signal was stopped, not finished: {exit:?}");
+        };
         assert_eq!(
             status.signal(),
             Some(libc::SIGTERM),
@@ -438,17 +476,20 @@ mod tests {
     /// helper returns its real exit status — the signal-listening path
     /// must not corrupt the happy path.
     #[tokio::test]
-    async fn wait_with_signal_forwarding_returns_natural_exit() {
+    async fn a_child_that_exits_on_its_own_finishes() {
         use std::time::Duration;
 
         let mut child = tokio::process::Command::new("true")
             .spawn()
             .expect("spawn true");
 
-        let status = wait_with_signal_forwarding(&mut child, Duration::from_secs(2))
+        let exit = wait_for_child_exit(&mut child, Duration::from_secs(2))
             .await
             .expect("wait result");
 
+        let ChildExit::Finished(status) = exit else {
+            panic!("a child that exited on its own finished: {exit:?}");
+        };
         assert!(status.success(), "expected success, got {status:?}");
     }
 
