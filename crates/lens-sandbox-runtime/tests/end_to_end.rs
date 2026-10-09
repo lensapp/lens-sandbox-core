@@ -13,6 +13,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -94,11 +95,14 @@ fn in_own_lens(keys: &Path) -> Command {
     command
 }
 
+/// The runtime keeps an exited exec under its id until the client
+/// acknowledges it, so each exec takes a new id.
 async fn exec(sandbox: &Sandbox, script: &str) -> String {
+    static NEXT_ID: AtomicU32 = AtomicU32::new(1);
     let mut session = open_exec(&sandbox.supervisor).await;
     let attach = serde_json::json!({
         "type": "exec_attach",
-        "execId": "e1",
+        "execId": format!("e{}", NEXT_ID.fetch_add(1, Ordering::Relaxed)),
         "argv": ["/bin/bash", "-c", script],
         "env": {"PATH": "/usr/bin:/bin"},
     });
