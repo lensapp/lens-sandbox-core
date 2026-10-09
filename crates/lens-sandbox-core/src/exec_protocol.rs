@@ -132,6 +132,13 @@ pub enum IncomingMessage {
         #[serde(default)]
         actor: Option<ActorIdentity>,
     },
+
+    /// Lens Sandbox has stored the terminal frame of this exec. Until this
+    /// arrives the supervisor keeps an exited exec, so a client that was
+    /// disconnected when it exited can reattach and still get its output
+    /// and its `exec_exit`. Ignored for an exec that is still running.
+    #[serde(rename = "exec_ack", rename_all = "camelCase")]
+    ExecAck { exec_id: String },
 }
 
 /// Outbound exec frames (supervisor → Lens).
@@ -348,6 +355,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_exec_ack() {
+        let json = r#"{"type":"exec_ack","execId":"e1"}"#;
+        match parse(json) {
+            IncomingMessage::ExecAck { exec_id } => assert_eq!(exec_id, "e1"),
+            other => panic!("expected ExecAck, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn emit_exec_attached_omits_owner_when_none() {
         let v = emit(&OutgoingMessage::ExecAttached {
             exec_id: "e1".into(),
@@ -440,6 +456,18 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({"type":"exec_detached","execId":"e1","reason":"stolen"}),
+        );
+    }
+
+    #[test]
+    fn emit_exec_detached_for_a_supervisor_shutdown() {
+        let v = emit(&OutgoingMessage::ExecDetached {
+            exec_id: "e1".into(),
+            reason: DetachReason::SupervisorShutdown,
+        });
+        assert_eq!(
+            v,
+            serde_json::json!({"type":"exec_detached","execId":"e1","reason":"supervisor_shutdown"}),
         );
     }
 
