@@ -69,7 +69,8 @@ const SCROLLBACK_CAPACITY_BYTES: usize = 64 * 1024;
 /// How long an exited exec waits for `exec_ack` before it is dropped. It
 /// bounds the memory a client that never acknowledges can make us hold,
 /// and it is long enough for a client to come back through the
-/// supervisor's WebSocket reconnect backoff.
+/// supervisor's WebSocket reconnect backoff. A reattach does not restart
+/// it; the replay is queued in full when the reattach is accepted.
 const FINISHED_EXEC_RETENTION: Duration = Duration::from_secs(5 * 60);
 
 /// Per-WS-session registry of running execs.
@@ -824,8 +825,10 @@ fn spawn_forwarder(
                 } => {
                     // Reject the swap if a live dest is already attached and
                     // the caller didn't pass force=true. The reattacher must
-                    // explicitly opt in to displacing whoever is there.
-                    if !force && dest.is_some() {
+                    // explicitly opt in to displacing whoever is there. A
+                    // closed dest is nobody: after the exit no later frame
+                    // probes it, so its `Some` alone is stale.
+                    if !force && dest.as_ref().is_some_and(|d| !d.is_closed()) {
                         let _ = reply.send(SwapOutcome::DestBusyNeedsForce);
                         continue;
                     }
@@ -1929,6 +1932,21 @@ mod tests {
             b"done\n"
         );
         assert_eq!(frames[2]["code"], 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_that_saw_the_exit_and_disconnected_reattaches_without_force() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_sh(&mgr, "seen", "echo done; exit 4", &tx).await;
+        let _ = drain_until_terminal(&mut rx, "seen").await;
+        drop(rx);
+
+        let frames = reattach_frames(&mgr, "seen").await;
+
+        let types: Vec<_> = frames.iter().map(|f| f["type"].clone()).collect();
+        assert_eq!(types, ["exec_attached", "exec_stdout", "exec_exit"]);
+        assert_eq!(frames[2]["code"], 4);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
