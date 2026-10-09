@@ -21,9 +21,17 @@
 //! `exec_detached` to the old dest and replays the scrollback to the
 //! new one. Owner-only steal: reattach refuses unless the calling
 //! actor's `user_id` matches the original attacher's.
+//!
+//! Exit retention: an exited exec stays registered, with its scrollback
+//! and its `exec_exit` / `exec_error` frame, until Lens Sandbox sends
+//! `exec_ack` or `FINISHED_EXEC_RETENTION` expires. A client that was
+//! disconnected when the exec exited reattaches and gets the output and
+//! the result. Without this, an exit during a disconnect is lost, and the
+//! caller cannot tell a command that finished from one that never will.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -58,6 +66,12 @@ const DEFAULT_KILL_SIGNAL: i32 = libc::SIGTERM;
 /// try to retain. Old chunks are evicted from the front.
 const SCROLLBACK_CAPACITY_BYTES: usize = 64 * 1024;
 
+/// How long an exited exec waits for `exec_ack` before it is dropped. It
+/// bounds the memory a gateway that never acknowledges can make us hold,
+/// and it is long enough for a client to come back through the
+/// supervisor's WebSocket reconnect backoff.
+const FINISHED_EXEC_RETENTION: Duration = Duration::from_secs(5 * 60);
+
 /// Per-WS-session registry of running execs.
 ///
 /// Cloned freely; the inner state is shared via `Arc<Mutex<...>>`.
@@ -78,6 +92,7 @@ struct Inner {
     /// a reaper, e.g. the short-lived shell sandbox, where it's a no-op.
     pid_guard: PidGuard,
     launcher: Arc<dyn Launcher>,
+    finished_exec_retention: Duration,
 }
 
 /// Stdin frame sent from the manager to the writer task. Bytes are written
@@ -98,6 +113,9 @@ struct SessionHandle {
     /// — that hop was a measurable source of flakiness under runtime
     /// contention (CI runners pegged, parallel test load).
     cancelled: Mutex<bool>,
+    /// Set once the child is reaped and its output is drained. Its pid can
+    /// then belong to another process, so a cancel must not signal it.
+    exited: bool,
     /// PTY master fd, present only for `tty=true` sessions. The `Arc`
     /// is the ownership story: as long as the registry holds it, the fd
     /// is alive. A `resize` clones the Arc out under the lock, so the fd
@@ -134,6 +152,7 @@ impl ExecManager {
                 is_root,
                 pid_guard,
                 launcher,
+                finished_exec_retention: FINISHED_EXEC_RETENTION,
             }),
         }
     }
@@ -184,6 +203,9 @@ impl ExecManager {
             } => {
                 self.reattach(exec_id, actor, force, initial_size, ws_tx)
                     .await;
+            }
+            IncomingMessage::ExecAck { exec_id } => {
+                self.ack(&exec_id);
             }
         }
     }
@@ -262,6 +284,7 @@ impl ExecManager {
         let handle = SessionHandle {
             stdin_tx,
             cancelled: Mutex::new(false),
+            exited: false,
             tty_master_fd: None,
             fwd_tx: fwd_tx.clone(),
             pid,
@@ -383,6 +406,7 @@ impl ExecManager {
         let handle = SessionHandle {
             stdin_tx,
             cancelled: Mutex::new(false),
+            exited: false,
             tty_master_fd: Some(master_fd),
             fwd_tx: fwd_tx.clone(),
             pid,
@@ -477,6 +501,9 @@ impl ExecManager {
             let Some(session) = sessions.get(exec_id) else {
                 return;
             };
+            if session.exited {
+                return;
+            }
             let mut cancelled = session.cancelled.lock().unwrap();
             if *cancelled {
                 return;
@@ -495,6 +522,31 @@ impl ExecManager {
         }
     }
 
+    /// Tell each client attached to a running exec that the supervisor is
+    /// stopping, so it records the exec as interrupted and not as exited.
+    /// Call it before the supervisor exits: the kernel then kills the execs
+    /// with no `exec_exit`, and a signal exit caused by the stop must not
+    /// look like the command's result. A client that is disconnected gets
+    /// nothing; for it, a supervisor that is gone without an exit is the
+    /// same signal. The frames are only queued, so the caller must let the
+    /// WebSocket writer send them before it exits.
+    pub fn detach_for_shutdown(&self) {
+        for session in self.inner.sessions.lock().unwrap().values() {
+            let _ = session
+                .fwd_tx
+                .send(ForwarderEvent::Detach(DetachReason::SupervisorShutdown));
+        }
+    }
+
+    /// Drop an exited exec whose result Lens Sandbox has stored. Removing
+    /// the handle drops the last sender of its forwarder, which then ends.
+    fn ack(&self, exec_id: &str) {
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        if sessions.get(exec_id).is_some_and(|s| s.exited) {
+            sessions.remove(exec_id);
+        }
+    }
+
     /// Reattach the calling WS connection to an existing exec, enforcing
     /// owner-only takeover.
     ///
@@ -508,9 +560,10 @@ impl ExecManager {
     ///   `exec_error "exec already attached"`. The same-user reattacher
     ///   must explicitly request the steal.
     /// - else → forwarder emits `exec_detached` to the prior dest (if any),
-    ///   replays scrollback to `ws_tx`, manager emits `exec_attached`
-    ///   carrying the original owner and pid. PTY size is applied if the
-    ///   reattach payload supplied one.
+    ///   then sends `ws_tx` the `exec_attached` carrying the original owner
+    ///   and pid, the scrollback, and — for an exec that already exited —
+    ///   its terminal frame. PTY size is applied if the reattach payload
+    ///   supplied one.
     async fn reattach(
         &self,
         exec_id: String,
@@ -556,13 +609,18 @@ impl ExecManager {
         if fwd_tx
             .send(ForwarderEvent::SwapDest {
                 new_dest: ws_tx.clone(),
+                attached: OutgoingMessage::ExecAttached {
+                    exec_id: exec_id.clone(),
+                    pid,
+                    owner,
+                },
                 reason: DetachReason::Stolen,
                 force,
                 reply: reply_tx,
             })
             .is_err()
         {
-            // Forwarder is gone — child must have just exited.
+            // Only if the forwarder task died: this handler holds a sender.
             emit(
                 ws_tx,
                 OutgoingMessage::ExecError {
@@ -575,14 +633,6 @@ impl ExecManager {
 
         match reply_rx.await {
             Ok(SwapOutcome::Swapped) => {
-                emit(
-                    ws_tx,
-                    OutgoingMessage::ExecAttached {
-                        exec_id: exec_id.clone(),
-                        pid,
-                        owner,
-                    },
-                );
                 if is_tty && let Some(sz) = initial_size {
                     self.resize(&exec_id, sz.cols, sz.rows);
                 }
@@ -645,9 +695,11 @@ enum ForwarderEvent {
         bytes: Vec<u8>,
     },
     /// Disconnect the current dest (if any) and attach a new one. The
-    /// new dest receives a base64'd replay of the scrollback in order,
-    /// then resumes live chunks. The old dest receives `exec_detached`
-    /// best-effort — failure is not surfaced.
+    /// new dest receives `attached`, a base64'd replay of the scrollback
+    /// in order, and the terminal frame if the exec already exited;
+    /// otherwise it resumes live chunks. The forwarder sends `attached`
+    /// itself so no chunk or terminal frame can overtake it. The old dest
+    /// receives `exec_detached` best-effort — failure is not surfaced.
     ///
     /// `force=false` declines the swap when there is already a live dest
     /// — the forwarder replies `DestBusyNeedsForce` and leaves state
@@ -656,14 +708,18 @@ enum ForwarderEvent {
     /// observable to the caller without sharing atomic state.
     SwapDest {
         new_dest: mpsc::UnboundedSender<String>,
+        attached: OutgoingMessage,
         reason: DetachReason,
         force: bool,
         reply: oneshot::Sender<SwapOutcome>,
     },
     /// Exec terminated. Carries the exec_exit / exec_error frame the
-    /// forwarder emits last; receipt also tells the forwarder to drop
-    /// its rx and exit.
+    /// forwarder emits last. The forwarder keeps it for a reattach until
+    /// every sender is dropped (see "Exit retention" in the module docs).
     Final(OutgoingMessage),
+    /// Send the current dest `exec_detached` and drop it. Nothing is sent
+    /// after the terminal frame, which must stay the last frame.
+    Detach(DetachReason),
 }
 
 /// Result of a `SwapDest` event, returned to the requester via a oneshot
@@ -732,9 +788,10 @@ fn encode_chunk(exec_id: &str, stream: Stream, bytes: &[u8]) -> String {
 ///
 /// Persistence: when the current dest's send fails (WS closed) we set
 /// `dest = None` instead of returning. Pipe readers keep producing,
-/// scrollback keeps rotating, the child keeps running. The forwarder
-/// only exits on `Final`, which is the controller's signal that the
-/// child has exited and `output_tasks` have been drained.
+/// scrollback keeps rotating, the child keeps running. After `Final`
+/// the forwarder keeps the terminal frame for a reattach, and exits only
+/// when every sender is gone: the manager dropped the session on
+/// `exec_ack` or when `FINISHED_EXEC_RETENTION` expired.
 fn spawn_forwarder(
     exec_id: String,
     initial_dest: mpsc::UnboundedSender<String>,
@@ -743,6 +800,7 @@ fn spawn_forwarder(
     tokio::spawn(async move {
         let mut dest: Option<mpsc::UnboundedSender<String>> = Some(initial_dest);
         let mut scrollback = Scrollback::new();
+        let mut terminal_frame: Option<String> = None;
         while let Some(ev) = rx.recv().await {
             match ev {
                 ForwarderEvent::Chunk { stream, bytes } => {
@@ -759,6 +817,7 @@ fn spawn_forwarder(
                 }
                 ForwarderEvent::SwapDest {
                     new_dest,
+                    attached,
                     reason,
                     force,
                     reply,
@@ -777,9 +836,16 @@ fn spawn_forwarder(
                         };
                         let _ = old.send(serde_json::to_string(&detached).unwrap());
                     }
+                    let replay = std::iter::once(serde_json::to_string(&attached).unwrap())
+                        .chain(
+                            scrollback
+                                .chunks
+                                .iter()
+                                .map(|(stream, bytes)| encode_chunk(&exec_id, *stream, bytes)),
+                        )
+                        .chain(terminal_frame.clone());
                     let mut new_dest_live = true;
-                    for (stream, bytes) in &scrollback.chunks {
-                        let msg = encode_chunk(&exec_id, *stream, bytes);
+                    for msg in replay {
                         if new_dest.send(msg).is_err() {
                             new_dest_live = false;
                             break;
@@ -789,12 +855,24 @@ fn spawn_forwarder(
                     let _ = reply.send(SwapOutcome::Swapped);
                 }
                 ForwarderEvent::Final(msg) => {
-                    // Send fire-and-forget — `exec_exit` for a client that's
-                    // already gone is a no-op (matches the old `emit` path).
-                    if let Some(d) = &dest {
-                        let _ = d.send(serde_json::to_string(&msg).unwrap());
+                    let frame = serde_json::to_string(&msg).unwrap();
+                    if let Some(d) = &dest
+                        && d.send(frame.clone()).is_err()
+                    {
+                        dest = None;
                     }
-                    return;
+                    terminal_frame = Some(frame);
+                }
+                ForwarderEvent::Detach(reason) => {
+                    if terminal_frame.is_none()
+                        && let Some(old) = dest.take()
+                    {
+                        let detached = OutgoingMessage::ExecDetached {
+                            exec_id: exec_id.clone(),
+                            reason,
+                        };
+                        let _ = old.send(serde_json::to_string(&detached).unwrap());
+                    }
                 }
             }
         }
@@ -872,6 +950,7 @@ async fn run_controller(
     if let Some(pid) = pid {
         registry.pid_guard.release(pid);
     }
+    let pid = pid.unwrap_or(0);
 
     // Drain output BEFORE emitting exit — the protocol contract says
     // exec_exit is the last frame for the exec_id, and clients trust it
@@ -881,6 +960,9 @@ async fn run_controller(
     for t in output_tasks {
         let _ = t.await;
     }
+    // Not before the drain: until the pipes close, descendants in the
+    // process group keep its pgid alive, and a cancel must still reach them.
+    mark_exited(&registry, &exec_id, pid);
 
     let exit = match status {
         Ok(st) => OutgoingMessage::ExecExit {
@@ -894,8 +976,29 @@ async fn run_controller(
         },
     };
     let _ = fwd_tx.send(ForwarderEvent::Final(exit));
+    // The session handle holds the forwarder's last sender now, so an
+    // `exec_ack` that removes it ends the forwarder at once.
+    drop(fwd_tx);
 
-    registry.sessions.lock().unwrap().remove(&exec_id);
+    tokio::time::sleep(registry.finished_exec_retention).await;
+    let mut sessions = registry.sessions.lock().unwrap();
+    if sessions.get(&exec_id).is_some_and(|s| is_exited(s, pid)) {
+        sessions.remove(&exec_id);
+    }
+}
+
+fn mark_exited(registry: &Inner, exec_id: &str, pid: u32) {
+    if let Some(session) = registry.sessions.lock().unwrap().get_mut(exec_id)
+        && session.pid == pid
+    {
+        session.exited = true;
+    }
+}
+
+/// True for the exited session of this exec. The pid tells it apart from
+/// a later exec that reused the id after this one was acknowledged.
+fn is_exited(session: &SessionHandle, pid: u32) -> bool {
+    session.pid == pid && session.exited
 }
 
 #[cfg(unix)]
@@ -1751,10 +1854,262 @@ mod tests {
         cleanup(&mgr, "r5", &tx1).await;
     }
 
+    // --- Exit retention ----------------------------------------------------
+
+    fn manager_with_retention(retention: Duration) -> ExecManager {
+        let mut mgr = manager();
+        Arc::get_mut(&mut mgr.inner)
+            .expect("a new manager is not shared yet")
+            .finished_exec_retention = retention;
+        mgr
+    }
+
+    async fn attach_sh(
+        mgr: &ExecManager,
+        exec_id: &str,
+        script: &str,
+        tx: &mpsc::UnboundedSender<String>,
+    ) {
+        mgr.handle(
+            IncomingMessage::ExecAttach {
+                exec_id: exec_id.into(),
+                argv: vec!["sh".into(), "-c".into(), script.into()],
+                env: HashMap::new(),
+                cwd: None,
+                tty: false,
+                stdin: true,
+                stdout: true,
+                stderr: true,
+                initial_size: None,
+                actor: Some(actor("user-1")),
+            },
+            tx,
+        )
+        .await;
+    }
+
+    async fn reattach_frames(mgr: &ExecManager, exec_id: &str) -> Vec<serde_json::Value> {
+        let (tx, mut rx) = channel();
+        mgr.handle(
+            IncomingMessage::ExecReattach {
+                exec_id: exec_id.into(),
+                force: false,
+                initial_size: None,
+                actor: Some(actor("user-1")),
+            },
+            &tx,
+        )
+        .await;
+        drain_until_terminal(&mut rx, exec_id).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exec_that_exits_while_disconnected_gives_its_result_on_reattach() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_sh(&mgr, "gone", "sleep 0.3; echo done; exit 3", &tx).await;
+        let attached = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(attached.contains("exec_attached"));
+        drop(rx);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let frames = reattach_frames(&mgr, "gone").await;
+
+        let types: Vec<_> = frames.iter().map(|f| f["type"].clone()).collect();
+        assert_eq!(
+            types,
+            ["exec_attached", "exec_stdout", "exec_exit"],
+            "the exit stays the last frame after the replay"
+        );
+        assert_eq!(
+            B64.decode(frames[1]["data"].as_str().unwrap()).unwrap(),
+            b"done\n"
+        );
+        assert_eq!(frames[2]["code"], 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_acknowledged_exec_is_dropped() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_sh(&mgr, "acked", "true", &tx).await;
+        let _ = drain_until_terminal(&mut rx, "acked").await;
+
+        mgr.handle(
+            IncomingMessage::ExecAck {
+                exec_id: "acked".into(),
+            },
+            &tx,
+        )
+        .await;
+
+        let frames = reattach_frames(&mgr, "acked").await;
+        assert_eq!(frames.last().unwrap()["message"], "no such exec");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ack_for_a_running_exec_keeps_it() {
+        let mgr = manager();
+        let (tx, _rx) = attach_with_actor(&mgr, "running", Some(actor("user-1"))).await;
+
+        mgr.handle(
+            IncomingMessage::ExecAck {
+                exec_id: "running".into(),
+            },
+            &tx,
+        )
+        .await;
+
+        assert!(mgr.inner.sessions.lock().unwrap().contains_key("running"));
+        cleanup(&mgr, "running", &tx).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exited_exec_nobody_acknowledges_expires() {
+        let mgr = manager_with_retention(Duration::from_millis(100));
+        let (tx, mut rx) = channel();
+        attach_sh(&mgr, "expired", "true", &tx).await;
+        let _ = drain_until_terminal(&mut rx, "expired").await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let frames = reattach_frames(&mgr, "expired").await;
+        assert_eq!(frames.last().unwrap()["message"], "no such exec");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_still_reaches_a_background_child_that_holds_the_output() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_sh(&mgr, "bg", "sleep 30 & exit 0", &tx).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        mgr.handle(
+            IncomingMessage::ExecCancel {
+                exec_id: "bg".into(),
+                signal: Some(libc::SIGKILL),
+            },
+            &tx,
+        )
+        .await;
+
+        let frames = drain_until_terminal(&mut rx, "bg").await;
+        assert_eq!(frames.last().unwrap()["type"], "exec_exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_after_the_exit_signals_nothing() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_sh(&mgr, "done", "true", &tx).await;
+        let _ = drain_until_terminal(&mut rx, "done").await;
+
+        mgr.handle(
+            IncomingMessage::ExecCancel {
+                exec_id: "done".into(),
+                signal: Some(libc::SIGKILL),
+            },
+            &tx,
+        )
+        .await;
+
+        let sessions = mgr.inner.sessions.lock().unwrap();
+        let session = sessions.get("done").expect("the exited exec is kept");
+        assert!(
+            !*session.cancelled.lock().unwrap(),
+            "the pid of an exited exec can belong to another process"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_detaches_running_execs_and_reports_no_exit() {
+        let mgr = manager();
+        let (tx, mut rx) = attach_with_actor(&mgr, "stopping", Some(actor("user-1"))).await;
+
+        mgr.detach_for_shutdown();
+        let detached = next_frame(&mut rx).await;
+        assert_eq!(detached["type"], "exec_detached");
+        assert_eq!(detached["reason"], "supervisor_shutdown");
+
+        cleanup(&mgr, "stopping", &tx).await;
+        let after = timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            after.is_err(),
+            "the kill that follows a shutdown is not the command's result: {after:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_sends_nothing_after_an_exit() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_sh(&mgr, "finished", "true", &tx).await;
+        let _ = drain_until_terminal(&mut rx, "finished").await;
+
+        mgr.detach_for_shutdown();
+
+        let after = timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(after.is_err(), "exec_exit stays the last frame: {after:?}");
+    }
+
     // --- Forwarder unit tests ---------------------------------------------
     //
     // These exercise `spawn_forwarder` directly (bypassing the manager)
     // so we can drive `SwapDest` and dest loss in isolation.
+
+    fn attached_frame(exec_id: &str) -> OutgoingMessage {
+        OutgoingMessage::ExecAttached {
+            exec_id: exec_id.into(),
+            pid: 4242,
+            owner: None,
+        }
+    }
+
+    async fn next_frame(rx: &mut mpsc::UnboundedReceiver<String>) -> serde_json::Value {
+        let frame = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&frame).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarder_replays_the_terminal_frame_last() {
+        let (dest1_tx, dest1_rx) = mpsc::unbounded_channel::<String>();
+        let fwd = spawn_forwarder("e3".into(), dest1_tx);
+        drop(dest1_rx);
+
+        fwd.send(ForwarderEvent::Chunk {
+            stream: Stream::Stdout,
+            bytes: b"out".to_vec(),
+        })
+        .unwrap();
+        fwd.send(ForwarderEvent::Final(OutgoingMessage::ExecExit {
+            exec_id: "e3".into(),
+            code: Some(0),
+            signal: None,
+        }))
+        .unwrap();
+
+        let (dest2_tx, mut dest2_rx) = mpsc::unbounded_channel::<String>();
+        let (reply_tx, reply_rx) = oneshot::channel::<SwapOutcome>();
+        fwd.send(ForwarderEvent::SwapDest {
+            new_dest: dest2_tx,
+            attached: attached_frame("e3"),
+            reason: DetachReason::Stolen,
+            force: false,
+            reply: reply_tx,
+        })
+        .unwrap();
+        assert_eq!(reply_rx.await.unwrap(), SwapOutcome::Swapped);
+
+        assert_eq!(next_frame(&mut dest2_rx).await["type"], "exec_attached");
+        assert_eq!(next_frame(&mut dest2_rx).await["type"], "exec_stdout");
+        assert_eq!(next_frame(&mut dest2_rx).await["type"], "exec_exit");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forwarder_replays_scrollback_to_new_dest_and_detaches_old() {
@@ -1780,6 +2135,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel::<SwapOutcome>();
         fwd.send(ForwarderEvent::SwapDest {
             new_dest: dest2_tx,
+            attached: attached_frame("e1"),
             reason: DetachReason::Stolen,
             force: true,
             reply: reply_tx,
@@ -1797,7 +2153,8 @@ mod tests {
         assert_eq!(v["reason"], "stolen");
         assert_eq!(v["execId"], "e1");
 
-        // New dest sees the replayed chunk.
+        // New dest sees exec_attached, then the replayed chunk.
+        assert_eq!(next_frame(&mut dest2_rx).await["type"], "exec_attached");
         let replay = timeout(Duration::from_secs(2), dest2_rx.recv())
             .await
             .unwrap()
@@ -1845,12 +2202,14 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel::<SwapOutcome>();
         fwd.send(ForwarderEvent::SwapDest {
             new_dest: dest2_tx,
+            attached: attached_frame("e2"),
             reason: DetachReason::Stolen,
             force: true,
             reply: reply_tx,
         })
         .unwrap();
         assert_eq!(reply_rx.await.unwrap(), SwapOutcome::Swapped);
+        assert_eq!(next_frame(&mut dest2_rx).await["type"], "exec_attached");
 
         let mut decoded = Vec::new();
         for _ in 0..5 {
