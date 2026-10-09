@@ -147,8 +147,9 @@ pub enum IncomingMessage {
 #[allow(clippy::enum_variant_names)]
 pub enum OutgoingMessage {
     /// Spawn succeeded. Sent once per `exec_attach`. Also sent in response
-    /// to a successful `exec_reattach`, in which case it's followed by an
-    /// `exec_stdout` carrying the scrollback before live output resumes.
+    /// to a successful `exec_reattach`, in which case it's followed by
+    /// `exec_stdout` frames carrying the scrollback, then live output or,
+    /// for an exec that already exited, its `exec_exit` / `exec_error`.
     /// `owner` lets clients display "this session belongs to X" and is the
     /// identity the supervisor compares against on future reattach attempts.
     #[serde(rename = "exec_attached", rename_all = "camelCase")]
@@ -176,7 +177,8 @@ pub enum OutgoingMessage {
     #[serde(rename = "exec_stderr", rename_all = "camelCase")]
     ExecStderr { exec_id: String, data: String },
 
-    /// Final frame for a successful spawn. After this no more frames carry this exec_id.
+    /// Final frame for a successful spawn. After this no more frames carry
+    /// this exec_id on this connection; a reattach replays it.
     #[serde(rename = "exec_exit", rename_all = "camelCase")]
     ExecExit {
         exec_id: String,
