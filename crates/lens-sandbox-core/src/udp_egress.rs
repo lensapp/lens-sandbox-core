@@ -444,9 +444,14 @@ pub fn spawn(state: Arc<ProxyState>) {
     let runtime = tokio::runtime::Handle::current();
     let thread = std::thread::Builder::new()
         .name("udp-egress".to_string())
-        .spawn(move || match run(&state, &runtime) {
-            Ok(()) => tracing::error!("udp egress relay ended; udp stays denied"),
-            Err(e) => tracing::error!("udp egress relay failed: {e}; udp stays denied"),
+        .spawn(move || {
+            // The audit dedup schedules each window's summary on the current
+            // runtime, and folds nothing on a thread that has none.
+            let _runtime = runtime.enter();
+            match run(&state, &runtime) {
+                Ok(()) => tracing::error!("udp egress relay ended; udp stays denied"),
+                Err(e) => tracing::error!("udp egress relay failed: {e}; udp stays denied"),
+            }
         });
     if let Err(e) = thread {
         tracing::error!("could not start the udp egress relay: {e}; udp stays denied");

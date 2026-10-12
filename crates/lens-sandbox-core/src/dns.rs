@@ -1592,6 +1592,20 @@ mod tests {
         assert_eq!(reasons, ["dns-denied", "dns-binary-not-allowed"]);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_folded_dns_refusal_is_counted_when_its_window_closes() {
+        use crate::proxy::tests::{
+            assert_one_refusal_and_its_summary, events_once_the_windows_close, refusals_in,
+            refuse_times, test_state,
+        };
+        let (state, mut rx) = test_state();
+        let last = refuse_times(3, || emit_deny(&state, "evil.example", "dns-denied"));
+
+        let events = events_once_the_windows_close(&mut rx).await;
+        assert_one_refusal_and_its_summary(&events, 2, last);
+        assert_eq!(refusals_in(&events), 3);
+    }
+
     #[test]
     fn explicit_deny_rule_blocks_dns_lookup() {
         // A `verdict: deny` rule for a hostname must not cause that name
