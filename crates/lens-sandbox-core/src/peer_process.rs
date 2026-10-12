@@ -134,6 +134,13 @@ impl ActorContext {
             if let Some(path) = p.exe.as_deref().and_then(Path::to_str) {
                 process["file"] = json!({ "path": path });
             }
+            // OCSF `process.lineage`: the launchers a `binaries` filter also
+            // admits a caller by, so the host can name the rule that matched.
+            // A non-UTF-8 ancestor is left out, as a non-UTF-8 exe is above.
+            let lineage: Vec<&str> = p.ancestors.iter().filter_map(|a| a.to_str()).collect();
+            if !lineage.is_empty() {
+                process["lineage"] = json!(lineage);
+            }
             event.insert("actor".into(), json!({ "process": process }));
         }
     }
@@ -425,7 +432,12 @@ mod tests {
         );
         assert_eq!(
             event["actor"],
-            json!({"process": {"name": "wget", "pid": 4242, "file": {"path": "/usr/bin/wget"}}})
+            json!({"process": {
+                "name": "wget",
+                "pid": 4242,
+                "file": {"path": "/usr/bin/wget"},
+                "lineage": ["/usr/bin/bash"],
+            }})
         );
     }
 
