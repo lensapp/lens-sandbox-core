@@ -1482,8 +1482,8 @@ async fn handle_connect(
                     .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                     .await?;
                 // `error`, not `failure`: this is a misconfiguration and every
-                // occurrence of it should be visible. A `failure` is deduped per
-                // host, so the second attempt would leave no trace at all.
+                // occurrence of it should be visible. A repeated `failure` is
+                // deduped, so the second attempt would leave no trace of its own.
                 emit_audit(state, target_host, "error", 502, actor);
                 return Err(format!(
                     "an llm route covers {target_host}, which the aws re-sign path also owns; \
@@ -2896,69 +2896,90 @@ async fn handle_transparent_http(
 
 /// Audit event for a transparent connection that was dropped before reaching
 /// any policy or MITM machinery (unknown protocol, missing SNI, missing Host,
-/// etc.). Dedup keyed on `"t:<orig-dst-ip>:<port>"` — the `t:` prefix
-/// namespaces transparent denials away from `emit_audit_action`, which uses
-/// a bare hostname as its key. The port is included because a process that
-/// probes `evil.com:443`, `evil.com:8443`, `evil.com:8080` in quick
-/// succession generates three distinct policy-relevant events; collapsing
-/// them onto a single IP-only key would leave gaps in the audit trail.
+/// etc.). The action carries the original destination's port, so a process
+/// that probes `evil.com:443`, `evil.com:8443`, `evil.com:8080` in quick
+/// succession produces three distinct events rather than one.
 fn emit_transparent_deny(state: &Arc<ProxyState>, orig_dst: SocketAddr, reason: &str) {
     tracing::info!(target = %orig_dst, reason, "transparent redirect dropped connection");
     emit_deny_event(
         state,
-        format!("t:{}:{}", orig_dst.ip(), orig_dst.port()),
         format!("TRANSPARENT {orig_dst}"),
         serde_json::json!({ "transparent": true, "reason": reason }),
     );
 }
 
 /// Shared deny-event emitter for paths that drop traffic before hitting
-/// `emit_audit_action` (transparent redirect, DNS stub). Handles dedup
-/// against `ProxyState.deny_dedup` and the audit-channel send. Callers own
-/// the `key` prefix to avoid collisions with hostname-keyed CONNECT
-/// events (see `emit_transparent_deny` for the `"t:"` convention; DNS uses
-/// `"d:"`).
+/// `emit_audit_action` (transparent redirect, DNS stub). Repeats are
+/// deduplicated by [`is_repeat_failure`].
 pub(crate) fn emit_deny_event(
     state: &Arc<ProxyState>,
-    key: String,
     action: String,
     metadata: serde_json::Value,
 ) {
-    let now = Instant::now();
-    {
-        let mut dedup = state.deny_dedup.lock().unwrap();
-        if let Some(last) = dedup.get(&key)
-            && now.duration_since(*last).as_secs() < AUDIT_DEDUP_SECS
-        {
-            return;
-        }
-        dedup.insert(key, now);
-        // Clear-on-overflow rather than LRU: simple, no per-insert cost,
-        // accepts that one in every-1024-distinct-keys deny gets re-emitted
-        // even though the dedup window hasn't elapsed. 1024 is generous
-        // enough that this is rare in practice.
-        if dedup.len() > 1024 {
-            dedup.clear();
-        }
+    let event = serde_json::json!({
+        "type": "audit_event",
+        "source": "sandbox-proxy",
+        "action": action,
+        "result": "failure",
+        "status_code": 0,
+        "metadata": metadata,
+    });
+    if is_repeat_failure(state, &event) {
+        return;
     }
+    send_audit_event(state, &event);
+}
 
-    let tx = state.audit_tx.lock().unwrap();
-    if let Some(tx) = tx.as_ref() {
-        let event = serde_json::json!({
-            "type": "audit_event",
-            "source": "sandbox-proxy",
-            "action": action,
-            "result": "failure",
-            "status_code": 0,
-            "metadata": metadata,
-        });
+fn send_audit_event(state: &ProxyState, event: &serde_json::Value) {
+    if let Some(tx) = state.audit_tx.lock().unwrap().as_ref() {
         let _ = tx.send(event.to_string());
     }
 }
 
+/// What makes two failure events the same refusal: everything but the fields
+/// that name the connection (`src_endpoint`, the caller's pid), which change
+/// on every retry a fresh process makes.
+fn refusal_identity(event: &serde_json::Value) -> serde_json::Value {
+    let mut identity = event.clone();
+    if let Some(fields) = identity.as_object_mut() {
+        fields.remove("src_endpoint");
+        if let Some(process) = fields
+            .get_mut("actor")
+            .and_then(|actor| actor.get_mut("process"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            process.remove("pid");
+        }
+    }
+    identity
+}
+
+/// Whether `event` repeats a failure sent less than [`AUDIT_DEDUP_SECS`] ago,
+/// which suppresses retry storms. Only the same refusal counts as a repeat, so
+/// a refusal for another reason, port, path or caller is always sent.
+fn is_repeat_failure(state: &ProxyState, event: &serde_json::Value) -> bool {
+    let key = refusal_identity(event).to_string();
+    let now = Instant::now();
+    let mut dedup = state.deny_dedup.lock().unwrap();
+    if let Some(last) = dedup.get(&key)
+        && now.duration_since(*last).as_secs() < AUDIT_DEDUP_SECS
+    {
+        return true;
+    }
+    dedup.insert(key, now);
+    // Clear-on-overflow rather than LRU: simple, no per-insert cost,
+    // accepts that one in every-1024-distinct-keys deny gets re-emitted
+    // even though the dedup window hasn't elapsed. 1024 is generous
+    // enough that this is rare in practice.
+    if dedup.len() > 1024 {
+        dedup.clear();
+    }
+    false
+}
+
 /// The audit facts for one egress request: the legacy combined `action` string
 /// plus the structured fields the host reads instead of re-parsing it. `host`
-/// is the bare hostname (no port) and doubles as the failure-dedup key; `path`
+/// is the bare hostname (no port); `path`
 /// is `None` for CONNECT tunnels, which have none.
 struct RequestFacts<'a> {
     action: &'a str,
@@ -3015,8 +3036,8 @@ fn emit_http_audit(
 }
 
 /// Emit an audit event back to Lens Sandbox via the WebSocket channel.
-/// Failure events are deduplicated (at most one per host per AUDIT_DEDUP_SECS)
-/// to suppress retry storms. Success and error events are always emitted.
+/// Failure events are deduplicated by [`is_repeat_failure`]. Success and error
+/// events are always emitted.
 fn emit_audit_action(
     state: &Arc<ProxyState>,
     result: &str,
@@ -3039,42 +3060,28 @@ fn emit_audit_action_with_metadata(
     facts: RequestFacts<'_>,
     actor: &crate::peer_process::ActorContext,
 ) {
-    if result == "failure" {
-        let now = Instant::now();
-        let mut dedup = state.deny_dedup.lock().unwrap();
-        if let Some(last) = dedup.get(facts.host)
-            && now.duration_since(*last).as_secs() < AUDIT_DEDUP_SECS
-        {
-            return;
-        }
-        dedup.insert(facts.host.to_string(), now);
-        if dedup.len() > 1024 {
-            dedup.clear();
-        }
+    let mut event = serde_json::json!({
+        "type": "audit_event",
+        "source": "sandbox-proxy",
+        "action": facts.action,
+        "method": facts.method,
+        "host": facts.host,
+        "result": result,
+        "status_code": status_code,
+    });
+    if let Some(path) = facts.path {
+        event["path"] = serde_json::Value::from(path);
     }
-
-    let tx = state.audit_tx.lock().unwrap();
-    if let Some(tx) = tx.as_ref() {
-        let mut event = serde_json::json!({
-            "type": "audit_event",
-            "source": "sandbox-proxy",
-            "action": facts.action,
-            "method": facts.method,
-            "host": facts.host,
-            "result": result,
-            "status_code": status_code,
-        });
-        if let Some(path) = facts.path {
-            event["path"] = serde_json::Value::from(path);
-        }
-        if let Some(meta) = metadata {
-            event["metadata"] = meta;
-        }
-        if let Some(obj) = event.as_object_mut() {
-            actor.augment(obj);
-        }
-        let _ = tx.send(event.to_string());
+    if let Some(meta) = metadata {
+        event["metadata"] = meta;
     }
+    if let Some(obj) = event.as_object_mut() {
+        actor.augment(obj);
+    }
+    if result == "failure" && is_repeat_failure(state, &event) {
+        return;
+    }
+    send_audit_event(state, &event);
 }
 
 /// Audit a CONNECT denied by policy. `reason` (`policy-deny` for a verdict
@@ -4838,10 +4845,9 @@ pub(crate) mod tests {
 
     #[test]
     fn transparent_deny_does_not_suppress_connect_deny_on_same_ip() {
-        // Prove the `t:` key prefix isolates the two dedup key spaces.
-        // Without the prefix, a CONNECT failure to `1.2.3.4:443` would
-        // share a key with a transparent denial on `1.2.3.4`, silently
-        // swallowing one of the audit events.
+        // A CONNECT failure to `1.2.3.4:443` is not the same refusal as a
+        // transparent denial on `1.2.3.4:443`; folding one into the other
+        // would silently swallow one of the audit events.
         let (state, mut rx) = test_state();
         let orig_dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
         emit_transparent_deny(&state, orig_dst, "unknown-protocol");
@@ -4862,6 +4868,125 @@ pub(crate) mod tests {
 
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_ok());
+    }
+
+    fn caller(exe: &str) -> crate::peer_process::ActorContext {
+        crate::peer_process::ActorContext::attributed(crate::peer_process::PeerProcess {
+            pid: 7,
+            name: exe.rsplit('/').next().unwrap_or(exe).to_string(),
+            exe: Some(exe.into()),
+            ancestors: Vec::new(),
+        })
+    }
+
+    fn events_in(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<serde_json::Value> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|msg| serde_json::from_str(&msg).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_refusal_unlike_the_one_its_host_last_sent_is_sent_too() {
+        // A folded refusal is counted against the event it repeats, so a
+        // refusal with another reason, port, path or caller must not fold into
+        // it: the consumer would file it under the wrong destination.
+        let (state, mut rx) = test_state();
+        emit_policy_deny_connect(
+            &state,
+            "evil.com:443",
+            "policy-deny",
+            &caller("/usr/bin/curl"),
+        );
+        emit_policy_deny_connect(
+            &state,
+            "evil.com:443",
+            "binary-not-allowed",
+            &caller("/usr/bin/curl"),
+        );
+        emit_policy_deny_connect(
+            &state,
+            "evil.com:8443",
+            "policy-deny",
+            &caller("/usr/bin/curl"),
+        );
+        emit_policy_deny_connect(
+            &state,
+            "evil.com:443",
+            "policy-deny",
+            &caller("/usr/bin/wget"),
+        );
+        emit_policy_deny_http(
+            &state,
+            "evil.com",
+            "GET",
+            "/a",
+            "policy-deny",
+            &caller("/usr/bin/curl"),
+        );
+        emit_policy_deny_http(
+            &state,
+            "evil.com",
+            "GET",
+            "/b",
+            "policy-deny",
+            &caller("/usr/bin/curl"),
+        );
+
+        let actions: Vec<_> = events_in(&mut rx)
+            .iter()
+            .map(|event| {
+                format!(
+                    "{} {} {}",
+                    event["action"].as_str().unwrap(),
+                    event["metadata"]["reason"].as_str().unwrap(),
+                    event["actor"]["process"]["file"]["path"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "CONNECT evil.com:443 policy-deny /usr/bin/curl",
+                "CONNECT evil.com:443 binary-not-allowed /usr/bin/curl",
+                "CONNECT evil.com:8443 policy-deny /usr/bin/curl",
+                "CONNECT evil.com:443 policy-deny /usr/bin/wget",
+                "GET http://evil.com/a policy-deny /usr/bin/curl",
+                "GET http://evil.com/b policy-deny /usr/bin/curl",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_from_another_process_of_the_same_binary_folds() {
+        // The pid and source port change on every retry a fresh process
+        // makes; they name the connection, not the refusal.
+        let (state, mut rx) = test_state();
+        let process = |pid| {
+            crate::peer_process::ActorContext::attributed(crate::peer_process::PeerProcess {
+                pid,
+                name: "curl".into(),
+                exe: Some("/usr/bin/curl".into()),
+                ancestors: Vec::new(),
+            })
+        };
+        emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &process(7));
+        emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &process(8));
+
+        assert_eq!(events_in(&mut rx).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_transparent_refusal_for_another_reason_is_sent_too() {
+        let (state, mut rx) = test_state();
+        let orig_dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        emit_transparent_deny(&state, orig_dst, "unknown-protocol");
+        emit_transparent_deny(&state, orig_dst, "tls-no-sni");
+
+        let reasons: Vec<_> = events_in(&mut rx)
+            .iter()
+            .map(|event| event["metadata"]["reason"].clone())
+            .collect();
+        assert_eq!(reasons, ["unknown-protocol", "tls-no-sni"]);
     }
 
     #[test]

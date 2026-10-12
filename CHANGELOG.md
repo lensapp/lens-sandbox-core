@@ -11,3 +11,4 @@ This project will use versioned releases once public releases begin. Until then,
 - Keep an exited exec, with its scrollback and its `exec_exit` / `exec_error`, until the client sends the new `exec_ack` frame or five minutes pass. A reattach to an exited exec gets `exec_attached`, the scrollback, then the final frame.
 - Add `ExecManager::detach_for_shutdown` and split `ChildExit` into `Finished` and `Stopped`, so a supervisor can tell a workload exit from a stop signal.
 - Bump the protocol date to 2026-10-09.
+- The audit dedup folds a failure event only into the same refusal: one with another reason, port, path or caller is sent, so a consumer never files it under the wrong destination.

@@ -587,13 +587,10 @@ fn parse_resolv_conf(content: &str) -> Option<SocketAddr> {
 
 fn emit_deny(state: &Arc<ProxyState>, qname: &str, reason: &str) {
     tracing::info!(qname, reason, "dns stub denied query");
-    // `"d:"` key prefix keeps DNS denies separate from the transparent-TCP
-    // (`"t:"`) and hostname-keyed CONNECT paths in the shared dedup map. The
-    // reason distinguishes an allowlist miss (`dns-denied`) from a
+    // The reason distinguishes an allowlist miss (`dns-denied`) from a
     // binary-scoping exclusion (`dns-binary-not-allowed`).
     emit_deny_event(
         state,
-        format!("d:{qname}"),
         format!("DNS {qname}"),
         serde_json::json!({ "dns": true, "reason": reason, "qname": qname }),
     );
@@ -1571,15 +1568,28 @@ mod tests {
     #[test]
     fn qname_case_is_normalized_for_audit_dedup() {
         // DNS is case-insensitive. The decision's `qname` must be
-        // lowercased so the dedup key (`format!("d:{qname}")` in
-        // `emit_deny`) collapses `EVIL.com`, `Evil.com`, and `evil.com`
-        // into a single audit event.
+        // lowercased so the deny event `emit_deny` builds from it is the
+        // same for `EVIL.com`, `Evil.com`, and `evil.com`, and the audit
+        // dedup collapses them into a single audit event.
         let state = state_with_routes(vec![rule("example.com")]);
         let packet = make_query("EVIL.example", RecordType::A);
         match classify_query(&packet, &state, None) {
             Decision::Deny { qname, .. } => assert_eq!(qname, "evil.example"),
             other => panic!("expected Deny, got {}", describe(&other)),
         }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_refused_for_another_reason_is_sent_too() {
+        let (state, mut rx) = crate::proxy::tests::test_state();
+        emit_deny(&state, "evil.example", "dns-denied");
+        emit_deny(&state, "evil.example", "dns-binary-not-allowed");
+
+        let reasons: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|msg| serde_json::from_str::<serde_json::Value>(&msg).unwrap())
+            .map(|event| event["metadata"]["reason"].clone())
+            .collect();
+        assert_eq!(reasons, ["dns-denied", "dns-binary-not-allowed"]);
     }
 
     #[test]
