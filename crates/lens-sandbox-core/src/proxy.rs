@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
+use crate::audit_dedup::Admission;
 use crate::routing::{
     HttpRule, RawTarget, RouteOutcome, RouteRule, Scheme, Transport, Verdict,
     find_matching_raw_egress, find_matching_route,
@@ -37,9 +38,6 @@ pub struct SandboxUpstream {
     /// ride plaintext over an untrusted path (BYOA, cross-region NLB).
     pub tls: bool,
 }
-
-/// How long to suppress duplicate audit events for the same host.
-const AUDIT_DEDUP_SECS: u64 = 10;
 
 /// Well-known DNS port. The nat chain only redirects DNS over UDP to the stub, so
 /// this is also the port whose TCP traffic must keep being dropped rather than
@@ -224,7 +222,7 @@ pub struct ProxyState {
     /// See [`NetworkPolicy`] for why these fields must live together.
     pub policy: RwLock<NetworkPolicy>,
     pub audit_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
-    pub(crate) deny_dedup: std::sync::Mutex<HashMap<String, Instant>>,
+    pub(crate) deny_dedup: std::sync::Mutex<crate::audit_dedup::DenyWindows>,
     /// Credential injections received via policy — maps domain to headers.
     /// Used for MITM header injection in the sandbox proxy.
     pub credential_injections: RwLock<HashMap<String, Vec<CredentialInjection>>>,
@@ -608,7 +606,7 @@ impl ProxyServer {
             upstream: Mutex::new(None),
             policy: RwLock::new(NetworkPolicy::default()),
             audit_tx: std::sync::Mutex::new(None),
-            deny_dedup: std::sync::Mutex::new(HashMap::new()),
+            deny_dedup: std::sync::Mutex::default(),
             credential_injections: RwLock::new(HashMap::new()),
             ephemeral_ca: std::sync::OnceLock::new(),
             client_certs: RwLock::new(HashMap::new()),
@@ -2910,7 +2908,7 @@ fn emit_transparent_deny(state: &Arc<ProxyState>, orig_dst: SocketAddr, reason: 
 
 /// Shared deny-event emitter for paths that drop traffic before hitting
 /// `emit_audit_action` (transparent redirect, DNS stub). Repeats are
-/// deduplicated by [`is_repeat_failure`].
+/// folded by the audit dedup ([`crate::audit_dedup`]).
 pub(crate) fn emit_deny_event(
     state: &Arc<ProxyState>,
     action: String,
@@ -2924,10 +2922,7 @@ pub(crate) fn emit_deny_event(
         "status_code": 0,
         "metadata": metadata,
     });
-    if is_repeat_failure(state, &event) {
-        return;
-    }
-    send_audit_event(state, &event);
+    send_failure_event(state, event);
 }
 
 fn send_audit_event(state: &ProxyState, event: &serde_json::Value) {
@@ -2936,45 +2931,43 @@ fn send_audit_event(state: &ProxyState, event: &serde_json::Value) {
     }
 }
 
-/// What makes two failure events the same refusal: everything but the fields
-/// that name the connection (`src_endpoint`, the caller's pid), which change
-/// on every retry a fresh process makes.
-fn refusal_identity(event: &serde_json::Value) -> serde_json::Value {
-    let mut identity = event.clone();
-    if let Some(fields) = identity.as_object_mut() {
-        fields.remove("src_endpoint");
-        if let Some(process) = fields
-            .get_mut("actor")
-            .and_then(|actor| actor.get_mut("process"))
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            process.remove("pid");
+/// Sends a failure event through the audit dedup ([`crate::audit_dedup`]).
+/// With no runtime to close a window on, nothing is folded, so no refusal
+/// goes uncounted.
+fn send_failure_event(state: &Arc<ProxyState>, event: serde_json::Value) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        send_audit_event(state, &event);
+        return;
+    };
+    let admission = state.deny_dedup.lock().unwrap().admit(
+        &event,
+        tokio::time::Instant::now(),
+        std::time::SystemTime::now(),
+    );
+    match admission {
+        Admission::Send { closed } => {
+            for summary in &closed {
+                send_audit_event(state, summary);
+            }
+            send_audit_event(state, &event);
         }
+        Admission::Folded {
+            first: Some(window),
+        } => {
+            let state = Arc::downgrade(state);
+            runtime.spawn(async move {
+                tokio::time::sleep_until(window.closes_at()).await;
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                let summary = state.deny_dedup.lock().unwrap().close(&window);
+                if let Some(summary) = summary {
+                    send_audit_event(&state, &summary);
+                }
+            });
+        }
+        Admission::Folded { first: None } => {}
     }
-    identity
-}
-
-/// Whether `event` repeats a failure sent less than [`AUDIT_DEDUP_SECS`] ago,
-/// which suppresses retry storms. Only the same refusal counts as a repeat, so
-/// a refusal for another reason, port, path or caller is always sent.
-fn is_repeat_failure(state: &ProxyState, event: &serde_json::Value) -> bool {
-    let key = refusal_identity(event).to_string();
-    let now = Instant::now();
-    let mut dedup = state.deny_dedup.lock().unwrap();
-    if let Some(last) = dedup.get(&key)
-        && now.duration_since(*last).as_secs() < AUDIT_DEDUP_SECS
-    {
-        return true;
-    }
-    dedup.insert(key, now);
-    // Clear-on-overflow rather than LRU: simple, no per-insert cost,
-    // accepts that one in every-1024-distinct-keys deny gets re-emitted
-    // even though the dedup window hasn't elapsed. 1024 is generous
-    // enough that this is rare in practice.
-    if dedup.len() > 1024 {
-        dedup.clear();
-    }
-    false
 }
 
 /// The audit facts for one egress request: the legacy combined `action` string
@@ -3036,8 +3029,8 @@ fn emit_http_audit(
 }
 
 /// Emit an audit event back to Lens Sandbox via the WebSocket channel.
-/// Failure events are deduplicated by [`is_repeat_failure`]. Success and error
-/// events are always emitted.
+/// Failure events go through the audit dedup ([`crate::audit_dedup`]). Success
+/// and error events are always emitted.
 fn emit_audit_action(
     state: &Arc<ProxyState>,
     result: &str,
@@ -3078,10 +3071,11 @@ fn emit_audit_action_with_metadata(
     if let Some(obj) = event.as_object_mut() {
         actor.augment(obj);
     }
-    if result == "failure" && is_repeat_failure(state, &event) {
-        return;
+    if result == "failure" {
+        send_failure_event(state, event);
+    } else {
+        send_audit_event(state, &event);
     }
-    send_audit_event(state, &event);
 }
 
 /// Audit a CONNECT denied by policy. `reason` (`policy-deny` for a verdict
@@ -3210,7 +3204,7 @@ pub(crate) fn emit_gate_resolved(
 /// denial against `WHERE result='failure'` queries.
 ///
 /// Bypasses the failure-event dedup pool: a second user click on the
-/// same host inside `AUDIT_DEDUP_SECS` is a fresh decision, not a retry
+/// same host inside the audit dedup window is a fresh decision, not a retry
 /// storm.
 pub(crate) fn emit_gate_denied(
     state: &Arc<ProxyState>,
@@ -3843,7 +3837,7 @@ pub(crate) mod tests {
             upstream: Mutex::new(None),
             policy: RwLock::new(NetworkPolicy::default()),
             audit_tx: std::sync::Mutex::new(Some(tx)),
-            deny_dedup: std::sync::Mutex::new(HashMap::new()),
+            deny_dedup: std::sync::Mutex::default(),
             credential_injections: RwLock::new(HashMap::new()),
             ephemeral_ca: std::sync::OnceLock::new(),
             client_certs: RwLock::new(HashMap::new()),
@@ -4775,8 +4769,8 @@ pub(crate) mod tests {
         assert_eq!(event["result"], "success");
     }
 
-    #[test]
-    fn emit_audit_failure_dedup_suppresses_rapid_repeats() {
+    #[tokio::test]
+    async fn emit_audit_failure_dedup_suppresses_rapid_repeats() {
         let (state, mut rx) = test_state();
         emit_audit(&state, "evil.com:443", "failure", 403, &test_actor());
         emit_audit(&state, "evil.com:443", "failure", 403, &test_actor());
@@ -4830,8 +4824,8 @@ pub(crate) mod tests {
         assert!(rx.try_recv().is_ok(), "port 8080 deny should emit");
     }
 
-    #[test]
-    fn transparent_deny_dedups_repeated_hits_on_same_ip_port() {
+    #[tokio::test]
+    async fn transparent_deny_dedups_repeated_hits_on_same_ip_port() {
         // Same IP+port within the dedup window collapses to one event —
         // otherwise a tight retry loop would spam the audit channel.
         let (state, mut rx) = test_state();
@@ -4879,7 +4873,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn events_in(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<serde_json::Value> {
+    pub(crate) fn events_in(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<serde_json::Value> {
         std::iter::from_fn(|| rx.try_recv().ok())
             .map(|msg| serde_json::from_str(&msg).unwrap())
             .collect()
@@ -4989,6 +4983,226 @@ pub(crate) mod tests {
         assert_eq!(reasons, ["unknown-protocol", "tls-no-sni"]);
     }
 
+    /// Every audit event sent by the time each dedup window open now has closed.
+    pub(crate) async fn events_once_the_windows_close(
+        rx: &mut mpsc::UnboundedReceiver<String>,
+    ) -> Vec<serde_json::Value> {
+        tokio::time::sleep(Duration::from_secs(
+            crate::audit_dedup::AUDIT_DEDUP_SECS + 1,
+        ))
+        .await;
+        events_in(rx)
+    }
+
+    fn is_summary(event: &serde_json::Value) -> bool {
+        event["metadata"]["summary"] == true
+    }
+
+    /// The refusals `events` stand for: one per event, and every refusal a
+    /// summary folded for a summary.
+    pub(crate) fn refusals_in(events: &[serde_json::Value]) -> u64 {
+        events
+            .iter()
+            .map(|event| match is_summary(event) {
+                true => event["metadata"]["suppressed"].as_u64().unwrap(),
+                false => 1,
+            })
+            .sum()
+    }
+
+    /// Asserts `events` are one refusal and the summary of `suppressed`
+    /// repeats of it, the last refused between `last_between`.
+    pub(crate) fn assert_one_refusal_and_its_summary(
+        events: &[serde_json::Value],
+        suppressed: u64,
+        last_between: (std::time::SystemTime, std::time::SystemTime),
+    ) {
+        let [refused, summary] = events else {
+            panic!("expected a refusal and its summary, got {events:#?}");
+        };
+        assert!(!is_summary(refused), "the first refusal is sent as it is");
+        assert!(is_summary(summary), "{summary:#}");
+        assert_eq!(summary["metadata"]["suppressed"], suppressed);
+        let last = time::OffsetDateTime::parse(
+            summary["metadata"]["last_suppressed_at"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let last = std::time::SystemTime::from(last);
+        assert!(
+            last_between.0 <= last && last <= last_between.1,
+            "the summary names the last refusal it folded, not another time"
+        );
+        let mut identity = summary.clone();
+        let metadata = identity["metadata"].as_object_mut().unwrap();
+        for field in ["summary", "suppressed", "last_suppressed_at"] {
+            metadata.remove(field);
+        }
+        assert_eq!(
+            identity,
+            crate::audit_dedup::refusal_identity(refused),
+            "the summary names the refusal it folded, so a consumer counts it on the same row"
+        );
+    }
+
+    /// Calls `refuse` `times` times and returns the wall-clock span of the last call.
+    pub(crate) fn refuse_times(
+        times: usize,
+        mut refuse: impl FnMut(),
+    ) -> (std::time::SystemTime, std::time::SystemTime) {
+        for _ in 1..times {
+            refuse();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        let before = std::time::SystemTime::now();
+        refuse();
+        (before, std::time::SystemTime::now())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_folded_connect_refusal_is_counted_when_its_window_closes() {
+        let (state, mut rx) = test_state();
+        let last = refuse_times(3, || {
+            emit_policy_deny_connect(
+                &state,
+                "evil.com:443",
+                "policy-deny",
+                &caller("/usr/bin/curl"),
+            )
+        });
+
+        let events = events_once_the_windows_close(&mut rx).await;
+        assert_one_refusal_and_its_summary(&events, 2, last);
+        assert_eq!(refusals_in(&events), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_folded_http_refusal_is_counted_when_its_window_closes() {
+        let (state, mut rx) = test_state();
+        let last = refuse_times(4, || {
+            emit_policy_deny_http(
+                &state,
+                "evil.com",
+                "GET",
+                "/x",
+                "policy-deny",
+                &caller("/usr/bin/curl"),
+            )
+        });
+
+        let events = events_once_the_windows_close(&mut rx).await;
+        assert_one_refusal_and_its_summary(&events, 3, last);
+        assert_eq!(refusals_in(&events), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_folded_transparent_refusal_is_counted_when_its_window_closes() {
+        let (state, mut rx) = test_state();
+        let orig_dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let last = refuse_times(5, || {
+            emit_transparent_deny(&state, orig_dst, "unknown-protocol")
+        });
+
+        let events = events_once_the_windows_close(&mut rx).await;
+        assert_one_refusal_and_its_summary(&events, 4, last);
+        assert_eq!(refusals_in(&events), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_that_folded_nothing_closes_without_a_summary() {
+        let (state, mut rx) = test_state();
+        emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+
+        let events = events_once_the_windows_close(&mut rx).await;
+        assert_eq!(events.len(), 1);
+        assert!(!is_summary(&events[0]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_after_its_window_closed_opens_a_fresh_one() {
+        let (state, mut rx) = test_state();
+        let refuse =
+            || emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+        let last = refuse_times(2, refuse);
+        assert_one_refusal_and_its_summary(&events_once_the_windows_close(&mut rx).await, 1, last);
+
+        refuse();
+        let events = events_once_the_windows_close(&mut rx).await;
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert!(
+            !is_summary(&events[0]),
+            "the closed window's count does not carry over"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refusals_folded_into_different_windows_are_counted_apart() {
+        let (state, mut rx) = test_state();
+        for host in [
+            "a.com:443",
+            "b.com:443",
+            "a.com:443",
+            "b.com:443",
+            "a.com:443",
+        ] {
+            emit_policy_deny_connect(&state, host, "policy-deny", &test_actor());
+        }
+
+        let events = events_once_the_windows_close(&mut rx).await;
+        let suppressed = |host: &str| {
+            events
+                .iter()
+                .filter(|event| is_summary(event) && event["host"] == host)
+                .map(|event| event["metadata"]["suppressed"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(suppressed("a.com"), [2]);
+        assert_eq!(suppressed("b.com"), [1]);
+        assert_eq!(refusals_in(&events), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_refused_request_is_counted_across_windows() {
+        let (state, mut rx) = test_state();
+        let mut refused = 0;
+        for (times, pause) in [(3, 4), (5, 7), (1, 12), (4, 0), (2, 9), (6, 3)] {
+            for host in ["a.com:443", "b.com:443"] {
+                for _ in 0..times {
+                    emit_policy_deny_connect(&state, host, "policy-deny", &test_actor());
+                    refused += 1;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(pause)).await;
+        }
+
+        let events = events_once_the_windows_close(&mut rx).await;
+        assert_eq!(refusals_in(&events), refused);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overflowing_the_dedup_map_loses_no_folded_refusal() {
+        let (state, mut rx) = test_state();
+        for host in 0..1100 {
+            let target = format!("host-{host}.com:443");
+            emit_policy_deny_connect(&state, &target, "policy-deny", &test_actor());
+            emit_policy_deny_connect(&state, &target, "policy-deny", &test_actor());
+        }
+
+        let events = events_once_the_windows_close(&mut rx).await;
+        assert_eq!(refusals_in(&events), 2200);
+    }
+
+    #[test]
+    fn without_a_runtime_to_close_its_window_every_refusal_is_sent() {
+        // A fold is only counted by the task that closes its window, so with
+        // no runtime to run that task nothing may fold.
+        let (state, mut rx) = test_state();
+        emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+        emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+
+        assert_eq!(refusals_in(&events_in(&mut rx)), 2);
+    }
+
     #[test]
     fn emit_gate_resolved_is_decision_marker_without_result_or_status_code() {
         let (state, mut rx) = test_state();
@@ -5015,7 +5229,7 @@ pub(crate) mod tests {
 
     #[test]
     fn emit_gate_denied_bypasses_failure_dedup_for_repeated_user_decisions() {
-        // A second user click on the same host inside AUDIT_DEDUP_SECS is a
+        // A second user click on the same host inside the dedup window is a
         // real new decision, not a retry storm — both audits must surface so
         // the audit log records every distinct denial intent.
         let (state, mut rx) = test_state();

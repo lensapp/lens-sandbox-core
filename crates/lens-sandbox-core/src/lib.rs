@@ -16,6 +16,8 @@
 #[cfg(feature = "proxy")]
 pub mod activity;
 #[cfg(feature = "proxy")]
+pub(crate) mod audit_dedup;
+#[cfg(feature = "proxy")]
 pub mod aws_resign;
 #[cfg(feature = "proxy")]
 pub mod aws_sigv4;
