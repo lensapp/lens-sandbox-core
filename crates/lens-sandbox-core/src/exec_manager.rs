@@ -53,10 +53,6 @@ use crate::pty::OwnedRawFd;
 /// read becomes a ~5.5 KiB JSON frame.
 const READ_CHUNK: usize = 4096;
 
-/// Bound on queued stdin frames per session. Typing throughput is bytes/sec,
-/// so 32 frames is a generous backstop without buffering MBs of stdin.
-const STDIN_QUEUE: usize = 32;
-
 /// Default signal for `exec_cancel { signal: None }`.
 const DEFAULT_KILL_SIGNAL: i32 = libc::SIGTERM;
 
@@ -106,7 +102,12 @@ enum StdinFrame {
 }
 
 struct SessionHandle {
-    stdin_tx: mpsc::Sender<StdinFrame>,
+    /// Unbounded so stdin is neither dropped nor able to stall the control
+    /// loop: `handle` runs on the WS read loop shared by every exec, policy
+    /// and credential frame, so waiting here for a child that reads stdin
+    /// slowly (or never) would stop all of them. Memory is the cost — stdin
+    /// the child has not read yet waits here.
+    stdin_tx: mpsc::UnboundedSender<StdinFrame>,
     /// Flip to `true` on first cancel so a second cancel for the same
     /// exec_id is a no-op. Used in place of the old kill-oneshot
     /// indirection: cancel now calls `libc::killpg` directly, which
@@ -184,7 +185,7 @@ impl ExecManager {
                 self.forward_stdin(&exec_id, &data, ws_tx);
             }
             IncomingMessage::ExecStdinEof { exec_id } => {
-                self.signal_stdin_eof(&exec_id).await;
+                self.signal_stdin_eof(&exec_id);
             }
             IncomingMessage::ExecCancel { exec_id, signal } => {
                 self.cancel(&exec_id, signal.unwrap_or(DEFAULT_KILL_SIGNAL));
@@ -277,7 +278,7 @@ impl ExecManager {
 
         let fwd_tx = spawn_forwarder(exec_id.clone(), ws_tx.clone());
 
-        let (stdin_tx, stdin_rx) = mpsc::channel::<StdinFrame>(STDIN_QUEUE);
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinFrame>();
 
         spawn_stdin_writer(stdin, stdin_rx);
 
@@ -399,7 +400,7 @@ impl ExecManager {
         // emits exec_stderr.
         let fwd_tx = spawn_forwarder(exec_id.clone(), ws_tx.clone());
 
-        let (stdin_tx, stdin_rx) = mpsc::channel::<StdinFrame>(STDIN_QUEUE);
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinFrame>();
 
         spawn_stdin_writer(writer, stdin_rx);
 
@@ -464,32 +465,16 @@ impl ExecManager {
                 return;
             }
         };
-        let stdin_tx = {
-            let sessions = self.inner.sessions.lock().unwrap();
-            sessions.get(exec_id).map(|s| s.stdin_tx.clone())
-        };
-        if let Some(tx) = stdin_tx {
-            // Drop on full → applies backpressure to whoever is generating
-            // typing faster than the child can drain. With STDIN_QUEUE=32
-            // and a real terminal this never trips; for non-interactive
-            // bulk stdin the producer should pace itself.
-            if let Err(e) = tx.try_send(StdinFrame::Bytes(bytes)) {
-                tracing::debug!(exec_id, ?e, "stdin queue full, dropping bytes");
-            }
+        if let Some(session) = self.inner.sessions.lock().unwrap().get(exec_id) {
+            let _ = session.stdin_tx.send(StdinFrame::Bytes(bytes));
         }
     }
 
-    async fn signal_stdin_eof(&self, exec_id: &str) {
-        let stdin_tx = {
-            let sessions = self.inner.sessions.lock().unwrap();
-            sessions.get(exec_id).map(|s| s.stdin_tx.clone())
-        };
-        if let Some(tx) = stdin_tx {
-            // Queue EOF behind any pending stdin so the child sees them
-            // before EOF. `send().await` instead of `try_send` because
-            // `ExecStdinEof` is a one-shot edge — dropping it would
-            // permanently leave the child waiting on stdin.
-            let _ = tx.send(StdinFrame::Eof).await;
+    fn signal_stdin_eof(&self, exec_id: &str) {
+        // Queued behind any pending stdin, so the child reads all of it
+        // before EOF.
+        if let Some(session) = self.inner.sessions.lock().unwrap().get(exec_id) {
+            let _ = session.stdin_tx.send(StdinFrame::Eof);
         }
     }
 
@@ -916,7 +901,7 @@ where
     })
 }
 
-fn spawn_stdin_writer<W>(mut sink: W, mut stdin_rx: mpsc::Receiver<StdinFrame>)
+fn spawn_stdin_writer<W>(mut sink: W, mut stdin_rx: mpsc::UnboundedReceiver<StdinFrame>)
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1221,6 +1206,68 @@ mod tests {
             .collect();
         assert_eq!(String::from_utf8(stdout_bytes).unwrap(), "ping\n");
         assert_eq!(frames.last().unwrap()["code"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdin_sent_faster_than_the_child_reads_arrives_whole() {
+        const FRAMES: usize = 200;
+        const FRAME_BYTES: usize = 4096;
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+
+        mgr.handle(
+            IncomingMessage::ExecAttach {
+                exec_id: "bulk".into(),
+                // The child starts reading only after every frame is sent.
+                argv: vec!["sh".into(), "-c".into(), "sleep 1; wc -c".into()],
+                env: HashMap::new(),
+                cwd: None,
+                tty: false,
+                stdin: true,
+                stdout: true,
+                stderr: true,
+                initial_size: None,
+                actor: None,
+            },
+            &tx,
+        )
+        .await;
+        let attached = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let attached_v: serde_json::Value = serde_json::from_str(&attached).unwrap();
+        assert_eq!(attached_v["type"], "exec_attached");
+
+        let frame = B64.encode(vec![b'x'; FRAME_BYTES]);
+        for _ in 0..FRAMES {
+            mgr.handle(
+                IncomingMessage::ExecStdin {
+                    exec_id: "bulk".into(),
+                    data: frame.clone(),
+                },
+                &tx,
+            )
+            .await;
+        }
+        mgr.handle(
+            IncomingMessage::ExecStdinEof {
+                exec_id: "bulk".into(),
+            },
+            &tx,
+        )
+        .await;
+
+        let frames = drain_until_terminal(&mut rx, "bulk").await;
+        let stdout: Vec<u8> = frames
+            .iter()
+            .filter(|f| f["type"] == "exec_stdout")
+            .flat_map(decode_data)
+            .collect();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap().trim(),
+            (FRAMES * FRAME_BYTES).to_string()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
