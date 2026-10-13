@@ -2966,18 +2966,21 @@ fn emit_transparent_deny(state: &Arc<ProxyState>, orig_dst: SocketAddr, reason: 
         state,
         format!("TRANSPARENT {orig_dst}"),
         serde_json::json!({ "transparent": true, "reason": reason }),
+        None,
     );
 }
 
 /// Shared deny-event emitter for paths that drop traffic before hitting
 /// `emit_audit_action` (transparent redirect, DNS stub). Repeats are
-/// folded by the audit dedup ([`crate::audit_dedup`]).
+/// folded by the audit dedup ([`crate::audit_dedup`]). A resolved `caller` is
+/// named in `actor.process`, as [`crate::peer_process::ActorContext`] names it.
 pub(crate) fn emit_deny_event(
     state: &Arc<ProxyState>,
     action: String,
     metadata: serde_json::Value,
+    caller: Option<&crate::peer_process::PeerProcess>,
 ) {
-    let event = serde_json::json!({
+    let mut event = serde_json::json!({
         "type": "audit_event",
         "source": "sandbox-proxy",
         "action": action,
@@ -2985,6 +2988,9 @@ pub(crate) fn emit_deny_event(
         "status_code": 0,
         "metadata": metadata,
     });
+    if let (Some(caller), Some(fields)) = (caller, event.as_object_mut()) {
+        crate::peer_process::ActorContext::attributed(caller.clone()).augment(fields);
+    }
     send_failure_event(state, event);
 }
 
