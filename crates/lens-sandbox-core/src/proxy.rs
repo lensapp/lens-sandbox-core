@@ -3010,17 +3010,33 @@ fn send_audit_event(state: &ProxyState, event: &serde_json::Value) {
     }
 }
 
-/// Sends a refusal summary, or holds it for the next audit channel when none
-/// takes it: the refusals it counts were sent no other way. The channel's lock
-/// is held throughout, so [`ProxyState::connect_audit`] sees the summary held
-/// or the channel it was sent on.
+/// Sends a refusal summary, or holds its count for the next audit channel when
+/// none takes it: the refusals it counts were sent no other way.
 fn send_summary(state: &ProxyState, tally: crate::audit_dedup::Tally) {
+    send_or_hold(state, tally.summary().to_string(), || tally);
+}
+
+/// Sends a refusal, or holds it, counted as one, for the next audit channel
+/// when none takes it, so a refusal while disconnected is counted too.
+fn send_refusal(state: &ProxyState, event: &serde_json::Value, refused_at: std::time::SystemTime) {
+    send_or_hold(state, event.to_string(), || {
+        crate::audit_dedup::Tally::refused(event, refused_at)
+    });
+}
+
+/// Sends `event` on the audit channel, or holds the count `tally` gives when
+/// no channel takes it. The channel's lock is held throughout, so
+/// [`ProxyState::connect_audit`] sees the count held or the channel `event`
+/// was sent on.
+fn send_or_hold(
+    state: &ProxyState,
+    event: String,
+    tally: impl FnOnce() -> crate::audit_dedup::Tally,
+) {
     let audit_tx = state.audit_tx.lock().unwrap();
-    let sent = audit_tx
-        .as_ref()
-        .is_some_and(|tx| tx.send(tally.summary().to_string()).is_ok());
+    let sent = audit_tx.as_ref().is_some_and(|tx| tx.send(event).is_ok());
     if !sent {
-        state.deny_dedup.lock().unwrap().hold(tally);
+        state.deny_dedup.lock().unwrap().hold(tally());
     }
 }
 
@@ -3028,21 +3044,23 @@ fn send_summary(state: &ProxyState, tally: crate::audit_dedup::Tally) {
 /// With no runtime to close a window on, nothing is folded, so no refusal
 /// goes uncounted.
 fn send_failure_event(state: &Arc<ProxyState>, event: serde_json::Value) {
+    let refused_at = std::time::SystemTime::now();
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        send_audit_event(state, &event);
+        send_refusal(state, &event, refused_at);
         return;
     };
-    let admission = state.deny_dedup.lock().unwrap().admit(
-        &event,
-        tokio::time::Instant::now(),
-        std::time::SystemTime::now(),
-    );
+    let admission =
+        state
+            .deny_dedup
+            .lock()
+            .unwrap()
+            .admit(&event, tokio::time::Instant::now(), refused_at);
     match admission {
         Admission::Send { closed } => {
             for tally in closed {
                 send_summary(state, tally);
             }
-            send_audit_event(state, &event);
+            send_refusal(state, &event, refused_at);
         }
         Admission::Folded {
             first: Some(window),
@@ -5243,6 +5261,127 @@ pub(crate) mod tests {
         let events = events_in(&mut reconnected);
         assert_eq!(refusals_in(&events), 1, "{events:#?}");
         assert!(is_summary(&events[0]));
+    }
+
+    /// Refuses a CONNECT to evil.com `times` times with no audit channel
+    /// connected, then returns what a channel connected once the windows have
+    /// closed is sent, and the wall-clock span of the last refusal.
+    async fn refused_while_disconnected(
+        times: usize,
+    ) -> (
+        Vec<serde_json::Value>,
+        (std::time::SystemTime, std::time::SystemTime),
+    ) {
+        let (state, _rx) = test_state();
+        *state.audit_tx.lock().unwrap() = None;
+        let last = refuse_times(times, || {
+            emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor())
+        });
+
+        tokio::time::sleep(Duration::from_secs(
+            crate::audit_dedup::AUDIT_DEDUP_SECS + 1,
+        ))
+        .await;
+        let (tx, mut reconnected) = mpsc::unbounded_channel();
+        state.connect_audit(tx);
+        (events_in(&mut reconnected), last)
+    }
+
+    /// Asserts `events` are one summary of `suppressed` refusals of evil.com,
+    /// the last refused between `last_between`.
+    fn assert_one_summary_of_evil_com(
+        events: &[serde_json::Value],
+        suppressed: u64,
+        last_between: (std::time::SystemTime, std::time::SystemTime),
+    ) {
+        let [summary] = events else {
+            panic!("expected one summary, got {events:#?}");
+        };
+        assert!(is_summary(summary), "{summary:#}");
+        assert_eq!(summary["action"], "CONNECT evil.com:443");
+        assert_eq!(summary["metadata"]["reason"], "policy-deny");
+        assert_eq!(summary["metadata"]["suppressed"], suppressed);
+        let last = time::OffsetDateTime::parse(
+            summary["metadata"]["last_suppressed_at"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let last = std::time::SystemTime::from(last);
+        assert!(last_between.0 <= last && last <= last_between.1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_while_the_audit_channel_is_down_is_counted_when_it_reconnects() {
+        let (events, last) = refused_while_disconnected(1).await;
+        assert_one_summary_of_evil_com(&events, 1, last);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_and_its_repeat_while_the_audit_channel_is_down_are_both_counted() {
+        // The first refusal was never sent, so it folds into the summary of
+        // the repeat its window folded rather than going uncounted.
+        let (events, last) = refused_while_disconnected(2).await;
+        assert_one_summary_of_evil_com(&events, 2, last);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_a_closed_audit_channel_refuses_is_held_for_the_next() {
+        let (state, rx) = test_state();
+        drop(rx);
+        emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+
+        let (tx, mut reconnected) = mpsc::unbounded_channel();
+        state.connect_audit(tx);
+        let events = events_in(&mut reconnected);
+        assert_eq!(refusals_in(&events), 1, "{events:#?}");
+    }
+
+    #[test]
+    fn without_a_runtime_a_refusal_while_the_audit_channel_is_down_is_held() {
+        let (state, _rx) = test_state();
+        *state.audit_tx.lock().unwrap() = None;
+        emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+        emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+
+        let (tx, mut reconnected) = mpsc::unbounded_channel();
+        state.connect_audit(tx);
+        assert_eq!(refusals_in(&events_in(&mut reconnected)), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refusals_held_past_the_cap_while_the_audit_channel_is_down_are_all_counted() {
+        // More distinct refusals than the held cap: those past it are counted
+        // in the overflow summary, the rest each in its own.
+        let (state, _rx) = test_state();
+        *state.audit_tx.lock().unwrap() = None;
+        let hosts = 1100;
+        for host in 0..hosts {
+            let target = format!("host-{host}.com:443");
+            emit_policy_deny_connect(&state, &target, "policy-deny", &test_actor());
+            emit_policy_deny_connect(&state, &target, "policy-deny", &test_actor());
+        }
+
+        tokio::time::sleep(Duration::from_secs(
+            crate::audit_dedup::AUDIT_DEDUP_SECS + 1,
+        ))
+        .await;
+        let (tx, mut reconnected) = mpsc::unbounded_channel();
+        state.connect_audit(tx);
+        let events = events_in(&mut reconnected);
+
+        assert_eq!(refusals_in(&events), 2 * hosts);
+        let (overflow, held): (Vec<_>, Vec<_>) = events
+            .iter()
+            .partition(|event| event["metadata"]["reason"] == "audit-overflow");
+        assert_eq!(held.len(), 1024);
+        for (host, summary) in held.iter().enumerate() {
+            assert_eq!(summary["host"], format!("host-{host}.com"));
+            assert_eq!(summary["metadata"]["suppressed"], 2);
+        }
+        let [overflow] = overflow.as_slice() else {
+            panic!("expected one overflow summary, got {overflow:#?}");
+        };
+        assert_eq!(overflow["metadata"]["suppressed"], 2 * (hosts - 1024));
     }
 
     #[tokio::test(start_paused = true)]
