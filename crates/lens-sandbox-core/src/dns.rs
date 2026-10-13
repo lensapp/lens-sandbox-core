@@ -238,7 +238,7 @@ pub async fn answer(
             }
         }
         Decision::Deny { qname, reason } => {
-            emit_deny(state, &qname, reason);
+            emit_deny(state, &qname, reason, caller);
             empty_response(packet, ResponseCode::NXDomain)
         }
         Decision::SuppressNodata { qname } => {
@@ -585,7 +585,9 @@ fn parse_resolv_conf(content: &str) -> Option<SocketAddr> {
     None
 }
 
-fn emit_deny(state: &Arc<ProxyState>, qname: &str, reason: &str) {
+/// `caller` rides in the event's `actor`, as it does on a proxy refusal, so the
+/// host can tell which of the `binaries` rules covering the name applied.
+fn emit_deny(state: &Arc<ProxyState>, qname: &str, reason: &str, caller: Option<&PeerProcess>) {
     tracing::info!(qname, reason, "dns stub denied query");
     // The reason distinguishes an allowlist miss (`dns-denied`) from a
     // binary-scoping exclusion (`dns-binary-not-allowed`).
@@ -593,6 +595,7 @@ fn emit_deny(state: &Arc<ProxyState>, qname: &str, reason: &str) {
         state,
         format!("DNS {qname}"),
         serde_json::json!({ "dns": true, "reason": reason, "qname": qname }),
+        caller,
     );
 }
 
@@ -1582,8 +1585,8 @@ mod tests {
     #[tokio::test]
     async fn a_lookup_refused_for_another_reason_is_sent_too() {
         let (state, mut rx) = crate::proxy::tests::test_state();
-        emit_deny(&state, "evil.example", "dns-denied");
-        emit_deny(&state, "evil.example", "dns-binary-not-allowed");
+        emit_deny(&state, "evil.example", "dns-denied", None);
+        emit_deny(&state, "evil.example", "dns-binary-not-allowed", None);
 
         let reasons: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok())
             .map(|msg| serde_json::from_str::<serde_json::Value>(&msg).unwrap())
@@ -1599,11 +1602,64 @@ mod tests {
             refuse_times, test_state,
         };
         let (state, mut rx) = test_state();
-        let last = refuse_times(3, || emit_deny(&state, "evil.example", "dns-denied"));
+        let last = refuse_times(3, || emit_deny(&state, "evil.example", "dns-denied", None));
 
         let events = events_once_the_windows_close(&mut rx).await;
         assert_one_refusal_and_its_summary(&events, 2, last);
         assert_eq!(refusals_in(&events), 3);
+    }
+
+    #[tokio::test]
+    async fn a_refused_lookup_names_the_caller_and_its_launchers() {
+        let (state, mut rx) = crate::proxy::tests::test_state();
+        state.policy.write().unwrap().routes = vec![
+            RouteRule {
+                binaries: Some(vec![PathBuf::from("/usr/bin/curl")]),
+                ..deny_rule("api.example")
+            },
+            deny_rule("*"),
+        ];
+        let node = PeerProcess {
+            ancestors: vec![PathBuf::from("/usr/bin/bash")],
+            ..caller("/usr/bin/node")
+        };
+        let packet = make_query("api.example.", RecordType::A);
+
+        answer(&packet, Some(&node), &state, "127.0.0.1:9".parse().unwrap()).await;
+
+        let events = crate::proxy::tests::events_in(&mut rx);
+        let [event] = events.as_slice() else {
+            panic!("expected one refusal");
+        };
+        assert_eq!(event["metadata"]["reason"], "dns-denied");
+        assert_eq!(
+            event["actor"],
+            serde_json::json!({"process": {
+                "name": "proc",
+                "pid": 100,
+                "file": {"path": "/usr/bin/node"},
+                "lineage": ["/usr/bin/bash"],
+            }})
+        );
+        assert!(
+            event.get("src_endpoint").is_none(),
+            "a lookup names its caller, not the datagram's source"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_refused_without_a_caller_names_no_actor() {
+        let (state, mut rx) = crate::proxy::tests::test_state();
+        state.policy.write().unwrap().routes = vec![deny_rule("*")];
+        let packet = make_query("api.example.", RecordType::A);
+
+        answer(&packet, None, &state, "127.0.0.1:9".parse().unwrap()).await;
+
+        let events = crate::proxy::tests::events_in(&mut rx);
+        let [event] = events.as_slice() else {
+            panic!("expected one refusal");
+        };
+        assert!(event.get("actor").is_none(), "{event:#}");
     }
 
     #[test]
