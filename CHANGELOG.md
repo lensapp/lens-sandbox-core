@@ -13,3 +13,5 @@ This project will use versioned releases once public releases begin. Until then,
 - Bump the protocol date to 2026-10-09.
 - The audit dedup folds a failure event only into the same refusal: one with another reason, port, path or caller is sent, so a consumer never files it under the wrong destination.
 - A dedup window that folded repeats of a failure event now closes with one summary event: the folded event with `metadata.summary: true`, `metadata.suppressed` (the repeats folded) and `metadata.last_suppressed_at` (when the last of them was refused, RFC 3339), so a consumer can count every refusal. A summary is sent when its window closes, not when the next refusal arrives.
+- Add the policy-message field `proxyUpstreamHttp` (`"connect"` or `"absolute"`). With `"absolute"`, the proxy sends a plain-HTTP request to the upstream proxy in absolute form, not through a `CONNECT host:80` tunnel. An absent or unknown value keeps `"connect"`.
+- Bump the protocol date to 2026-10-13.
