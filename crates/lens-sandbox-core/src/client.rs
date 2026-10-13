@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_tungstenite::tungstenite::Utf8Bytes;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -219,21 +220,16 @@ async fn connect_and_run(
 
     tracing::info!("Connected to Lens Sandbox");
 
-    let (mut write, mut read) = ws_stream.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (write, mut read) = ws_stream.split();
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
 
     // Wire audit sender so the proxy can emit audit events back to Lens Sandbox
     if let Some(state) = proxy_state {
         state.connect_audit(tx.clone());
     }
 
-    let writer_task = tokio::spawn(async move {
-        while let Some(text) = rx.recv().await {
-            if write.send(Message::Text(text.into())).await.is_err() {
-                break;
-            }
-        }
-    });
+    let (stop_writer, stop) = oneshot::channel();
+    let writer_task = tokio::spawn(write_messages(write, rx, stop, proxy_state.clone()));
 
     let mut close_code = None;
 
@@ -263,7 +259,8 @@ async fn connect_and_run(
                             );
                             session.shutdown().await;
                             drop(tx);
-                            writer_task.abort();
+                            let _ = stop_writer.send(());
+                            let _ = writer_task.await;
                             clear_audit_tx(proxy_state);
                             return ConnectionResult::VersionMismatch;
                         }
@@ -311,10 +308,53 @@ async fn connect_and_run(
 
     session.shutdown().await;
     drop(tx);
-    writer_task.abort();
+    let _ = stop_writer.send(());
+    let _ = writer_task.await;
     clear_audit_tx(proxy_state);
 
     ConnectionResult::Disconnected(close_code)
+}
+
+/// Writes the messages `rx` carries to the connection until `stop` fires, or
+/// its sender drops, or a write fails. The failure events it did not write,
+/// the one being written and those still queued, are then held for the next
+/// connection ([`ProxyState::hold_unwritten`]): a connection lost with a
+/// refusal still queued must not lose its count. Anything else unwritten is
+/// let go.
+async fn write_messages<S: futures_util::Sink<Message>>(
+    write: S,
+    mut rx: mpsc::UnboundedReceiver<String>,
+    mut stop: oneshot::Receiver<()>,
+    proxy_state: Option<Arc<ProxyState>>,
+) {
+    let mut write = std::pin::pin!(write);
+    let mut unwritten = Vec::new();
+    loop {
+        let text = tokio::select! {
+            biased;
+            _ = &mut stop => break,
+            text = rx.recv() => match text {
+                Some(text) => Utf8Bytes::from(text),
+                None => break,
+            },
+        };
+        let written = tokio::select! {
+            biased;
+            _ = &mut stop => false,
+            sent = write.send(Message::Text(text.clone())) => sent.is_ok(),
+        };
+        if !written {
+            unwritten.push(text);
+            break;
+        }
+    }
+    rx.close();
+    while let Ok(text) = rx.try_recv() {
+        unwritten.push(text.into());
+    }
+    if let Some(state) = proxy_state {
+        state.hold_unwritten(unwritten.iter().map(Utf8Bytes::as_str));
+    }
 }
 
 /// Drop the audit-channel sender clone held in `ProxyState` so the next
@@ -1842,6 +1882,184 @@ mod tests {
 
         let first: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
         assert_eq!(first, summary);
+    }
+
+    fn refusal(host: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "audit_event",
+            "source": "sandbox-proxy",
+            "action": format!("CONNECT {host}:443"),
+            "host": host,
+            "result": "failure",
+            "metadata": {"reason": "policy-deny"},
+        })
+    }
+
+    /// Holds `count` refusals of each host in `refusals` in `state`.
+    fn hold_refusals(state: &ProxyState, refusals: &[(&str, u64)]) {
+        let mut deny_dedup = state.deny_dedup.lock().unwrap();
+        for &(host, count) in refusals {
+            for _ in 0..count {
+                let refused = refusal(host);
+                deny_dedup.hold(crate::audit_dedup::Tally::refused(
+                    &refused,
+                    std::time::SystemTime::now(),
+                ));
+            }
+        }
+    }
+
+    /// The refusals `messages` count, per host: a summary's `suppressed`, one
+    /// for any other refusal.
+    fn refusals_per_host<'a>(
+        messages: impl IntoIterator<Item = &'a str>,
+    ) -> std::collections::BTreeMap<String, u64> {
+        let mut counts = std::collections::BTreeMap::new();
+        for message in messages {
+            let event: serde_json::Value = serde_json::from_str(message).unwrap();
+            if event["result"] != "failure" {
+                continue;
+            }
+            let count = match event["metadata"]["summary"] == true {
+                true => event["metadata"]["suppressed"].as_u64().unwrap(),
+                false => 1,
+            };
+            *counts
+                .entry(event["host"].as_str().unwrap().to_string())
+                .or_default() += count;
+        }
+        counts
+    }
+
+    fn held_per_host(state: &ProxyState) -> std::collections::BTreeMap<String, u64> {
+        let held: Vec<String> = state
+            .deny_dedup
+            .lock()
+            .unwrap()
+            .take_held()
+            .iter()
+            .map(|tally| tally.summary().to_string())
+            .collect();
+        refusals_per_host(held.iter().map(String::as_str))
+    }
+
+    /// A connection every write to fails, as one the peer has closed.
+    fn failing_sink() -> impl futures_util::Sink<Message, Error = io::Error> {
+        futures_util::sink::unfold((), |(), _: Message| async {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        })
+    }
+
+    /// A connection that takes `writes` messages into `written`, then fails.
+    fn sink_failing_after(
+        writes: usize,
+        written: mpsc::UnboundedSender<String>,
+    ) -> impl futures_util::Sink<Message, Error = io::Error> {
+        futures_util::sink::unfold(writes, move |left, message: Message| {
+            let written = written.clone();
+            async move {
+                if left == 0 {
+                    return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                }
+                if let Message::Text(text) = message {
+                    written.send(text.to_string()).unwrap();
+                }
+                Ok(left - 1)
+            }
+        })
+    }
+
+    /// Connects `state`'s audit channel, so the refusals it holds are queued
+    /// on it, and writes the queue to `sink`, returning once the writer stops.
+    async fn write_held_to(
+        state: &Arc<ProxyState>,
+        sink: impl futures_util::Sink<Message>,
+        queued: &[&str],
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.connect_audit(tx.clone());
+        for message in queued {
+            tx.send(message.to_string()).unwrap();
+        }
+        // With no sender left the writer stops once it has written the queue.
+        drop(tx);
+        *state.audit_tx.lock().unwrap() = None;
+        let (_stop_writer, stop) = oneshot::channel();
+        write_messages(sink, rx, stop, Some(state.clone())).await;
+    }
+
+    #[tokio::test]
+    async fn refusals_a_failed_connection_did_not_write_are_sent_on_the_next() {
+        let state = test_proxy_state();
+        hold_refusals(&state, &[("a.com", 2), ("b.com", 1), ("c.com", 3)]);
+        let queued_refusal = refusal("d.com").to_string();
+        let queued = [queued_refusal.as_str(), r#"{"type": "exec_result"}"#];
+
+        write_held_to(&state, failing_sink(), &queued).await;
+        let (written_tx, mut written) = mpsc::unbounded_channel();
+        write_held_to(&state, sink_failing_after(usize::MAX, written_tx), &[]).await;
+
+        let written: Vec<String> = std::iter::from_fn(|| written.try_recv().ok()).collect();
+        assert_eq!(
+            refusals_per_host(written.iter().map(String::as_str)),
+            [("a.com", 2), ("b.com", 1), ("c.com", 3), ("d.com", 1)]
+                .map(|(host, count)| (host.to_string(), count))
+                .into(),
+        );
+        assert!(
+            !written
+                .iter()
+                .any(|message| message.contains("exec_result")),
+            "only a refusal is held for the next connection"
+        );
+        assert!(held_per_host(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_a_failed_connection_wrote_is_not_held_again() {
+        let state = test_proxy_state();
+        hold_refusals(&state, &[("a.com", 2), ("b.com", 1), ("c.com", 3)]);
+        let (written_tx, mut written) = mpsc::unbounded_channel();
+
+        write_held_to(&state, sink_failing_after(1, written_tx), &[]).await;
+
+        let written: Vec<String> = std::iter::from_fn(|| written.try_recv().ok()).collect();
+        assert_eq!(
+            refusals_per_host(written.iter().map(String::as_str)),
+            [("a.com".to_string(), 2)].into(),
+        );
+        assert_eq!(
+            held_per_host(&state),
+            [("b.com", 1), ("c.com", 3)]
+                .map(|(host, count)| (host.to_string(), count))
+                .into(),
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_the_writer_mid_write_holds_the_refusals_it_was_carrying() {
+        // A connection that closes while a write is stuck, the peer no longer
+        // reading: the refusal being written and those queued are held.
+        let state = test_proxy_state();
+        hold_refusals(&state, &[("a.com", 2), ("b.com", 1)]);
+        let stuck = futures_util::sink::unfold((), |(), _: Message| {
+            std::future::pending::<io::Result<()>>()
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.connect_audit(tx);
+        let (stop_writer, stop) = oneshot::channel();
+        let writer = tokio::spawn(write_messages(stuck, rx, stop, Some(state.clone())));
+        tokio::task::yield_now().await;
+
+        stop_writer.send(()).unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(
+            held_per_host(&state),
+            [("a.com", 2), ("b.com", 1)]
+                .map(|(host, count)| (host.to_string(), count))
+                .into(),
+        );
     }
 
     // Unparseable message → loop continues, connection stays alive

@@ -29,6 +29,10 @@
 //! folds with the summary of the repeats its window goes on to fold, so one
 //! summary counts them all. A held summary then counts the first event too,
 //! as that was never sent.
+//!
+//! A failure event a channel took but did not write, because the connection
+//! failed or closed first, is held the same way ([`Tally::unwritten`]): a
+//! summary with its count, any other as one refusal.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -102,6 +106,40 @@ impl Tally {
             count: 1,
             last_at: refused_at,
         }
+    }
+
+    /// What a failure event the audit channel took but did not write counts:
+    /// a summary's `suppressed`, refused at its `last_suppressed_at`, or one
+    /// refusal at `now`. `None` for any other message.
+    pub(crate) fn unwritten(message: &str, now: SystemTime) -> Option<Tally> {
+        let event: Value = serde_json::from_str(message).ok()?;
+        if event["type"] != "audit_event" || event["result"] != "failure" {
+            return None;
+        }
+        if event["metadata"]["summary"] != true {
+            return Some(Tally::refused(&event, now));
+        }
+        let mut identity = event;
+        let fields = identity.as_object_mut()?;
+        let metadata = fields.get_mut("metadata")?.as_object_mut()?;
+        metadata.remove("summary");
+        let count = metadata.remove("suppressed")?.as_u64()?;
+        let last_at = metadata
+            .remove("last_suppressed_at")
+            .and_then(|at| {
+                let at = at.as_str()?;
+                time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+            })
+            .map_or(now, SystemTime::from);
+        if metadata.is_empty() {
+            fields.remove("metadata");
+        }
+        Some(Tally {
+            key: identity.to_string(),
+            identity,
+            count,
+            last_at,
+        })
     }
 
     /// The summary event that counts the tally's refusals.
@@ -250,6 +288,10 @@ impl DenyWindows {
     /// folds into the overflow summary, so no refusal goes uncounted and the
     /// held counts stay bounded.
     pub(crate) fn hold(&mut self, tally: Tally) {
+        if tally.identity == overflow_identity() {
+            self.hold_overflow(tally);
+            return;
+        }
         if let Some(held) = self.held.iter_mut().find(|held| held.key == tally.key) {
             held.fold(tally);
             return;
@@ -258,7 +300,10 @@ impl DenyWindows {
             self.held.push(tally);
             return;
         }
-        let tally = tally.into_overflow();
+        self.hold_overflow(tally.into_overflow());
+    }
+
+    fn hold_overflow(&mut self, tally: Tally) {
         match &mut self.overflow {
             Some(overflow) => overflow.fold(tally),
             None => self.overflow = Some(tally),
@@ -482,5 +527,64 @@ mod tests {
         let summary = windows.close(&id).unwrap().summary();
         assert_eq!(summary["metadata"]["summary"], true);
         assert_eq!(summary["metadata"]["suppressed"], 1);
+    }
+
+    #[test]
+    fn an_unwritten_summary_is_held_as_the_count_it_carried() {
+        // Its count folds with a later summary of the same refusal, so the
+        // identity it is held under is the one the window counted under.
+        let event = refused("evil.com");
+        let written = repeats(&event, 3, at(4));
+        let unwritten = Tally::unwritten(&written.summary().to_string(), at(9));
+        assert_eq!(unwritten.as_ref(), Some(&written));
+
+        let mut windows = DenyWindows::default();
+        windows.hold(unwritten.unwrap());
+        windows.hold(repeats(&event, 2, at(6)));
+        assert_eq!(counts(&windows.take_held()), [(json!("evil.com"), 5)]);
+    }
+
+    #[test]
+    fn an_unwritten_summary_of_a_refusal_without_metadata_keeps_its_identity() {
+        let event =
+            json!({"type": "audit_event", "action": "CONNECT evil.com:443", "result": "failure"});
+        let written = repeats(&event, 2, at(4));
+        assert_eq!(
+            Tally::unwritten(&written.summary().to_string(), at(9)),
+            Some(written)
+        );
+    }
+
+    #[test]
+    fn an_unwritten_refusal_is_held_as_one_refused_when_it_is_found() {
+        let mut event = refused("evil.com");
+        event["src_endpoint"] = json!({"ip": "10.0.0.2", "port": 40000});
+        assert_eq!(
+            Tally::unwritten(&event.to_string(), at(9)),
+            Some(Tally::refused(&event, at(9)))
+        );
+    }
+
+    #[test]
+    fn an_unwritten_message_that_is_no_refusal_is_not_held() {
+        for message in [
+            r#"{"type": "audit_event", "action": "CONNECT ok.com:443", "result": "success"}"#,
+            r#"{"type": "exec_result", "result": "failure"}"#,
+            "not json",
+        ] {
+            assert_eq!(Tally::unwritten(message, at(0)), None, "{message}");
+        }
+    }
+
+    #[test]
+    fn an_unwritten_overflow_summary_folds_into_the_overflow_not_a_slot() {
+        let mut windows = DenyWindows::default();
+        windows.hold(repeats(&refused("a.com"), 1, at(0)));
+        let overflow = repeats(&refused("b.com"), 3, at(1)).into_overflow();
+        windows.hold(Tally::unwritten(&overflow.summary().to_string(), at(2)).unwrap());
+
+        let held = windows.take_held();
+        assert_eq!(held.len(), 2);
+        assert_eq!(held[1], overflow);
     }
 }
