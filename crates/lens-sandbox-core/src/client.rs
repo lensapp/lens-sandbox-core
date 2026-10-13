@@ -1814,12 +1814,10 @@ mod tests {
     async fn a_reconnect_sends_the_refusal_summaries_held_while_disconnected() {
         let (listener, addr) = bind_server().await;
         let state = test_proxy_state();
-        let summary = serde_json::json!({"metadata": {"summary": true, "suppressed": 1}});
-        state
-            .deny_dedup
-            .lock()
-            .unwrap()
-            .hold_undelivered(summary.to_string());
+        let refused = serde_json::json!({"type": "audit_event", "result": "failure"});
+        let tally = crate::audit_dedup::Tally::refused(&refused, std::time::SystemTime::now());
+        let summary = tally.summary();
+        state.deny_dedup.lock().unwrap().hold(tally);
 
         let server = tokio::spawn(async move {
             let (stream, _peer) = listener.accept().await.unwrap();

@@ -329,8 +329,8 @@ impl ProxyState {
     /// first the refusal summaries no channel was connected to take.
     pub(crate) fn connect_audit(&self, tx: mpsc::UnboundedSender<String>) {
         let mut audit_tx = self.audit_tx.lock().unwrap();
-        for summary in self.deny_dedup.lock().unwrap().take_undelivered() {
-            let _ = tx.send(summary);
+        for tally in self.deny_dedup.lock().unwrap().take_held() {
+            let _ = tx.send(tally.summary().to_string());
         }
         *audit_tx = Some(tx);
     }
@@ -3014,15 +3014,13 @@ fn send_audit_event(state: &ProxyState, event: &serde_json::Value) {
 /// takes it: the refusals it counts were sent no other way. The channel's lock
 /// is held throughout, so [`ProxyState::connect_audit`] sees the summary held
 /// or the channel it was sent on.
-fn send_summary(state: &ProxyState, summary: &serde_json::Value) {
+fn send_summary(state: &ProxyState, tally: crate::audit_dedup::Tally) {
     let audit_tx = state.audit_tx.lock().unwrap();
-    let summary = summary.to_string();
-    let undelivered = match audit_tx.as_ref() {
-        Some(tx) => tx.send(summary).err().map(|unsent| unsent.0),
-        None => Some(summary),
-    };
-    if let Some(summary) = undelivered {
-        state.deny_dedup.lock().unwrap().hold_undelivered(summary);
+    let sent = audit_tx
+        .as_ref()
+        .is_some_and(|tx| tx.send(tally.summary().to_string()).is_ok());
+    if !sent {
+        state.deny_dedup.lock().unwrap().hold(tally);
     }
 }
 
@@ -3041,8 +3039,8 @@ fn send_failure_event(state: &Arc<ProxyState>, event: serde_json::Value) {
     );
     match admission {
         Admission::Send { closed } => {
-            for summary in &closed {
-                send_summary(state, summary);
+            for tally in closed {
+                send_summary(state, tally);
             }
             send_audit_event(state, &event);
         }
@@ -3055,9 +3053,9 @@ fn send_failure_event(state: &Arc<ProxyState>, event: serde_json::Value) {
                 let Some(state) = state.upgrade() else {
                     return;
                 };
-                let summary = state.deny_dedup.lock().unwrap().close(&window);
-                if let Some(summary) = summary {
-                    send_summary(&state, &summary);
+                let tally = state.deny_dedup.lock().unwrap().close(&window);
+                if let Some(tally) = tally {
+                    send_summary(&state, tally);
                 }
             });
         }

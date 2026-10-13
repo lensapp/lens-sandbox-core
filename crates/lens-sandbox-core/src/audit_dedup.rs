@@ -8,17 +8,23 @@
 //! ([`refusal_identity`]), with three more `metadata` fields:
 //!
 //! - `summary`: `true`. Count the event as `suppressed` refusals, not as one.
-//! - `suppressed`: how many repeats the window folded, the first event not
-//!   included.
+//! - `suppressed`: how many refusals it counts: the repeats the window folded,
+//!   the first event, which was sent, not included.
 //! - `last_suppressed_at`: when the last of them was refused, RFC 3339 in UTC.
 //!
 //! The first fold in a window schedules a task on the current tokio runtime
 //! that sends the summary when the window closes, so the summary never waits
 //! for another refusal. A window still open when that runtime stops is not
-//! summarised: the proxy has no shutdown hook to send it from. A summary that
-//! closes while the audit channel is disconnected is held, up to
-//! [`MAX_WINDOWS`] of them, and sent when the channel is next connected; a
-//! refusal sent while it is disconnected is lost, like any other event.
+//! summarised: the proxy has no shutdown hook to send it from.
+//!
+//! A summary that closes while the audit channel is disconnected is held and
+//! sent when the channel is next connected. One is held per refusal: a later
+//! summary of the same refusal folds into it, its count added. Past
+//! [`MAX_WINDOWS`] refusals held, the rest are counted in one overflow summary,
+//! `action` and `metadata.reason` `audit-overflow`, which names no destination,
+//! so a channel that never reconnects cannot grow the proxy without bound and
+//! still no refusal goes uncounted. A refusal sent while it is disconnected is
+//! lost, like any other event.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -61,26 +67,89 @@ struct Window {
 }
 
 impl Window {
-    fn summary(self) -> Option<Value> {
-        if self.suppressed == 0 {
-            return None;
+    /// The count of the repeats the window folded; `None` when it folded none.
+    fn tally(self, key: String) -> Option<Tally> {
+        (self.suppressed > 0).then_some(Tally {
+            key,
+            identity: self.identity,
+            count: self.suppressed,
+            last_at: self.last_suppressed_at,
+        })
+    }
+}
+
+/// Refusals of one kind counted but not yet sent: a closed window's repeats,
+/// or refusals no audit channel took. Sent as one summary.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Tally {
+    key: String,
+    identity: Value,
+    count: u64,
+    last_at: SystemTime,
+}
+
+impl Tally {
+    /// One refusal of `event`, refused at `refused_at`.
+    #[cfg(test)]
+    pub(crate) fn refused(event: &Value, refused_at: SystemTime) -> Tally {
+        let identity = refusal_identity(event);
+        Tally {
+            key: identity.to_string(),
+            identity,
+            count: 1,
+            last_at: refused_at,
         }
-        let Value::Object(mut fields) = self.identity else {
-            return None;
+    }
+
+    /// The summary event that counts the tally's refusals.
+    pub(crate) fn summary(&self) -> Value {
+        let mut fields = match &self.identity {
+            Value::Object(fields) => fields.clone(),
+            _ => Map::new(),
         };
         let mut metadata = match fields.remove("metadata") {
             Some(Value::Object(metadata)) => metadata,
             _ => Map::new(),
         };
-        let last_suppressed_at = time::OffsetDateTime::from(self.last_suppressed_at)
+        let last_suppressed_at = time::OffsetDateTime::from(self.last_at)
             .format(&time::format_description::well_known::Rfc3339)
             .map_or(Value::Null, Value::from);
         metadata.insert("summary".into(), Value::Bool(true));
-        metadata.insert("suppressed".into(), self.suppressed.into());
+        metadata.insert("suppressed".into(), self.count.into());
         metadata.insert("last_suppressed_at".into(), last_suppressed_at);
         fields.insert("metadata".into(), Value::Object(metadata));
-        Some(Value::Object(fields))
+        Value::Object(fields)
     }
+
+    fn fold(&mut self, other: Tally) {
+        self.count += other.count;
+        self.last_at = self.last_at.max(other.last_at);
+    }
+
+    /// The tally counted in the overflow summary instead, once [`MAX_WINDOWS`]
+    /// refusals are held.
+    fn into_overflow(self) -> Tally {
+        let identity = overflow_identity();
+        Tally {
+            key: identity.to_string(),
+            identity,
+            count: self.count,
+            last_at: self.last_at,
+        }
+    }
+}
+
+/// What the overflow summary counts: refusals held while [`MAX_WINDOWS`] other
+/// refusals already were. It names no destination, so `metadata.reason` is one
+/// no refusal has, and a consumer counts them without filing them under one.
+fn overflow_identity() -> Value {
+    serde_json::json!({
+        "type": "audit_event",
+        "source": "sandbox-proxy",
+        "action": "audit-overflow",
+        "result": "failure",
+        "metadata": {"reason": "audit-overflow"},
+    })
 }
 
 /// The window a scheduled close is for; a later window of the same refusal is
@@ -100,18 +169,21 @@ impl WindowId {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Admission {
     /// Send the event, after the summaries of the windows admitting it closed.
-    Send { closed: Vec<Value> },
+    Send { closed: Vec<Tally> },
     /// The event was folded. `first` is set on a window's first fold: it names
     /// the window a close must now be scheduled for.
     Folded { first: Option<WindowId> },
 }
 
-/// The open dedup windows, one per refusal, and the summaries of closed ones
-/// the audit channel was not connected to take.
+/// The open dedup windows, one per refusal, and the counts the audit channel
+/// was not connected to take.
 #[derive(Default)]
 pub(crate) struct DenyWindows {
     windows: HashMap<String, Window>,
-    undelivered: Vec<String>,
+    /// One per refusal, oldest first; at most [`MAX_WINDOWS`].
+    held: Vec<Tally>,
+    /// The refusals held past [`MAX_WINDOWS`], whatever they were.
+    overflow: Option<Tally>,
 }
 
 impl DenyWindows {
@@ -136,17 +208,17 @@ impl DenyWindows {
             });
             return Admission::Folded { first };
         }
-        let mut closed: Vec<Value> = self
+        let mut closed: Vec<Tally> = self
             .windows
-            .remove(&key)
-            .and_then(Window::summary)
+            .remove_entry(&key)
+            .and_then(|(key, window)| window.tally(key))
             .into_iter()
             .collect();
         if self.windows.len() >= MAX_WINDOWS {
             closed.extend(
                 self.windows
                     .drain()
-                    .filter_map(|(_, window)| window.summary()),
+                    .filter_map(|(key, window)| window.tally(key)),
             );
         }
         self.windows.insert(
@@ -161,26 +233,41 @@ impl DenyWindows {
         Admission::Send { closed }
     }
 
-    /// Closes the window `id` names, returning its summary. `None` when the
+    /// Closes the window `id` names, returning its count. `None` when the
     /// window folded nothing or was already closed by a later admission.
-    pub(crate) fn close(&mut self, id: &WindowId) -> Option<Value> {
+    pub(crate) fn close(&mut self, id: &WindowId) -> Option<Tally> {
         if self.windows.get(&id.key)?.opened != id.opened {
             return None;
         }
-        self.windows.remove(&id.key)?.summary()
+        self.windows.remove(&id.key)?.tally(id.key.clone())
     }
 
-    /// Holds a summary the audit channel could not take; one past
-    /// [`MAX_WINDOWS`] held is dropped.
-    pub(crate) fn hold_undelivered(&mut self, summary: String) {
-        if self.undelivered.len() < MAX_WINDOWS {
-            self.undelivered.push(summary);
+    /// Holds a count the audit channel could not take. It folds into the one
+    /// held for the same refusal; with [`MAX_WINDOWS`] other refusals held, it
+    /// folds into the overflow summary, so no refusal goes uncounted and the
+    /// held counts stay bounded.
+    pub(crate) fn hold(&mut self, tally: Tally) {
+        if let Some(held) = self.held.iter_mut().find(|held| held.key == tally.key) {
+            held.fold(tally);
+            return;
+        }
+        if self.held.len() < MAX_WINDOWS {
+            self.held.push(tally);
+            return;
+        }
+        let tally = tally.into_overflow();
+        match &mut self.overflow {
+            Some(overflow) => overflow.fold(tally),
+            None => self.overflow = Some(tally),
         }
     }
 
-    /// The held summaries, oldest first, for a newly connected channel.
-    pub(crate) fn take_undelivered(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.undelivered)
+    /// The held counts, oldest first and the overflow last, for a newly
+    /// connected channel.
+    pub(crate) fn take_held(&mut self) -> Vec<Tally> {
+        let mut held = std::mem::take(&mut self.held);
+        held.extend(self.overflow.take());
+        held
     }
 }
 
@@ -226,9 +313,10 @@ mod tests {
         let Admission::Send { closed } = windows.admit(&event, id.closes_at(), at(10)) else {
             panic!("a refusal after the window closed is sent");
         };
-        let [summary] = closed.as_slice() else {
+        let [tally] = closed.as_slice() else {
             panic!("expected the closed window's summary, got {closed:?}");
         };
+        let summary = tally.summary();
         assert_eq!(summary["metadata"]["suppressed"], 1);
         assert_eq!(
             summary["metadata"]["last_suppressed_at"],
@@ -241,19 +329,91 @@ mod tests {
         );
     }
 
-    #[test]
-    fn undelivered_summaries_are_held_up_to_the_window_cap_and_taken_once() {
-        // Past the cap a summary is dropped, so a channel that never reconnects
-        // cannot grow the proxy without bound; its refusals then go uncounted.
-        let mut windows = DenyWindows::default();
-        for n in 0..=MAX_WINDOWS {
-            windows.hold_undelivered(n.to_string());
+    /// The count of `count` repeats of `event` a closed window holds, the last
+    /// refused at `last_at`.
+    fn repeats(event: &Value, count: u64, last_at: SystemTime) -> Tally {
+        let identity = refusal_identity(event);
+        Tally {
+            key: identity.to_string(),
+            identity,
+            count,
+            last_at,
         }
+    }
 
-        let held = windows.take_undelivered();
-        assert_eq!(held.len(), MAX_WINDOWS);
-        assert_eq!(held.first().map(String::as_str), Some("0"));
-        assert!(windows.take_undelivered().is_empty());
+    fn counts(held: &[Tally]) -> Vec<(Value, u64)> {
+        held.iter()
+            .map(|tally| {
+                let summary = tally.summary();
+                (summary["host"].clone(), tally.count)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn held_summaries_are_taken_oldest_first_and_once() {
+        let mut windows = DenyWindows::default();
+        windows.hold(repeats(&refused("a.com"), 1, at(0)));
+        windows.hold(repeats(&refused("b.com"), 2, at(1)));
+
+        let held = windows.take_held();
+        assert_eq!(counts(&held), [(json!("a.com"), 1), (json!("b.com"), 2)]);
+        assert!(windows.take_held().is_empty());
+    }
+
+    #[test]
+    fn a_held_summary_of_a_refusal_already_held_folds_into_it() {
+        let mut windows = DenyWindows::default();
+        windows.hold(repeats(&refused("a.com"), 2, at(5)));
+        windows.hold(repeats(&refused("b.com"), 1, at(6)));
+        windows.hold(repeats(&refused("a.com"), 3, at(4)));
+
+        let held = windows.take_held();
+        assert_eq!(counts(&held), [(json!("a.com"), 5), (json!("b.com"), 1)]);
+        assert_eq!(
+            held[0].summary()["metadata"]["last_suppressed_at"],
+            "2025-10-09T08:53:25Z",
+            "the folded summary names the last refusal of either"
+        );
+    }
+
+    #[test]
+    fn refusals_held_past_the_cap_are_counted_in_the_overflow_summary() {
+        // Past the cap a refusal is not held on its own, so a channel that
+        // never reconnects cannot grow the proxy without bound, but it is still
+        // counted. A refusal already held keeps folding into its own summary.
+        let mut windows = DenyWindows::default();
+        for n in 0..MAX_WINDOWS {
+            windows.hold(repeats(&refused(&format!("{n}.com")), 1, at(0)));
+        }
+        windows.hold(repeats(&refused("past-the-cap.com"), 4, at(7)));
+        windows.hold(repeats(&refused("another.com"), 2, at(9)));
+        windows.hold(repeats(&refused("0.com"), 3, at(8)));
+
+        let held = windows.take_held();
+        assert_eq!(held.len(), MAX_WINDOWS + 1);
+        assert_eq!(
+            held[0].count, 4,
+            "a refusal held before the cap still folds"
+        );
+        let overflow = held.last().unwrap().summary();
+        assert_eq!(
+            overflow,
+            json!({
+                "type": "audit_event",
+                "source": "sandbox-proxy",
+                "action": "audit-overflow",
+                "result": "failure",
+                "metadata": {
+                    "reason": "audit-overflow",
+                    "summary": true,
+                    "suppressed": 6,
+                    "last_suppressed_at": "2025-10-09T08:53:29Z",
+                },
+            })
+        );
+        let total: u64 = held.iter().map(|tally| tally.count).sum();
+        assert_eq!(total, MAX_WINDOWS as u64 + 4 + 2 + 3);
     }
 
     #[test]
@@ -291,7 +451,7 @@ mod tests {
         let id = first_fold(windows.admit(&event, opened, at(1)));
 
         assert_eq!(
-            windows.close(&id),
+            windows.close(&id).map(|tally| tally.summary()),
             Some(json!({
                 "type": "audit_event",
                 "action": "CONNECT evil.com:443",
@@ -316,7 +476,7 @@ mod tests {
         windows.admit(&event, opened, at(0));
         let id = first_fold(windows.admit(&event, opened, at(1)));
 
-        let summary = windows.close(&id).unwrap();
+        let summary = windows.close(&id).unwrap().summary();
         assert_eq!(summary["metadata"]["summary"], true);
         assert_eq!(summary["metadata"]["suppressed"], 1);
     }
