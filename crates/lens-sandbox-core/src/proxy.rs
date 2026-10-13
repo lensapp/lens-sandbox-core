@@ -956,7 +956,10 @@ async fn handle_http_forward(
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate target: reject CRLF injection and loopback/link-local targets
-    validate_connect_target(target_host)?;
+    if let Err(e) = validate_connect_target(target_host) {
+        client.write_all(FORBIDDEN_RESPONSE).await?;
+        return Err(e);
+    }
 
     let header_str = String::from_utf8_lossy(&header_bytes);
 
@@ -1520,7 +1523,10 @@ async fn handle_connect(
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate target: reject CRLF injection and loopback/link-local targets
-    validate_connect_target(target_host)?;
+    if let Err(e) = validate_connect_target(target_host) {
+        client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+        return Err(e);
+    }
 
     // `egress.tcp` claims are final on every door — see `tcp_egress_verdict`.
     if let Some(decision) =
@@ -8711,5 +8717,23 @@ pub(crate) mod tests {
             response.starts_with("HTTP/1.1 403"),
             "the tcp claim is final on this door too; got {response:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_destination_the_proxy_never_dials_is_refused_with_403_on_every_door() {
+        let (state, _rx) = test_state();
+        install_catch_all_allow(&state);
+        for request in [
+            &b"CONNECT localhost:22 HTTP/1.1\r\nHost: localhost:22\r\n\r\n"[..],
+            b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            b"GET https://169.254.169.254/latest HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n",
+        ] {
+            let response = proxy_door_answer(&state, request).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "{:?} must be refused with 403; got {response:?}",
+                String::from_utf8_lossy(request)
+            );
+        }
     }
 }
