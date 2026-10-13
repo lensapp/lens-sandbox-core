@@ -772,6 +772,23 @@ fn parse_llm_routing(value: &serde_json::Value) -> Result<crate::llm::LlmRouting
     crate::llm::LlmRouting::from_policy(&policy)
 }
 
+/// Read `proxyUpstreamHttp`; an absent or unknown value means CONNECT.
+fn parse_upstream_http_form(value: &serde_json::Value) -> crate::proxy::UpstreamHttpForm {
+    if value.is_null() {
+        return crate::proxy::UpstreamHttpForm::default();
+    }
+    match value
+        .as_str()
+        .and_then(crate::proxy::UpstreamHttpForm::from_policy)
+    {
+        Some(form) => form,
+        None => {
+            tracing::warn!(value = %value, "unknown proxyUpstreamHttp in policy; using connect");
+            crate::proxy::UpstreamHttpForm::default()
+        }
+    }
+}
+
 /// Parse and apply a policy message. Returns the env vars for the session handler,
 /// or a version mismatch if the sandbox protocol date is too old.
 async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> PolicyResult {
@@ -783,6 +800,9 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     struct PolicyMessage {
         #[serde(default)]
         proxy_upstream: Option<String>,
+        /// Kept loose so a bad value falls back to CONNECT instead of dropping the message.
+        #[serde(default)]
+        proxy_upstream_http: serde_json::Value,
         #[serde(default)]
         proxy_ca_cert: Option<String>,
         #[serde(default)]
@@ -966,11 +986,13 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     // Update upstream
     if let Some(url) = msg.proxy_upstream {
         match crate::proxy::parse_upstream_url(&url) {
-            Some(upstream) => {
+            Some(mut upstream) => {
+                upstream.http_form = parse_upstream_http_form(&msg.proxy_upstream_http);
                 tracing::info!(
                     host = %upstream.host,
                     port = upstream.port,
                     has_auth = upstream.auth_header.is_some(),
+                    http_form = ?upstream.http_form,
                     "proxy upstream configured from policy"
                 );
                 *state.upstream.lock().await = Some(upstream);
@@ -3693,6 +3715,68 @@ mod tests {
             Vec::new(),
         );
         state
+    }
+
+    /// The plain-HTTP form a policy frame leaves on the upstream, applied after `previous`.
+    async fn upstream_http_form_after(
+        previous: Option<&str>,
+        field: Option<serde_json::Value>,
+    ) -> crate::proxy::UpstreamHttpForm {
+        let state = test_proxy_state();
+        let frame = |field: Option<serde_json::Value>| {
+            let mut policy = serde_json::json!({
+                "type": "policy",
+                "proxyUpstream": "http://some-user:some-pass@10.0.0.1:3128",
+            });
+            if let Some(value) = field {
+                policy["proxyUpstreamHttp"] = value;
+            }
+            policy.to_string()
+        };
+        if let Some(value) = previous {
+            handle_policy(&frame(Some(serde_json::json!(value))), &Some(state.clone())).await;
+        }
+        let result = handle_policy(&frame(field), &Some(state.clone())).await;
+        assert!(matches!(result, PolicyResult::Ok(_)));
+        state
+            .upstream
+            .lock()
+            .await
+            .as_ref()
+            .expect("the frame sets an upstream")
+            .http_form
+    }
+
+    #[tokio::test]
+    async fn handle_policy_reads_proxy_upstream_http() {
+        use crate::proxy::UpstreamHttpForm::{Absolute, Connect};
+        assert_eq!(
+            upstream_http_form_after(None, Some(serde_json::json!("absolute"))).await,
+            Absolute
+        );
+        assert_eq!(
+            upstream_http_form_after(None, Some(serde_json::json!("connect"))).await,
+            Connect
+        );
+        assert_eq!(upstream_http_form_after(None, None).await, Connect);
+    }
+
+    #[tokio::test]
+    async fn handle_policy_resets_proxy_upstream_http_to_connect_on_a_frame_without_it() {
+        assert_eq!(
+            upstream_http_form_after(Some("absolute"), None).await,
+            crate::proxy::UpstreamHttpForm::Connect
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_policy_falls_back_to_connect_on_an_unknown_proxy_upstream_http() {
+        for value in [serde_json::json!("tunnel"), serde_json::json!(1)] {
+            assert_eq!(
+                upstream_http_form_after(Some("absolute"), Some(value)).await,
+                crate::proxy::UpstreamHttpForm::Connect
+            );
+        }
     }
 
     #[tokio::test]
