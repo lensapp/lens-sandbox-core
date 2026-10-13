@@ -813,7 +813,13 @@ async fn handle_connection(
     )
     .await
     {
-        Ok(result) => result?,
+        Ok(Ok(request)) => request,
+        // Answered rather than dropped: a client left holding a closed socket
+        // cannot tell a request the proxy refused from a proxy that is broken.
+        Ok(Err(e)) => {
+            client.write_all(BAD_REQUEST_RESPONSE).await.ok();
+            return Err(e);
+        }
         Err(_) => {
             client
                 .write_all(b"HTTP/1.1 408 Request Timeout\r\n\r\n")
@@ -829,6 +835,12 @@ async fn handle_connection(
             header_bytes,
         } => {
             return handle_http_forward(client, &target_host, header_bytes, state, &actor).await;
+        }
+        ProxyRequest::Https {
+            target,
+            header_bytes,
+        } => {
+            return handle_https_forward(client, &target, header_bytes, state, &actor).await;
         }
         ProxyRequest::Connect {
             target: target_host,
@@ -880,6 +892,14 @@ fn resolve_route(
 /// door so both refusals look identical from outside.
 pub(crate) const FORBIDDEN_RESPONSE: &[u8] =
     b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+/// What a client is told when the proxy cannot read its request as one it serves.
+const BAD_REQUEST_RESPONSE: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+/// What a client is told when the destination was admitted but could not be reached.
+const BAD_GATEWAY_RESPONSE: &[u8] =
+    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// The facts every refusal on this door records, collected once.
 struct ForwardRequest<'a> {
@@ -1509,18 +1529,15 @@ async fn handle_connect(
         return connect_raw_passthrough(client, target_host, &decision, state, actor).await;
     }
 
-    // Find the matching route rule (first match wins, preserving order/specificity).
-    // CONNECT is always HTTPS — plain HTTP uses the absolute-form forward path.
-    let (verdict, transport, tls_terminate, domain_http_rules) =
-        match resolve_route(state, target_host, Scheme::Https, actor.process()) {
-            Some(decision) => decision,
-            None => {
-                client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-                tracing::info!(target = %target_host, "proxy DENIED (binary not allowed)");
-                emit_policy_deny_connect(state, target_host, "binary-not-allowed", actor);
-                return Ok(());
-            }
-        };
+    let Some(HttpsAdmission {
+        transport: effective_transport,
+        tls_terminate,
+        http_rules: domain_http_rules,
+    }) = admit_https_destination(state, target_host, actor).await
+    else {
+        client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+        return Ok(());
+    };
 
     let hostname = extract_hostname(target_host);
 
@@ -1528,37 +1545,6 @@ async fn handle_connect(
     let client_cert = {
         let map = state.client_certs.read().unwrap();
         map.get(&target_host.to_lowercase()).cloned()
-    };
-
-    let effective_transport = match verdict {
-        Verdict::Deny => {
-            client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-            tracing::info!(target = %target_host, "proxy DENIED");
-            emit_policy_deny_connect(state, target_host, "policy-deny", actor);
-            return Ok(());
-        }
-        Verdict::Ask => {
-            let action_str = format!("CONNECT {target_host}");
-            let key = gate_key(target_host);
-            let decision = crate::gate::gate_or_deny(
-                state,
-                &key,
-                &action_str,
-                "policy-ambiguous",
-                crate::protocol::Treatment::Inspected,
-            )
-            .await;
-            if !decision.is_allow() {
-                emit_gate_denied(state, &action_str, decision);
-                client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-                tracing::info!(target = %target_host, reason = decision.audit_reason(), "proxy DENIED (gated)");
-                return Ok(());
-            }
-            emit_gate_resolved(state, &action_str, decision);
-            tracing::info!(target = %target_host, reason = decision.audit_reason(), "proxy ALLOWED (gated)");
-            transport
-        }
-        Verdict::Allow => transport,
     };
 
     // Collect credential injections AFTER the gate resolves: accepting an integration
@@ -1611,12 +1597,13 @@ async fn handle_connect(
 
             let uri_placeholders = collect_uri_placeholders(state, target_host);
             let needs_aws_resign = state.aws_resign.matches(target_host);
-            let needs_mitm = injections.is_some()
-                || !domain_http_rules.is_empty()
-                || !uri_placeholders.is_empty()
-                || state.intercept_for_unarmed(target_host)
-                || state.intercept_for_llm(target_host)
-                || state.intercept_for_token_answer(target_host);
+            let needs_mitm = needs_interception(
+                state,
+                target_host,
+                injections.as_deref().unwrap_or(&[]),
+                &domain_http_rules,
+                &uri_placeholders,
+            );
             if needs_aws_resign {
                 // AWS-resign path owns the MITM for this connection; any
                 // other injections configured for the same host would be
@@ -1848,13 +1835,13 @@ async fn handle_connect(
                     tracing::debug!(target = %target_host, "proxy LENS (passthrough, no CA)");
                     tokio::io::copy_bidirectional(&mut client, &mut upstream_stream).await?;
                 }
-            } else if !injs.is_empty()
-                || !domain_http_rules.is_empty()
-                || !placeholders.is_empty()
-                || state.intercept_for_unarmed(target_host)
-                || state.intercept_for_llm(target_host)
-                || state.intercept_for_token_answer(target_host)
-            {
+            } else if needs_interception(
+                state,
+                target_host,
+                injs,
+                &domain_http_rules,
+                &placeholders,
+            ) {
                 if let Some(ca) = state.ephemeral_ca.get() {
                     // HTTPS upstream via Lens Sandbox tunnel — MITM to inject credentials,
                     // enforce HTTP rules, or rewrite URI placeholders.
@@ -1894,6 +1881,239 @@ async fn handle_connect(
     }
 
     Ok(())
+}
+
+/// The policy an HTTPS destination was admitted under.
+struct HttpsAdmission {
+    transport: Transport,
+    tls_terminate: bool,
+    http_rules: Vec<HttpRule>,
+}
+
+/// Admit an HTTPS destination, written `host:port`, the way a `CONNECT` to it
+/// is admitted: its `egress.http` route for the `https` scheme, then a deny or
+/// the developer's answer. Every door that names an HTTPS origin this way
+/// shares it, so a destination is decided once however a client reaches it, and
+/// an answer raised by one door — the same action, under the same key — covers
+/// the others.
+///
+/// `None` is a refusal, already logged and audited; the caller tells its client
+/// in its own framing.
+async fn admit_https_destination(
+    state: &Arc<ProxyState>,
+    target_host: &str,
+    actor: &crate::peer_process::ActorContext,
+) -> Option<HttpsAdmission> {
+    // Find the matching route rule (first match wins, preserving order/specificity).
+    // CONNECT is always HTTPS — plain HTTP uses the absolute-form forward path.
+    let Some((verdict, transport, tls_terminate, http_rules)) =
+        resolve_route(state, target_host, Scheme::Https, actor.process())
+    else {
+        tracing::info!(target = %target_host, "proxy DENIED (binary not allowed)");
+        emit_policy_deny_connect(state, target_host, "binary-not-allowed", actor);
+        return None;
+    };
+
+    match verdict {
+        Verdict::Deny => {
+            tracing::info!(target = %target_host, "proxy DENIED");
+            emit_policy_deny_connect(state, target_host, "policy-deny", actor);
+            return None;
+        }
+        Verdict::Ask => {
+            let action_str = format!("CONNECT {target_host}");
+            let key = gate_key(target_host);
+            let decision = crate::gate::gate_or_deny(
+                state,
+                &key,
+                &action_str,
+                "policy-ambiguous",
+                crate::protocol::Treatment::Inspected,
+            )
+            .await;
+            if !decision.is_allow() {
+                emit_gate_denied(state, &action_str, decision);
+                tracing::info!(target = %target_host, reason = decision.audit_reason(), "proxy DENIED (gated)");
+                return None;
+            }
+            emit_gate_resolved(state, &action_str, decision);
+            tracing::info!(target = %target_host, reason = decision.audit_reason(), "proxy ALLOWED (gated)");
+        }
+        Verdict::Allow => {}
+    }
+
+    Some(HttpsAdmission {
+        transport,
+        tls_terminate,
+        http_rules,
+    })
+}
+
+/// Whether a request to `target_host` has to be read before it is relayed:
+/// something policy holds for the host — a credential, an HTTP rule, a URI
+/// placeholder, an unarmed credential, an `llm` route, a token answer — only
+/// applies to a request the proxy can see.
+fn needs_interception(
+    state: &ProxyState,
+    target_host: &str,
+    injections: &[CredentialInjection],
+    http_rules: &[HttpRule],
+    uri_placeholders: &[(String, String)],
+) -> bool {
+    !injections.is_empty()
+        || !http_rules.is_empty()
+        || !uri_placeholders.is_empty()
+        || state.intercept_for_unarmed(target_host)
+        || state.intercept_for_llm(target_host)
+        || state.intercept_for_token_answer(target_host)
+}
+
+/// Handle an absolute-form `https://` request — `GET https://host/path HTTP/1.1`,
+/// sent to the proxy in the clear.
+///
+/// A client may hand a proxy an HTTPS URL this way instead of opening a
+/// `CONNECT` tunnel and speaking TLS through it; BusyBox `wget`, the stock HTTP
+/// client on Alpine, always does. The request names the destination a
+/// `CONNECT host:443` would, so it is admitted exactly as that `CONNECT` is (see
+/// [`admit_https_destination`]), and one answer covers a client of either kind.
+/// What follows is the `CONNECT` interception with the client's TLS already
+/// off: the head is restated in origin form and the request goes through the
+/// MITM pipeline, so HTTP rules, credentials, `llm` routes and the audit apply
+/// as they do to a decrypted request. The proxy opens the TLS session to the
+/// origin itself, verified as every upstream session is.
+///
+/// Every refusal is answered, so the client is never left holding a closed
+/// socket it cannot tell from a broken proxy.
+async fn handle_https_forward(
+    mut client: TcpStream,
+    target_host: &str,
+    header_bytes: Vec<u8>,
+    state: &Arc<ProxyState>,
+    actor: &crate::peer_process::ActorContext,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Validate target: reject CRLF injection and loopback/link-local targets
+    if let Err(e) = validate_connect_target(target_host) {
+        client.write_all(FORBIDDEN_RESPONSE).await?;
+        return Err(e);
+    }
+
+    let header_str = String::from_utf8_lossy(&header_bytes);
+    let raw_url = header_str
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_default();
+    // The parser only hands this door a URL it could split.
+    let Some((authority, path)) = split_absolute_url(raw_url, "https://") else {
+        client.write_all(BAD_REQUEST_RESPONSE).await?;
+        return Err(format!("not an absolute https URL: {raw_url}").into());
+    };
+
+    // `egress.tcp` claims are final on every door — see `tcp_egress_verdict`.
+    if let Some(decision) =
+        tcp_egress_verdict_for_hostport(state, target_host, 443, actor.process())
+    {
+        let head =
+            rewrite_http_forward_request(&header_str, &path, authority, Reuse::OneRequestOnly);
+        return https_forward_raw_passthrough(client, target_host, &head, &decision, state, actor)
+            .await;
+    }
+
+    let Some(HttpsAdmission {
+        transport,
+        http_rules,
+        ..
+    }) = admit_https_destination(state, target_host, actor).await
+    else {
+        client.write_all(FORBIDDEN_RESPONSE).await?;
+        return Ok(());
+    };
+
+    let hostname = extract_hostname(target_host);
+    let port = extract_port(target_host, 443);
+    // After the gate, for the reason `handle_connect` gives.
+    let injections = collect_header_injections(state, target_host);
+    let placeholders = collect_uri_placeholders(state, target_host);
+
+    // Two `CONNECT` interceptors accept the client's TLS themselves: the AWS
+    // re-sign path, and the mTLS bridge for a host with a client certificate.
+    // Here there is no TLS to accept, and relaying around them would reach the
+    // host without what they exist to add, so such a host is refused.
+    if transport == Transport::Direct {
+        let bridged = state.ephemeral_ca.get().is_some()
+            && state
+                .client_certs
+                .read()
+                .unwrap()
+                .contains_key(&target_host.to_lowercase())
+            && !needs_interception(state, target_host, &injections, &http_rules, &placeholders);
+        if state.aws_resign.matches(target_host) || bridged {
+            client.write_all(FORBIDDEN_RESPONSE).await?;
+            emit_audit(state, target_host, "error", 403, actor);
+            return Err(format!(
+                "{target_host} is served by an interceptor that needs the client's own TLS; \
+                 reach it with CONNECT"
+            )
+            .into());
+        }
+    }
+
+    let ca = match get_or_init_ca(state) {
+        Ok(ca) => ca,
+        Err(e) => {
+            client.write_all(BAD_GATEWAY_RESPONSE).await?;
+            emit_audit(state, target_host, "error", 502, actor);
+            return Err(e);
+        }
+    };
+
+    let mode = match transport {
+        Transport::Direct => crate::mitm::UpstreamMode::DirectTls {
+            host: hostname.clone(),
+            port,
+        },
+        // The proxy answers this host's token requests itself, so its tunnel
+        // opens only for a request that is forwarded — as on the CONNECT door.
+        Transport::Upstream if state.intercept_for_token_answer(target_host) => {
+            crate::mitm::UpstreamMode::TunnelOnDemand {
+                target: target_host.to_string(),
+            }
+        }
+        Transport::Upstream => match open_upstream_tunnel(state, target_host, actor).await {
+            Ok(tunnel) => crate::mitm::UpstreamMode::TunnelTls(tunnel),
+            Err(e) => {
+                client.write_all(BAD_GATEWAY_RESPONSE).await?;
+                return Err(e);
+            }
+        },
+    };
+
+    // The head was read off the socket to learn where the request goes, so it
+    // is replayed ahead of the rest — restated in origin form, the shape a
+    // decrypted `CONNECT` request already has.
+    use tokio::io::AsyncReadExt;
+    let head = rewrite_http_forward_request(&header_str, &path, authority, Reuse::AsClientSent);
+    let (client_read, client_write) = client.into_split();
+    let client = tokio::io::join(
+        std::io::Cursor::new(format!("{head}\r\n\r\n").into_bytes()).chain(client_read),
+        client_write,
+    );
+
+    tracing::debug!(target = %target_host, http_rules = http_rules.len(), injections = injections.len(), "proxy HTTPS forward+MITM");
+    let audit_tx = state.audit_tx.lock().unwrap().clone();
+    let extra_certs = state.extra_ca_certs.read().unwrap().clone();
+    let ctx = crate::mitm::MitmContext {
+        injections: &injections,
+        http_rules: &http_rules,
+        ca,
+        audit_tx: &audit_tx,
+        extra_ca_certs: &extra_certs,
+        placeholder_map: &placeholders,
+        state,
+        match_host: target_host,
+        actor,
+    };
+    crate::mitm::handle_mitm_pre_accepted(client, &hostname, mode, &ctx).await
 }
 
 /// Entry point for connections redirected by nftables into the transparent
@@ -2684,6 +2904,56 @@ async fn http_forward_raw_passthrough(
     Ok(())
 }
 
+/// Serve an absolute-form `https://` request whose destination the `egress.tcp`
+/// table claimed: refuse it, or open the TLS session the client left to the
+/// proxy, send the origin-form rewrite of the head, and splice the rest through
+/// untouched — the `https` counterpart of [`http_forward_raw_passthrough`], with
+/// the same framing contract for `request_head`.
+async fn https_forward_raw_passthrough(
+    mut client: TcpStream,
+    target_host: &str,
+    request_head: &str,
+    decision: &RawDecision,
+    state: &Arc<ProxyState>,
+    actor: &crate::peer_process::ActorContext,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(gated) = raw_verdict_admits(state, target_host, decision, actor).await else {
+        tracing::info!(target = %target_host, "HTTPS forward proxy DENIED (egress.tcp)");
+        client.write_all(FORBIDDEN_RESPONSE).await?;
+        return Ok(());
+    };
+
+    let extra_certs = state.extra_ca_certs.read().unwrap().clone();
+    let dialled =
+        match connect_egress_under_policy(state, target_host, 443, actor.process(), gated).await {
+            Ok(stream) => {
+                crate::mitm::connect_upstream_tls_public(
+                    stream,
+                    &extract_hostname(target_host),
+                    &extra_certs,
+                )
+                .await
+            }
+            Err(e) => Err(e.into()),
+        };
+    let mut upstream = match dialled {
+        Ok(s) => s,
+        Err(e) => {
+            emit_audit(state, target_host, "error", 502, actor);
+            client.write_all(BAD_GATEWAY_RESPONSE).await?;
+            return Err(format!("raw passthrough connect to {target_host}: {e}").into());
+        }
+    };
+
+    upstream
+        .write_all(format!("{request_head}\r\n\r\n").as_bytes())
+        .await?;
+    tracing::debug!(target = %target_host, "HTTPS forward proxy RAW passthrough");
+    emit_audit(state, target_host, "success", 200, actor);
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
+}
+
 async fn handle_transparent_tls(
     stream: TcpStream,
     orig_dst: SocketAddr,
@@ -3445,6 +3715,13 @@ enum ProxyRequest {
         target_host: String,
         header_bytes: Vec<u8>,
     },
+    /// HTTPS forward proxy — method + absolute `https://` URL, sent in the clear
+    /// for the proxy to carry over TLS. `target` is the `host:port` a `CONNECT`
+    /// to the same URL would name.
+    Https {
+        target: String,
+        header_bytes: Vec<u8>,
+    },
 }
 
 /// Read an HTTP request line + headers one byte at a time so we never buffer
@@ -3476,8 +3753,13 @@ async fn read_proxy_request_unbuffered(
             target_host: target,
             header_bytes,
         })
+    } else if let Some(target) = parse_https_forward_target(url) {
+        Ok(ProxyRequest::Https {
+            target,
+            header_bytes,
+        })
     } else {
-        Err(format!("not a proxy request (relative URL or https://): {request_line}").into())
+        Err(format!("not a proxy request (relative URL or unsupported URL): {request_line}").into())
     }
 }
 
@@ -3488,8 +3770,37 @@ async fn read_proxy_request_unbuffered(
 fn parse_http_forward_target(url: &str) -> Option<String> {
     let rest = url.strip_prefix("http://")?;
     let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
+    Some(with_default_port(&rest[..authority_end], 80))
+}
 
+/// Parse the `host[:port]` a `CONNECT` would name from an absolute-form HTTPS
+/// URL, defaulting to port 443. Stricter than its `http://` counterpart, since
+/// what it returns is admitted as that `CONNECT`: an authority with no host, or
+/// with userinfo, names no destination and is not a request this door serves.
+fn parse_https_forward_target(url: &str) -> Option<String> {
+    let (authority, _) = split_absolute_url(url, "https://")?;
+    if authority.is_empty() || authority.starts_with(':') || authority.contains('@') {
+        return None;
+    }
+    Some(with_default_port(authority, 443))
+}
+
+/// Split an absolute-form URL into its authority and the origin-form target
+/// after it: `https://host:8443/a?b` gives `host:8443` and `/a?b`, and a URL
+/// with a query but no path (`https://host?q=1`) gives `/?q=1`.
+fn split_absolute_url<'a>(url: &'a str, scheme_prefix: &str) -> Option<(&'a str, String)> {
+    let rest = url.strip_prefix(scheme_prefix)?;
+    let (authority, target) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let path = if target.starts_with('/') {
+        target.to_string()
+    } else {
+        format!("/{target}")
+    };
+    Some((authority, path))
+}
+
+/// `authority` with `default_port` appended when it names none.
+fn with_default_port(authority: &str, default_port: u16) -> String {
     // For bracketed IPv6 (`[::1]`), the port follows the closing `]`.
     // For bare hosts, any `:` indicates a port.
     let has_explicit_port = if authority.starts_with('[') {
@@ -3500,11 +3811,11 @@ fn parse_http_forward_target(url: &str) -> Option<String> {
         authority.contains(':')
     };
 
-    Some(if has_explicit_port {
+    if has_explicit_port {
         authority.to_string()
     } else {
-        format!("{authority}:80")
-    })
+        format!("{authority}:{default_port}")
+    }
 }
 
 /// Read an HTTP response status line + headers one byte at a time.
