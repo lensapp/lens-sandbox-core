@@ -15,8 +15,10 @@
 //! The first fold in a window schedules a task on the current tokio runtime
 //! that sends the summary when the window closes, so the summary never waits
 //! for another refusal. A window still open when that runtime stops is not
-//! summarised: the proxy has no shutdown hook to send it from. A summary sent
-//! while the audit channel is disconnected is lost, like any other event.
+//! summarised: the proxy has no shutdown hook to send it from. A summary that
+//! closes while the audit channel is disconnected is held, up to
+//! [`MAX_WINDOWS`] of them, and sent when the channel is next connected; a
+//! refusal sent while it is disconnected is lost, like any other event.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -104,10 +106,12 @@ pub(crate) enum Admission {
     Folded { first: Option<WindowId> },
 }
 
-/// The open dedup windows, one per refusal.
+/// The open dedup windows, one per refusal, and the summaries of closed ones
+/// the audit channel was not connected to take.
 #[derive(Default)]
 pub(crate) struct DenyWindows {
     windows: HashMap<String, Window>,
+    undelivered: Vec<String>,
 }
 
 impl DenyWindows {
@@ -164,6 +168,19 @@ impl DenyWindows {
             return None;
         }
         self.windows.remove(&id.key)?.summary()
+    }
+
+    /// Holds a summary the audit channel could not take; one past
+    /// [`MAX_WINDOWS`] held is dropped.
+    pub(crate) fn hold_undelivered(&mut self, summary: String) {
+        if self.undelivered.len() < MAX_WINDOWS {
+            self.undelivered.push(summary);
+        }
+    }
+
+    /// The held summaries, oldest first, for a newly connected channel.
+    pub(crate) fn take_undelivered(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.undelivered)
     }
 }
 
@@ -222,6 +239,21 @@ mod tests {
             None,
             "the new window is not the one the task closes"
         );
+    }
+
+    #[test]
+    fn undelivered_summaries_are_held_up_to_the_window_cap_and_taken_once() {
+        // Past the cap a summary is dropped, so a channel that never reconnects
+        // cannot grow the proxy without bound; its refusals then go uncounted.
+        let mut windows = DenyWindows::default();
+        for n in 0..=MAX_WINDOWS {
+            windows.hold_undelivered(n.to_string());
+        }
+
+        let held = windows.take_undelivered();
+        assert_eq!(held.len(), MAX_WINDOWS);
+        assert_eq!(held.first().map(String::as_str), Some("0"));
+        assert!(windows.take_undelivered().is_empty());
     }
 
     #[test]

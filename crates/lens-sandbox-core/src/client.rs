@@ -224,7 +224,7 @@ async fn connect_and_run(
 
     // Wire audit sender so the proxy can emit audit events back to Lens Sandbox
     if let Some(state) = proxy_state {
-        *state.audit_tx.lock().unwrap() = Some(tx.clone());
+        state.connect_audit(tx.clone());
     }
 
     let writer_task = tokio::spawn(async move {
@@ -1808,6 +1808,42 @@ mod tests {
             state.audit_tx.lock().unwrap().is_none(),
             "audit_tx must be cleared after disconnect so the next gate call fails closed",
         );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_sends_the_refusal_summaries_held_while_disconnected() {
+        let (listener, addr) = bind_server().await;
+        let state = test_proxy_state();
+        let summary = serde_json::json!({"metadata": {"summary": true, "suppressed": 1}});
+        state
+            .deny_dedup
+            .lock()
+            .unwrap()
+            .hold_undelivered(summary.to_string());
+
+        let server = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match ws.next().await.unwrap().unwrap() {
+                        Message::Text(text) => break text.to_string(),
+                        _ => continue,
+                    }
+                }
+            })
+            .await;
+            ws.send(Message::Close(None)).await.ok();
+            first.expect("the held summary is the first message sent")
+        });
+
+        let (ws_url, token) = make_config(addr);
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let session = TestDispatcher.new_session();
+        connect_and_run(&ws_url, &token, &last_activity, &Some(state), session).await;
+
+        let first: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+        assert_eq!(first, summary);
     }
 
     // Unparseable message → loop continues, connection stays alive
