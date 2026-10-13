@@ -2119,7 +2119,81 @@ async fn handle_https_forward(
         match_host: target_host,
         actor,
     };
-    crate::mitm::handle_mitm_pre_accepted(client, &hostname, mode, &ctx).await
+    let mut client = Answered::new(client);
+    let result = crate::mitm::handle_mitm_pre_accepted(&mut client, &hostname, mode, &ctx).await;
+    // The pipeline answers every refusal it makes itself; a dial or TLS setup
+    // that fails after the head was judged leaves the client unanswered.
+    if let Err(e) = &result
+        && !client.answered
+    {
+        let (response, status) = unanswered_failure_response(e.as_ref());
+        client.write_all(response).await.ok();
+        emit_audit(state, target_host, "error", status, actor);
+    }
+    result
+}
+
+/// What a client that the MITM pipeline left unanswered is told: 403 when the
+/// dial guard refused the address the name resolved to, else 502.
+fn unanswered_failure_response(error: &(dyn std::error::Error + 'static)) -> (&'static [u8], u16) {
+    match error.downcast_ref::<std::io::Error>() {
+        Some(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (FORBIDDEN_RESPONSE, 403),
+        _ => (BAD_GATEWAY_RESPONSE, 502),
+    }
+}
+
+/// A client stream that records whether anything has been written to it, so a
+/// door can tell a client the pipeline answered from one it left hanging.
+struct Answered<S> {
+    inner: S,
+    answered: bool,
+}
+
+impl<S> Answered<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            answered: false,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Answered<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Answered<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(polled, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.answered = true;
+        }
+        polled
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Entry point for connections redirected by nftables into the transparent
@@ -3793,9 +3867,12 @@ fn parse_https_forward_target(url: &str) -> Option<String> {
 
 /// Split an absolute-form URL into its authority and the origin-form target
 /// after it: `https://host:8443/a?b` gives `host:8443` and `/a?b`, and a URL
-/// with a query but no path (`https://host?q=1`) gives `/?q=1`.
+/// with a query but no path (`https://host?q=1`) gives `/?q=1`. A fragment is
+/// the client's own and is dropped, so no rule judges a path the origin never
+/// reads.
 fn split_absolute_url<'a>(url: &'a str, scheme_prefix: &str) -> Option<(&'a str, String)> {
     let rest = url.strip_prefix(scheme_prefix)?;
+    let rest = rest.split('#').next().unwrap_or(rest);
     let (authority, target) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
     let path = if target.starts_with('/') {
         target.to_string()
@@ -8376,6 +8453,7 @@ pub(crate) mod tests {
             ("https://h/a/b?c=1", "h", "/a/b?c=1"),
             ("https://h", "h", "/"),
             ("https://h:1?q=1", "h:1", "/?q=1"),
+            ("https://h/admin#/../v1/ok", "h", "/admin"),
         ] {
             assert_eq!(
                 split_absolute_url(url, "https://"),
@@ -8735,5 +8813,56 @@ pub(crate) mod tests {
                 String::from_utf8_lossy(request)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_admitted_https_request_whose_dial_fails_is_answered_with_502() {
+        // The pipeline judged the request and then could not reach the origin;
+        // the client must hear so rather than be left with a closed socket.
+        let (state, mut rx) = test_state();
+        install_catch_all_allow(&state);
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_https_forward(
+                server,
+                "nonexistent.invalid:443",
+                b"GET https://nonexistent.invalid/ HTTP/1.1\r\nHost: nonexistent.invalid\r\n\r\n"
+                    .to_vec(),
+                &state_for_handler,
+                &test_actor(),
+            )
+            .await
+        });
+
+        use tokio::io::AsyncReadExt;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .expect("the door must answer once the dial fails")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 502"), "{response:?}");
+        assert!(handler.await.unwrap().is_err());
+        assert!(
+            drain_audit_lines(&mut rx)
+                .iter()
+                .any(|e| e["result"] == "error" && e["status_code"] == 502),
+        );
+    }
+
+    #[test]
+    fn a_dial_the_guard_refused_is_answered_as_a_refusal() {
+        let refused: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "egress to 10.0.0.5 denied by policy",
+        ));
+        assert_eq!(
+            unanswered_failure_response(refused.as_ref()).1,
+            403,
+            "a policy refusal is a 403, not a gateway failure"
+        );
+        let failed: Box<dyn std::error::Error + Send + Sync> = "handshake failed".into();
+        assert_eq!(unanswered_failure_response(failed.as_ref()).1, 502);
     }
 }
