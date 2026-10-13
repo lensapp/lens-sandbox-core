@@ -214,13 +214,19 @@ pub async fn handle_mitm(
 
 /// MITM variant that skips the initial TLS accept — for callers that have
 /// already driven the ClientHello (e.g. the transparent-redirect listener,
-/// which peeks SNI via `LazyConfigAcceptor` before committing to a cert).
-pub async fn handle_mitm_pre_accepted(
-    tls_client: tokio_rustls::server::TlsStream<TcpStream>,
+/// which peeks SNI via `LazyConfigAcceptor` before committing to a cert), or
+/// that hold a client speaking cleartext HTTP to an HTTPS origin (the proxy
+/// door's absolute-form `https://` request). Whatever the client stream is, the
+/// request on it is judged and relayed exactly as a decrypted one would be.
+pub async fn handle_mitm_pre_accepted<C>(
+    tls_client: C,
     target_host: &str,
     upstream_mode: UpstreamMode,
     ctx: &MitmContext<'_>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let is_tunnel = !matches!(upstream_mode, UpstreamMode::DirectTls { .. });
 
     // Read/inject headers BEFORE connecting upstream, so a stalling client
@@ -283,14 +289,17 @@ pub async fn handle_mitm_pre_accepted(
 }
 
 /// Forward the request through an open tunnel and relay what comes back.
-async fn relay_through_tunnel(
-    tls_client: tokio_rustls::server::TlsStream<TcpStream>,
+async fn relay_through_tunnel<C>(
+    tls_client: C,
     upstream: crate::proxy::BoxedSandboxStream,
     target_host: &str,
     modified: &str,
     meta: &RequestMeta,
     ctx: &MitmContext<'_>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let mut tls_upstream =
         connect_upstream_tls(upstream, target_host, None, None, ctx.extra_ca_certs).await?;
     write_request_head_and_body(&mut tls_upstream, modified, meta).await?;
@@ -978,19 +987,15 @@ where
 /// enforce HTTP rules, inject credentials, rewrite URI placeholders, emit
 /// audit event. Returns the TLS client stream and the modified header
 /// block (ready to send upstream).
-async fn mitm_inject_after_accept(
-    mut tls_client: tokio_rustls::server::TlsStream<TcpStream>,
+async fn mitm_inject_after_accept<C>(
+    mut tls_client: C,
     target_host: &str,
     ctx: &MitmContext<'_>,
     is_tunnel: bool,
-) -> Result<
-    (
-        tokio_rustls::server::TlsStream<TcpStream>,
-        String,
-        RequestMeta,
-    ),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<(C, String, RequestMeta), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     // Read HTTP request headers byte-by-byte (up to 64 KB).
     let mut header_buf = Vec::with_capacity(4096);
     let mut byte = [0u8; 1];
