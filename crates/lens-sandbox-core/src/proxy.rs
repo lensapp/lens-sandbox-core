@@ -1229,7 +1229,6 @@ async fn handle_http_forward(
             tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
         }
         Transport::Upstream => {
-            // Route through Lens Sandbox — open a CONNECT tunnel, then send the HTTP request through it
             let upstream_opt = state.upstream.lock().await.clone();
             let upstream = match upstream_opt {
                 Some(n) => n,
