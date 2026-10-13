@@ -325,6 +325,16 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
+    /// Wire the audit channel a new connection to the host opened, sending it
+    /// first the refusal summaries no channel was connected to take.
+    pub(crate) fn connect_audit(&self, tx: mpsc::UnboundedSender<String>) {
+        let mut audit_tx = self.audit_tx.lock().unwrap();
+        for summary in self.deny_dedup.lock().unwrap().take_undelivered() {
+            let _ = tx.send(summary);
+        }
+        *audit_tx = Some(tx);
+    }
+
     /// Whether `target_host` matches the domain of any still-unarmed
     /// credential and so must be MITM'd to gate its first use — see
     /// [`Self::unarmed_credential_domains`].
@@ -3000,6 +3010,22 @@ fn send_audit_event(state: &ProxyState, event: &serde_json::Value) {
     }
 }
 
+/// Sends a refusal summary, or holds it for the next audit channel when none
+/// takes it: the refusals it counts were sent no other way. The channel's lock
+/// is held throughout, so [`ProxyState::connect_audit`] sees the summary held
+/// or the channel it was sent on.
+fn send_summary(state: &ProxyState, summary: &serde_json::Value) {
+    let audit_tx = state.audit_tx.lock().unwrap();
+    let summary = summary.to_string();
+    let undelivered = match audit_tx.as_ref() {
+        Some(tx) => tx.send(summary).err().map(|unsent| unsent.0),
+        None => Some(summary),
+    };
+    if let Some(summary) = undelivered {
+        state.deny_dedup.lock().unwrap().hold_undelivered(summary);
+    }
+}
+
 /// Sends a failure event through the audit dedup ([`crate::audit_dedup`]).
 /// With no runtime to close a window on, nothing is folded, so no refusal
 /// goes uncounted.
@@ -3016,7 +3042,7 @@ fn send_failure_event(state: &Arc<ProxyState>, event: serde_json::Value) {
     match admission {
         Admission::Send { closed } => {
             for summary in &closed {
-                send_audit_event(state, summary);
+                send_summary(state, summary);
             }
             send_audit_event(state, &event);
         }
@@ -3031,7 +3057,7 @@ fn send_failure_event(state: &Arc<ProxyState>, event: serde_json::Value) {
                 };
                 let summary = state.deny_dedup.lock().unwrap().close(&window);
                 if let Some(summary) = summary {
-                    send_audit_event(&state, &summary);
+                    send_summary(&state, &summary);
                 }
             });
         }
@@ -5177,6 +5203,48 @@ pub(crate) mod tests {
         let events = events_once_the_windows_close(&mut rx).await;
         assert_one_refusal_and_its_summary(&events, 4, last);
         assert_eq!(refusals_in(&events), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_summary_due_while_the_audit_channel_is_down_is_sent_when_it_reconnects() {
+        let (state, mut rx) = test_state();
+        let refuse =
+            || emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+        refuse();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let last = refuse_times(1, refuse);
+        let delivered = events_in(&mut rx);
+
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        *state.audit_tx.lock().unwrap() = None;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let (tx, mut reconnected) = mpsc::unbounded_channel();
+        state.connect_audit(tx);
+
+        let events = [delivered, events_in(&mut reconnected)].concat();
+        assert_one_refusal_and_its_summary(&events, 1, last);
+        assert_eq!(refusals_in(&events), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_summary_a_closed_audit_channel_refuses_is_held_for_the_next() {
+        let (state, rx) = test_state();
+        let refuse =
+            || emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+        refuse();
+        refuse();
+        drop(rx);
+
+        tokio::time::sleep(Duration::from_secs(
+            crate::audit_dedup::AUDIT_DEDUP_SECS + 1,
+        ))
+        .await;
+        let (tx, mut reconnected) = mpsc::unbounded_channel();
+        state.connect_audit(tx);
+
+        let events = events_in(&mut reconnected);
+        assert_eq!(refusals_in(&events), 1, "{events:#?}");
+        assert!(is_summary(&events[0]));
     }
 
     #[tokio::test(start_paused = true)]
