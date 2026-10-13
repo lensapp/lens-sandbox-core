@@ -23,8 +23,12 @@
 //! [`MAX_WINDOWS`] refusals held, the rest are counted in one overflow summary,
 //! `action` and `metadata.reason` `audit-overflow`, which names no destination,
 //! so a channel that never reconnects cannot grow the proxy without bound and
-//! still no refusal goes uncounted. A refusal sent while it is disconnected is
-//! lost, like any other event.
+//! still no refusal goes uncounted.
+//!
+//! A refusal no channel takes is held the same way, as a count of one: it
+//! folds with the summary of the repeats its window goes on to fold, so one
+//! summary counts them all. A held summary then counts the first event too,
+//! as that was never sent.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -90,7 +94,6 @@ pub(crate) struct Tally {
 
 impl Tally {
     /// One refusal of `event`, refused at `refused_at`.
-    #[cfg(test)]
     pub(crate) fn refused(event: &Value, refused_at: SystemTime) -> Tally {
         let identity = refusal_identity(event);
         Tally {
