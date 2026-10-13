@@ -1261,50 +1261,20 @@ async fn handle_http_forward(
                 }
             };
 
-            // Open a CONNECT tunnel to Lens Sandbox for the target host
-            let mut connect_req =
-                format!("CONNECT {target_host} HTTP/1.1\r\nHost: {target_host}\r\n");
-            if let Some(auth) = &upstream.auth_header {
-                connect_req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
-            }
-            connect_req.push_str("\r\n");
-
-            upstream_stream.write_all(connect_req.as_bytes()).await?;
-
-            // Read CONNECT response from Lens Sandbox
-            let status = match tokio::time::timeout(
-                HEADER_READ_TIMEOUT,
-                read_response_status_unbuffered(&mut upstream_stream),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    client
-                        .write_all(b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                        .await?;
-                    emit_http_audit(state, target_host, method, &path, "error", 504, actor);
-                    return Err("HTTP forward proxy upstream header read timeout".into());
-                }
-            };
-
-            if !status.starts_with("200") {
-                client
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                    .await?;
-                emit_http_audit(state, target_host, method, &path, "error", 502, actor);
-                return Err(format!("Lens Sandbox upstream returned: {status}").into());
-            }
-
             tracing::debug!(
                 target = %target_host,
                 method = %method,
                 has_injections = !injections.is_empty(),
-                "HTTP forward proxy LENS (via CONNECT tunnel)"
+                "HTTP forward proxy LENS (absolute form)"
             );
 
-            // Send modified HTTP request through the tunnel
-            upstream_stream.write_all(&modified_bytes).await?;
+            // A CONNECT would make the upstream proxy judge this request as https.
+            let absolute = to_upstream_absolute_form(
+                &modified_bytes,
+                target_host,
+                upstream.auth_header.as_deref(),
+            );
+            upstream_stream.write_all(&absolute).await?;
 
             // Relay the rest bidirectionally (request body + response)
             emit_http_audit(state, target_host, method, &path, "success", 200, actor);
@@ -1313,6 +1283,32 @@ async fn handle_http_forward(
     }
 
     Ok(())
+}
+
+/// Turn an origin-form request into the absolute form an upstream proxy reads.
+fn to_upstream_absolute_form(
+    origin_form: &[u8],
+    target_host: &str,
+    proxy_auth: Option<&str>,
+) -> Vec<u8> {
+    let line_end = origin_form
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(origin_form.len());
+    let request_line = String::from_utf8_lossy(&origin_form[..line_end]);
+    let mut parts = request_line.split_whitespace();
+    let mut out = match (parts.next(), parts.next(), parts.next()) {
+        (Some(method), Some(target), Some(version)) => {
+            format!("{method} http://{target_host}{target} {version}")
+        }
+        _ => request_line.to_string(),
+    };
+    if let Some(auth) = proxy_auth {
+        out.push_str(&format!("\r\nProxy-Authorization: {auth}"));
+    }
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(&origin_form[line_end..]);
+    bytes
 }
 
 /// Whether the rewritten head keeps the client's connection semantics or forces
@@ -5704,6 +5700,174 @@ pub(crate) mod tests {
                 scheme: None,
                 binaries: None,
             });
+    }
+
+    /// Forward one plain-HTTP request through an upstream-transport route to a
+    /// fake upstream proxy. Returns the head the upstream received and the
+    /// answer the client received.
+    async fn forward_http_via_upstream(
+        state: &Arc<ProxyState>,
+        head: &'static str,
+    ) -> (String, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        *state.upstream.lock().await = Some(SandboxUpstream {
+            host: "127.0.0.1".to_string(),
+            port,
+            auth_header: Some("Basic c29tZS11c2VyOnNvbWUtcGFzcw==".to_string()),
+            tls: false,
+        });
+        state
+            .policy
+            .write()
+            .unwrap()
+            .routes
+            .push(crate::routing::RouteRule {
+                matcher: crate::routing::RouteMatcher::Domain("*".to_string()),
+                verdict: Verdict::Allow,
+                transport: Transport::Upstream,
+                tls_terminate: false,
+                http_rules: Vec::new(),
+                scheme: None,
+                binaries: None,
+            });
+        let fake_upstream = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let received = read_until_double_crlf(&mut conn).await.unwrap();
+            conn.write_all(
+                b"HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            String::from_utf8_lossy(&received).to_string()
+        });
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let actor = test_actor();
+            handle_http_forward(
+                server,
+                "10.0.0.5:80",
+                head.as_bytes().to_vec(),
+                &state_for_handler,
+                &actor,
+            )
+            .await
+        });
+        let answer = read_response(&mut client).await;
+        let received = tokio::time::timeout(Duration::from_secs(2), fake_upstream)
+            .await
+            .expect("the upstream proxy must receive the request")
+            .unwrap();
+        (received, answer)
+    }
+
+    /// The outer proxy judges a CONNECT as https, so plain HTTP sent as
+    /// `CONNECT host:80` would skip its `scheme: http` rules.
+    #[tokio::test]
+    async fn http_forward_sends_plain_http_to_the_upstream_proxy_in_absolute_form() {
+        let (state, _rx) = test_state();
+        let (received, answer) = forward_http_via_upstream(
+            &state,
+            "GET http://10.0.0.5/some/path?q=1 HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            received.starts_with("GET http://10.0.0.5:80/some/path?q=1 HTTP/1.1\r\n"),
+            "the upstream proxy must receive an absolute-form request; got {received:?}"
+        );
+        assert!(
+            received.contains("\r\nHost: 10.0.0.5:80\r\n"),
+            "got {received:?}"
+        );
+        assert!(
+            received.contains("\r\nProxy-Authorization: Basic c29tZS11c2VyOnNvbWUtcGFzcw==\r\n"),
+            "got {received:?}"
+        );
+        assert!(
+            answer.starts_with("HTTP/1.1 418"),
+            "the upstream proxy's own answer must reach the client; got {answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_forward_injects_credentials_into_the_request_it_sends_to_the_upstream_proxy() {
+        let (state, _rx) = test_state();
+        state.credential_injections.write().unwrap().insert(
+            "10.0.0.5".to_string(),
+            vec![CredentialInjection {
+                header: "X-Api-Key".to_string(),
+                value: "some-key".to_string(),
+                body: None,
+                rules: Vec::new(),
+            }],
+        );
+        let (received, _answer) = forward_http_via_upstream(
+            &state,
+            "GET http://10.0.0.5/some/path HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            received.contains("\r\nX-Api-Key: some-key\r\n"),
+            "got {received:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_outer_proxy_applies_its_http_only_deny_to_a_request_the_inner_proxy_forwards() {
+        let rule = |verdict, scheme| crate::routing::RouteRule {
+            matcher: crate::routing::RouteMatcher::Domain("10.0.0.5".to_string()),
+            verdict,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme,
+            binaries: None,
+        };
+        let (outer, _outer_rx) = test_state();
+        {
+            let mut policy = outer.policy.write().unwrap();
+            policy.routes.push(rule(Verdict::Deny, Some(Scheme::Http)));
+            policy.routes.push(rule(Verdict::Allow, None));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (conn, peer) = listener.accept().await.unwrap();
+            handle_connection(conn, peer, &outer).await
+        });
+
+        let (inner, _inner_rx) = test_state();
+        *inner.upstream.lock().await = Some(SandboxUpstream {
+            host: "127.0.0.1".to_string(),
+            port,
+            auth_header: None,
+            tls: false,
+        });
+        inner
+            .policy
+            .write()
+            .unwrap()
+            .routes
+            .push(crate::routing::RouteRule {
+                transport: Transport::Upstream,
+                ..rule(Verdict::Allow, None)
+            });
+        let (mut client, server) = socket_pair().await;
+        tokio::spawn(async move {
+            let actor = test_actor();
+            let head = b"GET http://10.0.0.5/ HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n".to_vec();
+            handle_http_forward(server, "10.0.0.5:80", head, &inner, &actor).await
+        });
+
+        let answer = read_response(&mut client).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 403"),
+            "the outer http-only deny must decide; got {answer:?}"
+        );
     }
 
     /// Install one allow rule with `transport` for `domain`, and an `llm` route
