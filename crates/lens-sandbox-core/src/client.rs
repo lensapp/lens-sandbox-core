@@ -3772,7 +3772,11 @@ mod tests {
 
     #[tokio::test]
     async fn handle_policy_falls_back_to_tunnel_on_an_unknown_proxy_upstream_plain_http() {
-        for value in [serde_json::json!("tunnel"), serde_json::json!(1)] {
+        for value in [
+            serde_json::json!("absolute"),
+            serde_json::json!("connect"),
+            serde_json::json!(1),
+        ] {
             assert_eq!(
                 upstream_plain_http_after(Some("forward"), Some(value)).await,
                 crate::proxy::UpstreamPlainHttp::Tunnel
