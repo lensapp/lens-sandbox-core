@@ -772,19 +772,19 @@ fn parse_llm_routing(value: &serde_json::Value) -> Result<crate::llm::LlmRouting
     crate::llm::LlmRouting::from_policy(&policy)
 }
 
-/// Read `proxyUpstreamHttp`; an absent or unknown value means CONNECT.
-fn parse_upstream_http_form(value: &serde_json::Value) -> crate::proxy::UpstreamHttpForm {
+/// Read `proxyUpstreamPlainHttp`; an absent or unknown value means tunnel.
+fn parse_upstream_plain_http_mode(value: &serde_json::Value) -> crate::proxy::UpstreamPlainHttp {
     if value.is_null() {
-        return crate::proxy::UpstreamHttpForm::default();
+        return crate::proxy::UpstreamPlainHttp::default();
     }
     match value
         .as_str()
-        .and_then(crate::proxy::UpstreamHttpForm::from_policy)
+        .and_then(crate::proxy::UpstreamPlainHttp::from_policy)
     {
         Some(form) => form,
         None => {
-            tracing::warn!(value = %value, "unknown proxyUpstreamHttp in policy; using connect");
-            crate::proxy::UpstreamHttpForm::default()
+            tracing::warn!(value = %value, "unknown proxyUpstreamPlainHttp in policy; using tunnel");
+            crate::proxy::UpstreamPlainHttp::default()
         }
     }
 }
@@ -800,9 +800,9 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     struct PolicyMessage {
         #[serde(default)]
         proxy_upstream: Option<String>,
-        /// Kept loose so a bad value falls back to CONNECT instead of dropping the message.
+        /// Kept loose so a bad value falls back to tunnel instead of dropping the message.
         #[serde(default)]
-        proxy_upstream_http: serde_json::Value,
+        proxy_upstream_plain_http: serde_json::Value,
         #[serde(default)]
         proxy_ca_cert: Option<String>,
         #[serde(default)]
@@ -987,12 +987,13 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     if let Some(url) = msg.proxy_upstream {
         match crate::proxy::parse_upstream_url(&url) {
             Some(mut upstream) => {
-                upstream.http_form = parse_upstream_http_form(&msg.proxy_upstream_http);
+                upstream.plain_http =
+                    parse_upstream_plain_http_mode(&msg.proxy_upstream_plain_http);
                 tracing::info!(
                     host = %upstream.host,
                     port = upstream.port,
                     has_auth = upstream.auth_header.is_some(),
-                    http_form = ?upstream.http_form,
+                    plain_http = ?upstream.plain_http,
                     "proxy upstream configured from policy"
                 );
                 *state.upstream.lock().await = Some(upstream);
@@ -3718,10 +3719,10 @@ mod tests {
     }
 
     /// The plain-HTTP form a policy frame leaves on the upstream, applied after `previous`.
-    async fn upstream_http_form_after(
+    async fn upstream_plain_http_after(
         previous: Option<&str>,
         field: Option<serde_json::Value>,
-    ) -> crate::proxy::UpstreamHttpForm {
+    ) -> crate::proxy::UpstreamPlainHttp {
         let state = test_proxy_state();
         let frame = |field: Option<serde_json::Value>| {
             let mut policy = serde_json::json!({
@@ -3729,7 +3730,7 @@ mod tests {
                 "proxyUpstream": "http://some-user:some-pass@10.0.0.1:3128",
             });
             if let Some(value) = field {
-                policy["proxyUpstreamHttp"] = value;
+                policy["proxyUpstreamPlainHttp"] = value;
             }
             policy.to_string()
         };
@@ -3744,37 +3745,37 @@ mod tests {
             .await
             .as_ref()
             .expect("the frame sets an upstream")
-            .http_form
+            .plain_http
     }
 
     #[tokio::test]
-    async fn handle_policy_reads_proxy_upstream_http() {
-        use crate::proxy::UpstreamHttpForm::{Absolute, Connect};
+    async fn handle_policy_reads_proxy_upstream_plain_http() {
+        use crate::proxy::UpstreamPlainHttp::{Forward, Tunnel};
         assert_eq!(
-            upstream_http_form_after(None, Some(serde_json::json!("absolute"))).await,
-            Absolute
+            upstream_plain_http_after(None, Some(serde_json::json!("forward"))).await,
+            Forward
         );
         assert_eq!(
-            upstream_http_form_after(None, Some(serde_json::json!("connect"))).await,
-            Connect
+            upstream_plain_http_after(None, Some(serde_json::json!("tunnel"))).await,
+            Tunnel
         );
-        assert_eq!(upstream_http_form_after(None, None).await, Connect);
+        assert_eq!(upstream_plain_http_after(None, None).await, Tunnel);
     }
 
     #[tokio::test]
-    async fn handle_policy_resets_proxy_upstream_http_to_connect_on_a_frame_without_it() {
+    async fn handle_policy_resets_proxy_upstream_plain_http_to_tunnel_on_a_frame_without_it() {
         assert_eq!(
-            upstream_http_form_after(Some("absolute"), None).await,
-            crate::proxy::UpstreamHttpForm::Connect
+            upstream_plain_http_after(Some("forward"), None).await,
+            crate::proxy::UpstreamPlainHttp::Tunnel
         );
     }
 
     #[tokio::test]
-    async fn handle_policy_falls_back_to_connect_on_an_unknown_proxy_upstream_http() {
+    async fn handle_policy_falls_back_to_tunnel_on_an_unknown_proxy_upstream_plain_http() {
         for value in [serde_json::json!("tunnel"), serde_json::json!(1)] {
             assert_eq!(
-                upstream_http_form_after(Some("absolute"), Some(value)).await,
-                crate::proxy::UpstreamHttpForm::Connect
+                upstream_plain_http_after(Some("forward"), Some(value)).await,
+                crate::proxy::UpstreamPlainHttp::Tunnel
             );
         }
     }

@@ -37,25 +37,25 @@ pub struct SandboxUpstream {
     /// before writing the CONNECT envelope so the proxy-auth token doesn't
     /// ride plaintext over an untrusted path (BYOA, cross-region NLB).
     pub tls: bool,
-    pub http_form: UpstreamHttpForm,
+    pub plain_http: UpstreamPlainHttp,
 }
 
-/// How a plain-HTTP request reaches the upstream proxy (`proxyUpstreamHttp`).
+/// How a plain-HTTP request reaches the upstream proxy (`proxyUpstreamPlainHttp`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum UpstreamHttpForm {
-    /// A `CONNECT host:80` tunnel, the only method the Lens Agents gateway accepts.
+pub enum UpstreamPlainHttp {
+    /// Open a `CONNECT host:80` tunnel and send the request through it; the Lens Agents gateway accepts only CONNECT.
     #[default]
-    Connect,
-    /// An absolute-form request, so the upstream proxy judges it as `http`.
-    Absolute,
+    Tunnel,
+    /// Send a forward-proxy request in absolute form, so the upstream proxy judges it as `http`.
+    Forward,
 }
 
-impl UpstreamHttpForm {
-    /// The form a `proxyUpstreamHttp` value names, or `None` for an unknown value.
+impl UpstreamPlainHttp {
+    /// The mode a `proxyUpstreamPlainHttp` value names, or `None` for an unknown value.
     pub fn from_policy(value: &str) -> Option<Self> {
         match value {
-            "connect" => Some(Self::Connect),
-            "absolute" => Some(Self::Absolute),
+            "tunnel" => Some(Self::Tunnel),
+            "forward" => Some(Self::Forward),
             _ => None,
         }
     }
@@ -1282,14 +1282,14 @@ async fn handle_http_forward(
                 }
             };
 
-            let request = match upstream.http_form {
+            let request = match upstream.plain_http {
                 // A CONNECT would make an outer LNS proxy judge this request as https.
-                UpstreamHttpForm::Absolute => {
+                UpstreamPlainHttp::Forward => {
                     tracing::debug!(
                         target = %target_host,
                         method = %method,
                         has_injections = !injections.is_empty(),
-                        "HTTP forward proxy LENS (absolute form)"
+                        "HTTP forward proxy LENS (forward)"
                     );
                     to_upstream_absolute_form(
                         &modified_bytes,
@@ -1298,7 +1298,7 @@ async fn handle_http_forward(
                     )
                 }
                 // The Lens Agents gateway accepts only CONNECT.
-                UpstreamHttpForm::Connect => {
+                UpstreamPlainHttp::Tunnel => {
                     let mut connect_req =
                         format!("CONNECT {target_host} HTTP/1.1\r\nHost: {target_host}\r\n");
                     if let Some(auth) = &upstream.auth_header {
@@ -3514,7 +3514,7 @@ pub fn parse_upstream_url(url: &str) -> Option<SandboxUpstream> {
         port,
         auth_header: auth,
         tls,
-        http_form: UpstreamHttpForm::default(),
+        plain_http: UpstreamPlainHttp::default(),
     })
 }
 
@@ -3983,7 +3983,7 @@ pub(crate) mod tests {
             port: addr.port(),
             auth_header: None,
             tls: true,
-            http_form: UpstreamHttpForm::Connect,
+            plain_http: UpstreamPlainHttp::Tunnel,
         };
 
         // `BoxedSandboxStream` isn't `Debug`, so match rather than `expect_err`.
@@ -5776,7 +5776,7 @@ pub(crate) mod tests {
     /// head, then the tunnelled one) and the answer the client received.
     async fn forward_http_via_upstream(
         state: &Arc<ProxyState>,
-        http_form: UpstreamHttpForm,
+        plain_http: UpstreamPlainHttp,
         head: &'static str,
     ) -> (Vec<String>, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5786,7 +5786,7 @@ pub(crate) mod tests {
             port,
             auth_header: Some("Basic c29tZS11c2VyOnNvbWUtcGFzcw==".to_string()),
             tls: false,
-            http_form,
+            plain_http,
         });
         state
             .policy
@@ -5847,14 +5847,14 @@ pub(crate) mod tests {
     }
 
     /// The Lens Agents gateway answers every method but CONNECT with a 405, so
-    /// a policy that does not ask for absolute form keeps the CONNECT tunnel.
+    /// a policy that does not ask for forward keeps the CONNECT tunnel.
     #[tokio::test]
     async fn http_forward_tunnels_plain_http_through_connect_by_default_for_the_lens_agents_gateway()
      {
         let (state, _rx) = test_state();
         let (received, answer) = forward_http_via_upstream(
             &state,
-            UpstreamHttpForm::default(),
+            UpstreamPlainHttp::default(),
             "GET http://10.0.0.5/some/path?q=1 HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n",
         )
         .await;
@@ -5876,11 +5876,11 @@ pub(crate) mod tests {
     /// The outer proxy judges a CONNECT as https, so plain HTTP sent as
     /// `CONNECT host:80` would skip its `scheme: http` rules.
     #[tokio::test]
-    async fn http_forward_sends_plain_http_in_absolute_form_when_the_policy_asks() {
+    async fn http_forward_sends_plain_http_as_a_forward_request_when_the_policy_asks() {
         let (state, _rx) = test_state();
         let (received, answer) = forward_http_via_upstream(
             &state,
-            UpstreamHttpForm::Absolute,
+            UpstreamPlainHttp::Forward,
             "GET http://10.0.0.5/some/path?q=1 HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n",
         )
         .await;
@@ -5909,7 +5909,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn http_forward_injects_credentials_into_the_absolute_form_request_it_sends_upstream() {
+    async fn http_forward_injects_credentials_into_the_forward_request_it_sends_upstream() {
         let (state, _rx) = test_state();
         state.credential_injections.write().unwrap().insert(
             "10.0.0.5".to_string(),
@@ -5922,7 +5922,7 @@ pub(crate) mod tests {
         );
         let (received, _answer) = forward_http_via_upstream(
             &state,
-            UpstreamHttpForm::Absolute,
+            UpstreamPlainHttp::Forward,
             "GET http://10.0.0.5/some/path HTTP/1.1\r\nHost: 10.0.0.5\r\n\r\n",
         )
         .await;
@@ -5938,8 +5938,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn an_outer_proxy_applies_its_http_only_deny_to_an_absolute_form_request_the_inner_proxy_forwards()
-     {
+    async fn an_outer_proxy_applies_its_http_only_deny_to_a_request_the_inner_proxy_forwards() {
         let rule = |verdict, scheme| crate::routing::RouteRule {
             matcher: crate::routing::RouteMatcher::Domain("10.0.0.5".to_string()),
             verdict,
@@ -5968,7 +5967,7 @@ pub(crate) mod tests {
             port,
             auth_header: None,
             tls: false,
-            http_form: UpstreamHttpForm::Absolute,
+            plain_http: UpstreamPlainHttp::Forward,
         });
         inner
             .policy

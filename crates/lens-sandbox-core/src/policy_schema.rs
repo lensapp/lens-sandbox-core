@@ -3,7 +3,7 @@
 //! These types define the policy document the sandbox accepts. They serve as the
 //! canonical schema for validating policies across components (sandbox, API, CLI, UI).
 //!
-//! Transport-only fields (proxyUpstream, proxyUpstreamHttp, proxyCaCert, minProtocolDate) are intentionally
+//! Transport-only fields (proxyUpstream, proxyUpstreamPlainHttp, proxyCaCert, minProtocolDate) are intentionally
 //! excluded — they're filled by the server, not part of the policy definition.
 
 use std::collections::HashMap;
