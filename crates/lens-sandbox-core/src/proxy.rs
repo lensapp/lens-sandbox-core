@@ -245,6 +245,8 @@ pub struct ProxyState {
     pub policy: RwLock<NetworkPolicy>,
     pub audit_tx: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
     pub(crate) deny_dedup: std::sync::Mutex<crate::audit_dedup::DenyWindows>,
+    /// The refusals queued on the audit channel, with when each was refused.
+    pub(crate) queued_refusals: std::sync::Mutex<crate::audit_dedup::QueuedRefusals>,
     /// Credential injections received via policy — maps domain to headers.
     /// Used for MITM header injection in the sandbox proxy.
     pub credential_injections: RwLock<HashMap<String, Vec<CredentialInjection>>>,
@@ -335,16 +337,31 @@ impl ProxyState {
         *audit_tx = Some(tx);
     }
 
+    /// The audit channel's connection wrote `message`.
+    pub(crate) fn audit_written(&self, message: &str) {
+        self.queued_refusals.lock().unwrap().written(message);
+    }
+
     /// Hold, for the next connection, the failure events among `messages`,
-    /// those the audit channel took but did not write; anything else is let
-    /// go. See [`crate::audit_dedup`].
+    /// those the audit channel took but did not write, oldest first; anything
+    /// else is let go. A refusal is held as refused when it was sent. See
+    /// [`crate::audit_dedup`].
     pub(crate) fn hold_unwritten<'a>(&self, messages: impl IntoIterator<Item = &'a str>) {
         let now = std::time::SystemTime::now();
+        let tallies: Vec<_> = {
+            let mut queued = self.queued_refusals.lock().unwrap();
+            let tallies = messages
+                .into_iter()
+                .filter_map(|message| {
+                    let refused_at = queued.refused_at(message).unwrap_or(now);
+                    crate::audit_dedup::Tally::unwritten(message, refused_at)
+                })
+                .collect();
+            queued.clear();
+            tallies
+        };
         let mut deny_dedup = self.deny_dedup.lock().unwrap();
-        for tally in messages
-            .into_iter()
-            .filter_map(|message| crate::audit_dedup::Tally::unwritten(message, now))
-        {
+        for tally in tallies {
             deny_dedup.hold(tally);
         }
     }
@@ -653,6 +670,7 @@ impl ProxyServer {
             policy: RwLock::new(NetworkPolicy::default()),
             audit_tx: std::sync::Mutex::new(None),
             deny_dedup: std::sync::Mutex::default(),
+            queued_refusals: std::sync::Mutex::default(),
             credential_injections: RwLock::new(HashMap::new()),
             ephemeral_ca: std::sync::OnceLock::new(),
             client_certs: RwLock::new(HashMap::new()),
@@ -3027,13 +3045,15 @@ fn send_audit_event(state: &ProxyState, event: &serde_json::Value) {
 /// Sends a refusal summary, or holds its count for the next audit channel when
 /// none takes it: the refusals it counts were sent no other way.
 fn send_summary(state: &ProxyState, tally: crate::audit_dedup::Tally) {
-    send_or_hold(state, tally.summary().to_string(), || tally);
+    send_or_hold(state, tally.summary().to_string(), None, || tally);
 }
 
 /// Sends a refusal, or holds it, counted as one, for the next audit channel
-/// when none takes it, so a refusal while disconnected is counted too.
+/// when none takes it, so a refusal while disconnected is counted too. One the
+/// channel takes is queued with `refused_at`, so it is held as refused then if
+/// the connection goes before writing it.
 fn send_refusal(state: &ProxyState, event: &serde_json::Value, refused_at: std::time::SystemTime) {
-    send_or_hold(state, event.to_string(), || {
+    send_or_hold(state, event.to_string(), Some(refused_at), || {
         crate::audit_dedup::Tally::refused(event, refused_at)
     });
 }
@@ -3041,14 +3061,26 @@ fn send_refusal(state: &ProxyState, event: &serde_json::Value, refused_at: std::
 /// Sends `event` on the audit channel, or holds the count `tally` gives when
 /// no channel takes it. The channel's lock is held throughout, so
 /// [`ProxyState::connect_audit`] sees the count held or the channel `event`
-/// was sent on.
+/// was sent on. An event `refused_at` is queued as a refusal sent then, before
+/// the writer can write it.
 fn send_or_hold(
     state: &ProxyState,
     event: String,
+    refused_at: Option<std::time::SystemTime>,
     tally: impl FnOnce() -> crate::audit_dedup::Tally,
 ) {
     let audit_tx = state.audit_tx.lock().unwrap();
-    let sent = audit_tx.as_ref().is_some_and(|tx| tx.send(event).is_ok());
+    let sent = audit_tx.as_ref().is_some_and(|tx| match refused_at {
+        None => tx.send(event).is_ok(),
+        Some(refused_at) => {
+            let mut queued = state.queued_refusals.lock().unwrap();
+            let sent = tx.send(event.clone()).is_ok();
+            if sent {
+                queued.sent(event, refused_at);
+            }
+            sent
+        }
+    });
     if !sent {
         state.deny_dedup.lock().unwrap().hold(tally());
     }
@@ -3964,6 +3996,7 @@ pub(crate) mod tests {
             policy: RwLock::new(NetworkPolicy::default()),
             audit_tx: std::sync::Mutex::new(Some(tx)),
             deny_dedup: std::sync::Mutex::default(),
+            queued_refusals: std::sync::Mutex::default(),
             credential_injections: RwLock::new(HashMap::new()),
             ephemeral_ca: std::sync::OnceLock::new(),
             client_certs: RwLock::new(HashMap::new()),
