@@ -347,6 +347,9 @@ async fn write_messages<S: futures_util::Sink<Message>>(
             unwritten.push(text);
             break;
         }
+        if let Some(state) = &proxy_state {
+            state.audit_written(text.as_str());
+        }
     }
     rx.close();
     while let Ok(text) = rx.try_recv() {
@@ -2034,6 +2037,65 @@ mod tests {
                 .map(|(host, count)| (host.to_string(), count))
                 .into(),
         );
+    }
+
+    fn last_refused_at(tally: &crate::audit_dedup::Tally) -> std::time::SystemTime {
+        let summary = tally.summary();
+        let at = summary["metadata"]["last_suppressed_at"].as_str().unwrap();
+        time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn a_refusal_a_failed_connection_did_not_write_is_held_as_refused_when_it_was_sent() {
+        // A refusal written, then a refusal and a summary of a later refusal
+        // queued behind a write that fails. Held as refused when it was found
+        // unwritten, the earlier refusal would read as later than the summary.
+        let state = test_proxy_state();
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.connect_audit(tx.clone());
+        let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:54321".parse().unwrap());
+        crate::proxy::emit_policy_deny_connect(&state, "a.com:443", "policy-deny", &actor);
+        let refused = crate::proxy::tests::refuse_times(1, || {
+            crate::proxy::emit_policy_deny_connect(
+                &state,
+                "api.example:443",
+                "user-denied-once",
+                &actor,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(2));
+        let later =
+            crate::audit_dedup::Tally::refused(&refusal("b.com"), std::time::SystemTime::now());
+        tx.send(later.summary().to_string()).unwrap();
+        drop(tx);
+        *state.audit_tx.lock().unwrap() = None;
+        std::thread::sleep(Duration::from_millis(2));
+        let (written_tx, mut written) = mpsc::unbounded_channel();
+        let (_stop_writer, stop) = oneshot::channel();
+        write_messages(
+            sink_failing_after(1, written_tx),
+            rx,
+            stop,
+            Some(state.clone()),
+        )
+        .await;
+
+        let written: Vec<String> = std::iter::from_fn(|| written.try_recv().ok()).collect();
+        assert_eq!(
+            refusals_per_host(written.iter().map(String::as_str)),
+            [("a.com".to_string(), 1)].into(),
+        );
+        let held = state.deny_dedup.lock().unwrap().take_held();
+        let [answered, summary] = held.as_slice() else {
+            panic!("expected the refusal and the summary held, got {held:?}");
+        };
+        assert_eq!(answered.summary()["host"], "api.example");
+        let answered_at = last_refused_at(answered);
+        assert!(refused.0 <= answered_at && answered_at <= refused.1);
+        assert_eq!(summary, &later);
+        assert!(answered_at < last_refused_at(summary));
     }
 
     #[tokio::test]

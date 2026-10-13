@@ -32,9 +32,10 @@
 //!
 //! A failure event a channel took but did not write, because the connection
 //! failed or closed first, is held the same way ([`Tally::unwritten`]): a
-//! summary with its count, any other as one refusal.
+//! summary with its count, any other as one refusal, refused when it was sent
+//! ([`QueuedRefusals`]), not when it was found unwritten.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use serde_json::{Map, Value};
@@ -110,14 +111,14 @@ impl Tally {
 
     /// What a failure event the audit channel took but did not write counts:
     /// a summary's `suppressed`, refused at its `last_suppressed_at`, or one
-    /// refusal at `now`. `None` for any other message.
-    pub(crate) fn unwritten(message: &str, now: SystemTime) -> Option<Tally> {
+    /// refusal at `refused_at`. `None` for any other message.
+    pub(crate) fn unwritten(message: &str, refused_at: SystemTime) -> Option<Tally> {
         let event: Value = serde_json::from_str(message).ok()?;
         if event["type"] != "audit_event" || event["result"] != "failure" {
             return None;
         }
         if event["metadata"]["summary"] != true {
-            return Some(Tally::refused(&event, now));
+            return Some(Tally::refused(&event, refused_at));
         }
         let mut identity = event;
         let fields = identity.as_object_mut()?;
@@ -130,7 +131,7 @@ impl Tally {
                 let at = at.as_str()?;
                 time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
             })
-            .map_or(now, SystemTime::from);
+            .map_or(refused_at, SystemTime::from);
         if metadata.is_empty() {
             fields.remove("metadata");
         }
@@ -191,6 +192,47 @@ fn overflow_identity() -> Value {
         "result": "failure",
         "metadata": {"reason": "audit-overflow"},
     })
+}
+
+/// The refusals sent on the audit channel as themselves and not yet written,
+/// oldest first, each with when it was refused. An event does not say when it
+/// was refused, so one the channel took but did not write is held as refused
+/// then ([`Self::refused_at`]), not when the connection was found gone: a
+/// summary of a later refusal, dated by its own, must still read as later.
+///
+/// They are in the order the channel carries them, and the writer writes in
+/// that order, so each message it writes is compared with the oldest alone,
+/// and no more are queued here than on the channel.
+#[derive(Default)]
+pub(crate) struct QueuedRefusals {
+    queued: VecDeque<(String, SystemTime)>,
+}
+
+impl QueuedRefusals {
+    /// `message` was sent on the channel, refused at `refused_at`.
+    pub(crate) fn sent(&mut self, message: String, refused_at: SystemTime) {
+        self.queued.push_back((message, refused_at));
+    }
+
+    /// The channel wrote `message`; it is no longer queued if it was a refusal.
+    pub(crate) fn written(&mut self, message: &str) {
+        self.refused_at(message);
+    }
+
+    /// When `message` was refused, if it is the oldest refusal still queued,
+    /// which the first unwritten refusal is; it is no longer queued after.
+    pub(crate) fn refused_at(&mut self, message: &str) -> Option<SystemTime> {
+        let (oldest, _) = self.queued.front()?;
+        if oldest != message {
+            return None;
+        }
+        self.queued.pop_front().map(|(_, refused_at)| refused_at)
+    }
+
+    /// Forgets every refusal queued: the channel they were queued on is gone.
+    pub(crate) fn clear(&mut self) {
+        self.queued.clear();
+    }
 }
 
 /// The window a scheduled close is for; a later window of the same refusal is
@@ -556,13 +598,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unwritten_refusal_is_held_as_one_refused_when_it_is_found() {
+    fn an_unwritten_refusal_is_held_as_one_refused_when_it_was_sent() {
         let mut event = refused("evil.com");
         event["src_endpoint"] = json!({"ip": "10.0.0.2", "port": 40000});
         assert_eq!(
             Tally::unwritten(&event.to_string(), at(9)),
             Some(Tally::refused(&event, at(9)))
         );
+    }
+
+    #[test]
+    fn a_queued_refusal_is_dated_until_it_is_written() {
+        let mut queued = QueuedRefusals::default();
+        let (a, b) = (refused("a.com").to_string(), refused("b.com").to_string());
+        queued.sent(a.clone(), at(1));
+        queued.sent(b.clone(), at(2));
+
+        assert_eq!(
+            queued.refused_at(&b),
+            None,
+            "b.com is not the oldest queued"
+        );
+        queued.written(r#"{"type": "exec_result"}"#);
+        queued.written(&a);
+        assert_eq!(queued.refused_at(&a), None, "a.com was written");
+        assert_eq!(queued.refused_at(&b), Some(at(2)));
+        assert_eq!(queued.refused_at(&b), None, "b.com was taken");
     }
 
     #[test]
