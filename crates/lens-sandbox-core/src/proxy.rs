@@ -8329,4 +8329,387 @@ pub(crate) mod tests {
         // HTTPS should use CONNECT, not forward proxy
         assert!(parse_http_forward_target("https://example.com/path").is_none());
     }
+
+    // --- absolute-form https:// forward tests ---
+
+    #[test]
+    fn parse_https_target_names_the_host_a_connect_would() {
+        for (url, target) in [
+            ("https://api.github.com/", "api.github.com:443"),
+            ("https://api.github.com", "api.github.com:443"),
+            ("https://api.github.com?q=1", "api.github.com:443"),
+            ("https://svc.example:8443/a/b", "svc.example:8443"),
+            ("https://[2001:db8::1]/foo", "[2001:db8::1]:443"),
+            ("https://[2001:db8::1]:8443/foo", "[2001:db8::1]:8443"),
+        ] {
+            assert_eq!(
+                parse_https_forward_target(url).as_deref(),
+                Some(target),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_https_target_refuses_a_url_that_names_no_destination() {
+        for url in [
+            "http://example.com/",
+            "https://",
+            "https:///path",
+            "https://:443/",
+            "https://user:secret@example.com/",
+            "/relative",
+        ] {
+            assert_eq!(parse_https_forward_target(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn split_absolute_url_gives_the_origin_form_target() {
+        for (url, authority, path) in [
+            ("https://h/a/b?c=1", "h", "/a/b?c=1"),
+            ("https://h", "h", "/"),
+            ("https://h:1?q=1", "h:1", "/?q=1"),
+        ] {
+            assert_eq!(
+                split_absolute_url(url, "https://"),
+                Some((authority, path.to_string())),
+                "{url}"
+            );
+        }
+    }
+
+    /// The head BusyBox `wget` sends a proxy for an `https://` URL, byte for byte.
+    const WGET_HTTPS_HEAD: &[u8] = b"GET https://api.example.test/v1/things?page=2 HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: Wget\r\nConnection: close\r\n\r\n";
+
+    #[tokio::test]
+    async fn an_absolute_https_request_is_read_as_one() {
+        let (mut client, mut server) = socket_pair().await;
+        client.write_all(WGET_HTTPS_HEAD).await.unwrap();
+        let ProxyRequest::Https {
+            target,
+            header_bytes,
+        } = read_proxy_request_unbuffered(&mut server).await.unwrap()
+        else {
+            panic!("an https:// URL is an HTTPS forward request");
+        };
+        assert_eq!(target, "api.example.test:443");
+        assert_eq!(header_bytes, WGET_HTTPS_HEAD);
+    }
+
+    /// Send `request` to the proxy door, as a client would, and read the answer.
+    async fn proxy_door_answer(state: &Arc<ProxyState>, request: &[u8]) -> String {
+        let (mut client, server) = socket_pair().await;
+        let peer = client.local_addr().unwrap();
+        let state_for_handler = state.clone();
+        tokio::spawn(async move { handle_connection(server, peer, &state_for_handler).await });
+        client.write_all(request).await.unwrap();
+        read_response(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn a_request_the_door_cannot_serve_is_answered_with_400() {
+        // A closed socket is what BusyBox reported as "error getting response":
+        // nothing that tells a refusal from a broken proxy.
+        let (state, _rx) = test_state();
+        install_catch_all_allow(&state);
+        for request in [
+            &b"GET / HTTP/1.1\r\nHost: api.example.test\r\n\r\n"[..],
+            b"GET https:///v1 HTTP/1.1\r\n\r\n",
+            b"GET https://user@api.example.test/ HTTP/1.1\r\n\r\n",
+            b"GET ftp://api.example.test/ HTTP/1.1\r\n\r\n",
+            b"nonsense\r\n\r\n",
+        ] {
+            let response = proxy_door_answer(&state, request).await;
+            assert!(
+                response.starts_with("HTTP/1.1 400"),
+                "{:?} must be answered with 400; got {response:?}",
+                String::from_utf8_lossy(request)
+            );
+        }
+    }
+
+    /// The first card a door raises for `request`, against a fresh ask route.
+    async fn first_card(request: &'static [u8]) -> serde_json::Value {
+        let (state, mut rx) = test_state();
+        install_ask_route(&state, "api.example.test");
+        let (mut client, server) = socket_pair().await;
+        let peer = client.local_addr().unwrap();
+        let state_for_handler = state.clone();
+        tokio::spawn(async move { handle_connection(server, peer, &state_for_handler).await });
+        client.write_all(request).await.unwrap();
+        let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a card must be raised")
+            .unwrap();
+        serde_json::from_str(&pending).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_absolute_https_request_raises_the_card_its_connect_would() {
+        // One card for a destination however a client reaches it, so the answer
+        // given for it — and what Always Allow writes back — is the same too.
+        let wget = first_card(WGET_HTTPS_HEAD).await;
+        let curl = first_card(
+            b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n",
+        )
+        .await;
+        assert_eq!(wget["type"], "request_pending");
+        assert_eq!(wget["host"], "api.example.test");
+        assert_eq!(wget["action"], "CONNECT api.example.test:443");
+        assert_eq!(wget["treatment"], "inspected");
+        for field in ["type", "host", "action", "treatment", "reason"] {
+            assert_eq!(wget[field], curl[field], "{field}");
+        }
+    }
+
+    /// Drive the HTTPS forward door with [`WGET_HTTPS_HEAD`]-shaped `head` and
+    /// return the handler, so a test can answer the card it raises.
+    fn https_forward(
+        state: &Arc<ProxyState>,
+        server: TcpStream,
+        head: &'static [u8],
+    ) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            handle_https_forward(
+                server,
+                "api.example.test:443",
+                head.to_vec(),
+                &state_for_handler,
+                &test_actor(),
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn a_denied_card_refuses_an_absolute_https_request_with_403() {
+        let (state, mut rx) = test_state();
+        install_ask_route(&state, "api.example.test");
+        let (mut client, server) = socket_pair().await;
+        let _handler = https_forward(&state, server, WGET_HTTPS_HEAD);
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a card must be raised")
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&pending).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(crate::gate::resolve_pending(
+            &state,
+            &id,
+            crate::protocol::Decision::DenyOnce,
+        ));
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a denied card must be answered with 403; got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_that_denies_refuses_an_absolute_https_request_with_403() {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let (mut client, server) = socket_pair().await;
+        let _handler = https_forward(&state, server, WGET_HTTPS_HEAD);
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a deny must be answered with 403; got {response:?}"
+        );
+        // Recorded as its CONNECT would be, which is what the relay raises an
+        // Allow card from.
+        let refusals = drain_audit_lines(&mut rx);
+        assert!(
+            refusals
+                .iter()
+                .any(|e| e["action"] == "CONNECT api.example.test:443"
+                    && e["metadata"]["reason"] == "policy-deny"),
+            "{refusals:?}"
+        );
+    }
+
+    /// One `egress.http` route for `api.example.test` permitting `GET /v1/**` only.
+    fn install_v1_route(state: &Arc<ProxyState>, verdict: Verdict, transport: Transport) {
+        state
+            .policy
+            .write()
+            .unwrap()
+            .routes
+            .push(crate::routing::RouteRule {
+                matcher: crate::routing::RouteMatcher::Domain("api.example.test".to_string()),
+                verdict,
+                transport,
+                tls_terminate: false,
+                http_rules: vec![crate::policy_schema::HttpRule {
+                    method: Some("GET".to_string()),
+                    path: Some("/v1/**".to_string()),
+                    graphql: None,
+                    mcp: None,
+                }],
+                scheme: None,
+                binaries: None,
+            });
+    }
+
+    #[tokio::test]
+    async fn an_absolute_https_request_is_judged_by_the_routes_http_rules() {
+        let (state, mut rx) = test_state();
+        install_v1_route(&state, Verdict::Allow, Transport::Direct);
+        let (mut client, server) = socket_pair().await;
+        let _handler = https_forward(
+            &state,
+            server,
+            b"GET https://api.example.test/admin HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        );
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a path no rule covers must be refused; got {response:?}"
+        );
+        let refusals = drain_audit_lines(&mut rx);
+        assert!(
+            refusals
+                .iter()
+                .any(|e| e["path"] == "/admin" && e["metadata"]["http_rule_denied"] == true),
+            "{refusals:?}"
+        );
+    }
+
+    /// A Lens Sandbox upstream that opens the tunnel it is asked for and serves
+    /// HTTPS at the far end, under a certificate for `hostname` from a CA of its
+    /// own — trusted by nothing unless a test says so. Returns the upstream, that
+    /// CA's certificate, and a handle yielding the `CONNECT` the upstream got and
+    /// the request head the origin got.
+    async fn tls_origin_behind_a_tunnel(
+        hostname: &'static str,
+        body: &'static str,
+    ) -> (
+        SandboxUpstream,
+        rustls::pki_types::CertificateDer<'static>,
+        tokio::task::JoinHandle<(String, String)>,
+    ) {
+        use rustls::pki_types::pem::PemObject;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let origin_ca = crate::ca::EphemeralCa::new().unwrap();
+        let origin_ca_cert =
+            rustls::pki_types::CertificateDer::from_pem_slice(origin_ca.ca_cert_pem().as_bytes())
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            crate::mitm::build_ephemeral_server_config(&origin_ca, hostname).unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = tokio::spawn(async move {
+            let (mut tunnel, _) = listener.accept().await.unwrap();
+            let connect = read_until_double_crlf(&mut tunnel).await.unwrap();
+            tunnel
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut tls = acceptor.accept(tunnel).await.unwrap();
+            let head = read_until_double_crlf(&mut tls).await.unwrap();
+            tls.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            tls.shutdown().await.ok();
+            (
+                String::from_utf8(connect).unwrap(),
+                String::from_utf8(head).unwrap(),
+            )
+        });
+        let upstream = SandboxUpstream {
+            host: "127.0.0.1".to_string(),
+            port,
+            auth_header: None,
+            tls: false,
+        };
+        (upstream, origin_ca_cert, origin)
+    }
+
+    #[tokio::test]
+    async fn an_approved_absolute_https_request_reaches_the_origin_over_tls() {
+        let (state, mut rx) = test_state();
+        install_v1_route(&state, Verdict::Ask, Transport::Upstream);
+        let (upstream, origin_ca_cert, origin) =
+            tls_origin_behind_a_tunnel("api.example.test", "served-over-tls").await;
+        *state.upstream.lock().await = Some(upstream);
+        // The origin's CA is trusted by this proxy alone, and its certificate is
+        // still checked against the host the request named.
+        *state.extra_ca_certs.write().unwrap() = vec![origin_ca_cert];
+
+        let (mut client, server) = socket_pair().await;
+        let _handler = https_forward(
+            &state,
+            server,
+            b"GET https://api.example.test/v1/things?page=2 HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: Wget\r\nProxy-Authorization: Basic Zm9vOmJhcg==\r\nConnection: close\r\n\r\n",
+        );
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a card must be raised")
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&pending).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(crate::gate::resolve_pending(
+            &state,
+            &id,
+            crate::protocol::Decision::AllowOnce,
+        ));
+
+        use tokio::io::AsyncReadExt;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .expect("the origin's answer must reach the client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("served-over-tls"), "{response}");
+
+        let (connect, head) = origin.await.unwrap();
+        assert!(
+            connect.starts_with("CONNECT api.example.test:443 HTTP/1.1\r\n"),
+            "{connect}"
+        );
+        assert!(
+            head.starts_with("GET /v1/things?page=2 HTTP/1.1\r\n"),
+            "the origin must get the request in origin form: {head}"
+        );
+        assert!(head.contains("\r\nHost: api.example.test\r\n"), "{head}");
+        assert!(
+            !head.to_ascii_lowercase().contains("proxy-authorization"),
+            "a Proxy-* header is for the proxy alone: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absolute_https_request_to_a_tcp_denied_destination_is_refused_with_403() {
+        let (state, _rx) = test_state();
+        install_catch_all_allow(&state);
+        install_tcp_deny(&state, "api.example.test:443");
+        let (mut client, server) = socket_pair().await;
+        let _handler = https_forward(&state, server, WGET_HTTPS_HEAD);
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "the tcp claim is final on this door too; got {response:?}"
+        );
+    }
 }
