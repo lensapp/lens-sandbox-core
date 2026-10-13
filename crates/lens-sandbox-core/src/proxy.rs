@@ -335,6 +335,20 @@ impl ProxyState {
         *audit_tx = Some(tx);
     }
 
+    /// Hold, for the next connection, the failure events among `messages`,
+    /// those the audit channel took but did not write; anything else is let
+    /// go. See [`crate::audit_dedup`].
+    pub(crate) fn hold_unwritten<'a>(&self, messages: impl IntoIterator<Item = &'a str>) {
+        let now = std::time::SystemTime::now();
+        let mut deny_dedup = self.deny_dedup.lock().unwrap();
+        for tally in messages
+            .into_iter()
+            .filter_map(|message| crate::audit_dedup::Tally::unwritten(message, now))
+        {
+            deny_dedup.hold(tally);
+        }
+    }
+
     /// Whether `target_host` matches the domain of any still-unarmed
     /// credential and so must be MITM'd to gate its first use — see
     /// [`Self::unarmed_credential_domains`].

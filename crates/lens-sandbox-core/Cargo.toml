@@ -70,7 +70,7 @@ apollo-parser = { version = "0.8.6", optional = true }
 switchyard-translation = { version = "0.2", optional = true }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "transport", "tls-ring"], optional = true }
 bytes = { version = "1", optional = true }
-time = { version = "0.3", default-features = false, features = ["std", "formatting"], optional = true }
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "parsing"], optional = true }
 
 # AF_VSOCK and NFQUEUE are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
