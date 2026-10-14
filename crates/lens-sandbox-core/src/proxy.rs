@@ -2129,16 +2129,17 @@ async fn handle_https_forward(
     if let Err(e) = &result
         && !client.answered
     {
-        let (response, status) = unanswered_failure_response(e.as_ref());
+        let (response, status) = dial_failure_response(e.as_ref());
         client.write_all(response).await.ok();
         emit_audit(state, target_host, "error", status, actor);
     }
     result
 }
 
-/// What a client that the MITM pipeline left unanswered is told: 403 when the
-/// dial guard refused the address the name resolved to, else 502.
-fn unanswered_failure_response(error: &(dyn std::error::Error + 'static)) -> (&'static [u8], u16) {
+/// What a client is told when the dial to an admitted destination, or the TLS
+/// setup over it, fails: 403 when the dial guard refused the address the name
+/// resolved to, else 502.
+fn dial_failure_response(error: &(dyn std::error::Error + 'static)) -> (&'static [u8], u16) {
     match error.downcast_ref::<std::io::Error>() {
         Some(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (FORBIDDEN_RESPONSE, 403),
         _ => (BAD_GATEWAY_RESPONSE, 502),
@@ -3022,8 +3023,9 @@ async fn https_forward_raw_passthrough(
     let mut upstream = match dialled {
         Ok(s) => s,
         Err(e) => {
-            emit_audit(state, target_host, "error", 502, actor);
-            client.write_all(BAD_GATEWAY_RESPONSE).await?;
+            let (response, status) = dial_failure_response(e.as_ref());
+            emit_audit(state, target_host, "error", status, actor);
+            client.write_all(response).await?;
             return Err(format!("raw passthrough connect to {target_host}: {e}").into());
         }
     };
@@ -8885,11 +8887,76 @@ pub(crate) mod tests {
             "egress to 10.0.0.5 denied by policy",
         ));
         assert_eq!(
-            unanswered_failure_response(refused.as_ref()).1,
+            dial_failure_response(refused.as_ref()).1,
             403,
             "a policy refusal is a 403, not a gateway failure"
         );
         let failed: Box<dyn std::error::Error + Send + Sync> = "handshake failed".into();
-        assert_eq!(unanswered_failure_response(failed.as_ref()).1, 502);
+        assert_eq!(dial_failure_response(failed.as_ref()).1, 502);
+    }
+
+    #[tokio::test]
+    async fn a_raw_https_forward_the_dial_guard_refuses_is_answered_with_403() {
+        // The tcp claim binds `db.internal` through its pin, and the pin lapses
+        // while the card is up, so the approved dial meets the CIDR deny on the
+        // address. That is a policy refusal and must read as one, as on the
+        // inspected path, not as a gateway that failed.
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "db.internal:443", "verdict": "ask"},
+                {"match": "203.0.113.0/24:443", "verdict": "deny"}]"#,
+        );
+        pin_dns_answers(
+            &state,
+            &["203.0.113.80".parse().unwrap()],
+            "db.internal",
+            300,
+            0,
+        );
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_https_forward(
+                server,
+                "203.0.113.80:443",
+                b"GET https://203.0.113.80/ HTTP/1.1\r\nHost: 203.0.113.80\r\n\r\n".to_vec(),
+                &state_for_handler,
+                &test_actor(),
+            )
+            .await
+        });
+
+        let prompt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the ask must raise a card")
+            .unwrap();
+        let prompt: serde_json::Value = serde_json::from_str(&prompt).unwrap();
+        assert_eq!(prompt["type"], "request_pending");
+        state.policy.write().unwrap().pins.clear();
+        assert!(crate::gate::resolve_pending(
+            &state,
+            prompt["id"].as_str().unwrap(),
+            crate::protocol::Decision::AllowOnce,
+        ));
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a policy refusal at the dial is a 403; got {response:?}"
+        );
+        assert!(handler.await.unwrap().is_err());
+        let events = drain_audit_lines(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["host"] == "203.0.113.80" && e["status_code"] == 403),
+            "the refusal must be audited as a 403; got {events:#?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["status_code"] == 502),
+            "nothing may record it as a gateway failure; got {events:#?}"
+        );
     }
 }
