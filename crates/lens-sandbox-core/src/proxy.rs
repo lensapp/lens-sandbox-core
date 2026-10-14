@@ -8725,6 +8725,7 @@ pub(crate) mod tests {
             port,
             auth_header: None,
             tls: false,
+            plain_http: UpstreamPlainHttp::Tunnel,
         };
         (upstream, origin_ca_cert, origin)
     }
