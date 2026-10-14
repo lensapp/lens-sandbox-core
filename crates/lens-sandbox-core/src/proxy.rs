@@ -957,6 +957,7 @@ async fn handle_http_forward(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate target: reject CRLF injection and loopback/link-local targets
     if let Err(e) = validate_connect_target(target_host) {
+        emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
         client.write_all(FORBIDDEN_RESPONSE).await?;
         return Err(e);
     }
@@ -1524,6 +1525,7 @@ async fn handle_connect(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate target: reject CRLF injection and loopback/link-local targets
     if let Err(e) = validate_connect_target(target_host) {
+        emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
         client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
         return Err(e);
     }
@@ -1999,6 +2001,7 @@ async fn handle_https_forward(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate target: reject CRLF injection and loopback/link-local targets
     if let Err(e) = validate_connect_target(target_host) {
+        emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
         client.write_all(FORBIDDEN_RESPONSE).await?;
         return Err(e);
     }
@@ -8799,18 +8802,42 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_destination_the_proxy_never_dials_is_refused_with_403_on_every_door() {
-        let (state, _rx) = test_state();
+        // Refused and recorded, as the transparent door records the same floor:
+        // `blocked-destination`, which raises no card, since no answer could
+        // open it.
+        let (state, mut rx) = test_state();
         install_catch_all_allow(&state);
-        for request in [
-            &b"CONNECT localhost:22 HTTP/1.1\r\nHost: localhost:22\r\n\r\n"[..],
-            b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
-            b"GET https://169.254.169.254/latest HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n",
+        for (request, host) in [
+            (
+                &b"CONNECT localhost:22 HTTP/1.1\r\nHost: localhost:22\r\n\r\n"[..],
+                "localhost",
+            ),
+            (
+                b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                "127.0.0.1",
+            ),
+            (
+                b"GET https://169.254.169.254/latest HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n",
+                "169.254.169.254",
+            ),
         ] {
+            let request_line = String::from_utf8_lossy(request);
             let response = proxy_door_answer(&state, request).await;
             assert!(
                 response.starts_with("HTTP/1.1 403"),
-                "{:?} must be refused with 403; got {response:?}",
-                String::from_utf8_lossy(request)
+                "{request_line:?} must be refused with 403; got {response:?}"
+            );
+            let events = drain_audit_lines(&mut rx);
+            assert!(
+                events.iter().any(|e| e["host"] == host
+                    && e["result"] == "failure"
+                    && e["status_code"] == 403
+                    && e["metadata"]["reason"] == "blocked-destination"),
+                "{request_line:?} must be audited as a blocked destination; got {events:#?}"
+            );
+            assert!(
+                !events.iter().any(|e| e["type"] == "request_pending"),
+                "no card may be raised for a blocked destination; got {events:#?}"
             );
         }
     }
