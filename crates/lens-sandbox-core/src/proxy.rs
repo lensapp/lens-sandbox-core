@@ -3362,24 +3362,22 @@ pub(crate) fn emit_gate_resolved(
 ///
 /// Bypasses the failure-event dedup pool: a second user click on the
 /// same host inside the audit dedup window is a fresh decision, not a retry
-/// storm.
+/// storm. It is still sent as a refusal ([`send_refusal`]), so one the channel
+/// does not write is held as refused when the gate denied it.
 pub(crate) fn emit_gate_denied(
     state: &Arc<ProxyState>,
     action: &str,
     decision: crate::protocol::Decision,
 ) {
-    let tx = state.audit_tx.lock().unwrap().clone();
-    if let Some(tx) = tx {
-        let event = serde_json::json!({
-            "type": "audit_event",
-            "source": "sandbox-proxy",
-            "action": action,
-            "result": "failure",
-            "status_code": 403,
-            "metadata": {"reason": decision.audit_reason()},
-        });
-        let _ = tx.send(event.to_string());
-    }
+    let event = serde_json::json!({
+        "type": "audit_event",
+        "source": "sandbox-proxy",
+        "action": action,
+        "result": "failure",
+        "status_code": 403,
+        "metadata": {"reason": decision.audit_reason()},
+    });
+    send_refusal(state, &event, std::time::SystemTime::now());
 }
 
 /// Canonical dedup key for the JIT approval gate: bare hostname, no
@@ -5573,6 +5571,26 @@ pub(crate) mod tests {
         let second: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(second["result"], "failure");
         assert_eq!(second["metadata"]["reason"], "user-denied-once");
+    }
+
+    #[test]
+    fn emit_gate_denied_while_disconnected_is_held_for_the_next_channel() {
+        // Each user click is still counted: held, not folded away.
+        let (state, _rx) = test_state();
+        *state.audit_tx.lock().unwrap() = None;
+        for _ in 0..2 {
+            emit_gate_denied(
+                &state,
+                "CONNECT evil.example.com:443",
+                crate::protocol::Decision::DenyOnce,
+            );
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.connect_audit(tx);
+        let events = events_in(&mut rx);
+        assert_eq!(refusals_in(&events), 2);
+        assert_eq!(events[0]["metadata"]["reason"], "user-denied-once");
     }
 
     #[test]

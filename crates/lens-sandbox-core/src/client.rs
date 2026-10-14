@@ -2040,7 +2040,10 @@ mod tests {
     }
 
     fn last_refused_at(tally: &crate::audit_dedup::Tally) -> std::time::SystemTime {
-        let summary = tally.summary();
+        summary_refused_at(&tally.summary())
+    }
+
+    fn summary_refused_at(summary: &serde_json::Value) -> std::time::SystemTime {
         let at = summary["metadata"]["last_suppressed_at"].as_str().unwrap();
         time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
             .unwrap()
@@ -2058,12 +2061,7 @@ mod tests {
         let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:54321".parse().unwrap());
         crate::proxy::emit_policy_deny_connect(&state, "a.com:443", "policy-deny", &actor);
         let refused = crate::proxy::tests::refuse_times(1, || {
-            crate::proxy::emit_policy_deny_connect(
-                &state,
-                "api.example:443",
-                "user-denied-once",
-                &actor,
-            )
+            crate::proxy::emit_policy_deny_connect(&state, "api.example:443", "policy-deny", &actor)
         });
         std::thread::sleep(Duration::from_millis(2));
         let later =
@@ -2088,14 +2086,93 @@ mod tests {
             [("a.com".to_string(), 1)].into(),
         );
         let held = state.deny_dedup.lock().unwrap().take_held();
-        let [answered, summary] = held.as_slice() else {
+        let [earlier, summary] = held.as_slice() else {
             panic!("expected the refusal and the summary held, got {held:?}");
         };
-        assert_eq!(answered.summary()["host"], "api.example");
-        let answered_at = last_refused_at(answered);
-        assert!(refused.0 <= answered_at && answered_at <= refused.1);
+        assert_eq!(earlier.summary()["host"], "api.example");
+        let earlier_at = last_refused_at(earlier);
+        assert!(refused.0 <= earlier_at && earlier_at <= refused.1);
         assert_eq!(summary, &later);
-        assert!(answered_at < last_refused_at(summary));
+        assert!(earlier_at < last_refused_at(summary));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_refusal_a_failed_connection_did_not_write_is_held_as_refused_when_it_was_denied()
+     {
+        // A DNS refusal written, then a Deny Once and the summary of a later
+        // DNS repeat queued behind a write that fails, and sent on the next
+        // connection. Held as refused when it was found unwritten, the Deny
+        // Once would read as the latest cause of the refusals of api.example.
+        let state = test_proxy_state();
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.connect_audit(tx.clone());
+        let refuse_lookup = || {
+            crate::proxy::emit_deny_event(
+                &state,
+                "DNS api.example".to_string(),
+                serde_json::json!({"dns": true, "reason": "dns-denied", "qname": "api.example"}),
+                None,
+            )
+        };
+        refuse_lookup();
+        let denied = crate::proxy::tests::refuse_times(1, || {
+            crate::proxy::emit_gate_denied(
+                &state,
+                "CONNECT api.example:443",
+                crate::protocol::Decision::DenyOnce,
+            )
+        });
+        let repeated = crate::proxy::tests::refuse_times(1, refuse_lookup);
+        tokio::time::sleep(Duration::from_secs(
+            crate::audit_dedup::AUDIT_DEDUP_SECS + 1,
+        ))
+        .await;
+        drop(tx);
+        *state.audit_tx.lock().unwrap() = None;
+        std::thread::sleep(Duration::from_millis(2));
+        let (written_tx, mut written) = mpsc::unbounded_channel();
+        let (_stop_writer, stop) = oneshot::channel();
+        write_messages(
+            sink_failing_after(1, written_tx),
+            rx,
+            stop,
+            Some(state.clone()),
+        )
+        .await;
+        let written: Vec<String> = std::iter::from_fn(|| written.try_recv().ok()).collect();
+        let [lookup] = written.as_slice() else {
+            panic!("expected the first lookup written, got {written:?}");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(lookup).unwrap()["metadata"]["reason"],
+            "dns-denied"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        let recovered_from = std::time::SystemTime::now();
+        let (written_tx, mut written) = mpsc::unbounded_channel();
+        write_held_to(&state, sink_failing_after(usize::MAX, written_tx), &[]).await;
+
+        let recovered: Vec<serde_json::Value> = std::iter::from_fn(|| written.try_recv().ok())
+            .map(|message| serde_json::from_str(&message).unwrap())
+            .collect();
+        let [deny_once, repeat] = recovered.as_slice() else {
+            panic!("expected the Deny Once and the repeat sent, got {recovered:?}");
+        };
+        assert_eq!(deny_once["metadata"]["reason"], "user-denied-once");
+        assert_eq!(repeat["metadata"]["reason"], "dns-denied");
+        let denied_at = summary_refused_at(deny_once);
+        assert!(denied.0 <= denied_at && denied_at <= denied.1);
+        assert!(denied_at < recovered_from);
+        let repeated_at = summary_refused_at(repeat);
+        assert!(repeated.0 <= repeated_at && repeated_at <= repeated.1);
+        let latest = recovered
+            .iter()
+            .max_by_key(|event| summary_refused_at(event));
+        assert_eq!(
+            latest.map(|event| &event["metadata"]["reason"]),
+            Some(&"dns-denied".into()),
+            "the repeat after the Deny Once is the latest cause"
+        );
     }
 
     #[tokio::test]
