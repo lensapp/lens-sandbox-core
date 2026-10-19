@@ -144,6 +144,7 @@ mod tests {
                     stderr: true,
                     initial_size: None,
                     actor: None,
+                    output_window: None,
                 },
                 &tx,
             )

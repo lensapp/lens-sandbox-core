@@ -58,6 +58,7 @@ pub mod mcp;
 pub mod mitm;
 #[cfg(feature = "proxy")]
 pub mod network;
+pub(crate) mod output_credit;
 pub mod peer_process;
 #[cfg(feature = "proxy")]
 pub mod policy_schema;

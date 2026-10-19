@@ -85,6 +85,10 @@ pub enum IncomingMessage {
         initial_size: Option<TerminalSize>,
         #[serde(default)]
         actor: Option<ActorIdentity>,
+        /// Output bytes the client takes before it gives credit with
+        /// `exec_output_credit`. Omitted means no limit.
+        #[serde(default)]
+        output_window: Option<u32>,
     },
 
     /// base64-encoded bytes to write to the exec's stdin.
@@ -131,6 +135,10 @@ pub enum IncomingMessage {
         initial_size: Option<TerminalSize>,
         #[serde(default)]
         actor: Option<ActorIdentity>,
+        /// The window for this client, as on `exec_attach`. The scrollback
+        /// replay counts against it.
+        #[serde(default)]
+        output_window: Option<u32>,
     },
 
     /// Lens Sandbox has stored the terminal frame of this exec. Until this
@@ -139,6 +147,18 @@ pub enum IncomingMessage {
     /// and its `exec_exit`. Ignored for an exec that is still running.
     #[serde(rename = "exec_ack", rename_all = "camelCase")]
     ExecAck { exec_id: String },
+
+    /// The client delivered `bytes` more raw output bytes (before base64)
+    /// of an exec attached with an `outputWindow`. Ignored for an exec
+    /// with no limit.
+    #[serde(rename = "exec_output_credit", rename_all = "camelCase")]
+    ExecOutputCredit { exec_id: String, bytes: u32 },
+
+    /// The client is gone but the exec keeps running for a later
+    /// `exec_reattach`. Its output goes to the scrollback only, with no
+    /// limit, until a client reattaches.
+    #[serde(rename = "exec_release", rename_all = "camelCase")]
+    ExecRelease { exec_id: String },
 }
 
 /// Outbound exec frames (supervisor → Lens).
@@ -224,7 +244,8 @@ mod tests {
             "stdout": true,
             "stderr": false,
             "initialSize": {"cols": 120, "rows": 40},
-            "actor": {"userId": "user-1", "email": "u@example.com"}
+            "actor": {"userId": "user-1", "email": "u@example.com"},
+            "outputWindow": 262144
         }"#;
 
         match parse(json) {
@@ -239,7 +260,9 @@ mod tests {
                 stderr,
                 initial_size,
                 actor,
+                output_window,
             } => {
+                assert_eq!(output_window, Some(262144));
                 assert_eq!(exec_id, "e1");
                 assert_eq!(argv, vec!["bash".to_string(), "-l".to_string()]);
                 assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
@@ -283,8 +306,10 @@ mod tests {
                 env,
                 cwd,
                 actor,
+                output_window,
                 ..
             } => {
+                assert!(output_window.is_none(), "no window means no limit");
                 assert!(!tty, "tty must default to false");
                 assert!(stdin && stdout && stderr, "stdio bools default to true");
                 assert!(initial_size.is_none());
@@ -366,6 +391,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_exec_output_credit() {
+        let json = r#"{"type":"exec_output_credit","execId":"e1","bytes":131072}"#;
+        match parse(json) {
+            IncomingMessage::ExecOutputCredit { exec_id, bytes } => {
+                assert_eq!(exec_id, "e1");
+                assert_eq!(bytes, 131072);
+            }
+            other => panic!("expected ExecOutputCredit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_exec_release() {
+        let json = r#"{"type":"exec_release","execId":"e1"}"#;
+        match parse(json) {
+            IncomingMessage::ExecRelease { exec_id } => assert_eq!(exec_id, "e1"),
+            other => panic!("expected ExecRelease, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn emit_exec_attached_omits_owner_when_none() {
         let v = emit(&OutgoingMessage::ExecAttached {
             exec_id: "e1".into(),
@@ -408,9 +454,11 @@ mod tests {
                 force,
                 initial_size,
                 actor,
+                output_window,
             } => {
                 assert_eq!(exec_id, "e1");
                 assert!(!force, "force defaults to false");
+                assert!(output_window.is_none());
                 assert!(initial_size.is_none());
                 assert!(actor.is_none());
             }
@@ -420,14 +468,16 @@ mod tests {
 
     #[test]
     fn parse_exec_reattach_with_force_size_and_actor() {
-        let json = r#"{"type":"exec_reattach","execId":"e1","force":true,"initialSize":{"cols":120,"rows":40},"actor":{"userId":"user-1"}}"#;
+        let json = r#"{"type":"exec_reattach","execId":"e1","force":true,"initialSize":{"cols":120,"rows":40},"actor":{"userId":"user-1"},"outputWindow":65536}"#;
         match parse(json) {
             IncomingMessage::ExecReattach {
                 exec_id,
                 force,
                 initial_size,
                 actor,
+                output_window,
             } => {
+                assert_eq!(output_window, Some(65536));
                 assert_eq!(exec_id, "e1");
                 assert!(force);
                 assert_eq!(

@@ -28,6 +28,11 @@
 //! disconnected when the exec exited reattaches and gets the output and
 //! the result. Without this, an exit during a disconnect is lost, and the
 //! caller cannot tell a command that finished from one that never will.
+//!
+//! Output credit: a client that attaches with an `outputWindow` gets at
+//! most that many output bytes ahead of its `exec_output_credit`, so a
+//! slow client slows the child and not the memory (see `output_credit`).
+//! Only stdout and stderr use credit, and only while a client is attached.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -45,6 +50,7 @@ use crate::exec_protocol::{
     ActorIdentity, DetachReason, IncomingMessage, OutgoingMessage, TerminalSize,
 };
 use crate::lifecycle::PidGuard;
+use crate::output_credit::OutputCredit;
 use crate::privilege::SandboxCredentials;
 use crate::pty::OwnedRawFd;
 
@@ -127,6 +133,7 @@ struct SessionHandle {
     /// Channel into the forwarder task. `exec_reattach` sends `SwapDest`
     /// through here to redirect output to a new WS dest.
     fwd_tx: mpsc::UnboundedSender<ForwarderEvent>,
+    output_credit: Arc<OutputCredit>,
     /// Cached for replay in `exec_attached` on reattach so the new client
     /// can mirror the original attach response.
     pid: u32,
@@ -174,11 +181,22 @@ impl ExecManager {
                 stderr: _,
                 initial_size,
                 actor,
+                output_window,
             } => {
+                let output_credit = Arc::new(OutputCredit::new(output_window));
                 if tty {
-                    self.attach_pty(exec_id, argv, env, cwd, initial_size, actor, ws_tx);
+                    self.attach_pty(
+                        exec_id,
+                        argv,
+                        env,
+                        cwd,
+                        initial_size,
+                        actor,
+                        output_credit,
+                        ws_tx,
+                    );
                 } else {
-                    self.attach_piped(exec_id, argv, env, cwd, actor, ws_tx);
+                    self.attach_piped(exec_id, argv, env, cwd, actor, output_credit, ws_tx);
                 }
             }
             IncomingMessage::ExecStdin { exec_id, data } => {
@@ -202,16 +220,28 @@ impl ExecManager {
                 force,
                 initial_size,
                 actor,
+                output_window,
             } => {
-                self.reattach(exec_id, actor, force, initial_size, ws_tx)
+                self.reattach(exec_id, actor, force, initial_size, output_window, ws_tx)
                     .await;
             }
             IncomingMessage::ExecAck { exec_id } => {
                 self.ack(&exec_id);
             }
+            IncomingMessage::ExecOutputCredit { exec_id, bytes } => {
+                if let Some(session) = self.inner.sessions.lock().unwrap().get(&exec_id) {
+                    session.output_credit.grant(bytes);
+                }
+            }
+            IncomingMessage::ExecRelease { exec_id } => {
+                if let Some(session) = self.inner.sessions.lock().unwrap().get(&exec_id) {
+                    let _ = session.fwd_tx.send(ForwarderEvent::Release);
+                }
+            }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attach_piped(
         &self,
         exec_id: String,
@@ -219,6 +249,7 @@ impl ExecManager {
         env: HashMap<String, String>,
         cwd: Option<String>,
         actor: Option<ActorIdentity>,
+        output_credit: Arc<OutputCredit>,
         ws_tx: &mpsc::UnboundedSender<String>,
     ) {
         if self.inner.sessions.lock().unwrap().contains_key(&exec_id) {
@@ -276,7 +307,7 @@ impl ExecManager {
         let stderr = child.stderr.take().expect("stderr was piped");
         let stdin = child.stdin.take().expect("stdin was piped");
 
-        let fwd_tx = spawn_forwarder(exec_id.clone(), ws_tx.clone());
+        let fwd_tx = spawn_forwarder(exec_id.clone(), ws_tx.clone(), output_credit.clone());
 
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinFrame>();
 
@@ -289,6 +320,7 @@ impl ExecManager {
             exited: false,
             tty_master_fd: None,
             fwd_tx: fwd_tx.clone(),
+            output_credit: output_credit.clone(),
             pid,
             owner: owner.clone(),
         };
@@ -318,8 +350,13 @@ impl ExecManager {
             },
         );
 
-        let stdout_task = spawn_pipe_reader(stdout, Stream::Stdout, fwd_tx.clone());
-        let stderr_task = spawn_pipe_reader(stderr, Stream::Stderr, fwd_tx.clone());
+        let stdout_task = spawn_pipe_reader(
+            stdout,
+            Stream::Stdout,
+            fwd_tx.clone(),
+            output_credit.clone(),
+        );
+        let stderr_task = spawn_pipe_reader(stderr, Stream::Stderr, fwd_tx.clone(), output_credit);
 
         let registry = self.inner.clone();
         tokio::spawn(async move {
@@ -343,6 +380,7 @@ impl ExecManager {
         cwd: Option<String>,
         initial_size: Option<TerminalSize>,
         actor: Option<ActorIdentity>,
+        output_credit: Arc<OutputCredit>,
         ws_tx: &mpsc::UnboundedSender<String>,
     ) {
         if self.inner.sessions.lock().unwrap().contains_key(&exec_id) {
@@ -398,7 +436,7 @@ impl ExecManager {
         // Single output stream — PTY slave merges stdout+stderr into the
         // master. The protocol contract reflects this: tty=true never
         // emits exec_stderr.
-        let fwd_tx = spawn_forwarder(exec_id.clone(), ws_tx.clone());
+        let fwd_tx = spawn_forwarder(exec_id.clone(), ws_tx.clone(), output_credit.clone());
 
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinFrame>();
 
@@ -411,6 +449,7 @@ impl ExecManager {
             exited: false,
             tty_master_fd: Some(master_fd),
             fwd_tx: fwd_tx.clone(),
+            output_credit: output_credit.clone(),
             pid,
             owner: owner.clone(),
         };
@@ -431,7 +470,7 @@ impl ExecManager {
             },
         );
 
-        let output_task = spawn_pipe_reader(reader, Stream::Stdout, fwd_tx.clone());
+        let output_task = spawn_pipe_reader(reader, Stream::Stdout, fwd_tx.clone(), output_credit);
 
         let registry = self.inner.clone();
         tokio::spawn(async move {
@@ -556,6 +595,7 @@ impl ExecManager {
         actor: Option<ActorIdentity>,
         force: bool,
         initial_size: Option<TerminalSize>,
+        output_window: Option<u32>,
         ws_tx: &mpsc::UnboundedSender<String>,
     ) {
         let (fwd_tx, owner, pid, is_tty) = {
@@ -602,6 +642,7 @@ impl ExecManager {
                 },
                 reason: DetachReason::Stolen,
                 force,
+                output_window,
                 reply: reply_tx,
             })
             .is_err()
@@ -697,6 +738,7 @@ enum ForwarderEvent {
         attached: OutgoingMessage,
         reason: DetachReason,
         force: bool,
+        output_window: Option<u32>,
         reply: oneshot::Sender<SwapOutcome>,
     },
     /// Exec terminated. Carries the exec_exit / exec_error frame the
@@ -706,6 +748,9 @@ enum ForwarderEvent {
     /// Send the current dest `exec_detached` and drop it. Nothing is sent
     /// after the terminal frame, which must stay the last frame.
     Detach(DetachReason),
+    /// Drop the current dest with no `exec_detached`: the client asked
+    /// for it with `exec_release`.
+    Release,
 }
 
 /// Result of a `SwapDest` event, returned to the requester via a oneshot
@@ -781,13 +826,27 @@ fn encode_chunk(exec_id: &str, stream: Stream, bytes: &[u8]) -> String {
 fn spawn_forwarder(
     exec_id: String,
     initial_dest: mpsc::UnboundedSender<String>,
+    output_credit: Arc<OutputCredit>,
 ) -> mpsc::UnboundedSender<ForwarderEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ForwarderEvent>();
     tokio::spawn(async move {
         let mut dest: Option<mpsc::UnboundedSender<String>> = Some(initial_dest);
         let mut scrollback = Scrollback::new();
         let mut terminal_frame: Option<String> = None;
-        while let Some(ev) = rx.recv().await {
+        loop {
+            let ev = tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                },
+                () = closed(&dest) => {
+                    // A reader that waits for credit sends no chunk that
+                    // would find this out by a failed send.
+                    dest = None;
+                    output_credit.reset(None);
+                    continue;
+                }
+            };
             match ev {
                 ForwarderEvent::Chunk { stream, bytes } => {
                     scrollback.push(stream, &bytes);
@@ -798,6 +857,7 @@ fn spawn_forwarder(
                             // buffering — the exec persists; a future
                             // SwapDest replays everything we held onto.
                             dest = None;
+                            output_credit.reset(None);
                         }
                     }
                 }
@@ -806,6 +866,7 @@ fn spawn_forwarder(
                     attached,
                     reason,
                     force,
+                    output_window,
                     reply,
                 } => {
                     // Reject the swap if a live dest is already attached and
@@ -840,6 +901,12 @@ fn spawn_forwarder(
                         }
                     }
                     dest = if new_dest_live { Some(new_dest) } else { None };
+                    output_credit.reset(output_window.filter(|_| new_dest_live));
+                    if new_dest_live {
+                        // The client cannot tell the replay from live
+                        // output, so it credits both.
+                        output_credit.spend(scrollback.bytes);
+                    }
                     let _ = reply.send(SwapOutcome::Swapped);
                 }
                 ForwarderEvent::Final(msg) => {
@@ -848,6 +915,7 @@ fn spawn_forwarder(
                         && d.send(frame.clone()).is_err()
                     {
                         dest = None;
+                        output_credit.reset(None);
                     }
                     terminal_frame = Some(frame);
                 }
@@ -861,6 +929,11 @@ fn spawn_forwarder(
                         };
                         let _ = old.send(serde_json::to_string(&detached).unwrap());
                     }
+                    output_credit.reset(None);
+                }
+                ForwarderEvent::Release => {
+                    dest = None;
+                    output_credit.reset(None);
                 }
             }
         }
@@ -868,10 +941,18 @@ fn spawn_forwarder(
     tx
 }
 
+async fn closed(dest: &Option<mpsc::UnboundedSender<String>>) {
+    match dest {
+        Some(d) => d.closed().await,
+        None => std::future::pending().await,
+    }
+}
+
 fn spawn_pipe_reader<R>(
     mut reader: R,
     which: Stream,
     fwd_tx: mpsc::UnboundedSender<ForwarderEvent>,
+    output_credit: Arc<OutputCredit>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -879,9 +960,11 @@ where
     tokio::spawn(async move {
         let mut buf = vec![0u8; READ_CHUNK];
         loop {
+            output_credit.ready().await;
             match reader.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    output_credit.spend(n);
                     if fwd_tx
                         .send(ForwarderEvent::Chunk {
                             stream: which,
@@ -1082,6 +1165,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1128,6 +1212,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1169,6 +1254,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1228,6 +1314,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1287,6 +1374,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1342,6 +1430,7 @@ mod tests {
                 stderr: false,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1434,6 +1523,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1467,6 +1557,7 @@ mod tests {
                 stderr: true,
                 initial_size: Some(TerminalSize { cols: 80, rows: 24 }),
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1513,6 +1604,7 @@ mod tests {
                 stderr: true,
                 initial_size: Some(TerminalSize { cols: 80, rows: 24 }),
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1565,6 +1657,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1614,6 +1707,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1634,6 +1728,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx,
         )
@@ -1692,6 +1787,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor,
+                output_window: None,
             },
             &tx,
         )
@@ -1726,6 +1822,7 @@ mod tests {
                 force: false,
                 initial_size: None,
                 actor: Some(actor("user-1")),
+                output_window: None,
             },
             &tx,
         )
@@ -1752,6 +1849,7 @@ mod tests {
                 force: true,
                 initial_size: None,
                 actor: Some(actor("user-1")),
+                output_window: None,
             },
             &tx2,
         )
@@ -1792,6 +1890,7 @@ mod tests {
                 force: true,
                 initial_size: None,
                 actor: Some(actor("user-2")),
+                output_window: None,
             },
             &tx2,
         )
@@ -1826,6 +1925,7 @@ mod tests {
                 force: true,
                 initial_size: None,
                 actor: None,
+                output_window: None,
             },
             &tx2,
         )
@@ -1855,6 +1955,7 @@ mod tests {
                 force: true,
                 initial_size: None,
                 actor: Some(actor("user-1")),
+                output_window: None,
             },
             &tx2,
         )
@@ -1884,6 +1985,7 @@ mod tests {
                 force: false,
                 initial_size: None,
                 actor: Some(actor("user-1")),
+                output_window: None,
             },
             &tx2,
         )
@@ -1932,6 +2034,7 @@ mod tests {
                 stderr: true,
                 initial_size: None,
                 actor: Some(actor("user-1")),
+                output_window: None,
             },
             tx,
         )
@@ -1946,6 +2049,7 @@ mod tests {
                 force: false,
                 initial_size: None,
                 actor: Some(actor("user-1")),
+                output_window: None,
             },
             &tx,
         )
@@ -2120,6 +2224,159 @@ mod tests {
         assert!(after.is_err(), "exec_exit stays the last frame: {after:?}");
     }
 
+    // --- Output credit ----------------------------------------------------
+
+    const WINDOW: u32 = 64 * 1024;
+    const OUTPUT: usize = 1024 * 1024;
+
+    async fn attach_metered(mgr: &ExecManager, exec_id: &str, tx: &mpsc::UnboundedSender<String>) {
+        mgr.handle(
+            IncomingMessage::ExecAttach {
+                exec_id: exec_id.into(),
+                argv: vec![
+                    "head".into(),
+                    "-c".into(),
+                    OUTPUT.to_string(),
+                    "/dev/zero".into(),
+                ],
+                env: HashMap::new(),
+                cwd: None,
+                tty: false,
+                stdin: true,
+                stdout: true,
+                stderr: true,
+                initial_size: None,
+                actor: Some(actor("user-1")),
+                output_window: Some(WINDOW),
+            },
+            tx,
+        )
+        .await;
+    }
+
+    /// The stdout bytes that arrive before the output stops for 300 ms.
+    async fn stdout_until_quiet(rx: &mut mpsc::UnboundedReceiver<String>) -> usize {
+        let mut bytes = 0;
+        while let Ok(Some(text)) = timeout(Duration::from_millis(300), rx.recv()).await {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_ne!(v["type"], "exec_exit", "the exec waits for credit");
+            if v["type"] == "exec_stdout" {
+                bytes += decode_data(&v).len();
+            }
+        }
+        bytes
+    }
+
+    /// A read past the credit is paid back by the next grant, so a window
+    /// after the first can be one read short as well as one read long.
+    fn assert_stopped_at(bytes: usize, window: u32) {
+        assert!(
+            bytes.abs_diff(window as usize) <= READ_CHUNK,
+            "one window of {window}, give or take one read, got {bytes}"
+        );
+    }
+
+    fn assert_stopped_at_the_window(bytes: usize) {
+        assert_stopped_at(bytes, WINDOW);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_metered_exec_stops_after_its_window_until_credit_arrives() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_metered(&mgr, "c1", &tx).await;
+
+        let before_credit = stdout_until_quiet(&mut rx).await;
+        assert_stopped_at_the_window(before_credit);
+
+        mgr.handle(
+            IncomingMessage::ExecOutputCredit {
+                exec_id: "c1".into(),
+                bytes: OUTPUT as u32,
+            },
+            &tx,
+        )
+        .await;
+        let frames = drain_until_terminal(&mut rx, "c1").await;
+        let after_credit: usize = frames
+            .iter()
+            .filter(|f| f["type"] == "exec_stdout")
+            .map(|f| decode_data(f).len())
+            .sum();
+        assert_eq!(before_credit + after_credit, OUTPUT);
+        assert_eq!(frames.last().unwrap()["code"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_released_exec_runs_to_the_end_without_credit() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_metered(&mgr, "c2", &tx).await;
+        assert_stopped_at_the_window(stdout_until_quiet(&mut rx).await);
+
+        mgr.handle(
+            IncomingMessage::ExecRelease {
+                exec_id: "c2".into(),
+            },
+            &tx,
+        )
+        .await;
+
+        let late = timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(late.is_err(), "a released exec sends nothing: {late:?}");
+        let frames = reattach_frames(&mgr, "c2").await;
+        assert_eq!(frames.last().unwrap()["code"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exec_that_loses_its_client_runs_to_the_end_without_credit() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_metered(&mgr, "c3", &tx).await;
+        assert_stopped_at_the_window(stdout_until_quiet(&mut rx).await);
+
+        drop(rx);
+
+        let frames = reattach_frames(&mgr, "c3").await;
+        assert_eq!(frames.last().unwrap()["code"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reattach_gets_a_new_window_that_the_replay_counts_against() {
+        let mgr = manager();
+        let (tx, mut rx) = channel();
+        attach_metered(&mgr, "c4", &tx).await;
+        assert_stopped_at_the_window(stdout_until_quiet(&mut rx).await);
+
+        let (tx2, mut rx2) = channel();
+        mgr.handle(
+            IncomingMessage::ExecReattach {
+                exec_id: "c4".into(),
+                force: true,
+                initial_size: None,
+                actor: Some(actor("user-1")),
+                output_window: Some(2 * WINDOW),
+            },
+            &tx2,
+        )
+        .await;
+
+        // A window unlike the first one, so a missing reset and a missing
+        // spend of the replay each give another count.
+        assert_stopped_at(stdout_until_quiet(&mut rx2).await, 2 * WINDOW);
+
+        mgr.handle(
+            IncomingMessage::ExecOutputCredit {
+                exec_id: "c4".into(),
+                bytes: WINDOW,
+            },
+            &tx2,
+        )
+        .await;
+        assert_stopped_at_the_window(stdout_until_quiet(&mut rx2).await);
+        cleanup(&mgr, "c4", &tx2).await;
+    }
+
     // --- Forwarder unit tests ---------------------------------------------
     //
     // These exercise `spawn_forwarder` directly (bypassing the manager)
@@ -2144,7 +2401,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forwarder_replays_the_terminal_frame_last() {
         let (dest1_tx, dest1_rx) = mpsc::unbounded_channel::<String>();
-        let fwd = spawn_forwarder("e3".into(), dest1_tx);
+        let fwd = spawn_forwarder("e3".into(), dest1_tx, Arc::new(OutputCredit::new(None)));
         drop(dest1_rx);
 
         fwd.send(ForwarderEvent::Chunk {
@@ -2167,6 +2424,7 @@ mod tests {
             reason: DetachReason::Stolen,
             force: false,
             reply: reply_tx,
+            output_window: None,
         })
         .unwrap();
         assert_eq!(reply_rx.await.unwrap(), SwapOutcome::Swapped);
@@ -2179,7 +2437,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forwarder_replays_scrollback_to_new_dest_and_detaches_old() {
         let (dest1_tx, mut dest1_rx) = mpsc::unbounded_channel::<String>();
-        let fwd = spawn_forwarder("e1".into(), dest1_tx);
+        let fwd = spawn_forwarder("e1".into(), dest1_tx, Arc::new(OutputCredit::new(None)));
 
         fwd.send(ForwarderEvent::Chunk {
             stream: Stream::Stdout,
@@ -2204,6 +2462,7 @@ mod tests {
             reason: DetachReason::Stolen,
             force: true,
             reply: reply_tx,
+            output_window: None,
         })
         .unwrap();
         assert_eq!(reply_rx.await.unwrap(), SwapOutcome::Swapped);
@@ -2250,7 +2509,7 @@ mod tests {
         // persistent exec the forwarder must keep buffering so a later
         // SwapDest can replay everything to a reattaching client.
         let (dest1_tx, dest1_rx) = mpsc::unbounded_channel::<String>();
-        let fwd = spawn_forwarder("e2".into(), dest1_tx);
+        let fwd = spawn_forwarder("e2".into(), dest1_tx, Arc::new(OutputCredit::new(None)));
 
         // Drop the rx before we send anything — every send to dest fails.
         drop(dest1_rx);
@@ -2271,6 +2530,7 @@ mod tests {
             reason: DetachReason::Stolen,
             force: true,
             reply: reply_tx,
+            output_window: None,
         })
         .unwrap();
         assert_eq!(reply_rx.await.unwrap(), SwapOutcome::Swapped);
