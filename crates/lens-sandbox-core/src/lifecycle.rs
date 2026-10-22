@@ -81,6 +81,31 @@ pub async fn wait_with_signal_forwarding(
 /// Every path after a signal returns [`ChildExit::Stopped`].
 #[cfg(unix)]
 pub async fn wait_for_child_exit(child: &mut Child, grace: Duration) -> std::io::Result<ChildExit> {
+    wait_for_shutdown(child, Some(grace)).await
+}
+
+/// Await the child's exit with no deadline of its own after a shutdown
+/// signal, and say whether the child finished or was stopped.
+///
+/// The same as [`wait_for_child_exit`] except that nothing here ends the
+/// wait on a timer: after the first SIGTERM / SIGINT / SIGHUP the helper
+/// waits for the child for as long as the caller does. A second signal
+/// still sends SIGKILL to the child's process group at once. A caller
+/// that owns the end of the run (a host that stops a sandbox with a
+/// timeout) puts that deadline on its own side and sends the second
+/// signal when the timeout runs out.
+#[cfg(unix)]
+pub async fn wait_for_child_exit_host_owned(child: &mut Child) -> std::io::Result<ChildExit> {
+    wait_for_shutdown(child, None).await
+}
+
+/// The shared body of the two unix waits. `grace` of `None` means no
+/// deadline after the first shutdown signal.
+#[cfg(unix)]
+async fn wait_for_shutdown(
+    child: &mut Child,
+    grace: Option<Duration>,
+) -> std::io::Result<ChildExit> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut term = signal(SignalKind::terminate())?;
@@ -100,24 +125,26 @@ pub async fn wait_for_child_exit(child: &mut Child, grace: Duration) -> std::io:
 
     forward_sigterm(child);
 
-    // Wait for the child to exit, the grace period to expire, or a
-    // second signal to short-circuit straight to SIGKILL.
+    // Wait for the child to exit, the grace period to expire (if there is
+    // one), or a second signal to short-circuit straight to SIGKILL.
     let kill_reason = tokio::select! {
         status = child.wait() => return status.map(ChildExit::Stopped),
-        _ = tokio::time::sleep(grace) => "grace expired",
+        _ = until_grace_expires(grace) => "grace expired",
         _ = term.recv() => "second SIGTERM during grace",
         _ = intr.recv() => "second SIGINT during grace",
         _ = hup.recv() => "second SIGHUP during grace",
     };
-    tracing::warn!(
-        reason = kill_reason,
-        grace_secs = grace.as_secs(),
-        "escalating to SIGKILL"
-    );
-    if let Err(e) = child.start_kill() {
-        tracing::warn!(error = %e, "SIGKILL on agent failed");
-    }
+    tracing::warn!(reason = kill_reason, "escalating to SIGKILL");
+    kill_agent(child, nix::sys::signal::Signal::SIGKILL);
     child.wait().await.map(ChildExit::Stopped)
+}
+
+#[cfg(unix)]
+async fn until_grace_expires(grace: Option<Duration>) {
+    match grace {
+        Some(grace) => tokio::time::sleep(grace).await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(not(unix))]
@@ -125,6 +152,11 @@ pub async fn wait_for_child_exit(
     child: &mut Child,
     _grace: Duration,
 ) -> std::io::Result<ChildExit> {
+    child.wait().await.map(ChildExit::Finished)
+}
+
+#[cfg(not(unix))]
+pub async fn wait_for_child_exit_host_owned(child: &mut Child) -> std::io::Result<ChildExit> {
     child.wait().await.map(ChildExit::Finished)
 }
 
@@ -152,11 +184,34 @@ pub fn exit_code_of(status: ExitStatus) -> i32 {
 /// returns `None` after the child has been reaped via `wait()`, which
 /// hasn't happened yet at this point in the call chain.
 #[cfg(unix)]
-fn forward_sigterm(child: &Child) {
+fn forward_sigterm(child: &mut Child) {
+    kill_agent(child, nix::sys::signal::Signal::SIGTERM);
+}
+
+/// Send `signal` to the agent and, when the agent leads its own process
+/// group, to every process in that group, so a wrapper's children get it
+/// too (`child_spawner` starts the agent as a group leader). A SIGKILL also
+/// goes to the child handle itself, so the wait can return.
+#[cfg(unix)]
+fn kill_agent(child: &mut Child, signal: nix::sys::signal::Signal) {
+    use nix::sys::signal::{kill, killpg};
+    use nix::unistd::{Pid, getpgid};
+
     let Some(pid) = child.id() else { return };
-    let pid = nix::unistd::Pid::from_raw(pid as i32);
-    if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
-        tracing::warn!(error = %e, %pid, "SIGTERM on agent failed");
+    let pid = Pid::from_raw(pid as i32);
+    let leads_group = getpgid(Some(pid)).is_ok_and(|group| group == pid);
+    let sent = if leads_group {
+        killpg(pid, signal)
+    } else {
+        kill(pid, signal)
+    };
+    if let Err(e) = sent {
+        tracing::warn!(error = %e, %pid, ?signal, "signal to agent failed");
+    }
+    if signal == nix::sys::signal::Signal::SIGKILL
+        && let Err(e) = child.start_kill()
+    {
+        tracing::warn!(error = %e, "SIGKILL on agent failed");
     }
 }
 
@@ -430,6 +485,7 @@ mod tests {
         use std::time::Duration;
         use tokio::signal::unix::{SignalKind, signal};
 
+        let _serial = SIGNAL_TESTS.lock().await;
         // Install the SIGTERM stream *before* anything raises the signal.
         // tokio's `signal()` calls `sigaction` synchronously, so once this
         // line returns the OS will deliver SIGTERM to tokio's handler
@@ -470,6 +526,149 @@ mod tests {
             Some(libc::SIGTERM),
             "child should have been killed by SIGTERM, got status {status:?}"
         );
+    }
+
+    /// The signal tests raise SIGTERM on this process, and every wait in
+    /// the test binary that is listening hears it, so they run one at a time.
+    static SIGNAL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn raise_on_self(signal: nix::sys::signal::Signal) {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(std::process::id() as i32),
+            signal,
+        )
+        .expect("raise signal on self");
+    }
+
+    /// A shutdown reaches the agent's whole process group: a wrapper and
+    /// the child it forked each get SIGTERM and write their marker.
+    #[tokio::test]
+    async fn a_forwarded_sigterm_reaches_every_process_in_the_agent_group() {
+        use std::time::Duration;
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let _serial = SIGNAL_TESTS.lock().await;
+        let _term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let marker = std::env::temp_dir().join(format!("lens-core-group-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let script = r#"trap 'echo wrapper >> "$MARK"; exit 0' TERM
+sh -c 'trap "echo child >> \$MARK; exit 0" TERM; while :; do sleep 0.05; done' &
+wait"#;
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("MARK", &marker)
+            .process_group(0)
+            .spawn()
+            .expect("spawn wrapper");
+
+        // Give the nested shell time to install its trap, then signal.
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            raise_on_self(nix::sys::signal::Signal::SIGTERM);
+        });
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_child_exit(&mut child, Duration::from_secs(2)),
+        )
+        .await
+        .expect("helper did not return in time")
+        .expect("wait result");
+        assert!(matches!(exit, ChildExit::Stopped(_)), "got {exit:?}");
+
+        // The grandchild may finish its trap a moment after the wrapper exits.
+        let mut lines = String::new();
+        for _ in 0..50 {
+            lines = std::fs::read_to_string(&marker).unwrap_or_default();
+            if lines.contains("wrapper") && lines.contains("child") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            lines.contains("wrapper") && lines.contains("child"),
+            "both the wrapper and its child should get SIGTERM, markers: {lines:?}"
+        );
+    }
+
+    /// The host-owned wait has no deadline of its own: after a SIGTERM that
+    /// the agent ignores it keeps waiting past the timed wait's grace, and a
+    /// second signal sends SIGKILL to the whole group, including a grandchild
+    /// that ignores TERM.
+    #[tokio::test]
+    async fn the_host_owned_wait_keeps_waiting_until_a_second_signal_kills_the_group() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::Duration;
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let _serial = SIGNAL_TESTS.lock().await;
+        let _term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let pid_file = std::env::temp_dir().join(format!("lens-core-kill-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+
+        let script = r#"trap '' TERM
+sh -c 'trap "" TERM; while :; do sleep 0.05; done' &
+echo $! > "$MARK"
+wait"#;
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("MARK", &pid_file)
+            .process_group(0)
+            .spawn()
+            .expect("spawn wrapper");
+
+        let mut wait = Box::pin(wait_for_child_exit_host_owned(&mut child));
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            raise_on_self(nix::sys::signal::Signal::SIGTERM);
+        });
+        let early = tokio::time::timeout(Duration::from_millis(2500), &mut wait).await;
+        assert!(
+            early.is_err(),
+            "the host-owned wait ended before a second signal"
+        );
+
+        raise_on_self(nix::sys::signal::Signal::SIGTERM);
+        let exit = tokio::time::timeout(Duration::from_secs(5), &mut wait)
+            .await
+            .expect("second signal did not end the wait")
+            .expect("wait result");
+        let ChildExit::Stopped(status) = exit else {
+            panic!("a child ended by a signal was stopped, not finished: {exit:?}");
+        };
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+
+        let grandchild: i32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("pid number");
+        let _ = std::fs::remove_file(&pid_file);
+        let mut gone = false;
+        for _ in 0..50 {
+            if process_is_gone(grandchild) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(gone, "the SIGKILL should reach the grandchild {grandchild}");
+    }
+
+    /// Whether `pid` is no longer running: absent, or a zombie waiting for
+    /// its parent to reap it.
+    fn process_is_gone(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+        }
     }
 
     /// If the child exits on its own before any signal arrives, the
