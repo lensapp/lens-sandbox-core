@@ -9,19 +9,28 @@ static INSTALLED_CA_CERTS: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
 
 const CA_BUNDLE_PATH: &str = "/etc/ssl/certs/ca-certificates.crt";
 
+/// `update-ca-certificates` (Debian, Ubuntu, Alpine) builds the bundle again
+/// from this directory, for example when apt upgrades `ca-certificates`. The
+/// copy appended to the bundle is lost then; the copy here is not.
+const CA_SOURCE_DIR: &str = "/usr/local/share/ca-certificates";
+const CA_DROPIN_PREFIX: &str = "lens-sandbox-";
+
 /// Install a CA PEM certificate into the system trust store.
 /// Idempotent — same PEM installed twice is a no-op.
 pub fn install_ca_cert(pem: &str) {
-    install_ca_cert_to(pem, CA_BUNDLE_PATH);
+    install_ca_cert_to(pem, CA_BUNDLE_PATH, CA_SOURCE_DIR);
 }
 
-fn install_ca_cert_to(pem: &str, ca_bundle_path: &str) {
+fn install_ca_cert_to(pem: &str, ca_bundle_path: &str, ca_source_dir: &str) {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     pem.hash(&mut hasher);
     let hash = hasher.finish();
 
     let mut guard = INSTALLED_CA_CERTS.lock().unwrap();
+    if guard.is_none() {
+        remove_stale_ca_dropins(ca_source_dir);
+    }
     let set = guard.get_or_insert_with(HashSet::new);
     if !set.insert(hash) {
         tracing::debug!("CA cert already installed, skipping");
@@ -29,6 +38,9 @@ fn install_ca_cert_to(pem: &str, ca_bundle_path: &str) {
     }
     drop(guard);
 
+    if let Err(e) = write_ca_dropin(pem, hash, ca_source_dir) {
+        tracing::warn!("failed to write CA cert into {ca_source_dir}: {e}");
+    }
     if write_ca_cert(pem, ca_bundle_path).is_err() {
         let mut guard = INSTALLED_CA_CERTS.lock().unwrap();
         if let Some(set) = guard.as_mut() {
@@ -54,6 +66,29 @@ fn write_ca_cert(pem: &str, ca_bundle_path: &str) -> std::io::Result<()> {
     })?;
     tracing::info!("proxy CA cert installed into {ca_bundle_path}");
     Ok(())
+}
+
+fn write_ca_dropin(pem: &str, hash: u64, ca_source_dir: &str) -> std::io::Result<()> {
+    let dir = std::path::Path::new(ca_source_dir);
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(format!("{CA_DROPIN_PREFIX}{hash:016x}.crt")), pem)
+}
+
+/// A drop-in outlives the process when the rootfs does, and a rebuild of the
+/// bundle would trust its CA again. Its key died with that process.
+fn remove_stale_ca_dropins(ca_source_dir: &str) {
+    let Ok(entries) = std::fs::read_dir(ca_source_dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.starts_with(CA_DROPIN_PREFIX) && name.ends_with(".crt") {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -279,9 +314,11 @@ mod tests {
 
         let pem = "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----";
         let path_str = path.to_str().unwrap();
+        let source_dir = dir.path().join("source");
+        let source_str = source_dir.to_str().unwrap();
 
-        install_ca_cert_to(pem, path_str);
-        install_ca_cert_to(pem, path_str); // should be skipped (same PEM)
+        install_ca_cert_to(pem, path_str, source_str);
+        install_ca_cert_to(pem, path_str, source_str); // should be skipped (same PEM)
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.matches("BEGIN CERTIFICATE").count(), 1);
@@ -460,19 +497,90 @@ mod tests {
         std::fs::write(&path, "").unwrap();
 
         let path_str = path.to_str().unwrap();
+        let source_dir = dir.path().join("source");
+        let source_str = source_dir.to_str().unwrap();
         install_ca_cert_to(
             "-----BEGIN CERTIFICATE-----\nCA1\n-----END CERTIFICATE-----",
             path_str,
+            source_str,
         );
         install_ca_cert_to(
             "-----BEGIN CERTIFICATE-----\nCA2\n-----END CERTIFICATE-----",
             path_str,
+            source_str,
         );
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.matches("BEGIN CERTIFICATE").count(), 2);
         assert!(contents.contains("CA1"));
         assert!(contents.contains("CA2"));
+        assert_eq!(std::fs::read_dir(&source_dir).unwrap().count(), 2);
+
+        reset_installed_certs();
+    }
+
+    #[test]
+    fn install_ca_cert_writes_a_crt_file_into_the_source_dir() {
+        let _guard = CA_TEST_LOCK.lock().unwrap();
+        reset_installed_certs();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca-certificates.crt");
+        std::fs::write(&path, "").unwrap();
+        let source_dir = dir.path().join("usr/local/share/ca-certificates");
+
+        let pem = "-----BEGIN CERTIFICATE-----\nPROXY\n-----END CERTIFICATE-----";
+        install_ca_cert_to(pem, path.to_str().unwrap(), source_dir.to_str().unwrap());
+
+        let sources: Vec<_> = std::fs::read_dir(&source_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0].extension().and_then(|e| e.to_str()),
+            Some("crt"),
+            "update-ca-certificates reads only *.crt"
+        );
+        assert_eq!(std::fs::read_to_string(&sources[0]).unwrap(), pem);
+
+        reset_installed_certs();
+    }
+
+    #[test]
+    fn the_first_install_removes_the_drop_ins_of_an_earlier_process() {
+        let _guard = CA_TEST_LOCK.lock().unwrap();
+        reset_installed_certs();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca-certificates.crt");
+        std::fs::write(&path, "").unwrap();
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("lens-sandbox-dead.crt"), "dead").unwrap();
+        std::fs::write(source_dir.join("corp-root.crt"), "corp").unwrap();
+
+        let source_str = source_dir.to_str().unwrap();
+        let path_str = path.to_str().unwrap();
+        install_ca_cert_to(
+            "-----BEGIN CERTIFICATE-----\nCA1\n-----END CERTIFICATE-----",
+            path_str,
+            source_str,
+        );
+        install_ca_cert_to(
+            "-----BEGIN CERTIFICATE-----\nCA2\n-----END CERTIFICATE-----",
+            path_str,
+            source_str,
+        );
+
+        let mut names: Vec<String> = std::fs::read_dir(&source_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert_eq!(names[0], "corp-root.crt");
+        assert!(!names.contains(&"lens-sandbox-dead.crt".to_string()));
 
         reset_installed_certs();
     }
