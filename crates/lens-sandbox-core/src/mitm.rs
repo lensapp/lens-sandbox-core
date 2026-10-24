@@ -279,8 +279,21 @@ where
             relay_through_tunnel(tls_client, upstream, target_host, &modified, &meta, ctx).await?;
         }
         UpstreamMode::TunnelOnDemand { target } => {
-            let upstream =
-                crate::proxy::open_upstream_tunnel(ctx.state, &target, ctx.actor).await?;
+            let upstream = match crate::proxy::open_upstream_tunnel(ctx.state, &target, ctx.actor)
+                .await
+            {
+                Ok(upstream) => upstream,
+                Err(e) => {
+                    if e.is::<crate::blocked::UpstreamBlocked>() {
+                        let reason = crate::blocked::BlockReason::UpstreamPolicy;
+                        let refusal =
+                            crate::blocked::response(reason, &meta.method, target_host, &meta.path);
+                        tls_client.write_all(&refusal).await.ok();
+                        tls_client.shutdown().await.ok();
+                    }
+                    return Err(e);
+                }
+            };
             relay_through_tunnel(tls_client, upstream, target_host, &modified, &meta, ctx).await?;
         }
     }
