@@ -33,6 +33,8 @@ pub(crate) enum BlockReason {
     AskDeclined,
     /// The request carries a credential the developer did not release.
     CredentialGate,
+    /// The upstream proxy refused the destination by its own policy.
+    UpstreamPolicy,
 }
 
 impl BlockReason {
@@ -43,6 +45,7 @@ impl BlockReason {
             Self::BinaryNotAllowed => "binary-not-allowed",
             Self::AskDeclined => "ask-declined",
             Self::CredentialGate => "credential-gate",
+            Self::UpstreamPolicy => "upstream-policy",
         }
     }
 }
@@ -90,6 +93,34 @@ pub(crate) fn response(reason: BlockReason, method: &str, host: &str, path: &str
     }
     out
 }
+
+/// Whether an upstream proxy's answer to a `CONNECT` is a refusal by its own
+/// policy: a `403` that carries `X-Lens-Agents-Blocked: upstream-policy`. Any
+/// other refusal it makes is a failure of the upstream, not a block.
+pub(crate) fn upstream_blocked(head: &str) -> bool {
+    let mut lines = head.lines();
+    let status = lines.next().unwrap_or_default();
+    status.split_whitespace().nth(1) == Some("403")
+        && lines.any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("x-lens-agents-blocked")
+                    && value.trim() == BlockReason::UpstreamPolicy.code()
+            })
+        })
+}
+
+/// The error an upstream tunnel fails with when the upstream proxy refused the
+/// destination by its policy, so the door can say so.
+#[derive(Debug)]
+pub(crate) struct UpstreamBlocked;
+
+impl std::fmt::Display for UpstreamBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Lens Sandbox upstream refused the destination by its policy")
+    }
+}
+
+impl std::error::Error for UpstreamBlocked {}
 
 /// How long a refused tunnel waits for the client's first byte. A TLS client
 /// sends its ClientHello as soon as the tunnel opens; a protocol whose server
@@ -252,6 +283,7 @@ pub(crate) mod tests {
             (BlockReason::BinaryNotAllowed, "binary-not-allowed"),
             (BlockReason::AskDeclined, "ask-declined"),
             (BlockReason::CredentialGate, "credential-gate"),
+            (BlockReason::UpstreamPolicy, "upstream-policy"),
         ] {
             let text = String::from_utf8(response(reason, "GET", "h.example", "/")).unwrap();
             assert_eq!(parse(&text).1, Some(code));
@@ -285,6 +317,20 @@ pub(crate) mod tests {
         let (_, body) = text.split_once("\r\n\r\n").unwrap();
         assert_eq!(body.lines().count(), 1, "{body}");
         assert!(body.len() < 1000, "{body}");
+    }
+
+    #[test]
+    fn only_a_marked_403_is_an_upstream_block() {
+        assert!(upstream_blocked(
+            "HTTP/1.1 403 Forbidden\r\nx-lens-agents-blocked:  upstream-policy\r\n\r\n"
+        ));
+        assert!(!upstream_blocked("HTTP/1.1 403 Forbidden\r\n\r\n"));
+        assert!(!upstream_blocked(
+            "HTTP/1.1 502 Bad Gateway\r\nX-Lens-Agents-Blocked: upstream-policy\r\n\r\n"
+        ));
+        assert!(!upstream_blocked(
+            "HTTP/1.1 403 Forbidden\r\nX-Lens-Agents-Blocked: policy-deny\r\n\r\n"
+        ));
     }
 
     #[test]

@@ -1390,7 +1390,7 @@ async fn handle_http_forward(
 
                     upstream_stream.write_all(connect_req.as_bytes()).await?;
 
-                    let status = match tokio::time::timeout(
+                    let (status, blocked) = match tokio::time::timeout(
                         HEADER_READ_TIMEOUT,
                         read_response_status_unbuffered(&mut upstream_stream),
                     )
@@ -1406,6 +1406,12 @@ async fn handle_http_forward(
                         }
                     };
 
+                    if blocked {
+                        emit_http_audit(state, target_host, method, &path, "failure", 403, actor);
+                        return refusal
+                            .refuse(&mut client, crate::blocked::BlockReason::UpstreamPolicy)
+                            .await;
+                    }
                     if !status.starts_with("200") {
                         client
                             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
@@ -1566,26 +1572,7 @@ async fn handle_connect(
         http_rules: domain_http_rules,
     } = match admit_https_destination(state, target_host, actor).await {
         Ok(admission) => admission,
-        // Said inside the tunnel, where the client shows it; a host no
-        // certificate can be made for is told on the CONNECT.
-        Err(reason) => match get_or_init_ca(state).and_then(|ca| {
-            crate::mitm::build_ephemeral_server_config(ca, &extract_hostname(target_host))
-        }) {
-            Ok(config) => {
-                return crate::blocked::answer_in_tunnel(client, config, target_host, reason).await;
-            }
-            Err(_) => {
-                client
-                    .write_all(&crate::blocked::response(
-                        reason,
-                        "CONNECT",
-                        target_host,
-                        "",
-                    ))
-                    .await?;
-                return Ok(());
-            }
-        },
+        Err(reason) => return refuse_connect(client, target_host, reason, state).await,
     };
 
     let hostname = extract_hostname(target_host);
@@ -1818,7 +1805,7 @@ async fn handle_connect(
             upstream_stream.write_all(connect_req.as_bytes()).await?;
 
             // Read response from Lens Sandbox byte-by-byte (same reason — don't buffer past headers)
-            let status = match tokio::time::timeout(
+            let (status, blocked) = match tokio::time::timeout(
                 HEADER_READ_TIMEOUT,
                 read_response_status_unbuffered(&mut upstream_stream),
             )
@@ -1834,6 +1821,17 @@ async fn handle_connect(
                 }
             };
 
+            if blocked {
+                emit_audit(state, target_host, "failure", 403, actor);
+                drop(upstream_stream);
+                return refuse_connect(
+                    client,
+                    target_host,
+                    crate::blocked::BlockReason::UpstreamPolicy,
+                    state,
+                )
+                .await;
+            }
             if !status.starts_with("200") {
                 client
                     .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -1930,6 +1928,33 @@ async fn handle_connect(
     }
 
     Ok(())
+}
+
+/// Refuse a `CONNECT` to `target_host` for `reason`. Said inside the tunnel,
+/// where the client shows it; a host no certificate can be made for is told on
+/// the `CONNECT`.
+async fn refuse_connect(
+    mut client: TcpStream,
+    target_host: &str,
+    reason: crate::blocked::BlockReason,
+    state: &Arc<ProxyState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match get_or_init_ca(state).and_then(|ca| {
+        crate::mitm::build_ephemeral_server_config(ca, &extract_hostname(target_host))
+    }) {
+        Ok(config) => crate::blocked::answer_in_tunnel(client, config, target_host, reason).await,
+        Err(_) => {
+            client
+                .write_all(&crate::blocked::response(
+                    reason,
+                    "CONNECT",
+                    target_host,
+                    "",
+                ))
+                .await?;
+            Ok(())
+        }
+    }
 }
 
 /// The policy an HTTPS destination was admitted under.
@@ -2143,7 +2168,8 @@ async fn handle_https_forward(
         Transport::Upstream => match open_upstream_tunnel(state, target_host, actor).await {
             Ok(tunnel) => crate::mitm::UpstreamMode::TunnelTls(tunnel),
             Err(e) => {
-                client.write_all(BAD_GATEWAY_RESPONSE).await?;
+                let (response, _) = dial_failure_response(e.as_ref(), target_host, &header_str);
+                client.write_all(&response).await?;
                 return Err(e);
             }
         },
@@ -2190,12 +2216,17 @@ async fn handle_https_forward(
 
 /// What a client is told when the dial to an admitted destination, or the TLS
 /// setup over it, fails: a policy refusal of the request in `head` when the dial
-/// guard refused the address the name resolved to, else 502.
+/// guard refused the address the name resolved to, or the upstream proxy
+/// refused the destination by its policy, else 502.
 fn dial_failure_response(
     error: &(dyn std::error::Error + 'static),
     target_host: &str,
     head: &str,
 ) -> (Vec<u8>, u16) {
+    if error.is::<crate::blocked::UpstreamBlocked>() {
+        let reason = crate::blocked::BlockReason::UpstreamPolicy;
+        return (refusal_for_head(reason, target_host, head), 403);
+    }
     match error.downcast_ref::<std::io::Error>() {
         Some(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (
             refusal_for_head(crate::blocked::BlockReason::PolicyDeny, target_host, head),
@@ -2774,7 +2805,7 @@ pub(crate) async fn open_upstream_tunnel(
     connect_req.push_str("\r\n");
     upstream_stream.write_all(connect_req.as_bytes()).await?;
 
-    let status = match tokio::time::timeout(
+    let (status, blocked) = match tokio::time::timeout(
         HEADER_READ_TIMEOUT,
         read_response_status_unbuffered(&mut upstream_stream),
     )
@@ -2786,6 +2817,10 @@ pub(crate) async fn open_upstream_tunnel(
             return Err("upstream header read timeout".into());
         }
     };
+    if blocked {
+        emit_audit(state, target, "failure", 403, actor);
+        return Err(Box::new(crate::blocked::UpstreamBlocked));
+    }
     if !status.starts_with("200") {
         emit_audit(state, target, "error", 502, actor);
         return Err(format!("Lens Sandbox upstream returned: {status}").into());
@@ -3359,9 +3394,19 @@ async fn handle_transparent_tls(
                     target: target_host.clone(),
                 }
             } else {
-                crate::mitm::UpstreamMode::TunnelTls(
-                    open_upstream_tunnel(state, &target_host, &actor).await?,
-                )
+                match open_upstream_tunnel(state, &target_host, &actor).await {
+                    Ok(tunnel) => crate::mitm::UpstreamMode::TunnelTls(tunnel),
+                    Err(e) if e.is::<crate::blocked::UpstreamBlocked>() => {
+                        let reason = crate::blocked::BlockReason::UpstreamPolicy;
+                        let _ = tokio::time::timeout(
+                            crate::blocked::DENIED_TUNNEL_TIMEOUT,
+                            crate::blocked::answer_tls(tls_client, &sni, reason),
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
             };
             tracing::debug!(target = %target_host, "transparent TLS LENS+MITM");
             crate::mitm::handle_mitm_pre_accepted(tls_client, &hostname, mode, &ctx).await?;
@@ -4040,10 +4085,11 @@ fn with_default_port(authority: &str, default_port: u16) -> String {
 }
 
 /// Read an HTTP response status line + headers one byte at a time.
-/// Returns the status code + reason (e.g. "200 Connection Established").
+/// Returns the status code + reason (e.g. "200 Connection Established"), and
+/// whether the upstream proxy marked the answer as a refusal by its policy.
 async fn read_response_status_unbuffered<S>(
     stream: &mut S,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + Unpin + ?Sized,
 {
@@ -4059,7 +4105,7 @@ where
         .unwrap_or("")
         .to_string();
 
-    Ok(status)
+    Ok((status, crate::blocked::upstream_blocked(&header_str)))
 }
 
 /// Read from an `AsyncRead` one byte at a time until we see `\r\n\r\n`.
@@ -6656,6 +6702,173 @@ pub(crate) mod tests {
             .expect("the upstream proxy must receive the request")
             .unwrap();
         (received, answer)
+    }
+
+    /// An upstream proxy that answers every `CONNECT` with `answer`, behind a
+    /// catch-all `upstream` route.
+    async fn install_refusing_upstream(state: &Arc<ProxyState>, answer: &'static [u8]) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        *state.upstream.lock().await = Some(SandboxUpstream {
+            host: "127.0.0.1".to_string(),
+            port,
+            auth_header: None,
+            tls: false,
+            plain_http: UpstreamPlainHttp::Tunnel,
+        });
+        state.policy.write().unwrap().routes = vec![crate::routing::RouteRule {
+            matcher: crate::routing::RouteMatcher::Domain("*".to_string()),
+            verdict: Verdict::Allow,
+            transport: Transport::Upstream,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: None,
+        }];
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let _ = read_until_double_crlf(&mut conn).await;
+                let _ = conn.write_all(answer).await;
+            }
+        });
+    }
+
+    const UPSTREAM_POLICY_REFUSAL: &[u8] =
+        b"HTTP/1.1 403 Forbidden\r\nX-Lens-Agents-Blocked: upstream-policy\r\n\r\n";
+
+    #[tokio::test]
+    async fn http_forward_relays_the_upstream_policy_refusal_as_a_block() {
+        let (state, mut rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        assert_blocked(
+            &plain_http_answer(&state).await,
+            BlockReason::UpstreamPolicy,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/x (reason: upstream-policy). \
+             This is not a response from api.example.test.",
+        );
+        let events = drain_audit_lines(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["result"] == "failure" && e["status_code"] == 403),
+            "the refusal is audited as the 403 the client was told; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_opened_on_demand_relays_the_upstream_policy_refusal() {
+        // A host whose token requests the proxy answers opens its tunnel only
+        // for a request it forwards, inside the session it already accepted.
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (state, _rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        state.token_answers.write().unwrap().insert(
+            "api.example.test".into(),
+            vec![
+                crate::token_answer::TokenAnswer::client_credentials(
+                    "some-credential",
+                    "/oauth2/token",
+                    "client-1",
+                    "api.default",
+                    "placeholder-token",
+                    3600,
+                )
+                .unwrap(),
+            ],
+        );
+        let (client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            handle_connect(
+                server,
+                "api.example.test:443",
+                &test_actor(),
+                &state_for_handler,
+            )
+            .await
+        });
+        assert_blocked(
+            &request_in_refused_tunnel(&state, client, "api.example.test").await,
+            BlockReason::UpstreamPolicy,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: upstream-policy). \
+             This is not a response from api.example.test.",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unmarked_upstream_refusal_stays_a_gateway_failure() {
+        let (state, _rx) = test_state();
+        install_refusing_upstream(&state, b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
+        let response = plain_http_answer(&state).await;
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            handle_connect(
+                server,
+                "api.example.test:443",
+                &test_actor(),
+                &state_for_handler,
+            )
+            .await
+        });
+        let response = read_response(&mut client).await;
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn connect_relays_the_upstream_policy_refusal_inside_the_tunnel() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (state, _rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        let (client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            handle_connect(
+                server,
+                "api.example.test:443",
+                &test_actor(),
+                &state_for_handler,
+            )
+            .await
+        });
+        assert_blocked(
+            &request_in_refused_tunnel(&state, client, "api.example.test").await,
+            BlockReason::UpstreamPolicy,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: upstream-policy). \
+             This is not a response from api.example.test.",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absolute_https_request_relays_the_upstream_policy_refusal() {
+        let (state, _rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        let (mut client, server) = socket_pair().await;
+        let _handler = https_forward(&state, server, WGET_HTTPS_HEAD);
+        assert_blocked(
+            &read_response(&mut client).await,
+            BlockReason::UpstreamPolicy,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/things (reason: upstream-policy). \
+             This is not a response from api.example.test.",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transparent_tls_upstream_policy_refusal_is_answered_inside_the_session() {
+        let (state, _rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        assert_blocked(
+            &transparent_tls_answer(&state).await,
+            BlockReason::UpstreamPolicy,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: upstream-policy). \
+             This is not a response from api.example.test.",
+        );
     }
 
     /// The Lens Agents gateway answers every method but CONNECT with a 405, so
