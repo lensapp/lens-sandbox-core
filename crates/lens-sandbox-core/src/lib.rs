@@ -22,6 +22,8 @@ pub mod aws_resign;
 #[cfg(feature = "proxy")]
 pub mod aws_sigv4;
 #[cfg(feature = "proxy")]
+pub(crate) mod blocked;
+#[cfg(feature = "proxy")]
 pub mod body_field;
 #[cfg(feature = "proxy")]
 pub mod ca;

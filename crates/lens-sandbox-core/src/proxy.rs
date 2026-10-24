@@ -888,9 +888,9 @@ fn resolve_route(
     }
 }
 
-/// What a client is told when policy refuses its request. Shared with the TLS
-/// door so both refusals look identical from outside.
-pub(crate) const FORBIDDEN_RESPONSE: &[u8] =
+/// What a client is told when a destination is refused for a reason that is
+/// not policy: an interceptor that needs the client's own TLS.
+const FORBIDDEN_RESPONSE: &[u8] =
     b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// What a client is told when the proxy cannot read its request as one it serves.
@@ -937,7 +937,24 @@ impl ForwardRequest<'_> {
             "policy-deny",
             self.actor,
         );
-        client.write_all(FORBIDDEN_RESPONSE).await?;
+        self.refuse(client, crate::blocked::BlockReason::PolicyDeny)
+            .await
+    }
+
+    /// Tell the client policy refused this request, for `reason`.
+    async fn refuse(
+        &self,
+        client: &mut TcpStream,
+        reason: crate::blocked::BlockReason,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        client
+            .write_all(&crate::blocked::response(
+                reason,
+                self.method,
+                self.target_host,
+                self.path,
+            ))
+            .await?;
         Ok(())
     }
 }
@@ -955,13 +972,6 @@ async fn handle_http_forward(
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Validate target: reject CRLF injection and loopback/link-local targets
-    if let Err(e) = validate_connect_target(target_host) {
-        emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
-        client.write_all(FORBIDDEN_RESPONSE).await?;
-        return Err(e);
-    }
-
     let header_str = String::from_utf8_lossy(&header_bytes);
 
     // Parse method and path from request line for HTTP rule enforcement and audit
@@ -989,6 +999,15 @@ async fn handle_http_forward(
         path: &path,
         actor,
     };
+
+    // Validate target: reject CRLF injection and loopback/link-local targets
+    if let Err(e) = validate_connect_target(target_host) {
+        emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
+        refusal
+            .refuse(&mut client, crate::blocked::BlockReason::PolicyDeny)
+            .await?;
+        return Err(e);
+    }
 
     // An `llm` route claims this request and this door cannot honour it: there is
     // no TLS session to redirect, and cleartext is no place to put a backend
@@ -1044,8 +1063,9 @@ async fn handle_http_forward(
                 "binary-not-allowed",
                 actor,
             );
-            client.write_all(FORBIDDEN_RESPONSE).await?;
-            return Ok(());
+            return refusal
+                .refuse(&mut client, crate::blocked::BlockReason::BinaryNotAllowed)
+                .await;
         }
     };
 
@@ -1241,10 +1261,8 @@ async fn handle_http_forward(
 
     let effective_transport = match verdict {
         Verdict::Deny => {
-            client
-                .write_all(
-                    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                )
+            refusal
+                .refuse(&mut client, crate::blocked::BlockReason::PolicyDeny)
                 .await?;
             tracing::info!(target = %target_host, method = %method, "HTTP forward proxy DENIED");
             emit_policy_deny_http(state, target_host, method, &path, "policy-deny", actor);
@@ -1263,10 +1281,8 @@ async fn handle_http_forward(
             .await;
             if !decision.is_allow() {
                 emit_gate_denied(state, &action_str, decision);
-                client
-                    .write_all(
-                        b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                    )
+                refusal
+                    .refuse(&mut client, crate::blocked::BlockReason::AskDeclined)
                     .await?;
                 tracing::info!(target = %target_host, method = %method, reason = decision.audit_reason(), "HTTP forward proxy DENIED (gated)");
                 return Ok(());
@@ -1526,7 +1542,14 @@ async fn handle_connect(
     // Validate target: reject CRLF injection and loopback/link-local targets
     if let Err(e) = validate_connect_target(target_host) {
         emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
-        client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+        client
+            .write_all(&crate::blocked::response(
+                crate::blocked::BlockReason::PolicyDeny,
+                "CONNECT",
+                target_host,
+                "",
+            ))
+            .await?;
         return Err(e);
     }
 
@@ -1537,14 +1560,23 @@ async fn handle_connect(
         return connect_raw_passthrough(client, target_host, &decision, state, actor).await;
     }
 
-    let Some(HttpsAdmission {
+    let HttpsAdmission {
         transport: effective_transport,
         tls_terminate,
         http_rules: domain_http_rules,
-    }) = admit_https_destination(state, target_host, actor).await
-    else {
-        client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        return Ok(());
+    } = match admit_https_destination(state, target_host, actor).await {
+        Ok(admission) => admission,
+        Err(reason) => {
+            client
+                .write_all(&crate::blocked::response(
+                    reason,
+                    "CONNECT",
+                    target_host,
+                    "",
+                ))
+                .await?;
+            return Ok(());
+        }
     };
 
     let hostname = extract_hostname(target_host);
@@ -1905,13 +1937,13 @@ struct HttpsAdmission {
 /// an answer raised by one door — the same action, under the same key — covers
 /// the others.
 ///
-/// `None` is a refusal, already logged and audited; the caller tells its client
+/// `Err` is a refusal, already logged and audited; the caller tells its client
 /// in its own framing.
 async fn admit_https_destination(
     state: &Arc<ProxyState>,
     target_host: &str,
     actor: &crate::peer_process::ActorContext,
-) -> Option<HttpsAdmission> {
+) -> Result<HttpsAdmission, crate::blocked::BlockReason> {
     // Find the matching route rule (first match wins, preserving order/specificity).
     // CONNECT is always HTTPS — plain HTTP uses the absolute-form forward path.
     let Some((verdict, transport, tls_terminate, http_rules)) =
@@ -1919,14 +1951,14 @@ async fn admit_https_destination(
     else {
         tracing::info!(target = %target_host, "proxy DENIED (binary not allowed)");
         emit_policy_deny_connect(state, target_host, "binary-not-allowed", actor);
-        return None;
+        return Err(crate::blocked::BlockReason::BinaryNotAllowed);
     };
 
     match verdict {
         Verdict::Deny => {
             tracing::info!(target = %target_host, "proxy DENIED");
             emit_policy_deny_connect(state, target_host, "policy-deny", actor);
-            return None;
+            return Err(crate::blocked::BlockReason::PolicyDeny);
         }
         Verdict::Ask => {
             let action_str = format!("CONNECT {target_host}");
@@ -1942,7 +1974,7 @@ async fn admit_https_destination(
             if !decision.is_allow() {
                 emit_gate_denied(state, &action_str, decision);
                 tracing::info!(target = %target_host, reason = decision.audit_reason(), "proxy DENIED (gated)");
-                return None;
+                return Err(crate::blocked::BlockReason::AskDeclined);
             }
             emit_gate_resolved(state, &action_str, decision);
             tracing::info!(target = %target_host, reason = decision.audit_reason(), "proxy ALLOWED (gated)");
@@ -1950,7 +1982,7 @@ async fn admit_https_destination(
         Verdict::Allow => {}
     }
 
-    Some(HttpsAdmission {
+    Ok(HttpsAdmission {
         transport,
         tls_terminate,
         http_rules,
@@ -1999,14 +2031,21 @@ async fn handle_https_forward(
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let header_str = String::from_utf8_lossy(&header_bytes);
+
     // Validate target: reject CRLF injection and loopback/link-local targets
     if let Err(e) = validate_connect_target(target_host) {
         emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
-        client.write_all(FORBIDDEN_RESPONSE).await?;
+        client
+            .write_all(&refusal_for_head(
+                crate::blocked::BlockReason::PolicyDeny,
+                target_host,
+                &header_str,
+            ))
+            .await?;
         return Err(e);
     }
 
-    let header_str = String::from_utf8_lossy(&header_bytes);
     let raw_url = header_str
         .lines()
         .next()
@@ -2028,14 +2067,18 @@ async fn handle_https_forward(
             .await;
     }
 
-    let Some(HttpsAdmission {
+    let HttpsAdmission {
         transport,
         http_rules,
         ..
-    }) = admit_https_destination(state, target_host, actor).await
-    else {
-        client.write_all(FORBIDDEN_RESPONSE).await?;
-        return Ok(());
+    } = match admit_https_destination(state, target_host, actor).await {
+        Ok(admission) => admission,
+        Err(reason) => {
+            client
+                .write_all(&refusal_for_head(reason, target_host, &header_str))
+                .await?;
+            return Ok(());
+        }
     };
 
     let hostname = extract_hostname(target_host);
@@ -2129,21 +2172,47 @@ async fn handle_https_forward(
     if let Err(e) = &result
         && !client.answered
     {
-        let (response, status) = dial_failure_response(e.as_ref());
-        client.write_all(response).await.ok();
+        let (response, status) = dial_failure_response(e.as_ref(), target_host, &header_str);
+        client.write_all(&response).await.ok();
         emit_audit(state, target_host, "error", status, actor);
     }
     result
 }
 
 /// What a client is told when the dial to an admitted destination, or the TLS
-/// setup over it, fails: 403 when the dial guard refused the address the name
-/// resolved to, else 502.
-fn dial_failure_response(error: &(dyn std::error::Error + 'static)) -> (&'static [u8], u16) {
+/// setup over it, fails: a policy refusal of the request in `head` when the dial
+/// guard refused the address the name resolved to, else 502.
+fn dial_failure_response(
+    error: &(dyn std::error::Error + 'static),
+    target_host: &str,
+    head: &str,
+) -> (Vec<u8>, u16) {
     match error.downcast_ref::<std::io::Error>() {
-        Some(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (FORBIDDEN_RESPONSE, 403),
-        _ => (BAD_GATEWAY_RESPONSE, 502),
+        Some(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (
+            refusal_for_head(crate::blocked::BlockReason::PolicyDeny, target_host, head),
+            403,
+        ),
+        _ => (BAD_GATEWAY_RESPONSE.to_vec(), 502),
     }
+}
+
+/// The policy refusal of the request whose head is `head`, as the client is told
+/// it on a door that reads the request in the clear.
+fn refusal_for_head(reason: crate::blocked::BlockReason, target_host: &str, head: &str) -> Vec<u8> {
+    let mut parts = head.lines().next().unwrap_or_default().split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or("/");
+    // The absolute form names the origin as well; the body names it once. The
+    // authority ends at the first `/`, `?` or `#`, and a `/` in a query is not
+    // the start of a path.
+    let path = match target.split_once("://") {
+        Some((_, rest)) => match rest.find(['/', '?', '#']) {
+            Some(i) if rest.as_bytes()[i] == b'/' => &rest[i..],
+            _ => "/",
+        },
+        None => target,
+    };
+    crate::blocked::response(reason, method, target_host, path)
 }
 
 /// A client stream that records whether anything has been written to it, so a
@@ -2739,7 +2808,7 @@ async fn handle_raw_passthrough(
     // there is no post-resolution re-check for an approval to have to survive.
     if raw_verdict_admits(state, &raw_target, decision, actor)
         .await
-        .is_none()
+        .is_err()
     {
         return Ok(());
     }
@@ -2773,12 +2842,12 @@ async fn raw_verdict_admits(
     target: &str,
     decision: &RawDecision,
     actor: &crate::peer_process::ActorContext,
-) -> Option<Gated> {
+) -> Result<Gated, crate::blocked::BlockReason> {
     match decision.verdict {
-        Verdict::Allow => Some(Gated::NotAsked),
+        Verdict::Allow => Ok(Gated::NotAsked),
         Verdict::Deny => {
             emit_policy_deny_connect(state, target, "policy-deny", actor);
-            None
+            Err(crate::blocked::BlockReason::PolicyDeny)
         }
         Verdict::Ask => {
             // The dialog names the destination the way the policy author wrote
@@ -2803,7 +2872,7 @@ async fn raw_verdict_admits(
                 emit_gate_denied(state, &action_str, answer);
                 emit_audit(state, target, "failure", 403, actor);
                 tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough DENIED (gated)");
-                return None;
+                return Err(crate::blocked::BlockReason::AskDeclined);
             }
             emit_gate_resolved(state, &action_str, answer);
             // The gate can hold a connection for `DECISION_TIMEOUT`, long enough
@@ -2821,10 +2890,10 @@ async fn raw_verdict_admits(
             {
                 emit_policy_deny_connect(state, target, "policy-changed", actor);
                 tracing::info!(target = %target, "raw passthrough DENIED (policy changed under the dialog)");
-                return None;
+                return Err(crate::blocked::BlockReason::PolicyDeny);
             }
             tracing::info!(target = %target, reason = answer.audit_reason(), "raw passthrough ALLOWED (gated)");
-            Some(Gated::ByTheDeveloper)
+            Ok(Gated::ByTheDeveloper)
         }
     }
 }
@@ -2910,10 +2979,20 @@ async fn connect_raw_passthrough(
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(gated) = raw_verdict_admits(state, target_host, decision, actor).await else {
-        tracing::info!(target = %target_host, "proxy DENIED (egress.tcp)");
-        client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        return Ok(());
+    let gated = match raw_verdict_admits(state, target_host, decision, actor).await {
+        Ok(gated) => gated,
+        Err(reason) => {
+            tracing::info!(target = %target_host, "proxy DENIED (egress.tcp)");
+            client
+                .write_all(&crate::blocked::response(
+                    reason,
+                    "CONNECT",
+                    target_host,
+                    "",
+                ))
+                .await?;
+            return Ok(());
+        }
     };
 
     let mut upstream =
@@ -2957,12 +3036,15 @@ async fn http_forward_raw_passthrough(
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(gated) = raw_verdict_admits(state, target_host, decision, actor).await else {
-        tracing::info!(target = %target_host, "HTTP forward proxy DENIED (egress.tcp)");
-        client
-            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-            .await?;
-        return Ok(());
+    let gated = match raw_verdict_admits(state, target_host, decision, actor).await {
+        Ok(gated) => gated,
+        Err(reason) => {
+            tracing::info!(target = %target_host, "HTTP forward proxy DENIED (egress.tcp)");
+            client
+                .write_all(&refusal_for_head(reason, target_host, request_head))
+                .await?;
+            return Ok(());
+        }
     };
 
     let mut upstream =
@@ -3001,10 +3083,15 @@ async fn https_forward_raw_passthrough(
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(gated) = raw_verdict_admits(state, target_host, decision, actor).await else {
-        tracing::info!(target = %target_host, "HTTPS forward proxy DENIED (egress.tcp)");
-        client.write_all(FORBIDDEN_RESPONSE).await?;
-        return Ok(());
+    let gated = match raw_verdict_admits(state, target_host, decision, actor).await {
+        Ok(gated) => gated,
+        Err(reason) => {
+            tracing::info!(target = %target_host, "HTTPS forward proxy DENIED (egress.tcp)");
+            client
+                .write_all(&refusal_for_head(reason, target_host, request_head))
+                .await?;
+            return Ok(());
+        }
     };
 
     let extra_certs = state.extra_ca_certs.read().unwrap().clone();
@@ -3023,9 +3110,9 @@ async fn https_forward_raw_passthrough(
     let mut upstream = match dialled {
         Ok(s) => s,
         Err(e) => {
-            let (response, status) = dial_failure_response(e.as_ref());
+            let (response, status) = dial_failure_response(e.as_ref(), target_host, request_head);
             emit_audit(state, target_host, "error", status, actor);
-            client.write_all(response).await?;
+            client.write_all(&response).await?;
             return Err(format!("raw passthrough connect to {target_host}: {e}").into());
         }
     };
@@ -4127,6 +4214,8 @@ pub(crate) fn extract_port(target: &str, default: u16) -> u16 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::blocked::BlockReason;
+    use crate::blocked::tests::assert_blocked;
 
     #[test]
     fn listen_addrs_keeps_loopback_first_and_reuses_its_port() {
@@ -6350,9 +6439,11 @@ pub(crate) mod tests {
         });
 
         let response = read_response(&mut client).await;
-        assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "only the GraphQL rule is installed; got {response:?}"
+        assert_blocked(
+            &response,
+            BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: GET 10.0.0.5/rest/things (reason: policy-deny). \
+             This is not a response from 10.0.0.5.",
         );
     }
 
@@ -6419,7 +6510,7 @@ pub(crate) mod tests {
     /// to *dial* the denied destination, which never answers.
     async fn read_response(client: &mut TcpStream) -> String {
         use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 256];
+        let mut buf = vec![0u8; 4096];
         let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
             .await
             .expect("handler must answer from policy, not dial the denied target")
@@ -6706,7 +6797,7 @@ pub(crate) mod tests {
         });
 
         use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 256];
+        let mut buf = vec![0u8; 4096];
         let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
             .await
             .expect("the door answers rather than dialling")
@@ -6872,9 +6963,11 @@ pub(crate) mod tests {
         });
 
         let response = read_response(&mut client).await;
-        assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "tcp deny must be terminal on CONNECT; got {response:?}"
+        assert_blocked(
+            &response,
+            BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: CONNECT 10.0.0.5:22 (reason: policy-deny). \
+             This is not a response from 10.0.0.5.",
         );
     }
 
@@ -6901,6 +6994,60 @@ pub(crate) mod tests {
         );
     }
 
+    /// What the plain-HTTP door answers `GET http://api.example.test/v1/x?q=1`.
+    async fn plain_http_answer(state: &Arc<ProxyState>) -> String {
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let headers =
+                b"GET http://api.example.test/v1/x?q=1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n"
+                    .to_vec();
+            handle_http_forward(
+                server,
+                "api.example.test:80",
+                headers,
+                &state_for_handler,
+                &test_actor(),
+            )
+            .await
+        });
+        read_response(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn http_forward_says_a_deny_is_a_block() {
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let response = plain_http_answer(&state).await;
+        assert_blocked(
+            &response,
+            BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/x (reason: policy-deny). \
+             This is not a response from api.example.test.",
+        );
+        assert!(!response.contains("q=1"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn http_forward_says_a_caller_the_rule_excludes_is_blocked() {
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().routes = vec![crate::routing::RouteRule {
+            matcher: crate::routing::RouteMatcher::Domain("api.example.test".to_string()),
+            verdict: Verdict::Allow,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+        }];
+        assert_blocked(
+            &plain_http_answer(&state).await,
+            BlockReason::BinaryNotAllowed,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/x (reason: binary-not-allowed). \
+             This is not a response from api.example.test.",
+        );
+    }
+
     #[tokio::test]
     async fn http_forward_applies_the_tcp_deny_on_port_80() {
         // `parse_http_forward_target` appends `:80` when the URL carries no
@@ -6919,9 +7066,10 @@ pub(crate) mod tests {
         });
 
         let response = read_response(&mut client).await;
-        assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "tcp deny must be terminal on the http forward path; got {response:?}"
+        assert_blocked(
+            &response,
+            BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: GET 10.0.0.5/ (reason: policy-deny). This is not a response from 10.0.0.5.",
         );
     }
 
@@ -7813,11 +7961,11 @@ pub(crate) mod tests {
         let actor = test_actor();
         assert_eq!(
             raw_verdict_admits(&state, "10.0.0.5:5432", &at(Verdict::Allow), &actor).await,
-            Some(Gated::NotAsked)
+            Ok(Gated::NotAsked)
         );
         assert_eq!(
             raw_verdict_admits(&state, "10.0.0.5:5432", &at(Verdict::Deny), &actor).await,
-            None
+            Err(crate::blocked::BlockReason::PolicyDeny)
         );
     }
 
@@ -7952,12 +8100,14 @@ pub(crate) mod tests {
         handler.await.unwrap().unwrap();
 
         use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 256];
+        let mut buf = vec![0u8; 4096];
         let n = client.read(&mut buf).await.unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "expected 403; got: {response:?}"
+        assert_blocked(
+            &response,
+            BlockReason::AskDeclined,
+            "Blocked by Lens Agents sandbox egress policy: CONNECT evil.example.com:443 \
+             (reason: ask-declined). This is not a response from evil.example.com.",
         );
 
         let events = drain_audit_lines(&mut rx);
@@ -8201,12 +8351,14 @@ pub(crate) mod tests {
         handler.await.unwrap().unwrap();
 
         use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 256];
+        let mut buf = vec![0u8; 4096];
         let n = client.read(&mut buf).await.unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "expected 403; got: {response:?}"
+        assert_blocked(
+            &response,
+            BlockReason::AskDeclined,
+            "Blocked by Lens Agents sandbox egress policy: GET api.evil.example.com/foo (reason: ask-declined). \
+             This is not a response from api.evil.example.com.",
         );
 
         let events = drain_audit_lines(&mut rx);
@@ -8594,9 +8746,11 @@ pub(crate) mod tests {
         ));
 
         let response = read_response(&mut client).await;
-        assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "a denied card must be answered with 403; got {response:?}"
+        assert_blocked(
+            &response,
+            BlockReason::AskDeclined,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/things (reason: ask-declined). \
+             This is not a response from api.example.test.",
         );
     }
 
@@ -8608,10 +8762,13 @@ pub(crate) mod tests {
         let _handler = https_forward(&state, server, WGET_HTTPS_HEAD);
 
         let response = read_response(&mut client).await;
-        assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "a deny must be answered with 403; got {response:?}"
+        assert_blocked(
+            &response,
+            BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/things (reason: policy-deny). \
+             This is not a response from api.example.test.",
         );
+        assert!(!response.contains("page=2"), "{response}");
         // Recorded as its CONNECT would be, which is what the relay raises an
         // Allow card from.
         let refusals = drain_audit_lines(&mut rx);
@@ -8797,9 +8954,11 @@ pub(crate) mod tests {
         let _handler = https_forward(&state, server, WGET_HTTPS_HEAD);
 
         let response = read_response(&mut client).await;
-        assert!(
-            response.starts_with("HTTP/1.1 403"),
-            "the tcp claim is final on this door too; got {response:?}"
+        assert_blocked(
+            &response,
+            BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/things (reason: policy-deny). \
+             This is not a response from api.example.test.",
         );
     }
 
@@ -8826,9 +8985,10 @@ pub(crate) mod tests {
         ] {
             let request_line = String::from_utf8_lossy(request);
             let response = proxy_door_answer(&state, request).await;
-            assert!(
-                response.starts_with("HTTP/1.1 403"),
-                "{request_line:?} must be refused with 403; got {response:?}"
+            assert_eq!(
+                crate::blocked::tests::parse(&response).1,
+                Some("policy-deny"),
+                "{request_line:?} must be refused as a block; got {response:?}"
             );
             let events = drain_audit_lines(&mut rx);
             assert!(
@@ -8887,13 +9047,38 @@ pub(crate) mod tests {
             std::io::ErrorKind::PermissionDenied,
             "egress to 10.0.0.5 denied by policy",
         ));
+        let (response, status) = dial_failure_response(
+            refused.as_ref(),
+            "203.0.113.80:443",
+            "GET /v1/x?q=1 HTTP/1.1",
+        );
         assert_eq!(
-            dial_failure_response(refused.as_ref()).1,
-            403,
+            status, 403,
             "a policy refusal is a 403, not a gateway failure"
         );
+        crate::blocked::tests::assert_blocked(
+            &String::from_utf8(response).unwrap(),
+            crate::blocked::BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: GET 203.0.113.80/v1/x \
+             (reason: policy-deny). This is not a response from 203.0.113.80.",
+        );
+        for head in [
+            "GET https://h/x?t=a/b HTTP/1.1",
+            "GET https://h?t=a/b HTTP/1.1",
+        ] {
+            let (response, _) = dial_failure_response(refused.as_ref(), "h:443", head);
+            let response = String::from_utf8(response).unwrap();
+            let line = crate::blocked::tests::parse(&response).2;
+            assert!(
+                !line.contains("t=") && !line.contains("/b"),
+                "{head}: {line}"
+            );
+        }
         let failed: Box<dyn std::error::Error + Send + Sync> = "handshake failed".into();
-        assert_eq!(dial_failure_response(failed.as_ref()).1, 502);
+        assert_eq!(
+            dial_failure_response(failed.as_ref(), "h:443", "GET / HTTP/1.1").1,
+            502
+        );
     }
 
     #[tokio::test]
