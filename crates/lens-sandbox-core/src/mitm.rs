@@ -683,6 +683,11 @@ where
 /// Input includes the trailing `\r\n\r\n`; output preserves that boundary so it
 /// can be written verbatim to the client.
 ///
+/// Also drops `Proxy-Status` and every `X-Lens-Agents-*` field: those say the
+/// sandbox refused a request (see [`crate::blocked`]), and an origin must not be
+/// able to say it in the sandbox's name. Only an intercepted response passes
+/// here; one relayed without interception cannot be read, and keeps them.
+///
 /// Operates on raw bytes (not UTF-8 decoded) so non-UTF-8 header values such as
 /// `Set-Cookie` or arbitrary `X-*` byte payloads pass through unmutated. Field
 /// names are ASCII per RFC 9110 §5.1, so the case-insensitive `connection:`
@@ -707,7 +712,7 @@ fn inject_response_connection_close(header_bytes: &[u8]) -> Vec<u8> {
             return output;
         }
 
-        if !line_starts_with_connection_field(line) {
+        if !line_starts_with_connection_field(line) && !line_is_a_block_field(line) {
             output.extend_from_slice(line);
             output.extend_from_slice(b"\r\n");
         }
@@ -731,6 +736,16 @@ fn find_crlf(bytes: &[u8]) -> Option<usize> {
 /// Field names are ASCII so byte-wise comparison is correct.
 fn line_starts_with_connection_field(line: &[u8]) -> bool {
     line.len() >= 11 && line[..11].eq_ignore_ascii_case(b"connection:")
+}
+
+/// Case-insensitive check for a field only the sandbox may send: `Proxy-Status`,
+/// or a name that starts `X-Lens-Agents-`.
+fn line_is_a_block_field(line: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"x-lens-agents-";
+    const PROXY_STATUS: &[u8] = b"proxy-status:";
+    (line.len() >= PREFIX.len() && line[..PREFIX.len()].eq_ignore_ascii_case(PREFIX))
+        || (line.len() >= PROXY_STATUS.len()
+            && line[..PROXY_STATUS.len()].eq_ignore_ascii_case(PROXY_STATUS))
 }
 
 /// Parse the numeric status code from an HTTP response header block.
@@ -3719,6 +3734,19 @@ mod tests {
         // The original mixed-case Connection line must be gone
         assert!(!s.contains("cOnNeCtIoN"), "{s}");
         assert!(!s.to_ascii_lowercase().contains("keep-alive"), "{s}");
+    }
+
+    #[test]
+    fn an_intercepted_response_cannot_claim_the_sandbox_blocked_it() {
+        let response = b"HTTP/1.1 403 Forbidden\r\nx-lens-agents-blocked: policy-deny\r\n\
+                         X-Lens-Agents-Other: 1\r\nPROXY-STATUS: lens-agents-sandbox\r\n\
+                         X-Lens-Agentsish: kept\r\nProxy-Status-Like: kept\r\n\r\n";
+        let s = String::from_utf8(inject_response_connection_close(response)).unwrap();
+        assert_eq!(
+            s,
+            "HTTP/1.1 403 Forbidden\r\nX-Lens-Agentsish: kept\r\nProxy-Status-Like: kept\r\n\
+             Connection: close\r\n\r\n"
+        );
     }
 
     #[test]
