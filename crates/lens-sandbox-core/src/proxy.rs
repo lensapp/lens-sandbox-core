@@ -1566,17 +1566,26 @@ async fn handle_connect(
         http_rules: domain_http_rules,
     } = match admit_https_destination(state, target_host, actor).await {
         Ok(admission) => admission,
-        Err(reason) => {
-            client
-                .write_all(&crate::blocked::response(
-                    reason,
-                    "CONNECT",
-                    target_host,
-                    "",
-                ))
-                .await?;
-            return Ok(());
-        }
+        // Said inside the tunnel, where the client shows it; a host no
+        // certificate can be made for is told on the CONNECT.
+        Err(reason) => match get_or_init_ca(state).and_then(|ca| {
+            crate::mitm::build_ephemeral_server_config(ca, &extract_hostname(target_host))
+        }) {
+            Ok(config) => {
+                return crate::blocked::answer_in_tunnel(client, config, target_host, reason).await;
+            }
+            Err(_) => {
+                client
+                    .write_all(&crate::blocked::response(
+                        reason,
+                        "CONNECT",
+                        target_host,
+                        "",
+                    ))
+                    .await?;
+                return Ok(());
+            }
+        },
     };
 
     let hostname = extract_hostname(target_host);
@@ -2198,7 +2207,11 @@ fn dial_failure_response(
 
 /// The policy refusal of the request whose head is `head`, as the client is told
 /// it on a door that reads the request in the clear.
-fn refusal_for_head(reason: crate::blocked::BlockReason, target_host: &str, head: &str) -> Vec<u8> {
+pub(crate) fn refusal_for_head(
+    reason: crate::blocked::BlockReason,
+    target_host: &str,
+    head: &str,
+) -> Vec<u8> {
     let mut parts = head.lines().next().unwrap_or_default().split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or("/");
@@ -3213,16 +3226,26 @@ async fn handle_transparent_tls(
         None => {
             tracing::info!(target = %target_host, "transparent TLS DENIED (binary not allowed)");
             emit_policy_deny_connect(state, &target_host, "binary-not-allowed", &actor);
-            drop(start);
-            return Ok(());
+            return refuse_transparent_tls(
+                start,
+                &sni,
+                crate::blocked::BlockReason::BinaryNotAllowed,
+                state,
+            )
+            .await;
         }
     };
 
     let effective_transport = match verdict {
         Verdict::Deny => {
             emit_policy_deny_connect(state, &target_host, "policy-deny", &actor);
-            drop(start);
-            return Ok(());
+            return refuse_transparent_tls(
+                start,
+                &sni,
+                crate::blocked::BlockReason::PolicyDeny,
+                state,
+            )
+            .await;
         }
         Verdict::Ask => {
             let action_str = format!("CONNECT {target_host}");
@@ -3238,8 +3261,13 @@ async fn handle_transparent_tls(
             if !decision.is_allow() {
                 emit_gate_denied(state, &action_str, decision);
                 tracing::info!(target = %target_host, reason = decision.audit_reason(), "transparent TLS DENIED (gated)");
-                drop(start);
-                return Ok(());
+                return refuse_transparent_tls(
+                    start,
+                    &sni,
+                    crate::blocked::BlockReason::AskDeclined,
+                    state,
+                )
+                .await;
             }
             emit_gate_resolved(state, &action_str, decision);
             tracing::info!(target = %target_host, reason = decision.audit_reason(), "transparent TLS ALLOWED (gated)");
@@ -3340,6 +3368,24 @@ async fn handle_transparent_tls(
         }
     }
 
+    Ok(())
+}
+
+/// Refuse a transparent TLS connection to `sni` by policy: complete the
+/// handshake whose ClientHello was peeked, and answer the request inside it.
+async fn refuse_transparent_tls(
+    start: tokio_rustls::StartHandshake<TcpStream>,
+    sni: &str,
+    reason: crate::blocked::BlockReason,
+    state: &Arc<ProxyState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = crate::mitm::build_ephemeral_server_config(get_or_init_ca(state)?, sni)?;
+    let _ = tokio::time::timeout(crate::blocked::DENIED_TUNNEL_TIMEOUT, async {
+        if let Ok(tls) = start.into_stream(config).await {
+            crate::blocked::answer_tls(tls, sni, reason).await;
+        }
+    })
+    .await;
     Ok(())
 }
 
@@ -8057,8 +8103,257 @@ pub(crate) mod tests {
         assert_eq!(parsed["type"], "request_pending");
     }
 
+    /// Read the `200` a refused `CONNECT` opens its tunnel with, complete the TLS
+    /// handshake trusting the sandbox CA, send `GET /v1/foo?secret=1`, and return
+    /// what comes back.
+    async fn request_in_refused_tunnel(
+        state: &Arc<ProxyState>,
+        mut client: TcpStream,
+        host: &str,
+    ) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut established = [0u8; 39];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut established))
+            .await
+            .expect("the tunnel opens")
+            .unwrap();
+        assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        let mut tls = sandbox_tls_client(state, client, host).await;
+        tls.write_all(format!("GET /v1/foo?secret=1 HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = tls.read_to_end(&mut response).await;
+        let response = String::from_utf8(response).unwrap();
+        assert!(!response.contains("secret"), "{response}");
+        response
+    }
+
+    /// A TLS client to `host` that trusts the sandbox CA and nothing else.
+    async fn sandbox_tls_client(
+        state: &Arc<ProxyState>,
+        stream: TcpStream,
+        host: &str,
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        use rustls::pki_types::pem::PemObject;
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let mut roots = rustls::RootCertStore::empty();
+        let pem = state.ephemeral_ca.get().unwrap().ca_cert_pem();
+        for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                rustls::pki_types::ServerName::try_from(host.to_string()).unwrap(),
+                stream,
+            )
+            .await
+            .expect("the refusal is served under the sandbox CA")
+    }
+
+    #[tokio::test]
+    async fn a_refused_connect_is_answered_inside_the_tunnel() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        // Default deny and no upstream configured: the tunnel must be answered
+        // without dialling anything.
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let (client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_connect(
+                server,
+                "api.example.test:443",
+                &test_actor(),
+                &state_for_handler,
+            )
+            .await
+        });
+        let response = request_in_refused_tunnel(&state, client, "api.example.test").await;
+        assert_blocked(
+            &response,
+            BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: policy-deny). \
+             This is not a response from api.example.test.",
+        );
+        handler.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connect_from_a_caller_the_rule_excludes_is_answered_inside_the_tunnel() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().routes = vec![crate::routing::RouteRule {
+            matcher: crate::routing::RouteMatcher::Domain("api.example.test".to_string()),
+            verdict: Verdict::Allow,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+        }];
+        let (client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            handle_connect(
+                server,
+                "api.example.test:443",
+                &test_actor(),
+                &state_for_handler,
+            )
+            .await
+        });
+        assert_blocked(
+            &request_in_refused_tunnel(&state, client, "api.example.test").await,
+            BlockReason::BinaryNotAllowed,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: binary-not-allowed). \
+             This is not a response from api.example.test.",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_connect_no_certificate_can_be_made_for_is_told_on_the_connect() {
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_connect(
+                server,
+                "bücher.example:443",
+                &test_actor(),
+                &state_for_handler,
+            )
+            .await
+        });
+        let response = read_response(&mut client).await;
+        assert_eq!(
+            crate::blocked::tests::parse(&response).1,
+            Some("policy-deny"),
+            "{response}"
+        );
+        assert!(
+            response.contains("CONNECT b?cher.example:443"),
+            "{response}"
+        );
+        handler.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_tunnel_that_does_not_speak_tls_is_closed() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            handle_connect(
+                server,
+                "api.example.test:22",
+                &test_actor(),
+                &state_for_handler,
+            )
+            .await
+        });
+        use tokio::io::AsyncReadExt;
+        let mut established = [0u8; 39];
+        client.read_exact(&mut established).await.unwrap();
+        assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        client.write_all(b"SSH-2.0-OpenSSH_9.6\r\n").await.unwrap();
+        // Closed with the client's bytes unread, which may reach it as a reset.
+        let mut rest = [0u8; 64];
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut rest))
+            .await
+            .expect("the tunnel is closed");
+        assert!(
+            !matches!(read, Ok(n) if n > 0),
+            "nothing more is said: {read:?}"
+        );
+    }
+
+    /// What a transparent TLS connection to `api.example.test` is answered with.
+    async fn transparent_tls_answer(state: &Arc<ProxyState>) -> String {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        get_or_init_ca(state).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_state = state.clone();
+        let client = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut tls = sandbox_tls_client(&client_state, stream, "api.example.test").await;
+            tls.write_all(b"GET /v1/foo?secret=1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            let _ = tls.read_to_end(&mut response).await;
+            String::from_utf8(response).unwrap()
+        });
+        let (server, peer) = listener.accept().await.unwrap();
+        let actor = crate::peer_process::ActorContext::resolve(peer);
+        let orig_dst: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            handle_transparent_tls(server, orig_dst, actor, state),
+        )
+        .await
+        .expect("the refusal does not dial")
+        .unwrap();
+        let response = client.await.unwrap();
+        assert!(!response.contains("secret"), "{response}");
+        response
+    }
+
+    #[tokio::test]
+    async fn a_transparent_tls_deny_is_answered_inside_the_session() {
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        assert_blocked(
+            &transparent_tls_answer(&state).await,
+            BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: policy-deny). \
+             This is not a response from api.example.test.",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transparent_tls_caller_the_rule_excludes_is_answered_inside_the_session() {
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().routes = vec![crate::routing::RouteRule {
+            matcher: crate::routing::RouteMatcher::Domain("api.example.test".to_string()),
+            verdict: Verdict::Allow,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+        }];
+        assert_blocked(
+            &transparent_tls_answer(&state).await,
+            BlockReason::BinaryNotAllowed,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: binary-not-allowed). \
+             This is not a response from api.example.test.",
+        );
+    }
+
     #[tokio::test]
     async fn handle_connect_ask_path_denies_on_user_decision() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         // Verdict::Ask should suspend the request, emit `request_pending`
         // keyed on the bare hostname (no port — see `gate_key`), await a
         // decision, and on Deny:
@@ -8071,7 +8366,7 @@ pub(crate) mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
 
         let state_for_handler = state.clone();
@@ -8097,17 +8392,13 @@ pub(crate) mod tests {
             crate::protocol::Decision::DenyOnce,
         ));
 
+        let response = request_in_refused_tunnel(&state, client, "evil.example.com").await;
         handler.await.unwrap().unwrap();
-
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 4096];
-        let n = client.read(&mut buf).await.unwrap();
-        let response = String::from_utf8_lossy(&buf[..n]);
         assert_blocked(
             &response,
             BlockReason::AskDeclined,
-            "Blocked by Lens Agents sandbox egress policy: CONNECT evil.example.com:443 \
-             (reason: ask-declined). This is not a response from evil.example.com.",
+            "Blocked by Lens Agents sandbox egress policy: GET evil.example.com/v1/foo (reason: ask-declined). \
+             This is not a response from evil.example.com.",
         );
 
         let events = drain_audit_lines(&mut rx);
