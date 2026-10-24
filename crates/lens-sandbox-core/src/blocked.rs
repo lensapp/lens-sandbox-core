@@ -10,6 +10,16 @@
 //! credential placeholder, no rule or policy name, and none of the free-text
 //! detail the log records: whoever reads it is the workload the policy is
 //! keeping things from.
+//!
+//! Most clients never show the answer to a `CONNECT`, so a refused tunnel is
+//! accepted and the refusal is given inside it (see [`answer_in_tunnel`]): the
+//! sandbox CA is already trusted, and the request the client then sends is
+//! answered with this response. The destination is never dialled.
+
+use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 /// Why policy refused a request. The set is fixed: a consumer matches on
 /// [`BlockReason::code`].
@@ -79,6 +89,61 @@ pub(crate) fn response(reason: BlockReason, method: &str, host: &str, path: &str
         out.extend_from_slice(body.as_bytes());
     }
     out
+}
+
+/// How long a refused tunnel waits for the client's first byte. A TLS client
+/// sends its ClientHello as soon as the tunnel opens; a protocol whose server
+/// speaks first never sends one, and is not kept waiting for long.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a refused TLS session may take, from the ClientHello to the answer.
+pub(crate) const DENIED_TUNNEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Answer the first request on an accepted TLS session to `host` with the
+/// refusal, then end the session. The request is read only to name it; nothing
+/// of it is logged.
+pub(crate) async fn answer_tls<S>(mut tls: S, host: &str, reason: BlockReason)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Ok(head) = crate::http_body::read_head(&mut tls).await else {
+        return;
+    };
+    let head = String::from_utf8_lossy(&head);
+    tls.write_all(&crate::proxy::refusal_for_head(reason, host, &head))
+        .await
+        .ok();
+    tls.shutdown().await.ok();
+}
+
+/// Refuse a `CONNECT` to `target_host` inside the tunnel: open it, and if the
+/// client speaks TLS, complete the handshake with `config`, which serves a
+/// certificate for the host, and answer the request it sends (see [`answer_tls`]). A client that does not
+/// speak TLS is disconnected.
+pub(crate) async fn answer_in_tunnel(
+    mut client: TcpStream,
+    config: std::sync::Arc<rustls::ServerConfig>,
+    target_host: &str,
+    reason: BlockReason,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let hostname = crate::proxy::extract_hostname(target_host);
+    client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+    // A TLS record starts with its content type, and a ClientHello is a
+    // handshake record: 0x16.
+    let mut first = [0u8; 1];
+    match tokio::time::timeout(FIRST_BYTE_TIMEOUT, client.peek(&mut first)).await {
+        Ok(Ok(1)) if first[0] == 0x16 => {}
+        _ => return Ok(()),
+    }
+    let _ = tokio::time::timeout(DENIED_TUNNEL_TIMEOUT, async {
+        if let Ok(tls) = tokio_rustls::TlsAcceptor::from(config).accept(client).await {
+            answer_tls(tls, &hostname, reason).await;
+        }
+    })
+    .await;
+    Ok(())
 }
 
 fn without_query(path: &str) -> &str {
