@@ -803,8 +803,18 @@ impl RequestFacts<'_, '_> {
             });
             send_audit(tx, event, self.ctx.actor);
         }
+        let block = if flag == "credential_gate_denied" {
+            crate::blocked::BlockReason::CredentialGate
+        } else {
+            crate::blocked::BlockReason::PolicyDeny
+        };
         tls_client
-            .write_all(crate::proxy::FORBIDDEN_RESPONSE)
+            .write_all(&crate::blocked::response(
+                block,
+                self.method,
+                self.target_host,
+                self.path,
+            ))
             .await
             .ok();
         tls_client.shutdown().await.ok();
@@ -1339,9 +1349,12 @@ where
                 send_audit(tx, event, ctx.actor);
             }
             tls_client
-                .write_all(
-                    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                )
+                .write_all(&crate::blocked::response(
+                    crate::blocked::BlockReason::CredentialGate,
+                    method,
+                    target_host,
+                    path,
+                ))
                 .await?;
             tls_client.shutdown().await.ok();
             return Err("credential gate denied".into());
@@ -3228,7 +3241,11 @@ mod tests {
         let (forwarded, response, _) = run_held_token_harness(HeldTokenHost::Deny).await;
 
         assert!(!forwarded);
-        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert_eq!(
+            crate::blocked::tests::parse(&response).1,
+            Some("credential-gate"),
+            "{response}"
+        );
     }
 
     #[tokio::test]
@@ -3379,9 +3396,11 @@ mod tests {
         )
         .await;
 
-        assert!(
-            response.contains("403 Forbidden"),
-            "expected 403, got: {response}"
+        crate::blocked::tests::assert_blocked(
+            &response,
+            crate::blocked::BlockReason::PolicyDeny,
+            "Blocked by Lens Agents sandbox egress policy: POST test.example.com/api/v1/upload (reason: policy-deny). \
+             This is not a response from test.example.com.",
         );
         assert_eq!(audits[0]["result"], "failure");
         assert_eq!(audits[0]["status_code"], 403);
@@ -5716,10 +5735,13 @@ mod tests {
             upstream_headers.is_empty(),
             "upstream must not be contacted on deny: {upstream_headers}"
         );
-        assert!(
-            client_response.contains("403 Forbidden"),
-            "client should see 403: {client_response}"
+        crate::blocked::tests::assert_blocked(
+            &client_response,
+            crate::blocked::BlockReason::CredentialGate,
+            "Blocked by Lens Agents sandbox egress policy: GET test.example.com/issues (reason: credential-gate). \
+             This is not a response from test.example.com.",
         );
+        assert!(!client_response.contains(placeholder), "{client_response}");
         let denied = events.iter().find(|e| {
             e["type"] == "audit_event" && e["metadata"]["credential_gate_denied"] == true
         });

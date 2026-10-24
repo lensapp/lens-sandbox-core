@@ -649,7 +649,15 @@ async fn enforce_http_rules(
         &detail,
         ctx.actor,
     );
-    write_client_error(tls_client, 403, "Forbidden").await?;
+    tls_client
+        .write_all(&crate::blocked::response(
+            crate::blocked::BlockReason::PolicyDeny,
+            &prepared.method,
+            target_host,
+            &prepared.path,
+        ))
+        .await?;
+    tls_client.shutdown().await.ok();
     Ok(false)
 }
 
@@ -1739,9 +1747,13 @@ mod tests {
             .await
             .expect("a policy refusal is not a handler error");
         let response = client_handle.await.unwrap();
-        assert!(
-            response.contains("403"),
-            "expected 403 for a mutation below a query-only rule, got: {response}"
+        crate::blocked::tests::assert_blocked(
+            &response,
+            crate::blocked::BlockReason::PolicyDeny,
+            &format!(
+                "Blocked by Lens Agents sandbox egress policy: POST {TEST_HOSTNAME}/graphql \
+                 (reason: policy-deny). This is not a response from {TEST_HOSTNAME}."
+            ),
         );
 
         // The refusal has to reach the relay as a `policy-deny`, the reason that
