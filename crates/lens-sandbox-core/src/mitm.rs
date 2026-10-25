@@ -568,8 +568,9 @@ where
     let response_forwarder = async {
         // RFC 9110 §15.2: a server MAY send 1xx informational responses (e.g.
         // 100 Continue, 103 Early Hints) before the final response. These
-        // each have their own header block but no body. Forward them
-        // verbatim — they're not the response we want to rewrite.
+        // each have their own header block but no body. Forward them as sent —
+        // they're not the response we want to rewrite — less any field only
+        // the sandbox may send.
         loop {
             let header_bytes = crate::http_body::read_head(&mut upstream_read).await?;
             match parse_status_code(&header_bytes) {
@@ -584,7 +585,9 @@ where
                                 .into(),
                         );
                     }
-                    client_write.write_all(&header_bytes).await?;
+                    client_write
+                        .write_all(&without_block_fields(&header_bytes))
+                        .await?;
                     return Ok::<ResponseOutcome, Box<dyn std::error::Error + Send + Sync>>(
                         ResponseOutcome::Switched,
                     );
@@ -595,7 +598,9 @@ where
                     return Err("upstream switched protocols unasked".into());
                 }
                 Some(code) if (100..200).contains(&code) => {
-                    client_write.write_all(&header_bytes).await?;
+                    client_write
+                        .write_all(&without_block_fields(&header_bytes))
+                        .await?;
                 }
                 _ => {
                     // Final response — rewrite Connection and stream the body.
@@ -728,6 +733,28 @@ fn inject_response_connection_close(header_bytes: &[u8]) -> Vec<u8> {
     // Defensive: malformed input (no terminating blank line). Still emit a
     // syntactically valid header block so the client doesn't hang.
     output.extend_from_slice(b"Connection: close\r\n\r\n");
+    output
+}
+
+/// The head with every field only the sandbox may send removed (see
+/// [`line_is_a_block_field`]) and nothing else changed: for an interim or
+/// `101` response, whose `Connection` and `Upgrade` must reach the client.
+fn without_block_fields(header_bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(header_bytes.len());
+    let mut start = 0;
+    while let Some(rel) = find_crlf(&header_bytes[start..]) {
+        let line = &header_bytes[start..start + rel];
+        if line.is_empty() {
+            break;
+        }
+        if !line_is_a_block_field(line) {
+            output.extend_from_slice(line);
+            output.extend_from_slice(b"\r\n");
+        }
+        start += rel + 2;
+    }
+    // The blank line that ends the head, or a malformed tail, as it came.
+    output.extend_from_slice(&header_bytes[start..]);
     output
 }
 
@@ -3930,6 +3957,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_interim_response_cannot_claim_the_sandbox_blocked_it() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client_outer, mut client_inner) = tokio::io::duplex(8192);
+        let (mut upstream_outer, mut upstream_inner) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            forward_response(
+                &mut client_inner,
+                &mut upstream_inner,
+                &relay_meta(BodyFraming::None),
+            )
+            .await
+        });
+
+        upstream_outer
+            .write_all(
+                b"HTTP/1.1 103 Early Hints\r\nx-sandbox-blocked: policy-deny\r\n\
+                  Link: </style.css>; rel=preload\r\nproxy-status: sandbox\r\n\r\n\
+                  HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            )
+            .await
+            .unwrap();
+        drop(upstream_outer);
+
+        let mut forwarded = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client_outer, &mut forwarded)
+            .await
+            .unwrap();
+        let s = String::from_utf8(forwarded).unwrap();
+        assert!(
+            s.starts_with(
+                "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n\
+                 HTTP/1.1 200 OK\r\n"
+            ),
+            "{s}"
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn forward_response_forwards_request_body_to_upstream() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4731,6 +4798,27 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"pong");
+    }
+
+    #[tokio::test]
+    async fn a_101_from_upstream_cannot_claim_the_sandbox_blocked_it() {
+        let (mut client, mut upstream, _task) = upgrade_bridge();
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+                  X-Sandbox-Blocked: policy-deny\r\nUpgrade: websocket\r\n\
+                  Proxy-Status: sandbox; error=http_request_denied\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let head = read_head(&mut client).await;
+        assert_eq!(
+            head,
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\n\r\n"
+        );
     }
 
     #[tokio::test]
