@@ -2031,6 +2031,9 @@ async fn admit_https_destination(
             emit_policy_deny_connect(state, target_host, "policy-deny", actor);
             return Err(crate::blocked::BlockReason::PolicyDeny);
         }
+        Verdict::Ask if state.intercept_for_token_answer(target_host) => {
+            tracing::info!(target = %target_host, "proxy ADMITTED for token answers (forwarded requests are gated)");
+        }
         Verdict::Ask => {
             let action_str = format!("CONNECT {target_host}");
             let key = gate_key(target_host);
@@ -2058,6 +2061,43 @@ async fn admit_https_destination(
         tls_terminate,
         http_rules,
     })
+}
+
+/// Whether a destination nobody has decided was admitted without asking because
+/// it holds token answers. An answered token request never leaves the proxy, so
+/// it raises no question; a request the proxy forwards from such a host waits
+/// for the decision the door would have asked for ([`gate_forwarded_request`]).
+pub(crate) fn gate_deferred(
+    state: &Arc<ProxyState>,
+    target_host: &str,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> bool {
+    matches!(
+        resolve_route(state, target_host, Scheme::Https, caller),
+        Some((Verdict::Ask, ..))
+    ) && state.intercept_for_token_answer(target_host)
+}
+
+/// The door's question about `target_host`, asked for a request the proxy is
+/// about to forward from a host [`gate_deferred`] admitted: the same key, action
+/// and audit, so one answer covers both and the developer sees one question.
+pub(crate) async fn gate_forwarded_request(state: &Arc<ProxyState>, target_host: &str) -> bool {
+    let action_str = format!("CONNECT {target_host}");
+    let decision = crate::gate::gate_or_deny(
+        state,
+        &gate_key(target_host),
+        &action_str,
+        "policy-ambiguous",
+        crate::protocol::Treatment::Inspected,
+    )
+    .await;
+    if decision.is_allow() {
+        emit_gate_resolved(state, &action_str, decision);
+        true
+    } else {
+        emit_gate_denied(state, &action_str, decision);
+        false
+    }
 }
 
 /// Whether a request to `target_host` has to be read before it is relayed:
@@ -3349,6 +3389,10 @@ async fn handle_transparent_tls(
                 state,
             )
             .await;
+        }
+        Verdict::Ask if state.intercept_for_token_answer(&target_host) => {
+            tracing::info!(target = %target_host, "transparent TLS ADMITTED for token answers (forwarded requests are gated)");
+            transport
         }
         Verdict::Ask => {
             let action_str = format!("CONNECT {target_host}");
@@ -8800,6 +8844,63 @@ pub(crate) mod tests {
         assert!(ev.get("result").is_none());
         assert!(ev.get("status_code").is_none());
 
+        handler.abort();
+    }
+
+    #[tokio::test]
+    async fn an_undecided_host_holding_a_token_answer_is_admitted_without_asking() {
+        // An answered token request never leaves the proxy, so it must not wait for a
+        // decision about the destination; what the proxy would forward is gated later.
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Ask;
+        state.policy.write().unwrap().default_transport = Transport::Direct;
+        state.token_answers.write().unwrap().insert(
+            "auth.some-provider.example".to_string(),
+            vec![
+                crate::token_answer::TokenAnswer::refresh_token(
+                    "some-credential",
+                    "/oauth/token",
+                    "placeholder-refresh",
+                    "placeholder-token",
+                    3600,
+                )
+                .unwrap(),
+            ],
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            let actor =
+                crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+            handle_connect(
+                server,
+                "auth.some-provider.example:443",
+                &actor,
+                &state_for_handler,
+            )
+            .await
+        });
+
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the door answers without waiting for a decision")
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+            "the tunnel opens for interception"
+        );
+        while let Ok(frame) = rx.try_recv() {
+            assert!(
+                !frame.contains("request_pending"),
+                "no question about the destination at the door: {frame}"
+            );
+        }
         handler.abort();
     }
 

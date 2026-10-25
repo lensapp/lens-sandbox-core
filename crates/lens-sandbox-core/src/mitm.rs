@@ -1274,6 +1274,20 @@ where
         }
     }
 
+    // A destination nobody has decided was admitted only for its token answers:
+    // what is forwarded waits for the decision the door would have asked for.
+    if crate::proxy::gate_deferred(ctx.state, ctx.match_host, ctx.actor.process())
+        && !crate::proxy::gate_forwarded_request(ctx.state, ctx.match_host).await
+    {
+        return Err(facts
+            .deny(
+                &mut tls_client,
+                "gate_denied",
+                "the destination was not allowed",
+            )
+            .await);
+    }
+
     // The route's own rules have now judged this request. An `llm` route may
     // send it somewhere else entirely, so everything below — the head, the
     // credentials, the gate, and the dial — works from `target` rather than from
@@ -3095,6 +3109,139 @@ mod tests {
             audits.push(serde_json::from_str(&msg).unwrap());
         }
         (outcome, response, audits)
+    }
+
+    /// Drives one request to an undecided destination that holds `answers`, as
+    /// the door admits it, and answers a gate question with `decision` when one
+    /// is asked. Returns what [`run_token_answer_harness`] does, and whether a
+    /// question was asked.
+    async fn run_undecided_token_host(
+        answers: Vec<crate::token_answer::TokenAnswer>,
+        request: &'static [u8],
+        decision: crate::protocol::Decision,
+    ) -> (Result<(String, Option<Vec<u8>>), String>, String, bool) {
+        use tokio::net::TcpListener;
+
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let ca = EphemeralCa::new().unwrap();
+        let hostname = "test.example.com";
+        let (state, mut frames) = crate::proxy::tests::test_state();
+        state.policy.write().unwrap().default_verdict = crate::policy_schema::Verdict::Ask;
+        state
+            .token_answers
+            .write()
+            .unwrap()
+            .insert(hostname.to_string(), answers);
+        let audit_tx_opt = state.audit_tx.lock().unwrap().clone();
+
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answerer = {
+            let state = state.clone();
+            let asked = asked.clone();
+            tokio::spawn(async move {
+                while let Some(frame) = frames.recv().await {
+                    let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                    if frame["type"] == "request_pending" {
+                        asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let id = frame["id"].as_str().unwrap().to_string();
+                        crate::gate::resolve_pending(&state, &id, decision);
+                    }
+                }
+            })
+        };
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let root_store = ca_root_store(&ca);
+        let client_handle = tokio::spawn(async move {
+            let stream = TcpStream::connect(client_addr).await.unwrap();
+            let client_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let server_name = ServerName::try_from(hostname.to_string()).unwrap();
+            let mut tls = connector.connect(server_name, stream).await.unwrap();
+            tls.write_all(request).await.unwrap();
+            let mut response = Vec::new();
+            let _ = tls.read_to_end(&mut response).await;
+            String::from_utf8(response).unwrap()
+        });
+
+        let (client_stream, _) = client_listener.accept().await.unwrap();
+        let actor = crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+        let ctx = MitmContext {
+            injections: &[],
+            http_rules: &[],
+            ca: &ca,
+            audit_tx: &audit_tx_opt,
+            extra_ca_certs: &[],
+            placeholder_map: &[],
+            state: &state,
+            match_host: hostname,
+            actor: &actor,
+        };
+        let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, hostname).unwrap());
+        let tls_client = acceptor.accept(client_stream).await.unwrap();
+        let outcome = match mitm_inject_after_accept(tls_client, hostname, &ctx, true).await {
+            Ok((mut tls_client, head, meta)) => {
+                tls_client.shutdown().await.ok();
+                Ok((head, meta.buffered_body))
+            }
+            Err(err) => Err(err.to_string()),
+        };
+        let response = client_handle.await.unwrap();
+        answerer.abort();
+        (
+            outcome,
+            response,
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    const OTHER_REQUEST: &[u8] =
+        b"GET /userinfo HTTP/1.1\r\nHost: test.example.com\r\nContent-Length: 0\r\n\r\n";
+
+    #[tokio::test]
+    async fn an_answered_token_request_to_an_undecided_host_asks_nothing() {
+        let (outcome, response, asked) = run_undecided_token_host(
+            vec![refresh_answer("placeholder-token")],
+            HELD_REFRESH,
+            crate::protocol::Decision::DenyOnce,
+        )
+        .await;
+
+        assert!(outcome.is_err(), "answered, so never forwarded");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(
+            !asked,
+            "a request that never leaves the proxy raises no card"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_other_request_to_an_undecided_token_host_waits_for_the_developer() {
+        let (outcome, _response, asked) = run_undecided_token_host(
+            vec![refresh_answer("placeholder-token")],
+            OTHER_REQUEST,
+            crate::protocol::Decision::AllowOnce,
+        )
+        .await;
+        assert!(asked, "the destination is decided before anything leaves");
+        let (head, _) = outcome.expect("allowed, so forwarded");
+        assert!(head.starts_with("GET /userinfo HTTP/1.1\r\n"), "{head}");
+
+        let (outcome, response, asked) = run_undecided_token_host(
+            vec![refresh_answer("placeholder-token")],
+            OTHER_REQUEST,
+            crate::protocol::Decision::DenyOnce,
+        )
+        .await;
+        assert!(asked);
+        assert!(outcome.is_err(), "denied, so never forwarded");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     }
 
     fn token_answer(scope: &str) -> crate::token_answer::TokenAnswer {
