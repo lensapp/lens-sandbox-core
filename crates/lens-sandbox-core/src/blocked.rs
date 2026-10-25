@@ -2,9 +2,13 @@
 //!
 //! A bare `403` reads to an agent as the destination refusing it, so every
 //! policy refusal on every door sends this one response instead: a reason
-//! phrase, an `X-Lens-Agents-Blocked` header carrying a fixed reason code, an
+//! phrase, an `X-Sandbox-Blocked` header carrying a fixed reason code, an
 //! RFC 9209 `Proxy-Status`, and a one-line plain-text body whose first line is
 //! stable enough to match on.
+//!
+//! The library does not know which product embeds it, so the wording is
+//! neutral unless the embedder names its product with
+//! [`crate::proxy::ProxyState::set_block_label`].
 //!
 //! The body names the request and nothing else. It carries no query string, no
 //! credential placeholder, no rule or policy name, and none of the free-text
@@ -38,7 +42,7 @@ pub(crate) enum BlockReason {
 }
 
 impl BlockReason {
-    /// The value of `X-Lens-Agents-Blocked`, and the one the body names.
+    /// The value of `X-Sandbox-Blocked`, and the one the body names.
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::PolicyDeny => "policy-deny",
@@ -50,14 +54,48 @@ impl BlockReason {
     }
 }
 
+/// The field that carries the reason code. It is the sandbox's, so an
+/// intercepted response loses one the origin sent (see `crate::mitm`).
+pub(crate) const BLOCKED_FIELD: &str = "X-Sandbox-Blocked";
+
 /// Longest method, host or path the body repeats. A real one is far shorter,
 /// and the client sent it, so the body never has to carry more of it than this.
 const MAX_FIELD_BYTES: usize = 256;
 
+/// Longest product label an embedder may set. It is a product name, and it goes
+/// into the status line.
+const MAX_LABEL_BYTES: usize = 64;
+
+/// Check a product label for [`response`]: printable ASCII and spaces, not
+/// blank, no surrounding spaces, at most [`MAX_LABEL_BYTES`]. Anything else
+/// could break the response head it is written into.
+pub(crate) fn check_label(label: &str) -> Result<(), String> {
+    if label.is_empty() || label.len() > MAX_LABEL_BYTES {
+        return Err(format!(
+            "a block label must be 1 to {MAX_LABEL_BYTES} bytes long"
+        ));
+    }
+    if label.trim() != label || !label.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+        return Err(
+            "a block label must be printable ASCII, with no surrounding spaces".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The response for a refused request: `method` to `host` at `path`, as the
 /// client sent them. `path` may carry a query string; it is dropped. A refused
-/// `CONNECT` passes its `host:port` target and an empty path.
-pub(crate) fn response(reason: BlockReason, method: &str, host: &str, path: &str) -> Vec<u8> {
+/// `CONNECT` passes its `host:port` target and an empty path. `label` names the
+/// embedding product in the status line and the body; it has passed
+/// [`check_label`] on its way in (see `ProxyState::set_block_label`), so it is
+/// written verbatim.
+pub(crate) fn response(
+    label: Option<&str>,
+    reason: BlockReason,
+    method: &str,
+    host: &str,
+    path: &str,
+) -> Vec<u8> {
     let method = printable(method);
     let host = printable(host);
     let hostname = crate::proxy::extract_hostname(&host);
@@ -72,14 +110,17 @@ pub(crate) fn response(reason: BlockReason, method: &str, host: &str, path: &str
         )
     };
     let code = reason.code();
+    let by = label.map_or_else(String::new, |label| format!("{label} "));
     let body = format!(
-        "Blocked by Lens Agents sandbox egress policy: {method} {shown} (reason: {code}). \
+        "Blocked by {by}sandbox egress policy: {method} {shown} (reason: {code}). \
          This is not a response from {hostname}.\n"
     );
+    // The `Proxy-Status` member names the intermediary with a token, which a
+    // product label is not, so it stays the same whatever the label.
     let mut out = format!(
-        "HTTP/1.1 403 Forbidden by Lens Agents sandbox policy\r\n\
-         X-Lens-Agents-Blocked: {code}\r\n\
-         Proxy-Status: lens-agents-sandbox; error=http_request_denied; details=\"{code}\"\r\n\
+        "HTTP/1.1 403 Forbidden by {by}sandbox policy\r\n\
+         {BLOCKED_FIELD}: {code}\r\n\
+         Proxy-Status: sandbox; error=http_request_denied; details=\"{code}\"\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
@@ -95,7 +136,7 @@ pub(crate) fn response(reason: BlockReason, method: &str, host: &str, path: &str
 }
 
 /// Whether an upstream proxy's answer to a `CONNECT` is a refusal by its own
-/// policy: a `403` that carries `X-Lens-Agents-Blocked: upstream-policy`. Any
+/// policy: a `403` that carries `X-Sandbox-Blocked: upstream-policy`. Any
 /// other refusal it makes is a failure of the upstream, not a block.
 pub(crate) fn upstream_blocked(head: &str) -> bool {
     let mut lines = head.lines();
@@ -103,7 +144,7 @@ pub(crate) fn upstream_blocked(head: &str) -> bool {
     status.split_whitespace().nth(1) == Some("403")
         && lines.any(|line| {
             line.split_once(':').is_some_and(|(name, value)| {
-                name.trim().eq_ignore_ascii_case("x-lens-agents-blocked")
+                name.trim().eq_ignore_ascii_case(BLOCKED_FIELD)
                     && value.trim() == BlockReason::UpstreamPolicy.code()
             })
         })
@@ -133,7 +174,7 @@ pub(crate) const DENIED_TUNNEL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Answer the first request on an accepted TLS session to `host` with the
 /// refusal, then end the session. The request is read only to name it; nothing
 /// of it is logged.
-pub(crate) async fn answer_tls<S>(mut tls: S, host: &str, reason: BlockReason)
+pub(crate) async fn answer_tls<S>(mut tls: S, label: Option<&str>, host: &str, reason: BlockReason)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -141,7 +182,7 @@ where
         return;
     };
     let head = String::from_utf8_lossy(&head);
-    tls.write_all(&crate::proxy::refusal_for_head(reason, host, &head))
+    tls.write_all(&crate::proxy::refusal_for_head(label, reason, host, &head))
         .await
         .ok();
     tls.shutdown().await.ok();
@@ -154,6 +195,7 @@ where
 pub(crate) async fn answer_in_tunnel(
     mut client: TcpStream,
     config: std::sync::Arc<rustls::ServerConfig>,
+    label: Option<&str>,
     target_host: &str,
     reason: BlockReason,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -170,7 +212,7 @@ pub(crate) async fn answer_in_tunnel(
     }
     let _ = tokio::time::timeout(DENIED_TUNNEL_TIMEOUT, async {
         if let Ok(tls) = tokio_rustls::TlsAcceptor::from(config).accept(client).await {
-            answer_tls(tls, &hostname, reason).await;
+            answer_tls(tls, label, &hostname, reason).await;
         }
     })
     .await;
@@ -218,7 +260,7 @@ pub(crate) mod tests {
         let status = head.lines().next().unwrap_or_default();
         let reason = head
             .lines()
-            .find_map(|line| line.strip_prefix("X-Lens-Agents-Blocked: "));
+            .find_map(|line| line.strip_prefix("X-Sandbox-Blocked: "));
         (status, reason, body.lines().next().unwrap_or_default())
     }
 
@@ -226,7 +268,7 @@ pub(crate) mod tests {
     pub(crate) fn assert_blocked(response: &str, reason: BlockReason, first_line: &str) {
         let (status, header, line) = parse(response);
         assert_eq!(
-            status, "HTTP/1.1 403 Forbidden by Lens Agents sandbox policy",
+            status, "HTTP/1.1 403 Forbidden by sandbox policy",
             "{response}"
         );
         assert_eq!(header, Some(reason.code()), "{response}");
@@ -236,6 +278,7 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_request_names_itself_and_its_reason() {
         let response = response(
+            None,
             BlockReason::PolicyDeny,
             "GET",
             "api.example.com:443",
@@ -245,12 +288,12 @@ pub(crate) mod tests {
         assert_blocked(
             &text,
             BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.com/v1/foo \
+            "Blocked by sandbox egress policy: GET api.example.com/v1/foo \
              (reason: policy-deny). This is not a response from api.example.com.",
         );
         assert!(!text.contains("secret"), "{text}");
         assert!(text.contains(
-            "Proxy-Status: lens-agents-sandbox; error=http_request_denied; details=\"policy-deny\"\r\n"
+            "Proxy-Status: sandbox; error=http_request_denied; details=\"policy-deny\"\r\n"
         ));
         assert!(text.contains("Content-Type: text/plain; charset=utf-8\r\n"));
         assert!(text.contains("Cache-Control: no-store\r\n"));
@@ -262,6 +305,7 @@ pub(crate) mod tests {
     #[test]
     fn a_refused_connect_names_its_target() {
         let text = String::from_utf8(response(
+            None,
             BlockReason::AskDeclined,
             "CONNECT",
             "db.example.com:5432",
@@ -271,7 +315,7 @@ pub(crate) mod tests {
         assert_blocked(
             &text,
             BlockReason::AskDeclined,
-            "Blocked by Lens Agents sandbox egress policy: CONNECT db.example.com:5432 \
+            "Blocked by sandbox egress policy: CONNECT db.example.com:5432 \
              (reason: ask-declined). This is not a response from db.example.com.",
         );
     }
@@ -285,7 +329,7 @@ pub(crate) mod tests {
             (BlockReason::CredentialGate, "credential-gate"),
             (BlockReason::UpstreamPolicy, "upstream-policy"),
         ] {
-            let text = String::from_utf8(response(reason, "GET", "h.example", "/")).unwrap();
+            let text = String::from_utf8(response(None, reason, "GET", "h.example", "/")).unwrap();
             assert_eq!(parse(&text).1, Some(code));
             assert!(text.contains(&format!("(reason: {code})")));
         }
@@ -294,6 +338,7 @@ pub(crate) mod tests {
     #[test]
     fn a_placeholder_in_the_path_is_not_repeated() {
         let text = String::from_utf8(response(
+            None,
             BlockReason::CredentialGate,
             "POST",
             "api.telegram.org",
@@ -307,6 +352,7 @@ pub(crate) mod tests {
     #[test]
     fn what_the_client_sent_cannot_break_the_line() {
         let text = String::from_utf8(response(
+            None,
             BlockReason::PolicyDeny,
             "GET",
             "evil.example\r\nX-Injected: 1",
@@ -322,21 +368,67 @@ pub(crate) mod tests {
     #[test]
     fn only_a_marked_403_is_an_upstream_block() {
         assert!(upstream_blocked(
-            "HTTP/1.1 403 Forbidden\r\nx-lens-agents-blocked:  upstream-policy\r\n\r\n"
+            "HTTP/1.1 403 Forbidden\r\nx-sandbox-blocked:  upstream-policy\r\n\r\n"
         ));
         assert!(!upstream_blocked("HTTP/1.1 403 Forbidden\r\n\r\n"));
         assert!(!upstream_blocked(
-            "HTTP/1.1 502 Bad Gateway\r\nX-Lens-Agents-Blocked: upstream-policy\r\n\r\n"
+            "HTTP/1.1 502 Bad Gateway\r\nX-Sandbox-Blocked: upstream-policy\r\n\r\n"
         ));
         assert!(!upstream_blocked(
-            "HTTP/1.1 403 Forbidden\r\nX-Lens-Agents-Blocked: policy-deny\r\n\r\n"
+            "HTTP/1.1 403 Forbidden\r\nX-Sandbox-Blocked: policy-deny\r\n\r\n"
         ));
     }
 
     #[test]
+    fn an_embedder_label_names_its_product() {
+        let text = String::from_utf8(response(
+            Some("Lens Agents"),
+            BlockReason::PolicyDeny,
+            "GET",
+            "api.example.com",
+            "/v1/foo",
+        ))
+        .unwrap();
+        let (status, reason, line) = parse(&text);
+        assert_eq!(
+            status,
+            "HTTP/1.1 403 Forbidden by Lens Agents sandbox policy"
+        );
+        assert_eq!(reason, Some("policy-deny"));
+        assert_eq!(
+            line,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.com/v1/foo \
+             (reason: policy-deny). This is not a response from api.example.com."
+        );
+        assert!(text.contains("Proxy-Status: sandbox; error=http_request_denied;"));
+    }
+
+    #[test]
+    fn a_label_that_could_break_the_head_is_refused() {
+        assert!(check_label("Lens Agents").is_ok());
+        for bad in [
+            "",
+            " Lens",
+            "Lens ",
+            "Lens\r\nX-Injected: 1",
+            "Lens\tAgents",
+            "Lëns",
+            &"x".repeat(MAX_LABEL_BYTES + 1),
+        ] {
+            assert!(check_label(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn a_refused_head_request_has_no_body() {
-        let text =
-            String::from_utf8(response(BlockReason::PolicyDeny, "HEAD", "h.example", "/")).unwrap();
+        let text = String::from_utf8(response(
+            None,
+            BlockReason::PolicyDeny,
+            "HEAD",
+            "h.example",
+            "/",
+        ))
+        .unwrap();
         let (head, body) = text.split_once("\r\n\r\n").unwrap();
         assert!(body.is_empty(), "{text}");
         assert!(!head.contains("Content-Length: 0\r\n"), "{head}");
