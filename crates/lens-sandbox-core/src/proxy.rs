@@ -324,6 +324,9 @@ pub struct ProxyState {
     /// developer's gate click adds entries, so the workload can't grow it to
     /// open a DNS exfil channel for names nobody approved.
     pub(crate) gate_resolved_hosts: RwLock<HashSet<String>>,
+    /// The product a block response names, if the embedder named one (see
+    /// [`Self::set_block_label`]); unset, the response is product-neutral.
+    block_label: std::sync::OnceLock<String>,
 }
 
 impl ProxyState {
@@ -395,6 +398,23 @@ impl ProxyState {
             .unwrap()
             .keys()
             .any(|pattern| crate::routing::injection_matches(pattern, target_host))
+    }
+
+    /// Name the embedding product in every block response: `Forbidden by
+    /// <label> sandbox policy`, `Blocked by <label> sandbox egress policy: …`.
+    /// Unset, both read `sandbox` alone. Set once, before traffic flows; a
+    /// label that is not printable ASCII, is blank or has surrounding spaces,
+    /// or is longer than 64 bytes is refused, as is a second call.
+    pub fn set_block_label(&self, label: &str) -> Result<(), String> {
+        crate::blocked::check_label(label)?;
+        self.block_label
+            .set(label.to_string())
+            .map_err(|_| "the block label is already set".to_string())
+    }
+
+    /// The product label for a block response, if the embedder set one.
+    pub(crate) fn block_label(&self) -> Option<&str> {
+        self.block_label.get().map(String::as_str)
     }
 
     /// Override the gate timeout. Test-only seam; production keeps the
@@ -692,6 +712,7 @@ impl ProxyServer {
                 .map(|h| h.to_ascii_lowercase())
                 .collect(),
             gate_resolved_hosts: RwLock::new(HashSet::new()),
+            block_label: std::sync::OnceLock::new(),
         });
         let server = Self {
             listen_addr,
@@ -949,6 +970,7 @@ impl ForwardRequest<'_> {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         client
             .write_all(&crate::blocked::response(
+                self.state.block_label(),
                 reason,
                 self.method,
                 self.target_host,
@@ -1550,6 +1572,7 @@ async fn handle_connect(
         emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
         client
             .write_all(&crate::blocked::response(
+                state.block_label(),
                 crate::blocked::BlockReason::PolicyDeny,
                 "CONNECT",
                 target_host,
@@ -1942,10 +1965,20 @@ async fn refuse_connect(
     match get_or_init_ca(state).and_then(|ca| {
         crate::mitm::build_ephemeral_server_config(ca, &extract_hostname(target_host))
     }) {
-        Ok(config) => crate::blocked::answer_in_tunnel(client, config, target_host, reason).await,
+        Ok(config) => {
+            crate::blocked::answer_in_tunnel(
+                client,
+                config,
+                state.block_label(),
+                target_host,
+                reason,
+            )
+            .await
+        }
         Err(_) => {
             client
                 .write_all(&crate::blocked::response(
+                    state.block_label(),
                     reason,
                     "CONNECT",
                     target_host,
@@ -2072,6 +2105,7 @@ async fn handle_https_forward(
         emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
         client
             .write_all(&refusal_for_head(
+                state.block_label(),
                 crate::blocked::BlockReason::PolicyDeny,
                 target_host,
                 &header_str,
@@ -2109,7 +2143,12 @@ async fn handle_https_forward(
         Ok(admission) => admission,
         Err(reason) => {
             client
-                .write_all(&refusal_for_head(reason, target_host, &header_str))
+                .write_all(&refusal_for_head(
+                    state.block_label(),
+                    reason,
+                    target_host,
+                    &header_str,
+                ))
                 .await?;
             return Ok(());
         }
@@ -2168,7 +2207,12 @@ async fn handle_https_forward(
         Transport::Upstream => match open_upstream_tunnel(state, target_host, actor).await {
             Ok(tunnel) => crate::mitm::UpstreamMode::TunnelTls(tunnel),
             Err(e) => {
-                let (response, _) = dial_failure_response(e.as_ref(), target_host, &header_str);
+                let (response, _) = dial_failure_response(
+                    state.block_label(),
+                    e.as_ref(),
+                    target_host,
+                    &header_str,
+                );
                 client.write_all(&response).await?;
                 return Err(e);
             }
@@ -2207,7 +2251,8 @@ async fn handle_https_forward(
     if let Err(e) = &result
         && !client.answered
     {
-        let (response, status) = dial_failure_response(e.as_ref(), target_host, &header_str);
+        let (response, status) =
+            dial_failure_response(state.block_label(), e.as_ref(), target_host, &header_str);
         client.write_all(&response).await.ok();
         emit_audit(state, target_host, "error", status, actor);
     }
@@ -2219,17 +2264,23 @@ async fn handle_https_forward(
 /// guard refused the address the name resolved to, or the upstream proxy
 /// refused the destination by its policy, else 502.
 fn dial_failure_response(
+    label: Option<&str>,
     error: &(dyn std::error::Error + 'static),
     target_host: &str,
     head: &str,
 ) -> (Vec<u8>, u16) {
     if error.is::<crate::blocked::UpstreamBlocked>() {
         let reason = crate::blocked::BlockReason::UpstreamPolicy;
-        return (refusal_for_head(reason, target_host, head), 403);
+        return (refusal_for_head(label, reason, target_host, head), 403);
     }
     match error.downcast_ref::<std::io::Error>() {
         Some(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (
-            refusal_for_head(crate::blocked::BlockReason::PolicyDeny, target_host, head),
+            refusal_for_head(
+                label,
+                crate::blocked::BlockReason::PolicyDeny,
+                target_host,
+                head,
+            ),
             403,
         ),
         _ => (BAD_GATEWAY_RESPONSE.to_vec(), 502),
@@ -2239,6 +2290,7 @@ fn dial_failure_response(
 /// The policy refusal of the request whose head is `head`, as the client is told
 /// it on a door that reads the request in the clear.
 pub(crate) fn refusal_for_head(
+    label: Option<&str>,
     reason: crate::blocked::BlockReason,
     target_host: &str,
     head: &str,
@@ -2256,7 +2308,7 @@ pub(crate) fn refusal_for_head(
         },
         None => target,
     };
-    crate::blocked::response(reason, method, target_host, path)
+    crate::blocked::response(label, reason, method, target_host, path)
 }
 
 /// A client stream that records whether anything has been written to it, so a
@@ -3033,6 +3085,7 @@ async fn connect_raw_passthrough(
             tracing::info!(target = %target_host, "proxy DENIED (egress.tcp)");
             client
                 .write_all(&crate::blocked::response(
+                    state.block_label(),
                     reason,
                     "CONNECT",
                     target_host,
@@ -3089,7 +3142,12 @@ async fn http_forward_raw_passthrough(
         Err(reason) => {
             tracing::info!(target = %target_host, "HTTP forward proxy DENIED (egress.tcp)");
             client
-                .write_all(&refusal_for_head(reason, target_host, request_head))
+                .write_all(&refusal_for_head(
+                    state.block_label(),
+                    reason,
+                    target_host,
+                    request_head,
+                ))
                 .await?;
             return Ok(());
         }
@@ -3136,7 +3194,12 @@ async fn https_forward_raw_passthrough(
         Err(reason) => {
             tracing::info!(target = %target_host, "HTTPS forward proxy DENIED (egress.tcp)");
             client
-                .write_all(&refusal_for_head(reason, target_host, request_head))
+                .write_all(&refusal_for_head(
+                    state.block_label(),
+                    reason,
+                    target_host,
+                    request_head,
+                ))
                 .await?;
             return Ok(());
         }
@@ -3158,7 +3221,8 @@ async fn https_forward_raw_passthrough(
     let mut upstream = match dialled {
         Ok(s) => s,
         Err(e) => {
-            let (response, status) = dial_failure_response(e.as_ref(), target_host, request_head);
+            let (response, status) =
+                dial_failure_response(state.block_label(), e.as_ref(), target_host, request_head);
             emit_audit(state, target_host, "error", status, actor);
             client.write_all(&response).await?;
             return Err(format!("raw passthrough connect to {target_host}: {e}").into());
@@ -3400,7 +3464,12 @@ async fn handle_transparent_tls(
                         let reason = crate::blocked::BlockReason::UpstreamPolicy;
                         let _ = tokio::time::timeout(
                             crate::blocked::DENIED_TUNNEL_TIMEOUT,
-                            crate::blocked::answer_tls(tls_client, &sni, reason),
+                            crate::blocked::answer_tls(
+                                tls_client,
+                                state.block_label(),
+                                &sni,
+                                reason,
+                            ),
                         )
                         .await;
                         return Ok(());
@@ -3427,7 +3496,7 @@ async fn refuse_transparent_tls(
     let config = crate::mitm::build_ephemeral_server_config(get_or_init_ca(state)?, sni)?;
     let _ = tokio::time::timeout(crate::blocked::DENIED_TUNNEL_TIMEOUT, async {
         if let Ok(tls) = start.into_stream(config).await {
-            crate::blocked::answer_tls(tls, sni, reason).await;
+            crate::blocked::answer_tls(tls, state.block_label(), sni, reason).await;
         }
     })
     .await;
@@ -4593,6 +4662,7 @@ pub(crate) mod tests {
             upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
             bootstrap_dns_allowlist: Vec::new(),
             gate_resolved_hosts: RwLock::new(HashSet::new()),
+            block_label: std::sync::OnceLock::new(),
         });
         (state, rx)
     }
@@ -6534,7 +6604,7 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: GET 10.0.0.5/rest/things (reason: policy-deny). \
+            "Blocked by sandbox egress policy: GET 10.0.0.5/rest/things (reason: policy-deny). \
              This is not a response from 10.0.0.5.",
         );
     }
@@ -6734,7 +6804,7 @@ pub(crate) mod tests {
     }
 
     const UPSTREAM_POLICY_REFUSAL: &[u8] =
-        b"HTTP/1.1 403 Forbidden\r\nX-Lens-Agents-Blocked: upstream-policy\r\n\r\n";
+        b"HTTP/1.1 403 Forbidden\r\nX-Sandbox-Blocked: upstream-policy\r\n\r\n";
 
     #[tokio::test]
     async fn http_forward_relays_the_upstream_policy_refusal_as_a_block() {
@@ -6743,7 +6813,7 @@ pub(crate) mod tests {
         assert_blocked(
             &plain_http_answer(&state).await,
             BlockReason::UpstreamPolicy,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/x (reason: upstream-policy). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/x (reason: upstream-policy). \
              This is not a response from api.example.test.",
         );
         let events = drain_audit_lines(&mut rx);
@@ -6792,7 +6862,7 @@ pub(crate) mod tests {
         assert_blocked(
             &request_in_refused_tunnel(&state, client, "api.example.test").await,
             BlockReason::UpstreamPolicy,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: upstream-policy). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/foo (reason: upstream-policy). \
              This is not a response from api.example.test.",
         );
     }
@@ -6840,7 +6910,7 @@ pub(crate) mod tests {
         assert_blocked(
             &request_in_refused_tunnel(&state, client, "api.example.test").await,
             BlockReason::UpstreamPolicy,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: upstream-policy). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/foo (reason: upstream-policy). \
              This is not a response from api.example.test.",
         );
     }
@@ -6854,7 +6924,7 @@ pub(crate) mod tests {
         assert_blocked(
             &read_response(&mut client).await,
             BlockReason::UpstreamPolicy,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/things (reason: upstream-policy). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/things (reason: upstream-policy). \
              This is not a response from api.example.test.",
         );
     }
@@ -6866,7 +6936,7 @@ pub(crate) mod tests {
         assert_blocked(
             &transparent_tls_answer(&state).await,
             BlockReason::UpstreamPolicy,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: upstream-policy). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/foo (reason: upstream-policy). \
              This is not a response from api.example.test.",
         );
     }
@@ -7225,7 +7295,7 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: CONNECT 10.0.0.5:22 (reason: policy-deny). \
+            "Blocked by sandbox egress policy: CONNECT 10.0.0.5:22 (reason: policy-deny). \
              This is not a response from 10.0.0.5.",
         );
     }
@@ -7281,10 +7351,32 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/x (reason: policy-deny). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/x (reason: policy-deny). \
              This is not a response from api.example.test.",
         );
         assert!(!response.contains("q=1"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_block_names_the_product_the_embedder_set() {
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        assert!(state.set_block_label("Lens\r\nX-Injected: 1").is_err());
+        state.set_block_label("Lens Agents").unwrap();
+        assert!(
+            state.set_block_label("Other").is_err(),
+            "the label is set once"
+        );
+        let response = plain_http_answer(&state).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden by Lens Agents sandbox policy\r\n"),
+            "{response}"
+        );
+        assert_eq!(
+            crate::blocked::tests::parse(&response).2,
+            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/x \
+             (reason: policy-deny). This is not a response from api.example.test."
+        );
     }
 
     #[tokio::test]
@@ -7302,7 +7394,7 @@ pub(crate) mod tests {
         assert_blocked(
             &plain_http_answer(&state).await,
             BlockReason::BinaryNotAllowed,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/x (reason: binary-not-allowed). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/x (reason: binary-not-allowed). \
              This is not a response from api.example.test.",
         );
     }
@@ -7328,7 +7420,7 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: GET 10.0.0.5/ (reason: policy-deny). This is not a response from 10.0.0.5.",
+            "Blocked by sandbox egress policy: GET 10.0.0.5/ (reason: policy-deny). This is not a response from 10.0.0.5.",
         );
     }
 
@@ -8393,7 +8485,7 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: policy-deny). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/foo (reason: policy-deny). \
              This is not a response from api.example.test.",
         );
         handler.await.unwrap().unwrap();
@@ -8428,7 +8520,7 @@ pub(crate) mod tests {
         assert_blocked(
             &request_in_refused_tunnel(&state, client, "api.example.test").await,
             BlockReason::BinaryNotAllowed,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: binary-not-allowed). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/foo (reason: binary-not-allowed). \
              This is not a response from api.example.test.",
         );
     }
@@ -8537,7 +8629,7 @@ pub(crate) mod tests {
         assert_blocked(
             &transparent_tls_answer(&state).await,
             BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: policy-deny). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/foo (reason: policy-deny). \
              This is not a response from api.example.test.",
         );
     }
@@ -8557,7 +8649,7 @@ pub(crate) mod tests {
         assert_blocked(
             &transparent_tls_answer(&state).await,
             BlockReason::BinaryNotAllowed,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/foo (reason: binary-not-allowed). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/foo (reason: binary-not-allowed). \
              This is not a response from api.example.test.",
         );
     }
@@ -8610,7 +8702,7 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::AskDeclined,
-            "Blocked by Lens Agents sandbox egress policy: GET evil.example.com/v1/foo (reason: ask-declined). \
+            "Blocked by sandbox egress policy: GET evil.example.com/v1/foo (reason: ask-declined). \
              This is not a response from evil.example.com.",
         );
 
@@ -8861,7 +8953,7 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::AskDeclined,
-            "Blocked by Lens Agents sandbox egress policy: GET api.evil.example.com/foo (reason: ask-declined). \
+            "Blocked by sandbox egress policy: GET api.evil.example.com/foo (reason: ask-declined). \
              This is not a response from api.evil.example.com.",
         );
 
@@ -9253,7 +9345,7 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::AskDeclined,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/things (reason: ask-declined). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/things (reason: ask-declined). \
              This is not a response from api.example.test.",
         );
     }
@@ -9269,7 +9361,7 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/things (reason: policy-deny). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/things (reason: policy-deny). \
              This is not a response from api.example.test.",
         );
         assert!(!response.contains("page=2"), "{response}");
@@ -9461,7 +9553,7 @@ pub(crate) mod tests {
         assert_blocked(
             &response,
             BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: GET api.example.test/v1/things (reason: policy-deny). \
+            "Blocked by sandbox egress policy: GET api.example.test/v1/things (reason: policy-deny). \
              This is not a response from api.example.test.",
         );
     }
@@ -9552,6 +9644,7 @@ pub(crate) mod tests {
             "egress to 10.0.0.5 denied by policy",
         ));
         let (response, status) = dial_failure_response(
+            None,
             refused.as_ref(),
             "203.0.113.80:443",
             "GET /v1/x?q=1 HTTP/1.1",
@@ -9563,14 +9656,14 @@ pub(crate) mod tests {
         crate::blocked::tests::assert_blocked(
             &String::from_utf8(response).unwrap(),
             crate::blocked::BlockReason::PolicyDeny,
-            "Blocked by Lens Agents sandbox egress policy: GET 203.0.113.80/v1/x \
+            "Blocked by sandbox egress policy: GET 203.0.113.80/v1/x \
              (reason: policy-deny). This is not a response from 203.0.113.80.",
         );
         for head in [
             "GET https://h/x?t=a/b HTTP/1.1",
             "GET https://h?t=a/b HTTP/1.1",
         ] {
-            let (response, _) = dial_failure_response(refused.as_ref(), "h:443", head);
+            let (response, _) = dial_failure_response(None, refused.as_ref(), "h:443", head);
             let response = String::from_utf8(response).unwrap();
             let line = crate::blocked::tests::parse(&response).2;
             assert!(
@@ -9580,7 +9673,7 @@ pub(crate) mod tests {
         }
         let failed: Box<dyn std::error::Error + Send + Sync> = "handshake failed".into();
         assert_eq!(
-            dial_failure_response(failed.as_ref(), "h:443", "GET / HTTP/1.1").1,
+            dial_failure_response(None, failed.as_ref(), "h:443", "GET / HTTP/1.1").1,
             502
         );
     }

@@ -651,6 +651,7 @@ async fn enforce_http_rules(
     );
     tls_client
         .write_all(&crate::blocked::response(
+            ctx.state.block_label(),
             crate::blocked::BlockReason::PolicyDeny,
             &prepared.method,
             target_host,
@@ -1751,7 +1752,7 @@ mod tests {
             &response,
             crate::blocked::BlockReason::PolicyDeny,
             &format!(
-                "Blocked by Lens Agents sandbox egress policy: POST {TEST_HOSTNAME}/graphql \
+                "Blocked by sandbox egress policy: POST {TEST_HOSTNAME}/graphql \
                  (reason: policy-deny). This is not a response from {TEST_HOSTNAME}."
             ),
         );
