@@ -928,6 +928,10 @@ struct ForwardRequest<'a> {
     target_host: &'a str,
     method: &'a str,
     path: &'a str,
+    /// The request head as the client sent it, never one with a credential
+    /// injected. The refusal names its request from this, not from `path`, so
+    /// it reads the URL with the same boundaries as every other door.
+    head: &'a str,
     actor: &'a crate::peer_process::ActorContext,
 }
 
@@ -969,12 +973,11 @@ impl ForwardRequest<'_> {
         reason: crate::blocked::BlockReason,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         client
-            .write_all(&crate::blocked::response(
+            .write_all(&refusal_for_head(
                 self.state.block_label(),
                 reason,
-                self.method,
                 self.target_host,
-                self.path,
+                self.head,
             ))
             .await?;
         Ok(())
@@ -1019,6 +1022,7 @@ async fn handle_http_forward(
         target_host,
         method,
         path: &path,
+        head: &header_str,
         actor,
     };
 
@@ -7355,6 +7359,35 @@ pub(crate) mod tests {
              This is not a response from api.example.test.",
         );
         assert!(!response.contains("q=1"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn http_forward_does_not_repeat_a_slash_in_the_query_as_the_path() {
+        let (state, _rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        tokio::spawn(async move {
+            let headers =
+                b"GET http://api.example.test?token=/secret HTTP/1.1\r\nHost: api.example.test\r\n\r\n"
+                    .to_vec();
+            handle_http_forward(
+                server,
+                "api.example.test:80",
+                headers,
+                &state_for_handler,
+                &test_actor(),
+            )
+            .await
+        });
+        let response = read_response(&mut client).await;
+        assert_blocked(
+            &response,
+            BlockReason::PolicyDeny,
+            "Blocked by sandbox egress policy: GET api.example.test/ (reason: policy-deny). \
+             This is not a response from api.example.test.",
+        );
+        assert!(!response.contains("secret"), "{response}");
     }
 
     #[tokio::test]
