@@ -899,8 +899,8 @@ pub enum CredentialInjection {
         session_token: String,
     },
     /// Answers a `POST` to [`path`](Self::OauthTokenAnswer::path) on
-    /// [`domain`](Self::OauthTokenAnswer::domain) whose urlencoded body asks for
-    /// `grant_type=client_credentials` for
+    /// [`domain`](Self::OauthTokenAnswer::domain) whose body (a form, or one
+    /// JSON object of string parameters) asks for `grant_type=client_credentials` for
     /// [`clientId`](Self::OauthTokenAnswer::client_id) (in the body or in HTTP
     /// Basic authentication). A request for exactly
     /// [`scope`](Self::OauthTokenAnswer::scope) gets
@@ -926,8 +926,8 @@ pub enum CredentialInjection {
         expires_in: u64,
     },
     /// Answers a `POST` to [`path`](Self::OauthRefreshAnswer::path) on
-    /// [`domain`](Self::OauthRefreshAnswer::domain) whose urlencoded body asks
-    /// for `grant_type=refresh_token` with
+    /// [`domain`](Self::OauthRefreshAnswer::domain) whose body (a form, or one
+    /// JSON object of string parameters) asks for `grant_type=refresh_token` with
     /// [`refreshToken`](Self::OauthRefreshAnswer::refresh_token), whatever
     /// client and scope it names. Every other request to the domain, including
     /// one with another refresh token, is forwarded unchanged.

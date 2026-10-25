@@ -213,7 +213,7 @@
           ]
         },
         {
-          "description": "Answers a `POST` to [`path`](Self::OauthTokenAnswer::path) on\n[`domain`](Self::OauthTokenAnswer::domain) whose urlencoded body asks for\n`grant_type=client_credentials` for\n[`clientId`](Self::OauthTokenAnswer::client_id) (in the body or in HTTP\nBasic authentication). A request for exactly\n[`scope`](Self::OauthTokenAnswer::scope) gets\n[`accessToken`](Self::OauthTokenAnswer::access_token); a request for a\nscope no answer names gets `invalid_scope`. Every other request to the\ndomain is forwarded unchanged.",
+          "description": "Answers a `POST` to [`path`](Self::OauthTokenAnswer::path) on\n[`domain`](Self::OauthTokenAnswer::domain) whose body (a form, or one\nJSON object of string parameters) asks for `grant_type=client_credentials` for\n[`clientId`](Self::OauthTokenAnswer::client_id) (in the body or in HTTP\nBasic authentication). A request for exactly\n[`scope`](Self::OauthTokenAnswer::scope) gets\n[`accessToken`](Self::OauthTokenAnswer::access_token); a request for a\nscope no answer names gets `invalid_scope`. Every other request to the\ndomain is forwarded unchanged.",
           "type": "object",
           "properties": {
             "accessToken": {
@@ -258,7 +258,7 @@
           ]
         },
         {
-          "description": "Answers a `POST` to [`path`](Self::OauthRefreshAnswer::path) on\n[`domain`](Self::OauthRefreshAnswer::domain) whose urlencoded body asks\nfor `grant_type=refresh_token` with\n[`refreshToken`](Self::OauthRefreshAnswer::refresh_token), whatever\nclient and scope it names. Every other request to the domain, including\none with another refresh token, is forwarded unchanged.",
+          "description": "Answers a `POST` to [`path`](Self::OauthRefreshAnswer::path) on\n[`domain`](Self::OauthRefreshAnswer::domain) whose body (a form, or one\nJSON object of string parameters) asks for `grant_type=refresh_token` with\n[`refreshToken`](Self::OauthRefreshAnswer::refresh_token), whatever\nclient and scope it names. Every other request to the domain, including\none with another refresh token, is forwarded unchanged.",
           "type": "object",
           "properties": {
             "accessToken": {
