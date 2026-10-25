@@ -3269,6 +3269,29 @@ mod tests {
         assert_eq!(json["refresh_token"], "placeholder-refresh");
     }
 
+    /// A client whose token endpoint takes JSON sends the same refresh as one JSON object.
+    const HELD_JSON_REFRESH: &[u8] = b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
+        Content-Type: application/json\r\nContent-Length: 103\r\n\r\n\
+        {\"grant_type\":\"refresh_token\",\"refresh_token\":\"placeholder-refresh\",\"client_id\":\"shared-public-client\"}";
+
+    #[tokio::test]
+    async fn mitm_answers_a_json_refresh_as_it_answers_a_form_one() {
+        let (forwarded, response, _) = run_held_token_harness_with(
+            HeldTokenHost::ArmAndAllow,
+            refresh_answer(""),
+            refresh_answer("placeholder-token"),
+            HELD_JSON_REFRESH,
+        )
+        .await;
+
+        assert!(!forwarded, "the request must not be forwarded");
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["access_token"], "placeholder-token");
+        assert_eq!(json["refresh_token"], "placeholder-refresh");
+    }
+
     #[tokio::test]
     async fn mitm_answers_a_held_request_for_another_scope_with_invalid_scope_once_armed() {
         let answer = |access_token: &str| {
@@ -3405,13 +3428,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mitm_forwards_a_non_urlencoded_post_to_the_token_path_unread() {
+    async fn mitm_forwards_a_post_to_the_token_path_that_is_neither_a_form_nor_json_unread() {
         // A body the answer could never apply to is not read, so framing the
         // inspection refuses, and a size past its cap, pass as they came.
         let (outcome, _response, _audits) = run_token_answer_harness(
             vec![token_answer("api.default")],
             b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
-              Content-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc",
+              Content-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc",
         )
         .await;
 
@@ -3421,6 +3444,23 @@ mod tests {
             "{head}"
         );
         assert_eq!(body, None, "the relay streams a body no answer needed");
+    }
+
+    #[tokio::test]
+    async fn mitm_refuses_a_token_request_it_cannot_read_whether_form_or_json() {
+        // Either body may carry the placeholder an answer covers; one the proxy
+        // cannot inspect is refused rather than sent upstream with it.
+        for request in [
+            &b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
+               Content-Type: application/x-www-form-urlencoded\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc"[..],
+            b"POST /oauth2/token HTTP/1.1\r\nHost: test.example.com\r\n\
+               Content-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc",
+        ] {
+            let (outcome, response, _audits) =
+                run_token_answer_harness(vec![token_answer("api.default")], request).await;
+            assert!(outcome.is_err(), "the request must not be forwarded");
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        }
     }
 
     #[tokio::test]

@@ -11,9 +11,10 @@
 //! policy.
 //!
 //! A request is answered only when it is a `POST` to a configured path whose
-//! form body asks for `grant_type=client_credentials` for a configured client,
-//! or for `grant_type=refresh_token` with a configured placeholder refresh
-//! token. Any other request to the host is forwarded as the sandbox sent it,
+//! body asks for `grant_type=client_credentials` for a configured client, or
+//! for `grant_type=refresh_token` with a configured placeholder refresh token.
+//! The body is a form, as RFC 6749 sends it, or one JSON object of the same
+//! parameters as strings, as some token endpoints take them. Any other request to the host is forwarded as the sandbox sent it,
 //! so a client the sandbox holds its own secret or refresh token for keeps
 //! working.
 //!
@@ -128,15 +129,15 @@ pub(crate) enum Decision<'a> {
 }
 
 /// Whether a request to this host may be one the proxy answers, judged from
-/// its head. Only a urlencoded `POST` to a configured path can be, so no other
-/// body is read and every other request is forwarded as it came.
+/// its head. Only a form or JSON `POST` to a configured path can be, so no
+/// other body is read and every other request is forwarded as it came.
 pub(crate) fn may_answer(answers: &[TokenAnswer], method: &str, path: &str, head: &str) -> bool {
     method.eq_ignore_ascii_case("POST")
         && answers.iter().any(|answer| answer.path == path)
-        && crate::body_field::is_urlencoded(head)
+        && (crate::body_field::is_urlencoded(head) || is_json(head))
 }
 
-/// Decide from the request head and its urlencoded body.
+/// Decide from the request head and its form or JSON body.
 pub(crate) fn decide<'a>(
     answers: &'a [TokenAnswer],
     method: &str,
@@ -147,7 +148,11 @@ pub(crate) fn decide<'a>(
     if !may_answer(answers, method, path, head) {
         return Decision::NotOurs;
     }
-    let form = parse_form(body);
+    let form = if is_json(head) {
+        parse_json(body)
+    } else {
+        parse_form(body)
+    };
     let field = |name: &str| {
         form.iter()
             .find(|(key, _)| key == name)
@@ -257,6 +262,33 @@ pub(crate) fn response(decision: &Decision<'_>) -> Option<TokenResponse> {
 
 fn scope_set(scope: &str) -> BTreeSet<String> {
     scope.split_whitespace().map(str::to_string).collect()
+}
+
+fn is_json(head: &str) -> bool {
+    head.split("\r\n").skip(1).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("content-type:")
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media| media.trim() == "application/json")
+    })
+}
+
+/// The string members of a JSON object body, the parameters a form would
+/// carry. Any other member reads as absent, and a body that is not an object
+/// carries none, so such a request is forwarded.
+fn parse_json(body: &[u8]) -> Vec<(String, String)> {
+    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body)
+        .map(|object| {
+            object
+                .into_iter()
+                .filter_map(|(key, value)| match value {
+                    serde_json::Value::String(text) => Some((key, text)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_form(body: &[u8]) -> Vec<(String, String)> {
@@ -390,16 +422,123 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_body_that_is_not_urlencoded_is_forwarded() {
-        let answers = [answer("scope-a")];
-        let head = "POST /oauth2/token HTTP/1.1\r\nContent-Type: application/json\r\n";
-        let body = br#"{"grant_type":"client_credentials","client_id":"client-1"}"#;
+    fn json_head(content_type: &str) -> String {
+        format!(
+            "POST /oauth2/token HTTP/1.1\r\nHost: login.example.com\r\nContent-Type: {content_type}\r\n"
+        )
+    }
 
-        assert_eq!(
-            decide(&answers, "POST", "/oauth2/token", head, body),
-            Decision::NotOurs
-        );
+    #[test]
+    fn a_body_that_is_neither_a_form_nor_json_is_forwarded() {
+        let answers = [answer("scope-a"), refresh_answer()];
+        for (content_type, body) in [
+            (
+                "text/plain",
+                &br#"{"grant_type":"client_credentials","client_id":"client-1","scope":"scope-a"}"#
+                    [..],
+            ),
+            ("multipart/form-data; boundary=x", &b"--x\r\n"[..]),
+        ] {
+            assert_eq!(
+                decide(
+                    &answers,
+                    "POST",
+                    "/oauth2/token",
+                    &json_head(content_type),
+                    body
+                ),
+                Decision::NotOurs,
+                "{content_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_token_request_is_answered_as_its_form_twin_would_be() {
+        // Some token endpoints take the same parameters as one JSON object of strings.
+        let answers = [answer("scope-a"), refresh_answer()];
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "Application/JSON",
+        ] {
+            let head = json_head(content_type);
+            assert_eq!(
+                decide(
+                    &answers,
+                    "POST",
+                    "/oauth2/token",
+                    &head,
+                    br#"{"grant_type":"refresh_token","refresh_token":"placeholder-refresh","client_id":"shared-public-client","scope":"narrower"}"#
+                ),
+                Decision::Answer(&answers[1]),
+                "{content_type}"
+            );
+            assert_eq!(
+                decide(
+                    &answers,
+                    "POST",
+                    "/oauth2/token",
+                    &head,
+                    br#"{"grant_type":"client_credentials","client_id":"client-1","client_secret":"__lens_cred:x__","scope":"scope-a"}"#
+                ),
+                Decision::Answer(&answers[0]),
+                "{content_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_token_request_that_is_not_exactly_ours_is_forwarded() {
+        let answers = [answer("scope-a"), refresh_answer()];
+        let head = json_head("application/json");
+        for body in [
+            &br#"{"grant_type":"refresh_token","refresh_token":"a-real-token-the-sandbox-holds"}"#
+                [..],
+            br#"{"grant_type":"refresh_token","refresh_token":["placeholder-refresh"]}"#,
+            br#"{"grant_type":"refresh_token","refresh_token":{"value":"placeholder-refresh"}}"#,
+            br#"{"grant_type":"client_credentials","client_id":1,"scope":"scope-a"}"#,
+            br#"[{"grant_type":"refresh_token","refresh_token":"placeholder-refresh"}]"#,
+            br#"{"grant_type":"refresh_token","refresh_token":"placeholder-refresh""#,
+            b"grant_type=refresh_token&refresh_token=placeholder-refresh",
+        ] {
+            assert_eq!(
+                decide(&answers, "POST", "/oauth2/token", &head, body),
+                Decision::NotOurs,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_form_or_json_post_to_an_answer_path_is_read() {
+        let answers = [refresh_answer()];
+        assert!(may_answer(
+            &answers,
+            "POST",
+            "/oauth2/token",
+            &json_head("application/json")
+        ));
+        assert!(may_answer(&answers, "POST", "/oauth2/token", &head("")));
+        assert!(!may_answer(
+            &answers,
+            "POST",
+            "/oauth2/token",
+            &json_head("text/plain")
+        ));
+        assert!(!may_answer(
+            &answers,
+            "GET",
+            "/oauth2/token",
+            &json_head("application/json")
+        ));
+        assert!(!may_answer(
+            &answers,
+            "POST",
+            "/other",
+            &json_head("application/json")
+        ));
     }
 
     #[test]
