@@ -18,8 +18,6 @@ pub mod activity;
 #[cfg(feature = "proxy")]
 pub(crate) mod audit_dedup;
 #[cfg(feature = "proxy")]
-pub mod aws_resign;
-#[cfg(feature = "proxy")]
 pub mod aws_sigv4;
 #[cfg(feature = "proxy")]
 pub(crate) mod blocked;
@@ -76,6 +74,8 @@ pub mod pty;
 pub mod resolver;
 #[cfg(feature = "proxy")]
 pub mod routing;
+#[cfg(feature = "proxy")]
+pub mod signing;
 #[cfg(feature = "proxy")]
 pub mod sock_mark;
 #[cfg(feature = "proxy")]

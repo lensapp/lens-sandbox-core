@@ -98,8 +98,8 @@ struct RequestMeta {
 /// `401`. The workload never held the value and cannot know to try again; the
 /// proxy can, once, when everything it sent is still in hand: the head before
 /// any credential went in, and a body it read whole. A request whose body it
-/// relayed as it arrived, an upgrade, and a request an `llm` route translated
-/// are never sent twice.
+/// relayed as it arrived, an upgrade, a request an `llm` route translated, and
+/// a request it re-signed are never sent twice.
 struct Resend {
     /// The head before credential injection, after every rewrite that is not a
     /// credential's.
@@ -1109,33 +1109,7 @@ impl RequestFacts<'_, '_> {
     where
         C: AsyncWrite + Unpin,
     {
-        tracing::info!(
-            target_host = %self.target_host,
-            method = %self.method,
-            path = %self.path,
-            reason,
-            "HTTP request denied by policy rules"
-        );
-        if let Some(tx) = self.ctx.audit_tx {
-            let event = serde_json::json!({
-                "type": "audit_event",
-                "source": "sandbox-proxy",
-                "action": format!("{} {}{}", self.method, self.target_host, self.path),
-                "method": self.method,
-                "host": self.target_host,
-                "path": self.path,
-                "result": "failure",
-                "status_code": 403,
-                "metadata": {
-                    "host": self.target_host,
-                    "mitm": true,
-                    "tunnel": self.is_tunnel,
-                    flag: true,
-                    "reason": reason,
-                }
-            });
-            send_audit(tx, event, self.ctx.actor);
-        }
+        self.record_refusal(flag, reason, 403);
         let block = match flag {
             "credential_gate_denied" => crate::blocked::BlockReason::CredentialGate,
             "gate_denied" => crate::blocked::BlockReason::AskDeclined,
@@ -1153,6 +1127,57 @@ impl RequestFacts<'_, '_> {
             .ok();
         tls_client.shutdown().await.ok();
         reason.into()
+    }
+
+    /// Refuse this request with the status the signer gave, as AWS itself
+    /// would answer a request it cannot authenticate.
+    async fn refuse_signing<C>(
+        &self,
+        tls_client: &mut C,
+        refusal: crate::signing::Refusal,
+    ) -> Box<dyn std::error::Error + Send + Sync>
+    where
+        C: AsyncWrite + Unpin,
+    {
+        self.record_refusal("signing_refused", refusal.reason, refusal.status);
+        let response = format!(
+            "HTTP/1.1 {} {}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            refusal.status, refusal.reason
+        );
+        tls_client.write_all(response.as_bytes()).await.ok();
+        tls_client.shutdown().await.ok();
+        format!("aws resign: {}", refusal.reason).into()
+    }
+
+    fn record_refusal(&self, flag: &'static str, reason: &str, status: u16) {
+        tracing::info!(
+            target_host = %self.target_host,
+            method = %self.method,
+            path = %self.path,
+            reason,
+            status,
+            "HTTP request refused"
+        );
+        if let Some(tx) = self.ctx.audit_tx {
+            let event = serde_json::json!({
+                "type": "audit_event",
+                "source": "sandbox-proxy",
+                "action": format!("{} {}{}", self.method, self.target_host, self.path),
+                "method": self.method,
+                "host": self.target_host,
+                "path": self.path,
+                "result": "failure",
+                "status_code": status,
+                "metadata": {
+                    "host": self.target_host,
+                    "mitm": true,
+                    "tunnel": self.is_tunnel,
+                    flag: true,
+                    "reason": reason,
+                }
+            });
+            send_audit(tx, event, self.ctx.actor);
+        }
     }
 
     /// Answer an OAuth token request in place of its token endpoint (see
@@ -1581,6 +1606,30 @@ where
         None => header_str.to_string(),
     };
 
+    // A host whose credential is a signing key has its request signed last,
+    // after every step below has written the head the signature covers. A
+    // redirect drops the signature the sandbox made with its other credentials,
+    // and the backend answers to its own, so a redirected request is not signed.
+    let signed = destination.is_none() && ctx.state.aws_signer.matches(ctx.match_host);
+    if signed && is_upgrade {
+        return Err(facts
+            .deny(
+                &mut tls_client,
+                "upgrade_denied",
+                "a re-signed request cannot open a connection upgrade",
+            )
+            .await);
+    }
+    // The signer consumes the placeholder in the signature headers, so the
+    // credential gate looks only at the rest of the head.
+    let gate_view = |head: String| {
+        if signed {
+            crate::signing::without_signature_headers(&head)
+        } else {
+            head
+        }
+    };
+
     // Two request-head mutations from policy, applied in order:
     //   1. inject_headers     — type=header credential injections
     //   2. rewrite_uri_placeholders — type=uriPlaceholder credential injections
@@ -1616,7 +1665,10 @@ where
     // re-trips the gate on every call. `ctx.placeholder_map` carries only
     // armed placeholders (`collect_uri_placeholders` skips unarmed ones), so a
     // first, unarmed use still survives and trips the gate.
-    let scan_target = rewrite_uri_placeholders(&header_injected, target.placeholders);
+    let scan_target = gate_view(rewrite_uri_placeholders(
+        &header_injected,
+        target.placeholders,
+    ));
     let matches = scan_for_unarmed_placeholders(ctx.state, &scan_target);
     if !matches.is_empty() {
         let state = ctx.state;
@@ -1640,7 +1692,7 @@ where
             // scan runs over the whole rebuilt head, so a header-resident
             // placeholder that inject_headers failed to replace is still
             // visible. That's the contract-violation case we want to catch.
-            let probe = rewrite_uri_placeholders(&rebuilt, &fresh_uri);
+            let probe = gate_view(rewrite_uri_placeholders(&rebuilt, &fresh_uri));
             let still_unarmed = scan_for_unarmed_placeholders(state, &probe);
             if let Some(m) = still_unarmed.first() {
                 tracing::warn!(
@@ -1865,8 +1917,10 @@ where
     }
 
     // Everything that went into this request is still in hand, so it can be
-    // sent again if the credential it carries is renewed on the way.
+    // sent again if the credential it carries is renewed on the way. A signed
+    // request is not: the head kept here is the one from before its signature.
     let resend = (!is_upgrade
+        && !signed
         && destination.is_none()
         && (buffered_body.is_some() || body_mode == BodyFraming::None)
         && matching_injections(&header_injected, effective_injections)
@@ -1891,11 +1945,29 @@ where
         None => (modified, body_mode),
     };
 
+    let (modified, body_mode, signed_service) = if signed {
+        let (head, body_mode, service) = sign_request(
+            &mut tls_client,
+            &facts,
+            &modified,
+            body_mode,
+            &mut buffered_body,
+        )
+        .await?;
+        (head, body_mode, Some(service))
+    } else {
+        (modified, body_mode, None)
+    };
+
     let mut audit = crate::upstream_answer::PendingAudit::none();
     if let Some(tx) = ctx.audit_tx {
         let mut metadata = serde_json::json!({
             "host": target_host, "mitm": true, "tunnel": is_tunnel
         });
+        if let (Some(service), Some(object)) = (&signed_service, metadata.as_object_mut()) {
+            object.insert("aws_resign".into(), true.into());
+            object.insert("service".into(), service.clone().into());
+        }
         // A redirected request never reaches the host the action names, so the
         // record has to say where it went instead.
         if let (Some(destination), Some(object)) = (&destination, metadata.as_object_mut()) {
@@ -1951,6 +2023,58 @@ where
             resend,
         },
     ))
+}
+
+/// Re-sign a request the pipeline has decided to forward, with the real key its
+/// placeholder signature stands for.
+///
+/// Returns the signed head, the framing the relay still has to forward, and the
+/// AWS service the request was signed for. A body the signature covers is read
+/// here when no earlier step read it, and replayed from `buffered_body`.
+async fn sign_request<C>(
+    tls_client: &mut C,
+    facts: &RequestFacts<'_, '_>,
+    head: &str,
+    body_mode: BodyFraming,
+    buffered_body: &mut Option<Vec<u8>>,
+) -> Result<(String, BodyFraming, String), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let signature = match facts.ctx.state.aws_signer.signature_for(head) {
+        Ok(signature) => signature,
+        Err(refusal) => return Err(facts.refuse_signing(tls_client, refusal).await),
+    };
+    // A request that declares no length has no body (RFC 9112 §6.3). It is
+    // signed for an empty one, and its head is left as the client wrote it.
+    let unread_body = buffered_body.is_none() && body_mode != BodyFraming::None;
+    let (head, body_mode) = if signature.signs_the_body() && unread_body {
+        let len = match crate::signing::signed_body_length(body_mode) {
+            Ok(len) => len,
+            Err(refusal) => return Err(facts.refuse_signing(tls_client, refusal).await),
+        };
+        if let Err(reason) = crate::http_body::answer_continue_if_expected(tls_client, head).await {
+            return Err(facts.deny(tls_client, "signing_refused", &reason).await);
+        }
+        let body = match crate::http_body::read_body(tls_client, body_mode, len).await {
+            Ok(body) => body,
+            Err(e) => {
+                return Err(facts
+                    .deny(tls_client, "signing_refused", &e.to_string())
+                    .await);
+            }
+        };
+        let head = crate::http_body::reframe_head_as_content_length(head, body.len());
+        *buffered_body = Some(body);
+        (head, BodyFraming::None)
+    } else {
+        (head.to_string(), body_mode)
+    };
+    let body = buffered_body.as_deref().unwrap_or_default();
+    match signature.sign(&head, body) {
+        Ok(signed) => Ok((signed, body_mode, signature.service().to_string())),
+        Err(refusal) => Err(facts.refuse_signing(tls_client, refusal).await),
+    }
 }
 
 /// Upstream TLS phase: wrap a TCP stream (direct or tunnel) with TLS.
@@ -2937,6 +3061,10 @@ mod tests {
     #[path = "answer_tests.rs"]
     mod answer;
 
+    /// Re-signing a request for a host whose credential is a signing key.
+    #[path = "signing_tests.rs"]
+    mod signing;
+
     /// Shared harness for MITM integration tests.
     /// Spins up: TLS upstream server ← upstream TLS ← MITM ← client TLS.
     /// Returns (upstream_headers, client_response, audit_events).
@@ -2973,21 +3101,59 @@ mod tests {
         request: &'static [u8],
         is_tunnel: bool,
     ) -> (String, String, Vec<serde_json::Value>) {
+        let (state, audit_rx) = crate::proxy::tests::test_state();
+        let policy = HarnessPolicy {
+            injections,
+            http_rules,
+            placeholder_map,
+        };
+        run_mitm_harness_in(
+            state,
+            audit_rx,
+            "test.example.com",
+            policy,
+            request.to_vec(),
+            is_tunnel,
+        )
+        .await
+    }
+
+    /// What the route hands the MITM for the harness host.
+    #[derive(Default)]
+    struct HarnessPolicy {
+        injections: Vec<CredentialInjection>,
+        http_rules: Vec<HttpRule>,
+        placeholder_map: Vec<(String, String)>,
+    }
+
+    /// As [`run_mitm_harness_full`], against a proxy state, host and request
+    /// the caller sets up.
+    async fn run_mitm_harness_in(
+        state: Arc<crate::proxy::ProxyState>,
+        mut audit_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        hostname: &'static str,
+        policy: HarnessPolicy,
+        request: Vec<u8>,
+        is_tunnel: bool,
+    ) -> (String, String, Vec<serde_json::Value>) {
         use tokio::net::TcpListener;
 
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
 
+        let HarnessPolicy {
+            injections,
+            http_rules,
+            placeholder_map,
+        } = policy;
         let ca = EphemeralCa::new().unwrap();
-        let hostname = "test.example.com";
 
         // TLS upstream server: reads HTTP request headers, sends 200 response.
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let server_config = test_tls_server_config(&ca, hostname);
 
-        let (state, mut audit_rx) = crate::proxy::tests::test_state();
         let audit_tx_opt = state.audit_tx.lock().unwrap().clone();
 
         let upstream_handle = tokio::spawn(async move {
@@ -3049,7 +3215,7 @@ mod tests {
             let server_name = ServerName::try_from(hostname.to_string()).unwrap();
             let mut tls = connector.connect(server_name, stream).await.unwrap();
 
-            tls.write_all(request).await.unwrap();
+            tls.write_all(&request).await.unwrap();
 
             let mut response = Vec::new();
             let _ = tls.read_to_end(&mut response).await;

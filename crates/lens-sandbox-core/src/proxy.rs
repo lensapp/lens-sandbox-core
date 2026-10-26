@@ -274,11 +274,11 @@ pub struct ProxyState {
     pub previous_policy_files: RwLock<Vec<String>>,
     /// Sandbox user credentials for chowning policy files.
     pub sandbox_creds: Option<crate::privilege::SandboxCredentials>,
-    /// AWS SigV4 re-sign interceptor. Owns the placeholder → real-STS-creds
-    /// map and the domain patterns that trigger re-signing. Real STS session
-    /// credentials live only in this process memory — they never touch the
-    /// sandbox filesystem or agent process memory.
-    pub aws_resign: Arc<crate::aws_resign::AwsResignInterceptor>,
+    /// AWS SigV4 signer. Owns the placeholder → real-STS-creds map and the
+    /// domain patterns whose requests the MITM pipeline re-signs. Real STS
+    /// session credentials live only in this process memory — they never touch
+    /// the sandbox filesystem or agent process memory.
+    pub aws_signer: crate::signing::AwsSigner,
     /// Just-in-time approval gate: dedup map of host → pending decision +
     /// id → host lookup for inbound `request_decision` frames.
     pub(crate) pending: std::sync::Mutex<crate::gate::PendingTable<crate::protocol::Decision>>,
@@ -700,7 +700,7 @@ impl ProxyServer {
             sandbox_tls_connector: RwLock::new(None),
             previous_policy_files: RwLock::new(Vec::new()),
             sandbox_creds,
-            aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
+            aws_signer: crate::signing::AwsSigner::new(),
             pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
             credential_pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
             placeholder_index: RwLock::new(HashMap::new()),
@@ -1624,27 +1624,6 @@ async fn handle_connect(
 
     match effective_transport {
         Transport::Direct => {
-            // The re-sign path owns whatever it matches: it knows nothing of
-            // `llm` and delivers to the host the sandbox named. Going on would
-            // send the request to the API the redirect exists to keep it away
-            // from, signed. Said before the tunnel is established, so the client
-            // is refused rather than left holding an open connection. A claim
-            // this door cannot honour must never become one it ignores.
-            if state.intercept_for_llm(target_host) && state.aws_resign.matches(target_host) {
-                client
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                    .await?;
-                // `error`, not `failure`: this is a misconfiguration and every
-                // occurrence of it should be visible. A repeated `failure` is
-                // deduped, so the second attempt would leave no trace of its own.
-                emit_audit(state, target_host, "error", 502, actor);
-                return Err(format!(
-                    "an llm route covers {target_host}, which the aws re-sign path also owns; \
-                     one connection cannot be both"
-                )
-                .into());
-            }
-
             client
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await?;
@@ -1660,7 +1639,6 @@ async fn handle_connect(
             );
 
             let uri_placeholders = collect_uri_placeholders(state, target_host);
-            let needs_aws_resign = takes_the_aws_re_sign_path(state, target_host, deferred);
             // A deferred door has a question to ask before anything leaves, which
             // only the MITM can ask, however the policy has changed since.
             let needs_mitm = deferred
@@ -1671,30 +1649,7 @@ async fn handle_connect(
                     &domain_http_rules,
                     &uri_placeholders,
                 );
-            if needs_aws_resign {
-                // AWS-resign path owns the MITM for this connection; any
-                // other injections configured for the same host would be
-                // silently ignored here. In practice `*.amazonaws.com`
-                // doesn't carry header injections, but surface the
-                // misconfiguration so it doesn't fail silently.
-                //
-                // HTTP rules are the exception: they are handed to the re-sign
-                // path below, which applies them itself.
-                if needs_mitm {
-                    tracing::warn!(
-                        target = %target_host,
-                        has_header_injections = injections.is_some(),
-                        has_uri_placeholders = !uri_placeholders.is_empty(),
-                        "aws-resign and other injections configured on same host — non-aws injections will be dropped"
-                    );
-                }
-                tracing::debug!(target = %target_host, "proxy DIRECT+AWS_RESIGN");
-                let port = extract_port(target_host, 443);
-                state
-                    .aws_resign
-                    .handle(client, &hostname, port, state, actor, &domain_http_rules)
-                    .await?;
-            } else if needs_mitm {
+            if needs_mitm {
                 let ca = get_or_init_ca(state)?;
                 let injs = injections.as_deref().unwrap_or(&[]);
                 tracing::debug!(target = %target_host, injections = injs.len(), http_rules = domain_http_rules.len(), uri_placeholders = uri_placeholders.len(), "proxy DIRECT+MITM");
@@ -2078,23 +2033,9 @@ async fn admit_https_destination(
 /// Whether the door admits an undecided destination without asking, because it
 /// holds token answers. An answered token request never leaves the proxy, so it
 /// raises no question; a request the proxy forwards from such a host waits for
-/// the decision the door would have asked for ([`gate_forwarded_request`]). The
-/// AWS re-sign path answers nothing and forwards every request, so a host it
-/// owns is asked about at the door.
+/// the decision the door would have asked for ([`gate_forwarded_request`]).
 fn defers_to_token_answers(state: &Arc<ProxyState>, target_host: &str) -> bool {
-    if !state.intercept_for_token_answer(target_host) {
-        return false;
-    }
-    if state.aws_resign.matches(target_host) {
-        tracing::warn!(target = %target_host, "token answers are not served on a host the aws re-sign path owns; asking at the door");
-        return false;
-    }
-    true
-}
-
-/// Whether a direct CONNECT goes to the AWS re-sign handler, which forwards without asking, so never one the door deferred, however the policy changed since.
-fn takes_the_aws_re_sign_path(state: &Arc<ProxyState>, target_host: &str, deferred: bool) -> bool {
-    !deferred && state.aws_resign.matches(target_host)
+    state.intercept_for_token_answer(target_host)
 }
 
 /// The door's question about `target_host`, asked for a request the proxy is
@@ -2136,6 +2077,7 @@ fn needs_interception(
         || state.intercept_for_unarmed(target_host)
         || state.intercept_for_llm(target_host)
         || state.intercept_for_token_answer(target_host)
+        || state.aws_signer.matches(target_host)
 }
 
 /// Handle an absolute-form `https://` request — `GET https://host/path HTTP/1.1`,
@@ -2224,10 +2166,10 @@ async fn handle_https_forward(
     let injections = collect_header_injections(state, target_host);
     let placeholders = collect_uri_placeholders(state, target_host);
 
-    // Two `CONNECT` interceptors accept the client's TLS themselves: the AWS
-    // re-sign path, and the mTLS bridge for a host with a client certificate.
-    // Here there is no TLS to accept, and relaying around them would reach the
-    // host without what they exist to add, so such a host is refused.
+    // The mTLS bridge for a host with a client certificate accepts the client's
+    // TLS itself. Here there is no TLS to accept, and relaying around it would
+    // reach the host without the certificate it exists to add, so such a host
+    // is refused.
     if transport == Transport::Direct {
         let bridged = state.ephemeral_ca.get().is_some()
             && state
@@ -2236,7 +2178,7 @@ async fn handle_https_forward(
                 .unwrap()
                 .contains_key(&target_host.to_lowercase())
             && !needs_interception(state, target_host, &injections, &http_rules, &placeholders);
-        if state.aws_resign.matches(target_host) || bridged {
+        if bridged {
             client.write_all(FORBIDDEN_RESPONSE).await?;
             emit_audit(state, target_host, "error", 403, actor);
             return Err(format!(
@@ -3445,20 +3387,13 @@ async fn handle_transparent_tls(
         Verdict::Allow => transport,
     };
 
-    // Specialised dispatch arms in the explicit-CONNECT path
-    // (`handle_connect`) take a RAW TcpStream and run their own TLS accept:
-    //   - aws_resign: re-signs SigV4 with the real STS creds
-    //   - client_cert: presents a client cert to the upstream (kubeconfig mTLS)
-    // The transparent path has already consumed the ClientHello via
-    // `LazyConfigAcceptor`, so those handlers can't be reused as-is. Until
-    // they learn to accept a pre-accepted TLS stream, deny the connection
-    // with a specific reason so the operator is alerted instead of silently
-    // getting wrong-signature or missing-cert upstream failures.
-    if state.aws_resign.matches(&target_host) {
-        emit_transparent_deny(state, orig_dst, "transparent-not-supported:aws-resign");
-        drop(start);
-        return Ok(());
-    }
+    // The mTLS bridge in the explicit-CONNECT path (`handle_connect`) takes a
+    // RAW TcpStream and runs its own TLS accept to present a client cert to the
+    // upstream (kubeconfig mTLS). The transparent path has already consumed the
+    // ClientHello via `LazyConfigAcceptor`, so that handler can't be reused
+    // as-is. Until it learns to accept a pre-accepted TLS stream, deny the
+    // connection with a specific reason so the operator is alerted instead of
+    // silently getting missing-cert upstream failures.
     let has_client_cert = {
         let map = state.client_certs.read().unwrap();
         map.contains_key(&target_host.to_lowercase())
@@ -3929,38 +3864,6 @@ pub(crate) fn emit_policy_deny_connect(
             method: "CONNECT",
             host: &host,
             path: None,
-        },
-        actor,
-    );
-}
-
-/// Audit a re-signed request denied by the route's HTTP rules. The reason is
-/// always `policy-deny`; `detail` says which rule refused it.
-pub(crate) fn emit_policy_deny_resigned(
-    state: &Arc<ProxyState>,
-    target_host: &str,
-    method: &str,
-    path: &str,
-    detail: &str,
-    actor: &crate::peer_process::ActorContext,
-) {
-    let host = extract_hostname(target_host);
-    emit_audit_action_with_metadata(
-        state,
-        "failure",
-        403,
-        Some(serde_json::json!({
-            "host": target_host,
-            "mitm": true,
-            "aws_resign": true,
-            "reason": "policy-deny",
-            "detail": detail,
-        })),
-        RequestFacts {
-            action: &format!("{method} https://{target_host}{path}"),
-            method,
-            host: &host,
-            path: Some(path),
         },
         actor,
     );
@@ -4724,7 +4627,7 @@ pub(crate) mod tests {
             sandbox_tls_connector: RwLock::new(None),
             previous_policy_files: RwLock::new(Vec::new()),
             sandbox_creds: None,
-            aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
+            aws_signer: crate::signing::AwsSigner::new(),
             pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
             credential_pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
             placeholder_index: RwLock::new(HashMap::new()),
@@ -7211,27 +7114,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn connect_refuses_an_llm_claim_the_aws_resign_path_would_swallow() {
-        // The re-sign path delivers to the host the sandbox named and knows
-        // nothing of `llm`. Letting it have the connection would send the
-        // request — signed — to the API the redirect exists to withhold it from.
-        let (state, mut rx) = test_state();
-        install_llm_route(&state, "bedrock.example.com", Transport::Direct);
-        state
-            .aws_resign
-            .update(Default::default(), vec!["bedrock.example.com".to_string()]);
-
-        let (answer, reason) = connect_answer(&state, "bedrock.example.com:443").await;
-        assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
-        assert!(reason.contains("aws re-sign"), "{reason}");
-        let events = drain_audit_lines(&mut rx);
-        assert!(
-            events.iter().any(|ev| ev["result"] == "error"),
-            "every occurrence of a misconfiguration is recorded: {events:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn a_tunnelled_llm_claim_is_given_the_ca_it_needs() {
         // Without one this branch splices the connection, and a spliced
         // connection carries the request to the API the route claims it from.
@@ -8927,34 +8809,15 @@ pub(crate) mod tests {
         handler.abort();
     }
 
-    #[test]
-    fn a_connection_the_door_deferred_is_never_re_signed_whatever_the_policy_says_later() {
-        // The door deferred this host; a policy frame then adds an aws re-sign domain
-        // that matches it before the dispatch reads the policy again.
-        let (state, _rx) = test_state();
-        state.aws_resign.update(
-            std::collections::HashMap::new(),
-            vec!["auth.some-provider.example".to_string()],
-        );
-        assert!(
-            !takes_the_aws_re_sign_path(&state, "auth.some-provider.example:443", true),
-            "the re-sign path forwards without asking, so a deferred connection stays on the MITM"
-        );
-        assert!(takes_the_aws_re_sign_path(
-            &state,
-            "auth.some-provider.example:443",
-            false
-        ));
-    }
-
     #[tokio::test]
-    async fn a_token_host_the_aws_re_sign_path_owns_is_asked_about_at_the_door() {
-        // The re-sign path answers no token request and forwards every one, so
-        // admitting it unasked would let requests leave with no question.
+    async fn a_token_host_whose_requests_are_signed_is_admitted_for_its_answers() {
+        // Signing is a step of the MITM pipeline, which serves token answers and
+        // asks about whatever it forwards. So the door defers such a host as it
+        // defers any other token host.
         let (state, mut rx) = test_state();
         state.policy.write().unwrap().default_verdict = Verdict::Ask;
         state.policy.write().unwrap().default_transport = Transport::Direct;
-        state.aws_resign.update(
+        state.aws_signer.update(
             std::collections::HashMap::new(),
             vec!["auth.some-provider.example".to_string()],
         );
@@ -8989,25 +8852,23 @@ pub(crate) mod tests {
             .await
         });
 
-        let asked = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(frame) = rx.recv().await {
-                if frame.contains("request_pending") {
-                    return true;
-                }
-            }
-            false
-        })
-        .await
-        .unwrap_or(false);
-        assert!(asked, "the door asks before the re-sign path can forward");
         use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the tunnel opens without a question")
+            .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), client.read(&mut buf))
-                .await
-                .is_err(),
-            "no tunnel opens while the question is open"
+            String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&buf[..n])
         );
+        while let Ok(frame) = rx.try_recv() {
+            assert!(
+                !frame.contains("request_pending"),
+                "no question about the destination at the door: {frame}"
+            );
+        }
         handler.abort();
     }
 
