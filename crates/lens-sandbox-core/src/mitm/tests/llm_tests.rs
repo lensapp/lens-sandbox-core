@@ -282,6 +282,7 @@ async fn run(
         state: &state,
         match_host: FRONT_HOST,
         actor: &test_actor,
+        gate_deferred: false,
     };
 
     let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, FRONT_HOST).unwrap());

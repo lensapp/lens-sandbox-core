@@ -53,6 +53,10 @@ pub struct MitmContext<'a> {
     /// which would never satisfy a `host:port` credential pattern.
     pub match_host: &'a str,
     pub actor: &'a crate::peer_process::ActorContext,
+    /// The door admitted this undecided destination without asking, for its
+    /// token answers: a request it forwards waits for that question first,
+    /// however the policy has changed since.
+    pub gate_deferred: bool,
 }
 
 /// Outputs from request-head parsing that the relay needs after
@@ -1276,9 +1280,7 @@ where
 
     // A destination nobody has decided was admitted only for its token answers:
     // what is forwarded waits for the decision the door would have asked for.
-    if crate::proxy::gate_deferred(ctx.state, ctx.match_host, ctx.actor.process())
-        && !crate::proxy::gate_forwarded_request(ctx.state, ctx.match_host).await
-    {
+    if ctx.gate_deferred && !crate::proxy::gate_forwarded_request(ctx.state, ctx.match_host).await {
         return Err(facts
             .deny(
                 &mut tls_client,
@@ -2766,6 +2768,7 @@ mod tests {
             state: &state,
             match_host: hostname,
             actor: &test_actor,
+            gate_deferred: false,
         };
         let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
         let acceptor = TlsAcceptor::from(mitm_server_config);
@@ -3093,6 +3096,7 @@ mod tests {
             state: &state,
             match_host: hostname,
             actor: &actor,
+            gate_deferred: false,
         };
         let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, hostname).unwrap());
         let tls_client = acceptor.accept(client_stream).await.unwrap();
@@ -3119,6 +3123,7 @@ mod tests {
         answers: Vec<crate::token_answer::TokenAnswer>,
         request: &'static [u8],
         decision: crate::protocol::Decision,
+        answers_removed_after_the_door: bool,
     ) -> (Result<(String, Option<Vec<u8>>), String>, String, bool) {
         use tokio::net::TcpListener;
 
@@ -3182,7 +3187,11 @@ mod tests {
             state: &state,
             match_host: hostname,
             actor: &actor,
+            gate_deferred: true,
         };
+        if answers_removed_after_the_door {
+            state.token_answers.write().unwrap().clear();
+        }
         let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, hostname).unwrap());
         let tls_client = acceptor.accept(client_stream).await.unwrap();
         let outcome = match mitm_inject_after_accept(tls_client, hostname, &ctx, true).await {
@@ -3210,6 +3219,7 @@ mod tests {
             vec![refresh_answer("placeholder-token")],
             HELD_REFRESH,
             crate::protocol::Decision::DenyOnce,
+            false,
         )
         .await;
 
@@ -3227,6 +3237,7 @@ mod tests {
             vec![refresh_answer("placeholder-token")],
             OTHER_REQUEST,
             crate::protocol::Decision::AllowOnce,
+            false,
         )
         .await;
         assert!(asked, "the destination is decided before anything leaves");
@@ -3237,9 +3248,26 @@ mod tests {
             vec![refresh_answer("placeholder-token")],
             OTHER_REQUEST,
             crate::protocol::Decision::DenyOnce,
+            false,
         )
         .await;
         assert!(asked);
+        assert!(outcome.is_err(), "denied, so never forwarded");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_request_the_door_deferred_is_asked_about_after_its_token_answer_is_withdrawn() {
+        // The door admitted the host without asking; a policy frame that removes the
+        // answer before the request arrives must not let the request leave unasked.
+        let (outcome, response, asked) = run_undecided_token_host(
+            vec![refresh_answer("placeholder-token")],
+            OTHER_REQUEST,
+            crate::protocol::Decision::DenyOnce,
+            true,
+        )
+        .await;
+        assert!(asked, "the door's question is still asked");
         assert!(outcome.is_err(), "denied, so never forwarded");
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     }
@@ -3378,6 +3406,7 @@ mod tests {
                 state: &state,
                 match_host: hostname,
                 actor: &actor,
+                gate_deferred: false,
             };
             let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, hostname).unwrap());
             let tls_client = acceptor.accept(client_stream).await.unwrap();
@@ -5845,6 +5874,7 @@ mod tests {
                 state: &state,
                 match_host,
                 actor: &test_actor,
+                gate_deferred: false,
             };
             let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
             let acceptor = TlsAcceptor::from(mitm_server_config);
@@ -6232,6 +6262,7 @@ mod tests {
             state: &state,
             match_host: hostname,
             actor: &test_actor,
+            gate_deferred: false,
         };
         let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
         let acceptor = TlsAcceptor::from(mitm_server_config);
@@ -6400,6 +6431,7 @@ mod tests {
                 state: &state,
                 match_host: hostname,
                 actor: &test_actor,
+                gate_deferred: false,
             };
             let mitm_server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
             let acceptor = TlsAcceptor::from(mitm_server_config);
@@ -6496,6 +6528,7 @@ mod tests {
             state: &state,
             match_host: hostname,
             actor: &actor,
+            gate_deferred: false,
         };
         let server_config = build_ephemeral_server_config(&ca, hostname).unwrap();
         let tls_client = TlsAcceptor::from(server_config)
