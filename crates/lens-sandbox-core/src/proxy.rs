@@ -1660,7 +1660,7 @@ async fn handle_connect(
             );
 
             let uri_placeholders = collect_uri_placeholders(state, target_host);
-            let needs_aws_resign = state.aws_resign.matches(target_host);
+            let needs_aws_resign = takes_the_aws_re_sign_path(state, target_host, deferred);
             // A deferred door has a question to ask before anything leaves, which
             // only the MITM can ask, however the policy has changed since.
             let needs_mitm = deferred
@@ -2090,6 +2090,11 @@ fn defers_to_token_answers(state: &Arc<ProxyState>, target_host: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Whether a direct CONNECT goes to the AWS re-sign handler, which forwards without asking, so never one the door deferred, however the policy changed since.
+fn takes_the_aws_re_sign_path(state: &Arc<ProxyState>, target_host: &str, deferred: bool) -> bool {
+    !deferred && state.aws_resign.matches(target_host)
 }
 
 /// The door's question about `target_host`, asked for a request the proxy is
@@ -8920,6 +8925,26 @@ pub(crate) mod tests {
             );
         }
         handler.abort();
+    }
+
+    #[test]
+    fn a_connection_the_door_deferred_is_never_re_signed_whatever_the_policy_says_later() {
+        // The door deferred this host; a policy frame then adds an aws re-sign domain
+        // that matches it before the dispatch reads the policy again.
+        let (state, _rx) = test_state();
+        state.aws_resign.update(
+            std::collections::HashMap::new(),
+            vec!["auth.some-provider.example".to_string()],
+        );
+        assert!(
+            !takes_the_aws_re_sign_path(&state, "auth.some-provider.example:443", true),
+            "the re-sign path forwards without asking, so a deferred connection stays on the MITM"
+        );
+        assert!(takes_the_aws_re_sign_path(
+            &state,
+            "auth.some-provider.example:443",
+            false
+        ));
     }
 
     #[tokio::test]
