@@ -868,10 +868,10 @@ impl RequestFacts<'_, '_> {
             });
             send_audit(tx, event, self.ctx.actor);
         }
-        let block = if flag == "credential_gate_denied" {
-            crate::blocked::BlockReason::CredentialGate
-        } else {
-            crate::blocked::BlockReason::PolicyDeny
+        let block = match flag {
+            "credential_gate_denied" => crate::blocked::BlockReason::CredentialGate,
+            "gate_denied" => crate::blocked::BlockReason::AskDeclined,
+            _ => crate::blocked::BlockReason::PolicyDeny,
         };
         tls_client
             .write_all(&crate::blocked::response(
@@ -3254,6 +3254,10 @@ mod tests {
         assert!(asked);
         assert!(outcome.is_err(), "denied, so never forwarded");
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("X-Sandbox-Blocked: ask-declined\r\n"),
+            "declined as the door declines it, not as a rule's deny: {response}"
+        );
     }
 
     #[tokio::test]
