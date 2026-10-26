@@ -1648,7 +1648,7 @@ async fn handle_connect(
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await?;
 
-            tracing::info!(
+            tracing::debug!(
                 target = %target_host,
                 has_injections = injections.is_some(),
                 has_client_cert = client_cert.is_some(),
