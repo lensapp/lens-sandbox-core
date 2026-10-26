@@ -228,10 +228,10 @@ fn kill_agent(child: &mut Child, signal: nix::sys::signal::Signal) {
 /// Why it's careful: `tokio::process::Child::wait()` calls
 /// `waitpid(agent_pid, ...)` to retrieve the exit status. If we
 /// `waitpid(-1, WNOHANG)` and win the race for the agent's PID, tokio
-/// sees `ECHILD` and loses the real exit code. So the reaper scans the
-/// supervisor's current direct children via `/proc/<pid>/task/<pid>/children`
-/// and only calls `waitpid(pid, WNOHANG)` on PIDs that are *not* the
-/// protected agent PID and *not* registered in the [`PidGuard`] set.
+/// sees `ECHILD` and loses the real exit code. So the reaper scans `/proc`
+/// for the supervisor's current direct children and only calls
+/// `waitpid(pid, WNOHANG)` on PIDs that are *not* the protected agent PID
+/// and *not* registered in the [`PidGuard`] set.
 /// Grandchildren that reparented to us are in neither, so they get
 /// reaped; the agent and any in-flight exec children are left to their
 /// own `Child::wait()`.
@@ -345,7 +345,7 @@ async fn run_reaper(protected: tokio::sync::watch::Receiver<Option<i32>>, guard:
 
 /// Reap every direct child of this process whose PID is neither
 /// `protected_pid` nor registered in `guard`, taking a single snapshot of
-/// `/proc/<self>/task/<self>/children` and calling `waitpid(pid, WNOHANG)`
+/// the direct children in `/proc` and calling `waitpid(pid, WNOHANG)`
 /// per entry. SIGCHLD coalesces, but we don't loop here — a still-running
 /// child returns `StillAlive` and the next SIGCHLD covers any new exits.
 #[cfg(target_os = "linux")]
@@ -373,31 +373,43 @@ fn reap_orphans(protected_pid: i32, guard: &PidGuard) {
     }
 }
 
-/// Read this supervisor's *current* direct children from `/proc`. Iterates
-/// every task (thread) under `/proc/<pid>/task/` because the kernel exposes
-/// the children list per-task — a child fork()ed from a tokio worker only
-/// shows up under that worker's tid, not the TGL's.
+/// Read this supervisor's *current* direct children: every process in
+/// `/proc` whose parent is this one. Not `/proc/<pid>/task/<tid>/children`,
+/// which only a kernel built with `CONFIG_PROC_CHILDREN` has.
 ///
-/// Returns an empty vec on any I/O error — the next SIGCHLD will trigger
-/// another scan, so transient failures self-heal.
+/// A process that exits during the scan is skipped; the next SIGCHLD
+/// covers it.
 #[cfg(target_os = "linux")]
 fn current_children() -> Vec<i32> {
-    let pid = std::process::id();
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in tasks.flatten() {
-        let path = entry.path().join("children");
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            out.extend(
-                contents
-                    .split_ascii_whitespace()
-                    .filter_map(|s| s.parse::<i32>().ok()),
-            );
+    let me = std::process::id() as i32;
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(e) => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(error = %e, "could not read /proc; orphans are not reaped");
+            });
+            return Vec::new();
         }
-    }
-    out
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| parent_pid(&stat))
+                == Some(me)
+        })
+        .collect()
+}
+
+/// The parent PID from a `/proc/<pid>/stat` line. The process name can hold
+/// spaces and `)`, so the fields are counted from the last `)`.
+#[cfg(target_os = "linux")]
+fn parent_pid(stat: &str) -> Option<i32> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields.split_ascii_whitespace().nth(1)?.parse().ok()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -446,6 +458,14 @@ mod tests {
         guard.release(1234);
         assert!(!guard.contains(1234));
         assert!(reaper_view.contains(42), "unrelated PID must stay guarded");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_pid_counts_fields_from_the_last_parenthesis() {
+        assert_eq!(parent_pid("977 (sh) S 1 977 977 0 -1"), Some(1));
+        assert_eq!(parent_pid("42 (a) (b) c) R 7 42 42 0 -1"), Some(7));
+        assert_eq!(parent_pid("42 (no parent"), None);
     }
 
     /// /proc-backed child enumeration matches `tokio::process::Child::id()`
