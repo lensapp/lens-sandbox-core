@@ -396,7 +396,7 @@ fn current_children() -> Vec<i32> {
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
         .filter(|pid| {
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            std::fs::read(format!("/proc/{pid}/stat"))
                 .ok()
                 .and_then(|stat| parent_pid(&stat))
                 == Some(me)
@@ -405,10 +405,12 @@ fn current_children() -> Vec<i32> {
 }
 
 /// The parent PID from a `/proc/<pid>/stat` line. The process name can hold
-/// spaces and `)`, so the fields are counted from the last `)`.
+/// spaces and `)`, so the fields are counted from the last `)`. It need not
+/// be UTF-8 either, so only the fields after it are decoded.
 #[cfg(target_os = "linux")]
-fn parent_pid(stat: &str) -> Option<i32> {
-    let (_, fields) = stat.rsplit_once(')')?;
+fn parent_pid(stat: &[u8]) -> Option<i32> {
+    let name_end = stat.iter().rposition(|&b| b == b')')?;
+    let fields = std::str::from_utf8(&stat[name_end + 1..]).ok()?;
     fields.split_ascii_whitespace().nth(1)?.parse().ok()
 }
 
@@ -463,9 +465,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn parent_pid_counts_fields_from_the_last_parenthesis() {
-        assert_eq!(parent_pid("977 (sh) S 1 977 977 0 -1"), Some(1));
-        assert_eq!(parent_pid("42 (a) (b) c) R 7 42 42 0 -1"), Some(7));
-        assert_eq!(parent_pid("42 (no parent"), None);
+        assert_eq!(parent_pid(b"977 (sh) S 1 977 977 0 -1"), Some(1));
+        assert_eq!(parent_pid(b"42 (a) (b) c) R 7 42 42 0 -1"), Some(7));
+        assert_eq!(parent_pid(b"42 (no parent"), None);
+    }
+
+    /// The kernel cuts a name to 15 bytes, which can split a UTF-8
+    /// character: such a process must still be found, or its zombie stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_pid_reads_a_name_that_is_not_utf8() {
+        assert_eq!(
+            parent_pid(b"977 (agent-\xe2\x82) Z 1 977 977 0 -1"),
+            Some(1)
+        );
     }
 
     /// /proc-backed child enumeration matches `tokio::process::Child::id()`
