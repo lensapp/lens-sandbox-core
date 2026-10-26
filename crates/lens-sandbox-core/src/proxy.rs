@@ -1597,6 +1597,7 @@ async fn handle_connect(
         transport: effective_transport,
         tls_terminate,
         http_rules: domain_http_rules,
+        deferred,
     } = match admit_https_destination(state, target_host, actor).await {
         Ok(admission) => admission,
         Err(reason) => return refuse_connect(client, target_host, reason, state).await,
@@ -1660,13 +1661,16 @@ async fn handle_connect(
 
             let uri_placeholders = collect_uri_placeholders(state, target_host);
             let needs_aws_resign = state.aws_resign.matches(target_host);
-            let needs_mitm = needs_interception(
-                state,
-                target_host,
-                injections.as_deref().unwrap_or(&[]),
-                &domain_http_rules,
-                &uri_placeholders,
-            );
+            // A deferred door has a question to ask before anything leaves, which
+            // only the MITM can ask, however the policy has changed since.
+            let needs_mitm = deferred
+                || needs_interception(
+                    state,
+                    target_host,
+                    injections.as_deref().unwrap_or(&[]),
+                    &domain_http_rules,
+                    &uri_placeholders,
+                );
             if needs_aws_resign {
                 // AWS-resign path owns the MITM for this connection; any
                 // other injections configured for the same host would be
@@ -1711,6 +1715,7 @@ async fn handle_connect(
                     state,
                     match_host: target_host,
                     actor,
+                    gate_deferred: deferred,
                 };
                 crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
             } else if let (Some(cc), Some(ca)) = (&client_cert, state.ephemeral_ca.get()) {
@@ -1755,7 +1760,7 @@ async fn handle_connect(
             // opens only for a request that is forwarded, and an upstream that
             // refuses the host cannot fail an answer. The CA is made here if it
             // has to be, since an answer cannot survive a splice.
-            if state.intercept_for_token_answer(target_host) {
+            if deferred || state.intercept_for_token_answer(target_host) {
                 let ca = get_or_init_ca(state)?;
                 client
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -1774,6 +1779,7 @@ async fn handle_connect(
                     state,
                     match_host: target_host,
                     actor,
+                    gate_deferred: deferred,
                 };
                 let mode = crate::mitm::UpstreamMode::TunnelOnDemand {
                     target: target_host.to_string(),
@@ -1902,6 +1908,7 @@ async fn handle_connect(
                         state,
                         match_host: target_host,
                         actor,
+                        gate_deferred: deferred,
                     };
                     crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
                 } else {
@@ -1938,6 +1945,7 @@ async fn handle_connect(
                         state,
                         match_host: target_host,
                         actor,
+                        gate_deferred: deferred,
                     };
                     crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
                 } else {
@@ -1999,6 +2007,8 @@ struct HttpsAdmission {
     transport: Transport,
     tls_terminate: bool,
     http_rules: Vec<HttpRule>,
+    /// Admitted without asking, for its token answers ([`defers_to_token_answers`]).
+    deferred: bool,
 }
 
 /// Admit an HTTPS destination, written `host:port`, the way a `CONNECT` to it
@@ -2025,13 +2035,14 @@ async fn admit_https_destination(
         return Err(crate::blocked::BlockReason::BinaryNotAllowed);
     };
 
+    let deferred = verdict == Verdict::Ask && defers_to_token_answers(state, target_host);
     match verdict {
         Verdict::Deny => {
             tracing::info!(target = %target_host, "proxy DENIED");
             emit_policy_deny_connect(state, target_host, "policy-deny", actor);
             return Err(crate::blocked::BlockReason::PolicyDeny);
         }
-        Verdict::Ask if state.intercept_for_token_answer(target_host) => {
+        Verdict::Ask if deferred => {
             tracing::info!(target = %target_host, "proxy ADMITTED for token answers (forwarded requests are gated)");
         }
         Verdict::Ask => {
@@ -2060,26 +2071,29 @@ async fn admit_https_destination(
         transport,
         tls_terminate,
         http_rules,
+        deferred,
     })
 }
 
-/// Whether a destination nobody has decided was admitted without asking because
-/// it holds token answers. An answered token request never leaves the proxy, so
-/// it raises no question; a request the proxy forwards from such a host waits
-/// for the decision the door would have asked for ([`gate_forwarded_request`]).
-pub(crate) fn gate_deferred(
-    state: &Arc<ProxyState>,
-    target_host: &str,
-    caller: Option<&crate::peer_process::PeerProcess>,
-) -> bool {
-    matches!(
-        resolve_route(state, target_host, Scheme::Https, caller),
-        Some((Verdict::Ask, ..))
-    ) && state.intercept_for_token_answer(target_host)
+/// Whether the door admits an undecided destination without asking, because it
+/// holds token answers. An answered token request never leaves the proxy, so it
+/// raises no question; a request the proxy forwards from such a host waits for
+/// the decision the door would have asked for ([`gate_forwarded_request`]). The
+/// AWS re-sign path answers nothing and forwards every request, so a host it
+/// owns is asked about at the door.
+fn defers_to_token_answers(state: &Arc<ProxyState>, target_host: &str) -> bool {
+    if !state.intercept_for_token_answer(target_host) {
+        return false;
+    }
+    if state.aws_resign.matches(target_host) {
+        tracing::warn!(target = %target_host, "token answers are not served on a host the aws re-sign path owns; asking at the door");
+        return false;
+    }
+    true
 }
 
 /// The door's question about `target_host`, asked for a request the proxy is
-/// about to forward from a host [`gate_deferred`] admitted: the same key, action
+/// about to forward from a host [`defers_to_token_answers`] admitted: the same key, action
 /// and audit, so one answer covers both and the developer sees one question.
 pub(crate) async fn gate_forwarded_request(state: &Arc<ProxyState>, target_host: &str) -> bool {
     let action_str = format!("CONNECT {target_host}");
@@ -2182,6 +2196,7 @@ async fn handle_https_forward(
     let HttpsAdmission {
         transport,
         http_rules,
+        deferred,
         ..
     } = match admit_https_destination(state, target_host, actor).await {
         Ok(admission) => admission,
@@ -2243,7 +2258,7 @@ async fn handle_https_forward(
         },
         // The proxy answers this host's token requests itself, so its tunnel
         // opens only for a request that is forwarded — as on the CONNECT door.
-        Transport::Upstream if state.intercept_for_token_answer(target_host) => {
+        Transport::Upstream if deferred || state.intercept_for_token_answer(target_host) => {
             crate::mitm::UpstreamMode::TunnelOnDemand {
                 target: target_host.to_string(),
             }
@@ -2287,6 +2302,7 @@ async fn handle_https_forward(
         state,
         match_host: target_host,
         actor,
+        gate_deferred: deferred,
     };
     let mut client = Answered::new(client);
     let result = crate::mitm::handle_mitm_pre_accepted(&mut client, &hostname, mode, &ctx).await;
@@ -3379,6 +3395,7 @@ async fn handle_transparent_tls(
         }
     };
 
+    let deferred = verdict == Verdict::Ask && defers_to_token_answers(state, &target_host);
     let effective_transport = match verdict {
         Verdict::Deny => {
             emit_policy_deny_connect(state, &target_host, "policy-deny", &actor);
@@ -3390,7 +3407,7 @@ async fn handle_transparent_tls(
             )
             .await;
         }
-        Verdict::Ask if state.intercept_for_token_answer(&target_host) => {
+        Verdict::Ask if deferred => {
             tracing::info!(target = %target_host, "transparent TLS ADMITTED for token answers (forwarded requests are gated)");
             transport
         }
@@ -3485,6 +3502,7 @@ async fn handle_transparent_tls(
         state,
         match_host: &target_host,
         actor: &actor,
+        gate_deferred: deferred,
     };
 
     match effective_transport {
@@ -3501,7 +3519,7 @@ async fn handle_transparent_tls(
             // pre-accepted TLS stream to the MITM pipeline, unless the proxy
             // answers this host's token requests itself. No success audit
             // here — the MITM pipeline audits per request.
-            let mode = if state.intercept_for_token_answer(&target_host) {
+            let mode = if deferred || state.intercept_for_token_answer(&target_host) {
                 crate::mitm::UpstreamMode::TunnelOnDemand {
                     target: target_host.clone(),
                 }
@@ -8901,6 +8919,70 @@ pub(crate) mod tests {
                 "no question about the destination at the door: {frame}"
             );
         }
+        handler.abort();
+    }
+
+    #[tokio::test]
+    async fn a_token_host_the_aws_re_sign_path_owns_is_asked_about_at_the_door() {
+        // The re-sign path answers no token request and forwards every one, so
+        // admitting it unasked would let requests leave with no question.
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Ask;
+        state.policy.write().unwrap().default_transport = Transport::Direct;
+        state.aws_resign.update(
+            std::collections::HashMap::new(),
+            vec!["auth.some-provider.example".to_string()],
+        );
+        state.token_answers.write().unwrap().insert(
+            "auth.some-provider.example".to_string(),
+            vec![
+                crate::token_answer::TokenAnswer::refresh_token(
+                    "some-credential",
+                    "/oauth/token",
+                    "placeholder-refresh",
+                    "placeholder-token",
+                    3600,
+                )
+                .unwrap(),
+            ],
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            let actor =
+                crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
+            handle_connect(
+                server,
+                "auth.some-provider.example:443",
+                &actor,
+                &state_for_handler,
+            )
+            .await
+        });
+
+        let asked = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(frame) = rx.recv().await {
+                if frame.contains("request_pending") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(asked, "the door asks before the re-sign path can forward");
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client.read(&mut buf))
+                .await
+                .is_err(),
+            "no tunnel opens while the question is open"
+        );
         handler.abort();
     }
 
