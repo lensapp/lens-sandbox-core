@@ -656,16 +656,35 @@ async fn a_route_that_translates_nothing_still_swaps_the_backend_and_the_key() {
 /// the backend with the backend's key, as from any other host.
 #[tokio::test]
 async fn a_redirect_from_a_host_whose_requests_are_re_signed_is_served() {
+    const PLACEHOLDER: &str = "LENSFAKE00AABB0000CC";
     let (state, audit_rx) = crate::proxy::tests::test_state();
     state
         .aws_signer
         .update(Default::default(), vec![FRONT_HOST.to_string()]);
+    state
+        .placeholder_index
+        .write()
+        .unwrap()
+        .insert(PLACEHOLDER.to_string(), "aws:connection-1".to_string());
+    // The sandbox signed with its placeholder key, as an AWS SDK does.
+    let request = String::from_utf8(anthropic_request(ANTHROPIC_BODY))
+        .expect("the head is text")
+        .replacen(
+            "Host:",
+            &format!(
+                "Authorization: AWS4-HMAC-SHA256 \
+                 Credential={PLACEHOLDER}/20260101/us-east-1/bedrock/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature=00\r\n\
+                 X-Amz-Date: 20260101T000000Z\r\nHost:"
+            ),
+            1,
+        );
     let (upstream, _, _) = run_on(
         state,
         audit_rx,
         ROUTES,
         LLM,
-        anthropic_request(ANTHROPIC_BODY),
+        request.into_bytes(),
         openai_answer(OPENAI_BODY),
         false,
     )
@@ -676,6 +695,10 @@ async fn a_redirect_from_a_host_whose_requests_are_re_signed_is_served() {
         "{upstream}"
     );
     assert!(upstream.contains("Bearer real-vllm-key"), "{upstream}");
+    assert!(
+        !upstream.contains(PLACEHOLDER) && !upstream.contains("AWS4-HMAC-SHA256"),
+        "the placeholder signature does not cross the redirect: {upstream}"
+    );
 }
 
 /// A backend on a host whose requests are re-signed answers to its own
