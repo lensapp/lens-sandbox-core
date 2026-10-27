@@ -159,9 +159,18 @@ async fn upstream_of(spec: &HarnessRequest<'_>, http_rules: Vec<HttpRule>) -> (S
 
 /// Send `request` and return what the client was answered, when the pipeline
 /// refuses it before anything is forwarded.
+///
+/// The credential gate does not see the signature headers on a signed host, so
+/// the refusal is the only thing that keeps the placeholder signature from
+/// leaving.
 async fn refusal_of(request: Vec<u8>) -> (String, Vec<serde_json::Value>) {
     let (state, audit_rx) = signing_state(TEST_HOSTNAME);
-    let (_, client, audits) = run_signed(state, audit_rx, TEST_HOSTNAME, vec![], request).await;
+    let (outcome, client, audits) =
+        run_signed(state, audit_rx, TEST_HOSTNAME, vec![], request).await;
+    assert!(
+        outcome.starts_with("aws resign: "),
+        "the refused request must not reach the origin: {outcome}"
+    );
     (client, audits)
 }
 
