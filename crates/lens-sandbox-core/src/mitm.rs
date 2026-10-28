@@ -82,6 +82,73 @@ struct RequestMeta {
     /// Where an `llm` route sent this request, when one claimed it. It decides
     /// the host that is dialled and the shape the answer comes back in.
     redirect: Option<Box<crate::llm::Redirect>>,
+    /// The audit record of the forwarded request, sent with what the origin
+    /// answered.
+    audit: crate::upstream_answer::PendingAudit,
+    /// What it takes to send this request again with a renewed credential, when
+    /// it can be sent again at all. See [`Resend`].
+    resend: Option<Resend>,
+}
+
+/// A request the proxy can send once more, with the credential it carried
+/// renewed.
+///
+/// A credential the host renews is retired by its issuer the moment the new
+/// value exists, so a request already on its way with the old value is refused
+/// `401`. The workload never held the value and cannot know to try again; the
+/// proxy can, once, when everything it sent is still in hand: the head before
+/// any credential went in, and a body it read whole. A request whose body it
+/// relayed as it arrived, an upgrade, and a request an `llm` route translated
+/// are never sent twice.
+struct Resend {
+    /// The head before credential injection, after every rewrite that is not a
+    /// credential's.
+    head: String,
+    /// The header credentials the request went out with.
+    sent: Vec<CredentialInjection>,
+    /// The host whose credentials are looked up again: the one `sent` came from.
+    match_host: String,
+    /// The URI placeholders the request line was rewritten with. A renewal of
+    /// one of these is not looked for; the line is rewritten as it was.
+    placeholders: Vec<(String, String)>,
+    /// What an MCP rule read of the request, to check the new head against.
+    mcp: Option<crate::mcp::RequestInfo>,
+    /// The length of the body read whole, sent again after the head.
+    body_len: Option<usize>,
+}
+
+impl Resend {
+    /// The head to send again, when a header credential this request carried
+    /// now has another value; `None` when nothing it carried was renewed, or
+    /// the new head would not pass where the first one did.
+    fn renewed_head(&self, state: &Arc<crate::proxy::ProxyState>) -> Option<String> {
+        let current = crate::proxy::collect_header_injections(state, &self.match_host);
+        let sent = matching_injections(&self.head, &self.sent);
+        let now = matching_injections(&self.head, &current);
+        let renewed = sent.iter().any(|old| {
+            now.iter()
+                .any(|new| new.header.eq_ignore_ascii_case(&old.header) && new.value != old.value)
+        });
+        // A credential that travels in the body went into the body read the
+        // first time, so the body would still carry the old value.
+        if !renewed || now.iter().any(|injection| injection.body.is_some()) {
+            return None;
+        }
+        let head =
+            rewrite_uri_placeholders(&inject_headers(&self.head, &current), &self.placeholders);
+        if !scan_for_unarmed_placeholders(state, &head).is_empty() {
+            return None;
+        }
+        if let Some(info) = &self.mcp
+            && crate::mcp::check_headers_agree(&head, info).is_err()
+        {
+            return None;
+        }
+        Some(match self.body_len {
+            Some(len) => crate::http_body::reframe_head_as_content_length(&head, len),
+            None => head,
+        })
+    }
 }
 
 /// Who a request is being sent to, once policy has had its say.
@@ -251,16 +318,18 @@ where
             // CIDR rule binds by address, so this is the first point at which it
             // can be applied to a target the client named. Skipping it would let
             // a CIDR deny hold on the transparent door and not here.
-            let target_stream = crate::proxy::connect_egress_under_policy(
-                ctx.state,
-                &format!("{host}:{port}"),
-                port,
-                ctx.actor.process(),
-                crate::proxy::Gated::NotAsked,
-            )
-            .await?;
-            let mut tls_upstream =
-                connect_upstream_tls(target_stream, &host, None, None, ctx.extra_ca_certs).await?;
+            let dial = async || {
+                let target_stream = crate::proxy::connect_egress_under_policy(
+                    ctx.state,
+                    &format!("{host}:{port}"),
+                    port,
+                    ctx.actor.process(),
+                    crate::proxy::Gated::NotAsked,
+                )
+                .await?;
+                connect_upstream_tls(target_stream, &host, None, None, ctx.extra_ca_certs).await
+            };
+            let mut tls_upstream = dial().await?;
             write_request_head_and_body(&mut tls_upstream, &modified, &meta).await?;
             match &meta.redirect {
                 // The answer is in the backend's format and the sandbox is
@@ -274,13 +343,25 @@ where
                     .await?;
                 }
                 None => {
-                    let denial = forward_or_bridge(tls_client, tls_upstream, &meta).await?;
+                    let denial =
+                        forward_renewing(tls_client, tls_upstream, &meta, ctx.state, dial).await?;
                     audit_frame_denial(ctx, target_host, is_tunnel, &meta, denial);
                 }
             }
         }
+        // A tunnel handed over already open cannot be opened again, so a
+        // request through one is never sent twice.
         UpstreamMode::TunnelTls(upstream) => {
-            relay_through_tunnel(tls_client, upstream, target_host, &modified, &meta, ctx).await?;
+            relay_through_tunnel(
+                tls_client,
+                upstream,
+                target_host,
+                &modified,
+                &meta,
+                ctx,
+                None,
+            )
+            .await?;
         }
         UpstreamMode::TunnelOnDemand { target } => {
             let upstream =
@@ -302,7 +383,16 @@ where
                         return Err(e);
                     }
                 };
-            relay_through_tunnel(tls_client, upstream, target_host, &modified, &meta, ctx).await?;
+            relay_through_tunnel(
+                tls_client,
+                upstream,
+                target_host,
+                &modified,
+                &meta,
+                ctx,
+                Some(&target),
+            )
+            .await?;
         }
     }
 
@@ -310,6 +400,8 @@ where
 }
 
 /// Forward the request through an open tunnel and relay what comes back.
+/// `reopen` is the tunnel target, when another tunnel to it can be opened to
+/// send the request again.
 async fn relay_through_tunnel<C>(
     tls_client: C,
     upstream: crate::proxy::BoxedSandboxStream,
@@ -317,6 +409,7 @@ async fn relay_through_tunnel<C>(
     modified: &str,
     meta: &RequestMeta,
     ctx: &MitmContext<'_>,
+    reopen: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -324,7 +417,17 @@ where
     let mut tls_upstream =
         connect_upstream_tls(upstream, target_host, None, None, ctx.extra_ca_certs).await?;
     write_request_head_and_body(&mut tls_upstream, modified, meta).await?;
-    let denial = forward_or_bridge(tls_client, tls_upstream, meta).await?;
+    let denial = match reopen {
+        Some(target) => {
+            let dial = async || {
+                let upstream =
+                    crate::proxy::open_upstream_tunnel(ctx.state, target, ctx.actor).await?;
+                connect_upstream_tls(upstream, target_host, None, None, ctx.extra_ca_certs).await
+            };
+            forward_renewing(tls_client, tls_upstream, meta, ctx.state, dial).await?
+        }
+        None => forward_or_bridge(tls_client, tls_upstream, meta).await?,
+    };
     audit_frame_denial(ctx, target_host, true, meta, denial);
     Ok(())
 }
@@ -469,11 +572,77 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    if matches!(
-        forward_response(&mut tls_client, &mut tls_upstream, meta).await?,
-        ResponseOutcome::Complete
-    ) {
-        return Ok(None);
+    // With no state to look a renewal up in, the request is never sent again.
+    match relay(&mut tls_client, &mut tls_upstream, meta, None).await? {
+        Relayed::Over(denial) => Ok(denial),
+        Relayed::Renewed(_) => Ok(None),
+    }
+}
+
+/// [`forward_or_bridge`], and the request sent once more when the origin
+/// refused it `401` and a header credential it carried has been renewed since.
+///
+/// `dial` opens a new connection to the same origin: the first one is closed,
+/// since the request asked for `Connection: close`. The second answer is
+/// relayed whatever it is, so a request is sent at most twice.
+async fn forward_renewing<C, U, D>(
+    mut tls_client: C,
+    mut tls_upstream: U,
+    meta: &RequestMeta,
+    state: &Arc<crate::proxy::ProxyState>,
+    dial: D,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+    D: AsyncFnOnce() -> Result<U, Box<dyn std::error::Error + Send + Sync>>,
+{
+    let head = match relay(&mut tls_client, &mut tls_upstream, meta, Some(state)).await? {
+        Relayed::Over(denial) => return Ok(denial),
+        Relayed::Renewed(head) => head,
+    };
+    drop(tls_upstream);
+    meta.audit.resent_after_renewal();
+    tracing::info!(
+        method = %meta.method,
+        path = %meta.path,
+        "origin refused a credential renewed in flight — sending the request once more"
+    );
+    let mut tls_upstream = dial().await?;
+    write_request_head_and_body(&mut tls_upstream, &head, meta).await?;
+    match relay(&mut tls_client, &mut tls_upstream, meta, None).await? {
+        Relayed::Over(denial) => Ok(denial),
+        Relayed::Renewed(_) => Ok(None),
+    }
+}
+
+/// What became of one request sent upstream.
+enum Relayed {
+    /// The answer was relayed; a refused client message on an upgraded
+    /// connection, if any, for the caller to record.
+    Over(Option<String>),
+    /// The answer was a `401` to a renewed credential, and nothing of it was
+    /// relayed. This is the head to send again.
+    Renewed(String),
+}
+
+/// One answer, relayed, or a pipe once upstream has switched protocols.
+/// `renew` is the state to look a renewed credential up in, when the request
+/// may be sent again.
+async fn relay<C, U>(
+    tls_client: &mut C,
+    tls_upstream: &mut U,
+    meta: &RequestMeta,
+    renew: Option<&Arc<crate::proxy::ProxyState>>,
+) -> Result<Relayed, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    match forward_response_renewing(tls_client, tls_upstream, meta, renew).await? {
+        ResponseOutcome::Complete => return Ok(Relayed::Over(None)),
+        ResponseOutcome::Renewed(head) => return Ok(Relayed::Renewed(head)),
+        ResponseOutcome::Switched => {}
     }
 
     // Upstream switched protocols. A GraphQL rule granted this upgrade, so it
@@ -481,10 +650,12 @@ where
     // because the negotiated protocol owns the connection now.
     let matchers: Vec<&GraphqlMatcher> = meta.graphql_frames.iter().collect();
     if matchers.is_empty() {
-        tokio::io::copy_bidirectional(&mut tls_client, &mut tls_upstream).await?;
-        return Ok(None);
+        tokio::io::copy_bidirectional(tls_client, tls_upstream).await?;
+        return Ok(Relayed::Over(None));
     }
-    crate::graphql_ws::relay(&mut tls_client, &mut tls_upstream, &matchers).await
+    crate::graphql_ws::relay(tls_client, tls_upstream, &matchers)
+        .await
+        .map(Relayed::Over)
 }
 
 /// What the response did to the connection.
@@ -494,6 +665,23 @@ enum ResponseOutcome {
     Complete,
     /// Upstream switched protocols; the connection is now a raw pipe.
     Switched,
+    /// Upstream refused a credential that has been renewed since, and nothing
+    /// was relayed. The request goes again with this head.
+    Renewed(String),
+}
+
+/// [`forward_response_renewing`] for a request that is never sent again.
+#[cfg(test)]
+async fn forward_response<C, U>(
+    tls_client: &mut C,
+    tls_upstream: &mut U,
+    meta: &RequestMeta,
+) -> Result<ResponseOutcome, Box<dyn std::error::Error + Send + Sync>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    forward_response_renewing(tls_client, tls_upstream, meta, None).await
 }
 
 /// Forward the response, and report whether the connection became a pipe.
@@ -501,11 +689,18 @@ enum ResponseOutcome {
 /// A `Connection: upgrade` header is the client asking, not the protocol
 /// changing, so the switch happens on the answer: `101 Switching Protocols`
 /// against a request that asked to upgrade. Every other final status is an
-/// ordinary response and gets `Connection: close`.
-async fn forward_response<C, U>(
+/// ordinary response and gets `Connection: close`. The final status goes into
+/// the request's audit record.
+///
+/// A `401` is given up instead of relayed when the request may be sent again
+/// (`renew` is set and `meta` can be resent), nothing of the answer has reached
+/// the client, and a header credential the request carried has been renewed
+/// since it was sent.
+async fn forward_response_renewing<C, U>(
     tls_client: &mut C,
     tls_upstream: &mut U,
     meta: &RequestMeta,
+    renew: Option<&Arc<crate::proxy::ProxyState>>,
 ) -> Result<ResponseOutcome, Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -570,6 +765,9 @@ where
     };
 
     let response_forwarder = async {
+        // An interim head that reached the client means the client is already
+        // reading this answer, so it is not swapped for another.
+        let mut relayed_interim = false;
         // RFC 9110 §15.2: a server MAY send 1xx informational responses (e.g.
         // 100 Continue, 103 Early Hints) before the final response. These
         // each have their own header block but no body. Forward them as sent —
@@ -577,7 +775,15 @@ where
         // the sandbox may send.
         loop {
             let header_bytes = crate::http_body::read_head(&mut upstream_read).await?;
-            match parse_status_code(&header_bytes) {
+            let status = parse_status_code(&header_bytes);
+            if status == Some(401)
+                && !relayed_interim
+                && let (Some(state), Some(resend)) = (renew, &meta.resend)
+                && let Some(head) = resend.renewed_head(state)
+            {
+                return Ok(ResponseOutcome::Renewed(head));
+            }
+            match status {
                 Some(101) if meta.is_upgrade => {
                     // The offer of an extension was stripped from the request, so
                     // one in the answer would compress frames a rule must read.
@@ -592,6 +798,7 @@ where
                     client_write
                         .write_all(&without_block_fields(&header_bytes))
                         .await?;
+                    meta.audit.answered(101, None);
                     return Ok::<ResponseOutcome, Box<dyn std::error::Error + Send + Sync>>(
                         ResponseOutcome::Switched,
                     );
@@ -605,14 +812,20 @@ where
                     client_write
                         .write_all(&without_block_fields(&header_bytes))
                         .await?;
+                    relayed_interim = true;
                 }
                 _ => {
                     // Final response — rewrite Connection and stream the body.
                     let modified = inject_response_connection_close(&header_bytes);
                     client_write.write_all(&modified).await?;
-                    // Stream the body. Returns on upstream EOF (server honored
-                    // Connection: close) or on a client write error.
-                    let _ = tokio::io::copy(&mut upstream_read, &mut client_write).await;
+                    relay_final_body(
+                        &header_bytes,
+                        status,
+                        &mut upstream_read,
+                        &mut client_write,
+                        &meta.audit,
+                    )
+                    .await;
                     // Eagerly send TLS close_notify + FIN to the client so its
                     // connection pool sees the connection as terminated *now*,
                     // before it can race a second pipelined request through the
@@ -634,6 +847,61 @@ where
         _ = request_forwarder => ResponseOutcome::Complete,
     };
     Ok(outcome)
+}
+
+/// Stream the body of the final answer to the client, and record the answer.
+///
+/// Returns on upstream EOF (the server honoured `Connection: close`) or on a
+/// read or client write error. A refusal that may name an error code is kept as
+/// it passes, up to [`crate::upstream_answer::MAX_ERROR_BODY_BYTES`]: each read
+/// reaches the client before it is kept, so the client waits for nothing.
+async fn relay_final_body<R, W>(
+    header_bytes: &[u8],
+    status: Option<u16>,
+    upstream_read: &mut R,
+    client_write: &mut W,
+    audit: &crate::upstream_answer::PendingAudit,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let head = String::from_utf8_lossy(header_bytes);
+    let mut kept = match status {
+        Some(code) if crate::upstream_answer::may_carry_error_code(code, &head) => Some(Vec::new()),
+        Some(code) => {
+            audit.answered(code, None);
+            None
+        }
+        None => None,
+    };
+    if kept.is_none() {
+        let _ = tokio::io::copy(upstream_read, client_write).await;
+        return;
+    }
+    let mut buf = vec![0u8; 8 * 1024];
+    loop {
+        let read = match upstream_read.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        if client_write.write_all(&buf[..read]).await.is_err() {
+            break;
+        }
+        if let Some(body) = &mut kept {
+            if body.len() + read > crate::upstream_answer::MAX_ERROR_BODY_BYTES {
+                kept = None;
+                if let Some(code) = status {
+                    audit.answered(code, None);
+                }
+            } else {
+                body.extend_from_slice(&buf[..read]);
+            }
+        }
+    }
+    if let (Some(body), Some(code)) = (kept, status) {
+        let error_code = crate::upstream_answer::error_code(&head, &body).await;
+        audit.answered(code, error_code);
+    }
 }
 
 /// Forward an HTTP/1.1 chunked-encoded request body verbatim from `reader`
@@ -1596,6 +1864,23 @@ where
             .await);
     }
 
+    // Everything that went into this request is still in hand, so it can be
+    // sent again if the credential it carries is renewed on the way.
+    let resend = (!is_upgrade
+        && destination.is_none()
+        && (buffered_body.is_some() || body_mode == BodyFraming::None)
+        && matching_injections(&header_injected, effective_injections)
+            .iter()
+            .all(|injection| injection.body.is_none()))
+    .then(|| Resend {
+        head: head.clone(),
+        sent: effective_injections.to_vec(),
+        match_host: target.match_host.to_string(),
+        placeholders: effective_uri_placeholders.to_vec(),
+        mcp: mcp_request.take(),
+        body_len: buffered_body.as_ref().map(Vec::len),
+    });
+
     // The body is in hand, so the head must describe it and the relay must not
     // look for it on the socket a second time.
     let (modified, body_mode) = match &buffered_body {
@@ -1606,6 +1891,7 @@ where
         None => (modified, body_mode),
     };
 
+    let mut audit = crate::upstream_answer::PendingAudit::none();
     if let Some(tx) = ctx.audit_tx {
         let mut metadata = serde_json::json!({
             "host": target_host, "mitm": true, "tunnel": is_tunnel
@@ -1629,7 +1915,17 @@ where
             "result": "success",
             "metadata": metadata,
         });
-        send_audit(tx, event, ctx.actor);
+        // The record waits for the origin's answer. A translated answer is the
+        // proxy's own rendering of the backend's, so that record goes now.
+        if destination.is_some() {
+            send_audit(tx, event, ctx.actor);
+        } else {
+            let mut event = event;
+            if let Some(object) = event.as_object_mut() {
+                ctx.actor.augment(object);
+            }
+            audit = crate::upstream_answer::PendingAudit::new(tx.clone(), event);
+        }
     }
 
     // A compressed frame hides the operation, so the client's offer of one does
@@ -1651,6 +1947,8 @@ where
             method: (*method).to_string(),
             path: path.to_string(),
             redirect: destination.map(|destination| destination.redirect),
+            audit,
+            resend,
         },
     ))
 }
@@ -2634,6 +2932,10 @@ mod tests {
     /// The `llm` redirect, end to end. Its own file: this one is long enough.
     #[path = "llm_tests.rs"]
     mod llm;
+
+    /// What the origin answered, and the request sent again after a renewal.
+    #[path = "answer_tests.rs"]
+    mod answer;
 
     /// Shared harness for MITM integration tests.
     /// Spins up: TLS upstream server ← upstream TLS ← MITM ← client TLS.
@@ -4963,6 +5265,8 @@ mod tests {
             method: "GET".to_string(),
             path: "/graphql".to_string(),
             redirect: None,
+            audit: crate::upstream_answer::PendingAudit::none(),
+            resend: None,
         };
         let task = tokio::spawn(async move {
             let _ = forward_or_bridge(client_near, upstream_near, &meta).await;
@@ -4980,6 +5284,8 @@ mod tests {
             method: "GET".to_string(),
             path: "/".to_string(),
             redirect: None,
+            audit: crate::upstream_answer::PendingAudit::none(),
+            resend: None,
         }
     }
 
