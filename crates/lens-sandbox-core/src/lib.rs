@@ -86,3 +86,5 @@ pub mod token_answer;
 pub mod transparent;
 #[cfg(feature = "proxy")]
 pub mod udp_egress;
+#[cfg(feature = "proxy")]
+pub(crate) mod upstream_answer;
