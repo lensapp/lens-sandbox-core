@@ -1336,7 +1336,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
             domains = aws_domains.len(),
             "aws_sigv4 configs updated from policy"
         );
-        state.aws_resign.update(aws_config_map, aws_domains);
+        state.aws_signer.update(aws_config_map, aws_domains);
     }
 
     // Write persistent files from policy (e.g. AWS credential files, synthetic
@@ -2721,7 +2721,7 @@ mod tests {
 
         connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
 
-        let configs = state.aws_resign.configs_snapshot();
+        let configs = state.aws_signer.configs_snapshot();
         assert_eq!(configs.len(), 1, "rotation must overwrite, not append");
         let cfg = configs
             .get("LENSFAKE00AABB0000CC")
