@@ -39,9 +39,9 @@ pub const DEFAULT_GRACE: Duration = Duration::from_secs(8);
 /// own, whatever status the forwarded signal left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildExit {
-    /// The child exited before the supervisor received a shutdown signal.
+    /// The child exited before the supervisor received SIGTERM.
     Finished(ExitStatus),
-    /// The supervisor received a shutdown signal first and stopped the child.
+    /// The supervisor received SIGTERM first and stopped the child.
     Stopped(ExitStatus),
 }
 
@@ -70,15 +70,17 @@ pub async fn wait_with_signal_forwarding(
 /// whether the child finished or was stopped.
 ///
 /// Behaviour:
-///   * If the child exits before any signal arrives, returns
+///   * If the child exits before SIGTERM arrives, returns
 ///     [`ChildExit::Finished`] with its exit status unchanged.
-///   * If the supervisor receives SIGTERM / SIGINT / SIGHUP, forwards
-///     SIGTERM to the child and waits up to `grace` for it to exit.
-///   * If a *second* signal arrives during the grace window, escalates
+///   * SIGHUP, SIGINT and SIGQUIT go to the child unchanged at any time;
+///     they do not stop it on their own.
+///   * If the supervisor receives SIGTERM, forwards it to the child and
+///     waits up to `grace` for it to exit.
+///   * If a *second* SIGTERM arrives during the grace window, escalates
 ///     to SIGKILL immediately — operator intent overrides graciousness.
 ///   * Otherwise, on grace expiry, escalates to SIGKILL.
 ///
-/// Every path after a signal returns [`ChildExit::Stopped`].
+/// Every path after a SIGTERM returns [`ChildExit::Stopped`].
 #[cfg(unix)]
 pub async fn wait_for_child_exit(child: &mut Child, grace: Duration) -> std::io::Result<ChildExit> {
     wait_for_shutdown(child, Some(grace)).await
@@ -88,19 +90,19 @@ pub async fn wait_for_child_exit(child: &mut Child, grace: Duration) -> std::io:
 /// signal, and say whether the child finished or was stopped.
 ///
 /// The same as [`wait_for_child_exit`] except that nothing here ends the
-/// wait on a timer: after the first SIGTERM / SIGINT / SIGHUP the helper
-/// waits for the child for as long as the caller does. A second signal
-/// still sends SIGKILL to the child's process group at once. A caller
-/// that owns the end of the run (a host that stops a sandbox with a
-/// timeout) puts that deadline on its own side and sends the second
-/// signal when the timeout runs out.
+/// wait on a timer: after the first SIGTERM the helper waits for the
+/// child for as long as the caller does. A second SIGTERM still sends
+/// SIGKILL to the child's process group at once. A caller that owns the
+/// end of the run (a host that stops a sandbox with a timeout) puts that
+/// deadline on its own side and sends the second SIGTERM when the
+/// timeout runs out.
 #[cfg(unix)]
 pub async fn wait_for_child_exit_host_owned(child: &mut Child) -> std::io::Result<ChildExit> {
     wait_for_shutdown(child, None).await
 }
 
 /// The shared body of the two unix waits. `grace` of `None` means no
-/// deadline after the first shutdown signal.
+/// deadline after the first SIGTERM.
 #[cfg(unix)]
 async fn wait_for_shutdown(
     child: &mut Child,
@@ -109,34 +111,68 @@ async fn wait_for_shutdown(
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut term = signal(SignalKind::terminate())?;
-    let mut intr = signal(SignalKind::interrupt())?;
-    let mut hup = signal(SignalKind::hangup())?;
+    let mut passed_on = PassedOn::listen()?;
 
-    let trigger = tokio::select! {
-        status = child.wait() => return status.map(ChildExit::Finished),
-        _ = term.recv() => "SIGTERM",
-        _ = intr.recv() => "SIGINT",
-        _ = hup.recv() => "SIGHUP",
-    };
-    tracing::info!(
-        signal = trigger,
-        "supervisor signalled, forwarding SIGTERM to agent"
-    );
+    loop {
+        tokio::select! {
+            status = child.wait() => return status.map(ChildExit::Finished),
+            _ = term.recv() => break,
+            signal = passed_on.recv() => pass_on(child, signal),
+        }
+    }
+    tracing::info!("supervisor got SIGTERM, forwarding it to agent");
+    kill_agent(child, nix::sys::signal::Signal::SIGTERM);
 
-    forward_sigterm(child);
-
-    // Wait for the child to exit, the grace period to expire (if there is
-    // one), or a second signal to short-circuit straight to SIGKILL.
-    let kill_reason = tokio::select! {
-        status = child.wait() => return status.map(ChildExit::Stopped),
-        _ = until_grace_expires(grace) => "grace expired",
-        _ = term.recv() => "second SIGTERM during grace",
-        _ = intr.recv() => "second SIGINT during grace",
-        _ = hup.recv() => "second SIGHUP during grace",
+    let grace_expires = until_grace_expires(grace);
+    tokio::pin!(grace_expires);
+    let kill_reason = loop {
+        tokio::select! {
+            status = child.wait() => return status.map(ChildExit::Stopped),
+            _ = &mut grace_expires => break "grace expired",
+            _ = term.recv() => break "second SIGTERM during grace",
+            signal = passed_on.recv() => pass_on(child, signal),
+        }
     };
     tracing::warn!(reason = kill_reason, "escalating to SIGKILL");
     kill_agent(child, nix::sys::signal::Signal::SIGKILL);
     child.wait().await.map(ChildExit::Stopped)
+}
+
+#[cfg(unix)]
+fn pass_on(child: &mut Child, signal: nix::sys::signal::Signal) {
+    tracing::debug!(?signal, "passing signal to agent");
+    kill_agent(child, signal);
+}
+
+/// The signals the supervisor passes on to the agent as they are.
+#[cfg(unix)]
+struct PassedOn {
+    hup: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl PassedOn {
+    fn listen() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            hup: signal(SignalKind::hangup())?,
+            int: signal(SignalKind::interrupt())?,
+            quit: signal(SignalKind::quit())?,
+        })
+    }
+
+    async fn recv(&mut self) -> nix::sys::signal::Signal {
+        use nix::sys::signal::Signal;
+
+        tokio::select! {
+            _ = self.hup.recv() => Signal::SIGHUP,
+            _ = self.int.recv() => Signal::SIGINT,
+            _ = self.quit.recv() => Signal::SIGQUIT,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -178,14 +214,6 @@ pub fn exit_code_of(status: ExitStatus) -> i32 {
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
         .unwrap_or(1)
-}
-
-/// Send SIGTERM to the child. Safe to call once: `child.id()` only
-/// returns `None` after the child has been reaped via `wait()`, which
-/// hasn't happened yet at this point in the call chain.
-#[cfg(unix)]
-fn forward_sigterm(child: &mut Child) {
-    kill_agent(child, nix::sys::signal::Signal::SIGTERM);
 }
 
 /// Send `signal` to the agent and, when the agent leads its own process
@@ -692,6 +720,52 @@ wait"#;
         assert!(gone, "the SIGKILL should reach the grandchild {grandchild}");
     }
 
+    /// Only SIGTERM stops the agent: SIGHUP, SIGINT and SIGQUIT reach the
+    /// agent unchanged, so its own exit is its result.
+    #[tokio::test]
+    async fn a_signal_other_than_sigterm_reaches_the_agent_unchanged() {
+        use nix::sys::signal::Signal;
+        use std::time::Duration;
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let _serial = SIGNAL_TESTS.lock().await;
+        let _hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        let _int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        let _quit = signal(SignalKind::quit()).expect("install SIGQUIT handler");
+
+        for (signal, code) in [
+            (Signal::SIGHUP, 11),
+            (Signal::SIGINT, 12),
+            (Signal::SIGQUIT, 13),
+        ] {
+            let script = "trap 'exit 11' HUP; trap 'exit 12' INT; trap 'exit 13' QUIT; \
+                          trap 'exit 99' TERM; while :; do sleep 0.05; done";
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .process_group(0)
+                .spawn()
+                .expect("spawn agent");
+
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                raise_on_self(signal);
+            });
+
+            let exit = tokio::time::timeout(
+                Duration::from_secs(5),
+                wait_for_child_exit_host_owned(&mut child),
+            )
+            .await
+            .expect("helper did not return in time")
+            .expect("wait result");
+            let ChildExit::Finished(status) = exit else {
+                panic!("{signal:?} stopped the agent instead of reaching it: {exit:?}");
+            };
+            assert_eq!(status.code(), Some(code), "{signal:?}");
+        }
+    }
+
     /// Whether `pid` is no longer running: absent, or a zombie waiting for
     /// its parent to reap it.
     fn process_is_gone(pid: i32) -> bool {
@@ -711,6 +785,7 @@ wait"#;
     async fn a_child_that_exits_on_its_own_finishes() {
         use std::time::Duration;
 
+        let _serial = SIGNAL_TESTS.lock().await;
         let mut child = tokio::process::Command::new("true")
             .spawn()
             .expect("spawn true");
