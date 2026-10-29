@@ -489,7 +489,7 @@ async fn a_request_its_rules_refuse_is_never_signed_or_sent() {
         ..Default::default()
     });
     let (state, audit_rx) = signing_state(TEST_HOSTNAME);
-    let (_, client, audits) = run_signed(
+    let (outcome, client, audits) = run_signed(
         state,
         audit_rx,
         TEST_HOSTNAME,
@@ -497,6 +497,10 @@ async fn a_request_its_rules_refuse_is_never_signed_or_sent() {
         request,
     )
     .await;
+    assert!(
+        outcome.starts_with("no rule permits GraphQL mutation"),
+        "the refused request must not reach the origin: {outcome}"
+    );
     crate::blocked::tests::assert_blocked(
         &client,
         crate::blocked::BlockReason::PolicyDeny,
