@@ -922,6 +922,21 @@ const BAD_REQUEST_RESPONSE: &[u8] =
 const BAD_GATEWAY_RESPONSE: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
+/// What a `CONNECT` client is told when the dial to an admitted destination
+/// fails: a 502 that names the target and the reason, sent before any tunnel
+/// opens, so the client reports why rather than a connection that closed.
+fn connect_dial_failure_response(target_host: &str, error: &std::io::Error) -> Vec<u8> {
+    let body = format!("Sandbox proxy could not connect to {target_host}: {error}\n");
+    format!(
+        "HTTP/1.1 502 Bad Gateway\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 /// The facts every refusal on this door records, collected once.
 struct ForwardRequest<'a> {
     state: &'a Arc<ProxyState>,
@@ -1645,6 +1660,53 @@ async fn handle_connect(
                 .into());
             }
 
+            let uri_placeholders = collect_uri_placeholders(state, target_host);
+            let needs_aws_resign = takes_the_aws_re_sign_path(state, target_host, deferred);
+            // A deferred door has a question to ask before anything leaves, which
+            // only the MITM can ask, however the policy has changed since.
+            let needs_mitm = deferred
+                || needs_interception(
+                    state,
+                    target_host,
+                    injections.as_deref().unwrap_or(&[]),
+                    &domain_http_rules,
+                    &uri_placeholders,
+                );
+            let bridged = client_cert.is_some() && state.ephemeral_ca.get().is_some();
+
+            // The interceptors below accept the client's TLS inside the tunnel
+            // and dial only once they have read and judged the request, so the
+            // tunnel has to open first. A plain relay has nothing to read, so it
+            // dials first: a destination it cannot reach is told as a 502, not
+            // as a tunnel that closes empty.
+            let relay = if needs_aws_resign || needs_mitm || bridged {
+                None
+            } else {
+                match connect_egress_under_policy(
+                    state,
+                    target_host,
+                    443,
+                    actor.process(),
+                    Gated::NotAsked,
+                )
+                .await
+                {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(
+                            target = %target_host,
+                            error = %e,
+                            "proxy DIRECT dial failed"
+                        );
+                        emit_audit(state, target_host, "error", 502, actor);
+                        client
+                            .write_all(&connect_dial_failure_response(target_host, &e))
+                            .await?;
+                        return Err(format!("direct connect to {target_host}: {e}").into());
+                    }
+                }
+            };
+
             client
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await?;
@@ -1659,18 +1721,6 @@ async fn handle_connect(
                 "proxy DIRECT dispatch decision"
             );
 
-            let uri_placeholders = collect_uri_placeholders(state, target_host);
-            let needs_aws_resign = takes_the_aws_re_sign_path(state, target_host, deferred);
-            // A deferred door has a question to ask before anything leaves, which
-            // only the MITM can ask, however the policy has changed since.
-            let needs_mitm = deferred
-                || needs_interception(
-                    state,
-                    target_host,
-                    injections.as_deref().unwrap_or(&[]),
-                    &domain_http_rules,
-                    &uri_placeholders,
-                );
             if needs_aws_resign {
                 // AWS-resign path owns the MITM for this connection; any
                 // other injections configured for the same host would be
@@ -1734,23 +1784,8 @@ async fn handle_connect(
                     actor,
                 )
                 .await?;
-            } else {
-                // Neither → plain TCP relay
-                let mut target = match connect_egress_under_policy(
-                    state,
-                    target_host,
-                    443,
-                    actor.process(),
-                    Gated::NotAsked,
-                )
-                .await
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        emit_audit(state, target_host, "error", 502, actor);
-                        return Err(format!("direct connect to {target_host}: {e}").into());
-                    }
-                };
+            } else if let Some(mut target) = relay {
+                // Neither → plain TCP relay, dialled above
                 tracing::debug!(target = %target_host, "proxy DIRECT");
                 tokio::io::copy_bidirectional(&mut client, &mut target).await?;
             }
@@ -1816,6 +1851,12 @@ async fn handle_connect(
                 match connect_sandbox_upstream(state, &upstream).await {
                     Ok(s) => s,
                     Err(e) => {
+                        tracing::warn!(
+                            target = %target_host,
+                            upstream = %upstream_addr,
+                            error = %e,
+                            "proxy upstream dial failed"
+                        );
                         client
                             .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                             .await?;
@@ -3165,9 +3206,10 @@ async fn connect_raw_passthrough(
         match connect_egress_under_policy(state, target_host, 443, actor.process(), gated).await {
             Ok(s) => s,
             Err(e) => {
+                tracing::warn!(target = %target_host, error = %e, "proxy RAW dial failed");
                 emit_audit(state, target_host, "error", 502, actor);
                 client
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    .write_all(&connect_dial_failure_response(target_host, &e))
                     .await?;
                 return Err(format!("raw passthrough connect to {target_host}: {e}").into());
             }
@@ -7229,6 +7271,119 @@ pub(crate) mod tests {
             events.iter().any(|ev| ev["result"] == "error"),
             "every occurrence of a misconfiguration is recorded: {events:?}"
         );
+    }
+
+    /// An address of this host that the egress floor lets a dial reach: the one
+    /// it would send from, which is never loopback. Finding it sends nothing.
+    fn an_address_of_this_host_off_loopback() -> IpAddr {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        probe
+            .connect("192.0.2.1:9")
+            .expect("these tests need a route off the host");
+        let ip = probe.local_addr().unwrap().ip();
+        assert!(!sock_mark::is_disallowed_egress_ip(ip), "{ip}");
+        ip
+    }
+
+    /// Drive the CONNECT door at `target` on a direct route and return the
+    /// client end once the handler has started.
+    async fn connect_direct(
+        state: &Arc<ProxyState>,
+        target: String,
+    ) -> (
+        TcpStream,
+        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    ) {
+        state.policy.write().unwrap().default_transport = Transport::Direct;
+        let (client, server) = socket_pair().await;
+        let state = state.clone();
+        let handler = tokio::spawn(async move {
+            let actor = test_actor();
+            handle_connect(server, &target, &actor, &state).await
+        });
+        (client, handler)
+    }
+
+    #[tokio::test]
+    async fn a_refused_direct_dial_is_answered_502_not_200() {
+        // Dialling after the 200 left the client holding a tunnel that closed
+        // empty, which it reported as a broken pipe or a TLS EOF.
+        let (state, mut rx) = test_state();
+        let ip = an_address_of_this_host_off_loopback();
+        let closed = std::net::TcpListener::bind((ip, 0)).unwrap();
+        let target = closed.local_addr().unwrap().to_string();
+        drop(closed);
+
+        let (mut client, handler) = connect_direct(&state, target.clone()).await;
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{response}"
+        );
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(
+            body.starts_with(&format!("Sandbox proxy could not connect to {target}: ")),
+            "the client is told what failed: {body:?}"
+        );
+        let reason = handler.await.unwrap().expect_err("the dial failed");
+        assert!(reason.to_string().contains(&target), "{reason}");
+        let events = drain_audit_lines(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|ev| ev["result"] == "error" && ev["status_code"] == 502),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_direct_target_is_answered_502_not_200() {
+        let (state, _rx) = test_state();
+        let (mut client, handler) =
+            connect_direct(&state, "nonexistent.invalid:443".to_string()).await;
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains("could not connect to nonexistent.invalid:443"),
+            "{response}"
+        );
+        handler
+            .await
+            .unwrap()
+            .expect_err("the name did not resolve");
+    }
+
+    #[tokio::test]
+    async fn a_direct_connect_opens_once_the_dial_succeeds() {
+        use tokio::io::AsyncReadExt;
+        let (state, _rx) = test_state();
+        let ip = an_address_of_this_host_off_loopback();
+        let origin = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
+        let target = origin.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut conn, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            conn.read_exact(&mut buf).await.unwrap();
+            conn.write_all(&buf).await.unwrap();
+        });
+
+        let (mut client, _handler) = connect_direct(&state, target).await;
+        let mut established = [0u8; 39];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut established))
+            .await
+            .expect("the tunnel opens")
+            .unwrap();
+        assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut echoed))
+            .await
+            .expect("the origin answers through the tunnel")
+            .unwrap();
+        assert_eq!(&echoed, b"ping");
     }
 
     #[tokio::test]
