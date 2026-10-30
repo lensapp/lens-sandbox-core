@@ -188,12 +188,17 @@ impl SeenRequest {
         if method.is_empty() {
             return None;
         }
+        Some(Self::new(method, path))
+    }
+
+    /// The request `method` to `path`, its path kept as the event names it.
+    pub(crate) fn new(method: &str, path: &str) -> Self {
         let mut path = redact_placeholders(without_query(path));
         path.truncate(path.floor_char_boundary(MAX_FIELD_BYTES));
-        Some(Self {
+        Self {
             method: method.to_string(),
             path,
-        })
+        }
     }
 }
 

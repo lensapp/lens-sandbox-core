@@ -365,7 +365,7 @@ where
         }
         UpstreamMode::TunnelOnDemand { target } => {
             let upstream =
-                match crate::proxy::open_upstream_tunnel(ctx.state, &target, ctx.actor).await {
+                match crate::proxy::dial_upstream_tunnel(ctx.state, &target, ctx.actor).await {
                     Ok(upstream) => upstream,
                     Err(e) => {
                         if e.is::<crate::blocked::UpstreamBlocked>() {
@@ -379,6 +379,15 @@ where
                             );
                             tls_client.write_all(&refusal).await.ok();
                             tls_client.shutdown().await.ok();
+                            // Audited by the request it refused, as a refused
+                            // `CONNECT` is once its tunnel is answered.
+                            crate::proxy::emit_refused_https(
+                                ctx.state,
+                                &target,
+                                reason,
+                                Some(&crate::blocked::SeenRequest::new(&meta.method, &meta.path)),
+                                ctx.actor,
+                            );
                         }
                         return Err(e);
                     }
