@@ -171,34 +171,65 @@ const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a refused TLS session may take, from the ClientHello to the answer.
 pub(crate) const DENIED_TUNNEL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The request a refused TLS session carried, as its audit event names it.
+#[derive(Debug)]
+pub(crate) struct SeenRequest {
+    pub(crate) method: String,
+    /// The path without its query, placeholders redacted as in the body, cut
+    /// to [`MAX_FIELD_BYTES`] on a character boundary.
+    pub(crate) path: String,
+}
+
+impl SeenRequest {
+    /// The request whose head is `head`, or `None` when its request line names
+    /// no method.
+    fn from_head(head: &str) -> Option<Self> {
+        let (method, path) = crate::proxy::request_target(head);
+        if method.is_empty() {
+            return None;
+        }
+        let mut path = redact_placeholders(without_query(path));
+        path.truncate(path.floor_char_boundary(MAX_FIELD_BYTES));
+        Some(Self {
+            method: method.to_string(),
+            path,
+        })
+    }
+}
+
 /// Answer the first request on an accepted TLS session to `host` with the
-/// refusal, then end the session. The request is read only to name it; nothing
-/// of it is logged.
-pub(crate) async fn answer_tls<S>(mut tls: S, label: Option<&str>, host: &str, reason: BlockReason)
+/// refusal, then end the session, and return the request for the caller to
+/// audit. The request is read only to name it; its query and headers are not
+/// kept. `None` when no request head was read.
+pub(crate) async fn answer_tls<S>(
+    mut tls: S,
+    label: Option<&str>,
+    host: &str,
+    reason: BlockReason,
+) -> Option<SeenRequest>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Ok(head) = crate::http_body::read_head(&mut tls).await else {
-        return;
-    };
+    let head = crate::http_body::read_head(&mut tls).await.ok()?;
     let head = String::from_utf8_lossy(&head);
     tls.write_all(&crate::proxy::refusal_for_head(label, reason, host, &head))
         .await
         .ok();
     tls.shutdown().await.ok();
+    SeenRequest::from_head(&head)
 }
 
 /// Refuse a `CONNECT` to `target_host` inside the tunnel: open it, and if the
 /// client speaks TLS, complete the handshake with `config`, which serves a
 /// certificate for the host, and answer the request it sends (see [`answer_tls`]). A client that does not
-/// speak TLS is disconnected.
+/// speak TLS is disconnected. Returns the request it answered, if any.
 pub(crate) async fn answer_in_tunnel(
     mut client: TcpStream,
     config: std::sync::Arc<rustls::ServerConfig>,
     label: Option<&str>,
     target_host: &str,
     reason: BlockReason,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<SeenRequest>, Box<dyn std::error::Error + Send + Sync>> {
     let hostname = crate::proxy::extract_hostname(target_host);
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -208,15 +239,17 @@ pub(crate) async fn answer_in_tunnel(
     let mut first = [0u8; 1];
     match tokio::time::timeout(FIRST_BYTE_TIMEOUT, client.peek(&mut first)).await {
         Ok(Ok(1)) if first[0] == 0x16 => {}
-        _ => return Ok(()),
+        _ => return Ok(None),
     }
-    let _ = tokio::time::timeout(DENIED_TUNNEL_TIMEOUT, async {
-        if let Ok(tls) = tokio_rustls::TlsAcceptor::from(config).accept(client).await {
-            answer_tls(tls, label, &hostname, reason).await;
-        }
+    let seen = tokio::time::timeout(DENIED_TUNNEL_TIMEOUT, async {
+        let tls = tokio_rustls::TlsAcceptor::from(config)
+            .accept(client)
+            .await
+            .ok()?;
+        answer_tls(tls, label, &hostname, reason).await
     })
     .await;
-    Ok(())
+    Ok(seen.ok().flatten())
 }
 
 fn without_query(path: &str) -> &str {

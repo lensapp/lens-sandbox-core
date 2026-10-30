@@ -1615,7 +1615,7 @@ async fn handle_connect(
         deferred,
     } = match admit_https_destination(state, target_host, actor).await {
         Ok(admission) => admission,
-        Err(reason) => return refuse_connect(client, target_host, reason, state).await,
+        Err(reason) => return refuse_connect(client, target_host, reason, state, actor).await,
     };
 
     let hostname = extract_hostname(target_host);
@@ -1896,13 +1896,13 @@ async fn handle_connect(
             };
 
             if blocked {
-                emit_audit(state, target_host, "failure", 403, actor);
                 drop(upstream_stream);
                 return refuse_connect(
                     client,
                     target_host,
                     crate::blocked::BlockReason::UpstreamPolicy,
                     state,
+                    actor,
                 )
                 .await;
             }
@@ -2008,14 +2008,15 @@ async fn handle_connect(
 
 /// Refuse a `CONNECT` to `target_host` for `reason`. Said inside the tunnel,
 /// where the client shows it; a host no certificate can be made for is told on
-/// the `CONNECT`.
+/// the `CONNECT`. Audited once it is said (see [`emit_refused_https`]).
 async fn refuse_connect(
     mut client: TcpStream,
     target_host: &str,
     reason: crate::blocked::BlockReason,
     state: &Arc<ProxyState>,
+    actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match get_or_init_ca(state).and_then(|ca| {
+    let answered = match get_or_init_ca(state).and_then(|ca| {
         crate::mitm::build_ephemeral_server_config(ca, &extract_hostname(target_host))
     }) {
         Ok(config) => {
@@ -2028,19 +2029,21 @@ async fn refuse_connect(
             )
             .await
         }
-        Err(_) => {
-            client
-                .write_all(&crate::blocked::response(
-                    state.block_label(),
-                    reason,
-                    "CONNECT",
-                    target_host,
-                    "",
-                ))
-                .await?;
-            Ok(())
-        }
-    }
+        Err(_) => client
+            .write_all(&crate::blocked::response(
+                state.block_label(),
+                reason,
+                "CONNECT",
+                target_host,
+                "",
+            ))
+            .await
+            .map(|()| None)
+            .map_err(Into::into),
+    };
+    let seen = answered.as_ref().ok().and_then(Option::as_ref);
+    emit_refused_https(state, target_host, reason, seen, actor);
+    answered.map(|_| ())
 }
 
 /// The policy an HTTPS destination was admitted under.
@@ -2059,8 +2062,8 @@ struct HttpsAdmission {
 /// an answer raised by one door — the same action, under the same key — covers
 /// the others.
 ///
-/// `Err` is a refusal, already logged and audited; the caller tells its client
-/// in its own framing.
+/// `Err` is a refusal, already logged; the caller tells its client in its own
+/// framing, then audits it (see [`emit_refused_https`]).
 async fn admit_https_destination(
     state: &Arc<ProxyState>,
     target_host: &str,
@@ -2072,7 +2075,6 @@ async fn admit_https_destination(
         resolve_route(state, target_host, Scheme::Https, actor.process())
     else {
         tracing::info!(target = %target_host, "proxy DENIED (binary not allowed)");
-        emit_policy_deny_connect(state, target_host, "binary-not-allowed", actor);
         return Err(crate::blocked::BlockReason::BinaryNotAllowed);
     };
 
@@ -2080,7 +2082,6 @@ async fn admit_https_destination(
     match verdict {
         Verdict::Deny => {
             tracing::info!(target = %target_host, "proxy DENIED");
-            emit_policy_deny_connect(state, target_host, "policy-deny", actor);
             return Err(crate::blocked::BlockReason::PolicyDeny);
         }
         Verdict::Ask if deferred => {
@@ -2247,6 +2248,8 @@ async fn handle_https_forward(
     } = match admit_https_destination(state, target_host, actor).await {
         Ok(admission) => admission,
         Err(reason) => {
+            // Audited by its destination, as the `CONNECT` it stands for.
+            emit_refused_https(state, target_host, reason, None, actor);
             client
                 .write_all(&refusal_for_head(
                     state.block_label(),
@@ -2401,6 +2404,13 @@ pub(crate) fn refusal_for_head(
     target_host: &str,
     head: &str,
 ) -> Vec<u8> {
+    let (method, path) = request_target(head);
+    crate::blocked::response(label, reason, method, target_host, path)
+}
+
+/// The method and the path, query included, of the request whose head is
+/// `head`. The method is empty when the request line names none.
+pub(crate) fn request_target(head: &str) -> (&str, &str) {
     let mut parts = head.lines().next().unwrap_or_default().split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or("/");
@@ -2414,7 +2424,7 @@ pub(crate) fn refusal_for_head(
         },
         None => target,
     };
-    crate::blocked::response(label, reason, method, target_host, path)
+    (method, path)
 }
 
 /// A client stream that records whether anything has been written to it, so a
@@ -2939,6 +2949,24 @@ pub(crate) async fn open_upstream_tunnel(
     target: &str,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<BoxedSandboxStream, Box<dyn std::error::Error + Send + Sync>> {
+    let tunnel = dial_upstream_tunnel(state, target, actor).await;
+    if tunnel
+        .as_ref()
+        .is_err_and(|e| e.is::<crate::blocked::UpstreamBlocked>())
+    {
+        emit_audit(state, target, "failure", 403, actor);
+    }
+    tunnel
+}
+
+/// [`open_upstream_tunnel`], leaving a refusal by the upstream's policy
+/// unaudited, for a door that audits it once it has read the request it
+/// refuses.
+async fn dial_upstream_tunnel(
+    state: &Arc<ProxyState>,
+    target: &str,
+    actor: &crate::peer_process::ActorContext,
+) -> Result<BoxedSandboxStream, Box<dyn std::error::Error + Send + Sync>> {
     let upstream = match state.upstream.lock().await.clone() {
         Some(n) => n,
         None => {
@@ -2976,7 +3004,6 @@ pub(crate) async fn open_upstream_tunnel(
         }
     };
     if blocked {
-        emit_audit(state, target, "failure", 403, actor);
         return Err(Box::new(crate::blocked::UpstreamBlocked));
     }
     if !status.starts_with("200") {
@@ -3431,12 +3458,12 @@ async fn handle_transparent_tls(
         Some(decision) => decision,
         None => {
             tracing::info!(target = %target_host, "transparent TLS DENIED (binary not allowed)");
-            emit_policy_deny_connect(state, &target_host, "binary-not-allowed", &actor);
             return refuse_transparent_tls(
                 start,
-                &sni,
+                &target_host,
                 crate::blocked::BlockReason::BinaryNotAllowed,
                 state,
+                &actor,
             )
             .await;
         }
@@ -3445,12 +3472,12 @@ async fn handle_transparent_tls(
     let deferred = verdict == Verdict::Ask && defers_to_token_answers(state, &target_host);
     let effective_transport = match verdict {
         Verdict::Deny => {
-            emit_policy_deny_connect(state, &target_host, "policy-deny", &actor);
             return refuse_transparent_tls(
                 start,
-                &sni,
+                &target_host,
                 crate::blocked::BlockReason::PolicyDeny,
                 state,
+                &actor,
             )
             .await;
         }
@@ -3474,9 +3501,10 @@ async fn handle_transparent_tls(
                 tracing::info!(target = %target_host, reason = decision.audit_reason(), "transparent TLS DENIED (gated)");
                 return refuse_transparent_tls(
                     start,
-                    &sni,
+                    &target_host,
                     crate::blocked::BlockReason::AskDeclined,
                     state,
+                    &actor,
                 )
                 .await;
             }
@@ -3571,11 +3599,11 @@ async fn handle_transparent_tls(
                     target: target_host.clone(),
                 }
             } else {
-                match open_upstream_tunnel(state, &target_host, &actor).await {
+                match dial_upstream_tunnel(state, &target_host, &actor).await {
                     Ok(tunnel) => crate::mitm::UpstreamMode::TunnelTls(tunnel),
                     Err(e) if e.is::<crate::blocked::UpstreamBlocked>() => {
                         let reason = crate::blocked::BlockReason::UpstreamPolicy;
-                        let _ = tokio::time::timeout(
+                        let seen = tokio::time::timeout(
                             crate::blocked::DENIED_TUNNEL_TIMEOUT,
                             crate::blocked::answer_tls(
                                 tls_client,
@@ -3585,6 +3613,13 @@ async fn handle_transparent_tls(
                             ),
                         )
                         .await;
+                        emit_refused_https(
+                            state,
+                            &target_host,
+                            reason,
+                            seen.ok().flatten().as_ref(),
+                            &actor,
+                        );
                         return Ok(());
                     }
                     Err(e) => return Err(e),
@@ -3598,22 +3633,34 @@ async fn handle_transparent_tls(
     Ok(())
 }
 
-/// Refuse a transparent TLS connection to `sni` by policy: complete the
-/// handshake whose ClientHello was peeked, and answer the request inside it.
+/// Refuse a transparent TLS connection to `target_host`, the SNI and the
+/// port, by policy: complete the handshake whose ClientHello was peeked, and
+/// answer the request inside it. Audited once it is answered (see
+/// [`emit_refused_https`]).
 async fn refuse_transparent_tls(
     start: tokio_rustls::StartHandshake<TcpStream>,
-    sni: &str,
+    target_host: &str,
     reason: crate::blocked::BlockReason,
     state: &Arc<ProxyState>,
+    actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = crate::mitm::build_ephemeral_server_config(get_or_init_ca(state)?, sni)?;
-    let _ = tokio::time::timeout(crate::blocked::DENIED_TUNNEL_TIMEOUT, async {
-        if let Ok(tls) = start.into_stream(config).await {
-            crate::blocked::answer_tls(tls, state.block_label(), sni, reason).await;
+    let sni = extract_hostname(target_host);
+    let answered = match get_or_init_ca(state)
+        .and_then(|ca| crate::mitm::build_ephemeral_server_config(ca, &sni))
+    {
+        Ok(config) => {
+            let answer = async {
+                let tls = start.into_stream(config).await.ok()?;
+                crate::blocked::answer_tls(tls, state.block_label(), &sni, reason).await
+            };
+            let seen = tokio::time::timeout(crate::blocked::DENIED_TUNNEL_TIMEOUT, answer).await;
+            Ok(seen.ok().flatten())
         }
-    })
-    .await;
-    Ok(())
+        Err(e) => Err(e),
+    };
+    let seen = answered.as_ref().ok().and_then(Option::as_ref);
+    emit_refused_https(state, target_host, reason, seen, actor);
+    answered.map(|_| ())
 }
 
 async fn handle_transparent_http(
@@ -3971,6 +4018,50 @@ pub(crate) fn emit_policy_deny_connect(
             method: "CONNECT",
             host: &host,
             path: None,
+        },
+        actor,
+    );
+}
+
+/// Audit an HTTPS destination refused for `reason`, once the client is told:
+/// by the request it sent inside the refused TLS session, `seen`, or by the
+/// destination when none was read, as a refused `CONNECT` is audited. The
+/// request is `<METHOD> https://<host><path>`, its path as [`SeenRequest`]
+/// keeps it. A refusal by the upstream proxy has no `metadata.reason`, and
+/// one the developer answered was audited with the answer.
+///
+/// [`SeenRequest`]: crate::blocked::SeenRequest
+fn emit_refused_https(
+    state: &Arc<ProxyState>,
+    target_host: &str,
+    reason: crate::blocked::BlockReason,
+    seen: Option<&crate::blocked::SeenRequest>,
+    actor: &crate::peer_process::ActorContext,
+) {
+    use crate::blocked::BlockReason;
+    let reason = match reason {
+        BlockReason::PolicyDeny | BlockReason::BinaryNotAllowed => Some(reason.code()),
+        BlockReason::UpstreamPolicy => None,
+        BlockReason::AskDeclined | BlockReason::CredentialGate => return,
+    };
+    let Some(request) = seen else {
+        match reason {
+            Some(reason) => emit_policy_deny_connect(state, target_host, reason, actor),
+            None => emit_audit(state, target_host, "failure", 403, actor),
+        }
+        return;
+    };
+    let host = extract_hostname(target_host);
+    emit_audit_action_with_metadata(
+        state,
+        "failure",
+        403,
+        reason.map(|reason| serde_json::json!({ "reason": reason })),
+        RequestFacts {
+            action: &format!("{} https://{host}{}", request.method, request.path),
+            method: &request.method,
+            host: &host,
+            path: Some(&request.path),
         },
         actor,
     );
@@ -8668,9 +8759,34 @@ pub(crate) mod tests {
     /// what comes back.
     async fn request_in_refused_tunnel(
         state: &Arc<ProxyState>,
-        mut client: TcpStream,
+        client: TcpStream,
         host: &str,
     ) -> String {
+        let head = format!("GET /v1/foo?secret=1 HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        let response = send_in_refused_tunnel(state, client, host, &head).await;
+        assert!(!response.contains("secret"), "{response}");
+        response
+    }
+
+    /// Read the `200` a refused `CONNECT` opens its tunnel with, complete the TLS
+    /// handshake trusting the sandbox CA, send `head`, and return what comes back.
+    async fn send_in_refused_tunnel(
+        state: &Arc<ProxyState>,
+        mut client: TcpStream,
+        host: &str,
+        head: &str,
+    ) -> String {
+        use tokio::io::AsyncReadExt;
+        read_established(&mut client).await;
+        let mut tls = sandbox_tls_client(state, client, host).await;
+        tls.write_all(head.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tls.read_to_end(&mut response).await;
+        String::from_utf8(response).unwrap()
+    }
+
+    /// Read the `200` a refused `CONNECT` opens its tunnel with.
+    async fn read_established(client: &mut TcpStream) {
         use tokio::io::AsyncReadExt;
         let mut established = [0u8; 39];
         tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut established))
@@ -8678,15 +8794,6 @@ pub(crate) mod tests {
             .expect("the tunnel opens")
             .unwrap();
         assert_eq!(&established, b"HTTP/1.1 200 Connection Established\r\n\r\n");
-        let mut tls = sandbox_tls_client(state, client, host).await;
-        tls.write_all(format!("GET /v1/foo?secret=1 HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
-        let mut response = Vec::new();
-        let _ = tls.read_to_end(&mut response).await;
-        let response = String::from_utf8(response).unwrap();
-        assert!(!response.contains("secret"), "{response}");
-        response
     }
 
     /// A TLS client to `host` that trusts the sandbox CA and nothing else.
@@ -8844,37 +8951,57 @@ pub(crate) mod tests {
 
     /// What a transparent TLS connection to `api.example.test` is answered with.
     async fn transparent_tls_answer(state: &Arc<ProxyState>) -> String {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
-        get_or_init_ca(state).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let response = transparent_tls_answer_to(
+            state,
+            "GET /v1/foo?secret=1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .await;
+        assert!(!response.contains("secret"), "{response}");
+        response
+    }
+
+    /// What a transparent TLS connection to `api.example.test` that sends
+    /// `head` is answered with, once the handler is done.
+    async fn transparent_tls_answer_to(state: &Arc<ProxyState>, head: &'static str) -> String {
+        let (stream, handler) = transparent_tls_connection(state).await;
         let client_state = state.clone();
         let client = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
-            let stream = TcpStream::connect(addr).await.unwrap();
             let mut tls = sandbox_tls_client(&client_state, stream, "api.example.test").await;
-            tls.write_all(b"GET /v1/foo?secret=1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n")
-                .await
-                .unwrap();
+            tls.write_all(head.as_bytes()).await.unwrap();
             let mut response = Vec::new();
             let _ = tls.read_to_end(&mut response).await;
             String::from_utf8(response).unwrap()
         });
-        let (server, peer) = listener.accept().await.unwrap();
-        let actor = crate::peer_process::ActorContext::resolve(peer);
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("the refusal does not dial")
+            .unwrap()
+            .unwrap();
+        client.await.unwrap()
+    }
+
+    /// A transparent TLS connection to `api.example.test` at `203.0.113.9:443`:
+    /// the client end, and the handler serving the other.
+    async fn transparent_tls_connection(
+        state: &Arc<ProxyState>,
+    ) -> (
+        TcpStream,
+        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    ) {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        get_or_init_ca(state).unwrap();
+        let (client, server) = socket_pair().await;
+        let actor = crate::peer_process::ActorContext::resolve(client.local_addr().unwrap());
         let orig_dst: SocketAddr = "203.0.113.9:443".parse().unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            handle_transparent_tls(server, orig_dst, actor, state),
-        )
-        .await
-        .expect("the refusal does not dial")
-        .unwrap();
-        let response = client.await.unwrap();
-        assert!(!response.contains("secret"), "{response}");
-        response
+        let state = state.clone();
+        let handler =
+            tokio::spawn(
+                async move { handle_transparent_tls(server, orig_dst, actor, &state).await },
+            );
+        (client, handler)
     }
 
     #[tokio::test]
@@ -8906,6 +9033,528 @@ pub(crate) mod tests {
             BlockReason::BinaryNotAllowed,
             "Blocked by sandbox egress policy: GET api.example.test/v1/foo (reason: binary-not-allowed). \
              This is not a response from api.example.test.",
+        );
+    }
+
+    /// The failure events sent so far.
+    fn refusal_events(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<serde_json::Value> {
+        drain_audit_lines(rx)
+            .into_iter()
+            .filter(|event| event["result"] == "failure")
+            .collect()
+    }
+
+    /// The event a refusal of `target` was audited with at connect time, before
+    /// the request inside it was read: `metadata.reason` is `reason`, or there is
+    /// no metadata when the upstream proxy refused.
+    fn host_only_refusal(
+        target: &str,
+        reason: Option<&str>,
+        actor: &crate::peer_process::ActorContext,
+    ) -> serde_json::Value {
+        let (state, mut rx) = test_state();
+        match reason {
+            Some(reason) => emit_policy_deny_connect(&state, target, reason, actor),
+            None => emit_audit(&state, target, "failure", 403, actor),
+        }
+        let events = refusal_events(&mut rx);
+        assert_eq!(events.len(), 1, "{events:?}");
+        events.into_iter().next().unwrap()
+    }
+
+    /// [`host_only_refusal`], naming the request `method` to `path` instead.
+    fn request_refusal(
+        target: &str,
+        reason: Option<&str>,
+        actor: &crate::peer_process::ActorContext,
+        method: &str,
+        path: &str,
+    ) -> serde_json::Value {
+        let mut event = host_only_refusal(target, reason, actor);
+        let host = extract_hostname(target);
+        event["action"] = serde_json::Value::from(format!("{method} https://{host}{path}"));
+        event["method"] = serde_json::Value::from(method);
+        event["path"] = serde_json::Value::from(path);
+        event
+    }
+
+    /// Refuse a `CONNECT` to `api.example.test:443` under `state`, send `head`
+    /// inside the tunnel, and return the answer once the handler is done.
+    async fn refused_connect_sending(state: &Arc<ProxyState>, head: &str) -> String {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_connect(
+                server,
+                "api.example.test:443",
+                &test_actor(),
+                &state_for_handler,
+            )
+            .await
+        });
+        let response = send_in_refused_tunnel(state, client, "api.example.test", head).await;
+        handler.await.unwrap().unwrap();
+        response
+    }
+
+    /// A `CONNECT` to `target` that default deny refuses: the events, the
+    /// client end, and the handler serving the other.
+    async fn refused_connect_to(
+        target: &'static str,
+    ) -> (
+        Arc<ProxyState>,
+        mpsc::UnboundedReceiver<String>,
+        TcpStream,
+        tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    ) {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (state, rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let (client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_connect(server, target, &test_actor(), &state_for_handler).await
+        });
+        (state, rx, client, handler)
+    }
+
+    /// A TLS client that trusts no CA at all, so it refuses the sandbox's.
+    async fn distrusting_tls_client(stream: TcpStream, host: &str) {
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let handshake = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                rustls::pki_types::ServerName::try_from(host.to_string()).unwrap(),
+                stream,
+            )
+            .await;
+        assert!(handshake.is_err(), "the sandbox CA is not trusted");
+    }
+
+    const GET_A_B: &str = "GET /a/b?x=1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n";
+
+    #[tokio::test]
+    async fn a_refused_connect_is_audited_with_the_request_inside_it() {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let response = refused_connect_sending(&state, GET_A_B).await;
+        assert_blocked(
+            &response,
+            BlockReason::PolicyDeny,
+            "Blocked by sandbox egress policy: GET api.example.test/a/b (reason: policy-deny). \
+             This is not a response from api.example.test.",
+        );
+        let events = refusal_events(&mut rx);
+        assert_eq!(
+            events,
+            [request_refusal(
+                "api.example.test:443",
+                Some("policy-deny"),
+                &test_actor(),
+                "GET",
+                "/a/b"
+            )]
+        );
+        assert_eq!(events[0]["action"], "GET https://api.example.test/a/b");
+    }
+
+    #[tokio::test]
+    async fn a_connect_from_a_caller_the_rule_excludes_is_audited_with_the_request_inside_it() {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().routes = vec![crate::routing::RouteRule {
+            matcher: crate::routing::RouteMatcher::Domain("api.example.test".to_string()),
+            verdict: Verdict::Allow,
+            transport: Transport::Direct,
+            tls_terminate: false,
+            http_rules: Vec::new(),
+            scheme: None,
+            binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+        }];
+        refused_connect_sending(&state, GET_A_B).await;
+        assert_eq!(
+            refusal_events(&mut rx),
+            [request_refusal(
+                "api.example.test:443",
+                Some("binary-not-allowed"),
+                &test_actor(),
+                "GET",
+                "/a/b"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_the_upstream_refuses_is_audited_with_the_request_inside_it() {
+        let (state, mut rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        refused_connect_sending(&state, GET_A_B).await;
+        assert_eq!(
+            refusal_events(&mut rx),
+            [request_refusal(
+                "api.example.test:443",
+                None,
+                &test_actor(),
+                "GET",
+                "/a/b"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_transparent_tls_connection_is_audited_with_the_request_inside_it() {
+        for (reason, policy) in [
+            ("policy-deny", Verdict::Deny),
+            ("binary-not-allowed", Verdict::Allow),
+        ] {
+            let (state, mut rx) = test_state();
+            if policy == Verdict::Deny {
+                state.policy.write().unwrap().default_verdict = Verdict::Deny;
+            } else {
+                state.policy.write().unwrap().routes = vec![crate::routing::RouteRule {
+                    matcher: crate::routing::RouteMatcher::Domain("api.example.test".to_string()),
+                    verdict: Verdict::Allow,
+                    transport: Transport::Direct,
+                    tls_terminate: false,
+                    http_rules: Vec::new(),
+                    scheme: None,
+                    binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+                }];
+            }
+            let (stream, handler) = transparent_tls_connection(&state).await;
+            let actor = crate::peer_process::ActorContext::resolve(stream.local_addr().unwrap());
+            let client_state = state.clone();
+            let client = tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut tls = sandbox_tls_client(&client_state, stream, "api.example.test").await;
+                tls.write_all(GET_A_B.as_bytes()).await.unwrap();
+                let mut response = Vec::new();
+                let _ = tls.read_to_end(&mut response).await;
+            });
+            handler.await.unwrap().unwrap();
+            client.await.unwrap();
+            assert_eq!(
+                refusal_events(&mut rx),
+                [request_refusal(
+                    "api.example.test:443",
+                    Some(reason),
+                    &actor,
+                    "GET",
+                    "/a/b"
+                )],
+                "{reason}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transparent_tls_connection_the_upstream_refuses_is_audited_with_the_request_inside_it()
+     {
+        let (state, mut rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        transparent_tls_answer_to(&state, GET_A_B).await;
+        let events = refusal_events(&mut rx);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["method"], "GET");
+        assert_eq!(events[0]["path"], "/a/b");
+        assert_eq!(events[0]["action"], "GET https://api.example.test/a/b");
+        assert!(events[0].get("metadata").is_none(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connect_audits_a_long_path_cut_on_a_character() {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        // `/` and two-byte characters: byte 256 falls inside one.
+        let long = format!("/{}", "é".repeat(200));
+        refused_connect_sending(
+            &state,
+            &format!("GET {long}?x=1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n"),
+        )
+        .await;
+        let events = refusal_events(&mut rx);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let path = events[0]["path"].as_str().unwrap();
+        assert_eq!(path, format!("/{}", "é".repeat(127)), "{events:?}");
+        assert_eq!(path.len(), 255);
+    }
+
+    #[tokio::test]
+    async fn a_refused_connect_does_not_audit_a_placeholder_it_carries() {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        refused_connect_sending(
+            &state,
+            "POST /bot__lens_cred:telegram-bot-token__/sendMessage?chat=1 HTTP/1.1\r\n\
+             Host: api.example.test\r\n\r\n",
+        )
+        .await;
+        let events = refusal_events(&mut rx);
+        assert_eq!(
+            events,
+            [request_refusal(
+                "api.example.test:443",
+                Some("policy-deny"),
+                &test_actor(),
+                "POST",
+                "/bot__lens_cred__/sendMessage"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_request_a_refused_connect_carries_is_counted_apart() {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        refused_connect_sending(&state, GET_A_B).await;
+        refused_connect_sending(
+            &state,
+            "GET /a/c HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .await;
+        refused_connect_sending(
+            &state,
+            "POST /a/b HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .await;
+        // The same request again is a repeat, folded into the first.
+        refused_connect_sending(&state, GET_A_B).await;
+        let named: Vec<_> = refusal_events(&mut rx)
+            .iter()
+            .map(|event| format!("{} {}", event["method"], event["path"]))
+            .collect();
+        assert_eq!(
+            named,
+            [r#""GET" "/a/b""#, r#""GET" "/a/c""#, r#""POST" "/a/b""#]
+        );
+    }
+
+    // A refused tunnel the client sends no request through is audited by its
+    // target, on every way the session can end.
+
+    #[tokio::test]
+    async fn a_refused_tunnel_that_does_not_speak_tls_is_audited_by_its_target() {
+        let (_state, mut rx, mut client, handler) = refused_connect_to("api.example.test:22").await;
+        read_established(&mut client).await;
+        client.write_all(b"SSH-2.0-OpenSSH_9.6\r\n").await.unwrap();
+        handler.await.unwrap().unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "api.example.test:22",
+                Some("policy-deny"),
+                &test_actor()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_tunnel_the_client_says_nothing_in_is_audited_by_its_target() {
+        let (_state, mut rx, mut client, handler) =
+            refused_connect_to("api.example.test:443").await;
+        read_established(&mut client).await;
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("the first byte is waited for 2 s")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "api.example.test:443",
+                Some("policy-deny"),
+                &test_actor()
+            )]
+        );
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn a_refused_tunnel_the_client_closes_is_audited_by_its_target() {
+        let (_state, mut rx, mut client, handler) =
+            refused_connect_to("api.example.test:443").await;
+        read_established(&mut client).await;
+        drop(client);
+        handler.await.unwrap().unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "api.example.test:443",
+                Some("policy-deny"),
+                &test_actor()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_tunnel_whose_client_distrusts_the_sandbox_ca_is_audited_by_its_target() {
+        let (_state, mut rx, mut client, handler) =
+            refused_connect_to("api.example.test:443").await;
+        read_established(&mut client).await;
+        distrusting_tls_client(client, "api.example.test").await;
+        handler.await.unwrap().unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "api.example.test:443",
+                Some("policy-deny"),
+                &test_actor()
+            )]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_tunnel_whose_handshake_stalls_is_audited_by_its_target() {
+        let (_state, mut rx, mut client, handler) =
+            refused_connect_to("api.example.test:443").await;
+        read_established(&mut client).await;
+        // A handshake record header, and then nothing.
+        client.write_all(&[0x16, 0x03, 0x01]).await.unwrap();
+        handler.await.unwrap().unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "api.example.test:443",
+                Some("policy-deny"),
+                &test_actor()
+            )]
+        );
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn a_refused_tunnel_closed_before_a_request_is_audited_by_its_target() {
+        let (state, mut rx, mut client, handler) = refused_connect_to("api.example.test:443").await;
+        read_established(&mut client).await;
+        let mut tls = sandbox_tls_client(&state, client, "api.example.test").await;
+        tls.shutdown().await.unwrap();
+        drop(tls);
+        handler.await.unwrap().unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "api.example.test:443",
+                Some("policy-deny"),
+                &test_actor()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_connect_no_certificate_can_be_made_for_is_audited_by_its_target() {
+        let (_state, mut rx, mut client, handler) = refused_connect_to("bücher.example:443").await;
+        read_response(&mut client).await;
+        handler.await.unwrap().unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "bücher.example:443",
+                Some("policy-deny"),
+                &test_actor()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_transparent_tls_connection_whose_client_distrusts_the_ca_is_audited_by_its_target()
+     {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let (stream, handler) = transparent_tls_connection(&state).await;
+        let actor = crate::peer_process::ActorContext::resolve(stream.local_addr().unwrap());
+        distrusting_tls_client(stream, "api.example.test").await;
+        handler.await.unwrap().unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "api.example.test:443",
+                Some("policy-deny"),
+                &actor
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_transparent_tls_connection_closed_before_a_request_is_audited_by_its_target()
+    {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        let (stream, handler) = transparent_tls_connection(&state).await;
+        let actor = crate::peer_process::ActorContext::resolve(stream.local_addr().unwrap());
+        let mut tls = sandbox_tls_client(&state, stream, "api.example.test").await;
+        tls.shutdown().await.unwrap();
+        drop(tls);
+        handler.await.unwrap().unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "api.example.test:443",
+                Some("policy-deny"),
+                &actor
+            )]
+        );
+    }
+
+    // A raw TCP refusal names the address only, the bytes it always did.
+
+    #[tokio::test]
+    async fn a_connect_an_egress_tcp_rule_refuses_is_audited_as_it_always_was() {
+        let (state, mut rx) = test_state();
+        install_tcp_deny(&state, "10.0.0.0/8:22");
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_connect(server, "10.0.0.5:22", &test_actor(), &state_for_handler).await
+        });
+        read_response(&mut client).await;
+        handler.await.unwrap().unwrap();
+        let sent: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            sent,
+            [
+                r#"{"action":"CONNECT 10.0.0.5:22","host":"10.0.0.5","metadata":{"reason":"policy-deny"},"method":"CONNECT","result":"failure","source":"sandbox-proxy","src_endpoint":{"ip":"10.0.0.5","port":54321},"status_code":403,"type":"audit_event"}"#
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transparent_tls_name_an_egress_tcp_rule_refuses_is_audited_as_it_always_was() {
+        let (state, mut rx) = test_state();
+        install_tcp_deny(&state, "api.example.test:443");
+        let (stream, handler) = transparent_tls_connection(&state).await;
+        let source = stream.local_addr().unwrap();
+        // What resolving the caller finds depends on the host the test runs on.
+        let mut caller = serde_json::Map::new();
+        crate::peer_process::ActorContext::resolve(source).augment(&mut caller);
+        let actor = caller
+            .get("actor")
+            .map(|actor| format!(r#""actor":{actor},"#))
+            .unwrap_or_default();
+        let client = tokio::spawn(async move {
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            let _ = tokio_rustls::TlsConnector::from(Arc::new(config))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("api.example.test").unwrap(),
+                    stream,
+                )
+                .await;
+        });
+        handler.await.unwrap().unwrap();
+        client.await.unwrap();
+        let sent: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            sent,
+            [format!(
+                r#"{{"action":"CONNECT api.example.test:443",{actor}"host":"api.example.test","metadata":{{"reason":"policy-deny"}},"method":"CONNECT","result":"failure","source":"sandbox-proxy","src_endpoint":{{"ip":"127.0.0.1","port":{port}}},"status_code":403,"type":"audit_event"}}"#,
+                port = source.port()
+            )]
         );
     }
 
@@ -8970,6 +9619,13 @@ pub(crate) mod tests {
             user_denied.len(),
             1,
             "exactly one user-denied-once event; got {events:?}"
+        );
+        // The answer is the refusal's audit: the request read in the tunnel
+        // after it adds none.
+        assert_eq!(
+            events.iter().filter(|ev| ev["result"] == "failure").count(),
+            1,
+            "{events:?}"
         );
         let failure = user_denied[0];
         assert_eq!(failure["action"], "CONNECT evil.example.com:443");
