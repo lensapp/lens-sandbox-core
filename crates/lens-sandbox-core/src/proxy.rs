@@ -2416,8 +2416,12 @@ pub(crate) fn request_target(head: &str) -> (&str, &str) {
     let target = parts.next().unwrap_or("/");
     // The absolute form names the origin as well; the body names it once. The
     // authority ends at the first `/`, `?` or `#`, and a `/` in a query is not
-    // the start of a path.
-    let path = match target.split_once("://") {
+    // the start of a path. A `://` after a `/`, `?` or `#` is in the path or
+    // the query of an origin-form target, not after its scheme.
+    let path = match target
+        .split_once("://")
+        .filter(|(scheme, _)| !scheme.contains(['/', '?', '#']))
+    {
         Some((_, rest)) => match rest.find(['/', '?', '#']) {
             Some(i) if rest.as_bytes()[i] == b'/' => &rest[i..],
             _ => "/",

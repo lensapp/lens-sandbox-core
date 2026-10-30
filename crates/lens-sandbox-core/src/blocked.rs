@@ -458,6 +458,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_url_in_the_query_is_not_the_path() {
+        for (head, path) in [
+            (
+                "GET /redirect?url=https://example.test/secret HTTP/1.1",
+                "/redirect",
+            ),
+            ("GET /r#https://example.test/secret HTTP/1.1", "/r"),
+            (
+                "GET https://h/x?url=https://example.test/secret HTTP/1.1",
+                "/x",
+            ),
+            (
+                "GET https://h?url=https://example.test/secret HTTP/1.1",
+                "/",
+            ),
+        ] {
+            let seen = SeenRequest::from_head(head).unwrap();
+            assert_eq!(seen.path, path, "{head}");
+            let response = String::from_utf8(crate::proxy::refusal_for_head(
+                None,
+                BlockReason::PolicyDeny,
+                "h:443",
+                head,
+            ))
+            .unwrap();
+            assert_eq!(
+                parse(&response).2,
+                format!(
+                    "Blocked by sandbox egress policy: GET h{path} \
+                     (reason: policy-deny). This is not a response from h."
+                ),
+                "{head}"
+            );
+        }
+    }
+
+    #[test]
     fn a_refused_head_request_has_no_body() {
         let text = String::from_utf8(response(
             None,
