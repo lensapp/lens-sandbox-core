@@ -2962,7 +2962,7 @@ pub(crate) async fn open_upstream_tunnel(
 /// [`open_upstream_tunnel`], leaving a refusal by the upstream's policy
 /// unaudited, for a door that audits it once it has read the request it
 /// refuses.
-async fn dial_upstream_tunnel(
+pub(crate) async fn dial_upstream_tunnel(
     state: &Arc<ProxyState>,
     target: &str,
     actor: &crate::peer_process::ActorContext,
@@ -4026,12 +4026,12 @@ pub(crate) fn emit_policy_deny_connect(
 /// Audit an HTTPS destination refused for `reason`, once the client is told:
 /// by the request it sent inside the refused TLS session, `seen`, or by the
 /// destination when none was read, as a refused `CONNECT` is audited. The
-/// request is `<METHOD> https://<host><path>`, its path as [`SeenRequest`]
-/// keeps it. A refusal by the upstream proxy has no `metadata.reason`, and
+/// request is `<METHOD> https://<host>:<port><path>`, its path as
+/// [`SeenRequest`] keeps it. A refusal by the upstream proxy has no `metadata.reason`, and
 /// one the developer answered was audited with the answer.
 ///
 /// [`SeenRequest`]: crate::blocked::SeenRequest
-fn emit_refused_https(
+pub(crate) fn emit_refused_https(
     state: &Arc<ProxyState>,
     target_host: &str,
     reason: crate::blocked::BlockReason,
@@ -4058,7 +4058,7 @@ fn emit_refused_https(
         403,
         reason.map(|reason| serde_json::json!({ "reason": reason })),
         RequestFacts {
-            action: &format!("{} https://{host}{}", request.method, request.path),
+            action: &format!("{} https://{target_host}{}", request.method, request.path),
             method: &request.method,
             host: &host,
             path: Some(&request.path),
@@ -7029,17 +7029,12 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_session_opened_on_demand_relays_the_upstream_policy_refusal() {
-        // A host whose token requests the proxy answers opens its tunnel only
-        // for a request it forwards, inside the session it already accepted.
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
-        let (state, _rx) = test_state();
-        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+    /// Have the proxy answer the token requests of `host` itself, so a tunnel
+    /// through the upstream to it opens only for a request it forwards, inside
+    /// the session it already accepted.
+    fn answer_token_requests_for(state: &Arc<ProxyState>, host: &str) {
         state.token_answers.write().unwrap().insert(
-            "api.example.test".into(),
+            host.into(),
             vec![
                 crate::token_answer::TokenAnswer::client_credentials(
                     "some-credential",
@@ -7052,6 +7047,16 @@ pub(crate) mod tests {
                 .unwrap(),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_opened_on_demand_relays_the_upstream_policy_refusal() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (state, _rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        answer_token_requests_for(&state, "api.example.test");
         let (client, server) = socket_pair().await;
         let state_for_handler = state.clone();
         tokio::spawn(async move {
@@ -7130,6 +7135,31 @@ pub(crate) mod tests {
             BlockReason::UpstreamPolicy,
             "Blocked by sandbox egress policy: GET api.example.test/v1/things (reason: upstream-policy). \
              This is not a response from api.example.test.",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absolute_https_request_whose_tunnel_opens_on_demand_is_audited_with_its_request() {
+        let (state, mut rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        answer_token_requests_for(&state, "api.example.test");
+        let (mut client, server) = socket_pair().await;
+        let _handler = https_forward(&state, server, WGET_HTTPS_HEAD);
+        assert_blocked(
+            &read_response(&mut client).await,
+            BlockReason::UpstreamPolicy,
+            "Blocked by sandbox egress policy: GET api.example.test/v1/things (reason: upstream-policy). \
+             This is not a response from api.example.test.",
+        );
+        assert_eq!(
+            refusal_events(&mut rx),
+            [request_refusal(
+                "api.example.test:443",
+                None,
+                &test_actor(),
+                "GET",
+                "/v1/things"
+            )]
         );
     }
 
@@ -8963,6 +8993,17 @@ pub(crate) mod tests {
     /// What a transparent TLS connection to `api.example.test` that sends
     /// `head` is answered with, once the handler is done.
     async fn transparent_tls_answer_to(state: &Arc<ProxyState>, head: &'static str) -> String {
+        let (response, handled) = transparent_tls_sending(state, head).await;
+        handled.unwrap();
+        response
+    }
+
+    /// Send `head` in a transparent TLS connection to `api.example.test`: the
+    /// answer, and what the handler returned.
+    async fn transparent_tls_sending(
+        state: &Arc<ProxyState>,
+        head: &'static str,
+    ) -> (String, Result<(), Box<dyn std::error::Error + Send + Sync>>) {
         let (stream, handler) = transparent_tls_connection(state).await;
         let client_state = state.clone();
         let client = tokio::spawn(async move {
@@ -8973,12 +9014,11 @@ pub(crate) mod tests {
             let _ = tls.read_to_end(&mut response).await;
             String::from_utf8(response).unwrap()
         });
-        tokio::time::timeout(Duration::from_secs(5), handler)
+        let handled = tokio::time::timeout(Duration::from_secs(5), handler)
             .await
             .expect("the refusal does not dial")
-            .unwrap()
             .unwrap();
-        client.await.unwrap()
+        (client.await.unwrap(), handled)
     }
 
     /// A transparent TLS connection to `api.example.test` at `203.0.113.9:443`:
@@ -9071,8 +9111,7 @@ pub(crate) mod tests {
         path: &str,
     ) -> serde_json::Value {
         let mut event = host_only_refusal(target, reason, actor);
-        let host = extract_hostname(target);
-        event["action"] = serde_json::Value::from(format!("{method} https://{host}{path}"));
+        event["action"] = serde_json::Value::from(format!("{method} https://{target}{path}"));
         event["method"] = serde_json::Value::from(method);
         event["path"] = serde_json::Value::from(path);
         event
@@ -9081,23 +9120,37 @@ pub(crate) mod tests {
     /// Refuse a `CONNECT` to `api.example.test:443` under `state`, send `head`
     /// inside the tunnel, and return the answer once the handler is done.
     async fn refused_connect_sending(state: &Arc<ProxyState>, head: &str) -> String {
+        refused_connect_to_sending(state, "api.example.test:443", head).await
+    }
+
+    /// [`refused_connect_sending`], to `target` on `api.example.test`.
+    async fn refused_connect_to_sending(
+        state: &Arc<ProxyState>,
+        target: &'static str,
+        head: &str,
+    ) -> String {
+        let (response, handled) = connect_sending(state, target, head).await;
+        handled.unwrap();
+        response
+    }
+
+    /// Send `head` inside a `CONNECT` to `target` on `api.example.test` that is
+    /// answered inside the tunnel: the answer, and what the handler returned.
+    async fn connect_sending(
+        state: &Arc<ProxyState>,
+        target: &'static str,
+        head: &str,
+    ) -> (String, Result<(), Box<dyn std::error::Error + Send + Sync>>) {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
         let (client, server) = socket_pair().await;
         let state_for_handler = state.clone();
         let handler = tokio::spawn(async move {
-            handle_connect(
-                server,
-                "api.example.test:443",
-                &test_actor(),
-                &state_for_handler,
-            )
-            .await
+            handle_connect(server, target, &test_actor(), &state_for_handler).await
         });
         let response = send_in_refused_tunnel(state, client, "api.example.test", head).await;
-        handler.await.unwrap().unwrap();
-        response
+        (response, handler.await.unwrap())
     }
 
     /// A `CONNECT` to `target` that default deny refuses: the events, the
@@ -9161,7 +9214,45 @@ pub(crate) mod tests {
                 "/a/b"
             )]
         );
-        assert_eq!(events[0]["action"], "GET https://api.example.test/a/b");
+        assert_eq!(events[0]["action"], "GET https://api.example.test:443/a/b");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connect_to_another_port_is_audited_with_its_port() {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        refused_connect_to_sending(&state, "api.example.test:8443", GET_A_B).await;
+        let events = refusal_events(&mut rx);
+        assert_eq!(
+            events,
+            [request_refusal(
+                "api.example.test:8443",
+                Some("policy-deny"),
+                &test_actor(),
+                "GET",
+                "/a/b"
+            )]
+        );
+        assert_eq!(events[0]["action"], "GET https://api.example.test:8443/a/b");
+    }
+
+    #[tokio::test]
+    async fn the_same_request_refused_on_two_ports_is_counted_apart() {
+        let (state, mut rx) = test_state();
+        state.policy.write().unwrap().default_verdict = Verdict::Deny;
+        refused_connect_to_sending(&state, "api.example.test:443", GET_A_B).await;
+        refused_connect_to_sending(&state, "api.example.test:8443", GET_A_B).await;
+        let actions: Vec<_> = refusal_events(&mut rx)
+            .iter()
+            .map(|event| event["action"].clone())
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "GET https://api.example.test:443/a/b",
+                "GET https://api.example.test:8443/a/b"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -9262,8 +9353,88 @@ pub(crate) mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["method"], "GET");
         assert_eq!(events[0]["path"], "/a/b");
-        assert_eq!(events[0]["action"], "GET https://api.example.test/a/b");
+        assert_eq!(events[0]["action"], "GET https://api.example.test:443/a/b");
         assert!(events[0].get("metadata").is_none(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_connect_whose_tunnel_opens_on_demand_is_audited_with_the_request_the_upstream_refuses()
+     {
+        let (state, mut rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        answer_token_requests_for(&state, "api.example.test");
+        let (response, handled) = connect_sending(&state, "api.example.test:443", GET_A_B).await;
+        assert!(handled.is_err_and(|e| e.is::<crate::blocked::UpstreamBlocked>()));
+        assert_blocked(
+            &response,
+            BlockReason::UpstreamPolicy,
+            "Blocked by sandbox egress policy: GET api.example.test/a/b (reason: upstream-policy). \
+             This is not a response from api.example.test.",
+        );
+        assert_eq!(
+            refusal_events(&mut rx),
+            [request_refusal(
+                "api.example.test:443",
+                None,
+                &test_actor(),
+                "GET",
+                "/a/b"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transparent_tls_session_whose_tunnel_opens_on_demand_is_audited_with_the_request_the_upstream_refuses()
+     {
+        let (state, mut rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        answer_token_requests_for(&state, "api.example.test");
+        let (response, handled) = transparent_tls_sending(&state, GET_A_B).await;
+        assert!(handled.is_err_and(|e| e.is::<crate::blocked::UpstreamBlocked>()));
+        assert_eq!(
+            crate::blocked::tests::parse(&response).1,
+            Some("upstream-policy"),
+            "{response}"
+        );
+        let events = refusal_events(&mut rx);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["method"], "GET");
+        assert_eq!(events[0]["path"], "/a/b");
+        assert_eq!(events[0]["action"], "GET https://api.example.test:443/a/b");
+        assert!(events[0].get("metadata").is_none(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_opened_on_demand_audits_the_refused_path_as_a_refused_connect_does() {
+        let (state, mut rx) = test_state();
+        install_refusing_upstream(&state, UPSTREAM_POLICY_REFUSAL).await;
+        answer_token_requests_for(&state, "api.example.test");
+        let _ = connect_sending(
+            &state,
+            "api.example.test:443",
+            "POST /bot__lens_cred:telegram-bot-token__/sendMessage?chat=1 HTTP/1.1\r\n\
+             Host: api.example.test\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        // `/` and two-byte characters: byte 256 falls inside one.
+        let long = format!("/{}", "é".repeat(200));
+        let _ = connect_sending(
+            &state,
+            "api.example.test:443",
+            &format!("GET {long}?x=1 HTTP/1.1\r\nHost: api.example.test\r\n\r\n"),
+        )
+        .await;
+        let named: Vec<_> = refusal_events(&mut rx)
+            .iter()
+            .map(|event| format!("{} {}", event["method"], event["path"]))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                r#""POST" "/bot__lens_cred__/sendMessage""#.to_string(),
+                format!(r#""GET" "/{}""#, "é".repeat(127)),
+            ]
+        );
     }
 
     #[tokio::test]
