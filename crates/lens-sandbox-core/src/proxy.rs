@@ -6125,18 +6125,34 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_summary_due_while_the_audit_channel_is_down_is_sent_when_it_reconnects() {
+    async fn a_repeat_folded_shortly_after_the_first_refusal_is_reported_within_1_s() {
+        // The host's denied count must move within 1 s of a refusal.
         let (state, mut rx) = test_state();
         let refuse =
             || emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
         refuse();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let last = refuse_times(1, refuse);
+
         tokio::time::sleep(Duration::from_secs(1)).await;
+        let events = events_in(&mut rx);
+        assert_one_refusal_and_its_summary(&events, 1, last);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_summary_due_while_the_audit_channel_is_down_is_sent_when_it_reconnects() {
+        let (state, mut rx) = test_state();
+        let refuse =
+            || emit_policy_deny_connect(&state, "evil.com:443", "policy-deny", &test_actor());
+        let window = Duration::from_secs(crate::audit_dedup::AUDIT_DEDUP_SECS);
+        refuse();
+        tokio::time::sleep(window / 10).await;
         let last = refuse_times(1, refuse);
         let delivered = events_in(&mut rx);
 
-        tokio::time::sleep(Duration::from_secs(8)).await;
+        tokio::time::sleep(window * 7 / 10).await;
         *state.audit_tx.lock().unwrap() = None;
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        tokio::time::sleep(window).await;
         let (tx, mut reconnected) = mpsc::unbounded_channel();
         state.connect_audit(tx);
 
