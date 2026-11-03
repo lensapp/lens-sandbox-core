@@ -41,8 +41,9 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Map, Value};
 use tokio::time::Instant;
 
-/// How long repeats of a failure event are folded into the first one.
-pub(crate) const AUDIT_DEDUP_SECS: u64 = 10;
+/// How long repeats of a failure event are folded into the first one. At most
+/// 1 s: the host must count a repeated refusal within 1 s of it.
+pub(crate) const AUDIT_DEDUP_SECS: u64 = 1;
 
 const WINDOW: Duration = Duration::from_secs(AUDIT_DEDUP_SECS);
 
@@ -398,7 +399,7 @@ mod tests {
             windows.admit(&event, opened, at(0)),
             Admission::Send { closed: vec![] }
         );
-        let id = first_fold(windows.admit(&event, opened + Duration::from_secs(3), at(3)));
+        let id = first_fold(windows.admit(&event, opened + WINDOW / 2, at(3)));
 
         let Admission::Send { closed } = windows.admit(&event, id.closes_at(), at(10)) else {
             panic!("a refusal after the window closed is sent");
