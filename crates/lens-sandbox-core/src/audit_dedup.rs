@@ -230,6 +230,10 @@ impl QueuedRefusals {
         self.queued.pop_front().map(|(_, refused_at)| refused_at)
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.queued.len()
+    }
+
     /// Forgets every refusal queued: the channel they were queued on is gone.
     pub(crate) fn clear(&mut self) {
         self.queued.clear();
@@ -365,7 +369,17 @@ impl DenyWindows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use serde_json::json;
+
+    #[test]
+    fn a_refusal_is_counted_until_the_consumer_says_it_wrote_it() {
+        let mut queued = QueuedRefusals::default();
+        queued.sent("refused".to_string(), SystemTime::UNIX_EPOCH);
+        assert_eq!(queued.len(), 1);
+        queued.written("refused");
+        assert_eq!(queued.len(), 0);
+    }
 
     fn refused(host: &str) -> Value {
         json!({

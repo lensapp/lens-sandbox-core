@@ -344,9 +344,14 @@ impl ProxyState {
         *audit_tx = Some(tx);
     }
 
-    /// The audit channel's connection wrote `message`.
-    pub(crate) fn audit_written(&self, message: &str) {
+    /// The audit channel's consumer wrote or discarded `message`, so it no longer holds it for a later connection.
+    pub fn audit_written(&self, message: &str) {
         self.queued_refusals.lock().unwrap().written(message);
+    }
+
+    /// Refusals sent on the audit channel that its consumer has not yet said it wrote.
+    pub fn unwritten_refusals(&self) -> usize {
+        self.queued_refusals.lock().unwrap().len()
     }
 
     /// Hold, for the next connection, the failure events among `messages`,
