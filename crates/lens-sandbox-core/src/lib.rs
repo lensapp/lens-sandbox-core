@@ -60,6 +60,7 @@ pub mod llm;
 pub mod mcp;
 #[cfg(feature = "proxy")]
 pub mod mitm;
+pub mod mount_points;
 #[cfg(feature = "proxy")]
 pub mod network;
 pub(crate) mod output_credit;

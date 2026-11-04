@@ -2,11 +2,12 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use base64::Engine;
 use nix::errno::Errno;
 
+use crate::mount_points::MountPoints;
 use crate::privilege::SandboxCredentials;
 use crate::protocol::{FileOwner, TempFile};
 
@@ -86,6 +87,7 @@ struct Root {
 struct FileRoots {
     roots: Vec<Root>,
     home: Option<Vec<OsString>>,
+    mounts: Option<Arc<MountPoints>>,
 }
 
 impl Default for FileRoots {
@@ -101,6 +103,7 @@ impl Default for FileRoots {
                 from_home: false,
             }],
             home: None,
+            mounts: None,
         }
     }
 }
@@ -135,6 +138,11 @@ impl FileRoots {
                 base
             }
         }
+    }
+
+    fn on_mounts(mut self, mounts: Option<Arc<MountPoints>>) -> Self {
+        self.mounts = mounts;
+        self
     }
 
     /// Set the home directory a leading `~` expands against, and allow it as a
@@ -186,6 +194,7 @@ impl FileRoots {
                     .cloned()
                     .collect(),
                 home: None,
+                mounts: self.mounts.clone(),
             }
         };
         let dir = match fs.open_root(&path) {
@@ -246,9 +255,10 @@ impl FileRoots {
             .ok_or_else(|| format!("temp file path is outside the allowed roots: {requested}"))?;
 
         Ok(ResolvedPath {
-            root: render(&root.components, &[]),
+            root: root.components.clone(),
             components: absolute[root.components.len()..].to_vec(),
             new_dirs: root.new_dirs,
+            mounts: self.mounts.clone(),
         })
     }
 
@@ -286,18 +296,45 @@ impl FileRoots {
 /// An allowed root plus the safe, root-relative component sequence beneath it.
 #[derive(Debug)]
 struct ResolvedPath {
-    root: PathBuf,
+    root: Vec<OsString>,
     components: Vec<OsString>,
     new_dirs: NewDirs,
+    mounts: Option<Arc<MountPoints>>,
 }
 
 impl ResolvedPath {
     fn display(&self) -> String {
-        let mut path = self.root.clone();
-        for comp in &self.components {
-            path.push(comp);
+        render(&self.root, &self.components)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn root_path(&self) -> PathBuf {
+        render(&self.root, &[])
+    }
+
+    /// A directory is admitted only on a trusted mount that still sits at or above it.
+    fn admits(&self, dir: &dyn DirHandle, depth: usize) -> bool {
+        let Some(mounts) = &self.mounts else {
+            return true;
+        };
+        let path: Vec<OsString> = self
+            .root
+            .iter()
+            .chain(&self.components[..depth])
+            .cloned()
+            .collect();
+        dir.mount_id().is_ok_and(|id| mounts.holds(id, &path))
+    }
+
+    fn refuse_unless_admitted(&self, dir: &dyn DirHandle, depth: usize) -> Result<(), String> {
+        if self.admits(dir, depth) {
+            return Ok(());
         }
-        path.to_string_lossy().to_string()
+        Err(format!(
+            "refusing to write under {}: it is not on a mount trusted at that place",
+            render(&self.root, &self.components[..depth]).display()
+        ))
     }
 }
 
@@ -378,6 +415,7 @@ trait DirHandle {
     /// The uid owning this directory, read from the open fd rather than the
     /// path, so the answer describes the inode the caller already holds.
     fn owner_uid(&self) -> Result<u32, Errno>;
+    fn mount_id(&self) -> Result<u64, Errno>;
     fn chown(&self, uid: u32, gid: u32) -> Result<(), Errno>;
     fn chmod(&self, mode: u32) -> Result<(), Errno>;
 }
@@ -453,13 +491,14 @@ pub async fn refresh_policy_files(
     old_paths: &[String],
     files: Option<&[TempFile]>,
     sandbox_creds: Option<&SandboxCredentials>,
+    mounts: Option<Arc<MountPoints>>,
 ) -> Option<Vec<String>> {
     refresh_policy_files_with(
         &RealTempFs,
         old_paths,
         files,
         raw_creds(sandbox_creds),
-        &FileRoots::for_sandbox(sandbox_creds),
+        &FileRoots::for_sandbox(sandbox_creds).on_mounts(mounts),
     )
 }
 
@@ -670,7 +709,7 @@ fn remove_one(fs: &dyn TempFs, resolved: &ResolvedPath) {
     let Some((file_name, dir_components)) = resolved.components.split_last() else {
         return;
     };
-    let Ok(mut dir) = fs.open_root(&resolved.root) else {
+    let Ok(mut dir) = fs.open_root(&resolved.root_path()) else {
         return;
     };
     for comp in dir_components {
@@ -679,7 +718,9 @@ fn remove_one(fs: &dyn TempFs, resolved: &ResolvedPath) {
             Err(_) => return,
         }
     }
-    let _ = dir.unlink_child(file_name);
+    if resolved.admits(dir.as_ref(), dir_components.len()) {
+        let _ = dir.unlink_child(file_name);
+    }
 }
 
 /// Open the directory that holds the delivered file, creating the missing
@@ -692,14 +733,15 @@ fn walk_to_parent(
     dir_components: &[OsString],
     workload: Option<(u32, u32)>,
 ) -> Result<Box<dyn DirHandle>, String> {
-    let root = resolved.root.to_string_lossy().to_string();
+    let root = resolved.root_path();
     let mut dir = fs
-        .open_root(&resolved.root)
-        .map_err(|e| format!("open root {root}: {e}"))?;
+        .open_root(&root)
+        .map_err(|e| format!("open root {}: {e}", root.display()))?;
 
     let dir_mode = resolved.new_dirs.mode();
 
-    for comp in dir_components {
+    for (depth, comp) in dir_components.iter().enumerate() {
+        resolved.refuse_unless_admitted(dir.as_ref(), depth)?;
         let created = match dir.make_child_dir(comp, dir_mode) {
             Ok(()) => true,
             Err(Errno::EEXIST) => false,
@@ -710,8 +752,9 @@ fn walk_to_parent(
             .open_child_dir(comp)
             .map_err(|e| {
                 format!(
-                    "open dir component {} under {root}: {e}",
-                    comp.to_string_lossy()
+                    "open dir component {} under {}: {e}",
+                    comp.to_string_lossy(),
+                    root.display()
                 )
             })
             .and_then(|child| {
@@ -737,6 +780,7 @@ fn walk_to_parent(
             }
         };
     }
+    resolved.refuse_unless_admitted(dir.as_ref(), dir_components.len())?;
 
     Ok(dir)
 }
@@ -870,6 +914,10 @@ impl DirHandle for RealDir {
 
     fn owner_uid(&self) -> Result<u32, Errno> {
         nix::sys::stat::fstat(&self.0).map(|st| st.st_uid)
+    }
+
+    fn mount_id(&self) -> Result<u64, Errno> {
+        crate::mount_points::mount_id(std::os::fd::AsFd::as_fd(&self.0))
     }
 
     fn chown(&self, uid: u32, gid: u32) -> Result<(), Errno> {
@@ -1409,6 +1457,8 @@ mod tests {
         dir_uid: u32,
         // If set, reading a directory's owner returns this error.
         owner_uid_err: Option<Errno>,
+        // The mount each named directory sits on; any other is on mount 1.
+        mount_ids: std::collections::HashMap<String, u64>,
     }
 
     impl FakeTempFs {
@@ -1424,6 +1474,7 @@ mod tests {
                 unopenable_roots: Vec::new(),
                 dir_uid: 1000,
                 owner_uid_err: None,
+                mount_ids: std::collections::HashMap::new(),
             }
         }
     }
@@ -1439,6 +1490,7 @@ mod tests {
         open_err: Option<Errno>,
         dir_uid: u32,
         owner_uid_err: Option<Errno>,
+        mount_ids: std::collections::HashMap<String, u64>,
     }
 
     struct FakeFile {
@@ -1466,6 +1518,7 @@ mod tests {
                 open_err: self.open_err,
                 dir_uid: self.dir_uid,
                 owner_uid_err: self.owner_uid_err,
+                mount_ids: self.mount_ids.clone(),
             }))
         }
     }
@@ -1494,6 +1547,7 @@ mod tests {
                 open_err: self.open_err,
                 dir_uid: self.dir_uid,
                 owner_uid_err: self.owner_uid_err,
+                mount_ids: self.mount_ids.clone(),
             }))
         }
 
@@ -1537,6 +1591,10 @@ mod tests {
                 Some(e) => Err(e),
                 None => Ok(self.dir_uid),
             }
+        }
+
+        fn mount_id(&self) -> Result<u64, Errno> {
+            Ok(self.mount_ids.get(&self.name).copied().unwrap_or(1))
         }
 
         fn unlink_child(&self, name: &OsStr) -> Result<(), Errno> {
@@ -1617,6 +1675,102 @@ mod tests {
             mode: None,
             owner: None,
         }
+    }
+
+    /// The root filesystem on mount 1 and a share on mount 7 at `/work`, as they sat when they were trusted.
+    fn trusted_mounts() -> Option<Arc<MountPoints>> {
+        Some(Arc::new(MountPoints::parse(
+            b"1 0 0:1 / / rw - overlay overlay rw\n7 1 0:7 / /work rw - virtiofs share rw\n",
+        )))
+    }
+
+    fn write_provider_config(fs: &FakeTempFs) -> Result<Vec<String>, String> {
+        write_temp_files_with(
+            fs,
+            &[file("~/.provider/config", "secret", None)],
+            Some((1000, 1000)),
+            &home_roots().on_mounts(trusted_mounts()),
+        )
+    }
+
+    fn assert_nothing_created(rec: &Rc<RefCell<Recorder>>) {
+        assert!(
+            !rec.borrow()
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CreateFile(..) | Event::MakeDir(..))),
+            "a refused walk must not create anything on the mount it refused"
+        );
+    }
+
+    #[test]
+    fn a_policy_file_lands_on_a_trusted_mount_where_that_mount_sat() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        assert_eq!(
+            write_provider_config(&fs).unwrap(),
+            ["/home/sandbox/.provider/config"]
+        );
+    }
+
+    #[test]
+    fn a_policy_file_is_refused_on_a_mount_made_after_the_mounts_were_trusted() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.existing_dirs.push(".provider".to_string());
+        fs.mount_ids.insert(".provider".to_string(), 99);
+        let err = write_provider_config(&fs).unwrap_err();
+        assert!(err.contains("/home/sandbox/.provider"), "{err}");
+        assert_nothing_created(&rec);
+    }
+
+    #[test]
+    fn a_policy_file_is_refused_on_a_trusted_mount_moved_from_where_it_sat() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.existing_dirs.push(".provider".to_string());
+        fs.mount_ids.insert(".provider".to_string(), 7);
+        assert!(
+            write_provider_config(&fs).is_err(),
+            "a share moved over the home keeps its mount id, so the id alone must not admit it"
+        );
+        assert_nothing_created(&rec);
+    }
+
+    #[test]
+    fn a_policy_file_is_refused_when_its_root_is_on_a_mount_made_since() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.mount_ids.insert("/home/sandbox".to_string(), 99);
+        assert!(
+            write_provider_config(&fs).is_err(),
+            "no directory may be made on a mount laid over the home itself"
+        );
+        assert_nothing_created(&rec);
+    }
+
+    #[test]
+    fn a_policy_file_is_not_removed_through_a_mount_made_since_it_was_written() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.mount_ids.insert(".provider".to_string(), 99);
+        let roots = home_roots().on_mounts(trusted_mounts());
+        remove_temp_files_with(&fs, &["/home/sandbox/.provider/config".to_string()], &roots);
+        assert!(
+            !rec.borrow()
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Unlink(..))),
+            "the same name on a share laid there since is a host file, not the one this process wrote"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_directory_sits_on_a_mount_the_mountinfo_puts_there() {
+        let dir = RealTempFs.open_root(Path::new("/")).unwrap();
+        let mounts = MountPoints::current().unwrap();
+        assert!(mounts.holds(dir.mount_id().unwrap(), &[]));
     }
 
     #[test]

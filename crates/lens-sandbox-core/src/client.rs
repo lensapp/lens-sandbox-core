@@ -853,6 +853,7 @@ fn parse_upstream_plain_http_mode(value: &serde_json::Value) -> crate::proxy::Up
 pub struct PlacedFiles {
     paths: std::sync::RwLock<Vec<String>>,
     creds: Option<crate::privilege::SandboxCredentials>,
+    mounts: Option<Arc<crate::mount_points::MountPoints>>,
 }
 
 impl PlacedFiles {
@@ -861,7 +862,14 @@ impl PlacedFiles {
         Self {
             paths: std::sync::RwLock::new(Vec::new()),
             creds,
+            mounts: None,
         }
+    }
+
+    /// Files land only on these mounts, so a mount made or moved later cannot redirect them.
+    pub fn only_on(mut self, mounts: crate::mount_points::MountPoints) -> Self {
+        self.mounts = Some(Arc::new(mounts));
+        self
     }
 
     pub fn paths(&self) -> Vec<String> {
@@ -896,9 +904,13 @@ async fn write_policy_files(placed: &PlacedFiles, files: &[crate::protocol::Temp
     // The roots — `/tmp` plus the sandbox user's home, so a `~/…` policy
     // path resolves without opening the rest of the filesystem — come from
     // these same credentials, inside the call.
-    if let Some(tracked) =
-        crate::temp_files::refresh_policy_files(&old_paths, Some(files), placed.creds.as_ref())
-            .await
+    if let Some(tracked) = crate::temp_files::refresh_policy_files(
+        &old_paths,
+        Some(files),
+        placed.creds.as_ref(),
+        placed.mounts.clone(),
+    )
+    .await
     {
         *placed.paths.write().unwrap() = tracked;
     }
