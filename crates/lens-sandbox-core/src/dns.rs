@@ -84,7 +84,7 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per bound address, not global: `serve` makes its own semaphore, so a stub
 /// listening on two addresses admits twice this. That is the intent — each
 /// address is a separate door and neither should be able to starve the other.
-const MAX_INFLIGHT_QUERIES: usize = 64;
+pub const MAX_INFLIGHT_QUERIES: usize = 64;
 
 /// Run the UDP DNS stub. One bound socket per address, one receive loop each,
 /// one spawned task per query so a slow upstream doesn't block the accept path.
