@@ -8,7 +8,8 @@ use lens_sandbox_core::ca_env::CA_BUNDLE;
 use lens_sandbox_core::channel::ChannelTls;
 use lens_sandbox_core::exec_manager::ExecManager;
 use lens_sandbox_core::lifecycle::{OrphanReaper, PidGuard};
-use rustix::process::{DumpableBehavior, geteuid, set_dumpable_behavior};
+use lens_sandbox_core::privilege::Confinement;
+use rustix::process::{DumpableBehavior, set_dumpable_behavior};
 
 use crate::linux::boundary::Boundary;
 use crate::linux::broker::NetworkBroker;
@@ -54,7 +55,7 @@ fn start(
     })?;
     let exec = ExecManager::with_launcher(
         None,
-        geteuid().is_root(),
+        Confinement::of_this_process(),
         pid_guard,
         Arc::new(RuntimeLauncher::new(launcher, config.ca_bundle.clone())),
     );

@@ -51,7 +51,7 @@ use crate::exec_protocol::{
 };
 use crate::lifecycle::PidGuard;
 use crate::output_credit::OutputCredit;
-use crate::privilege::SandboxCredentials;
+use crate::privilege::{Confinement, SandboxCredentials};
 use crate::pty::OwnedRawFd;
 
 /// Read buffer per chunk of stdout/stderr. Picks 4 KiB to amortize syscall
@@ -86,7 +86,7 @@ pub struct ExecManager {
 struct Inner {
     sessions: Mutex<HashMap<String, SessionHandle>>,
     creds: Option<SandboxCredentials>,
-    is_root: bool,
+    confinement: Confinement,
     /// Shields exec child PIDs from the PID-1 orphan reaper for the window
     /// between spawn and this manager's own `Child::wait()`. Exec children
     /// are direct children of the supervisor, so without this the reaper
@@ -144,13 +144,17 @@ struct SessionHandle {
 }
 
 impl ExecManager {
-    pub fn new(creds: Option<SandboxCredentials>, is_root: bool, pid_guard: PidGuard) -> Self {
-        Self::with_launcher(creds, is_root, pid_guard, Arc::new(DirectLauncher))
+    pub fn new(
+        creds: Option<SandboxCredentials>,
+        confinement: Confinement,
+        pid_guard: PidGuard,
+    ) -> Self {
+        Self::with_launcher(creds, confinement, pid_guard, Arc::new(DirectLauncher))
     }
 
     pub fn with_launcher(
         creds: Option<SandboxCredentials>,
-        is_root: bool,
+        confinement: Confinement,
         pid_guard: PidGuard,
         launcher: Arc<dyn Launcher>,
     ) -> Self {
@@ -158,7 +162,7 @@ impl ExecManager {
             inner: std::sync::Arc::new(Inner {
                 sessions: Mutex::new(HashMap::new()),
                 creds,
-                is_root,
+                confinement,
                 pid_guard,
                 launcher,
                 finished_exec_retention: FINISHED_EXEC_RETENTION,
@@ -268,7 +272,7 @@ impl ExecManager {
             cwd,
             env,
             creds: self.inner.creds.clone(),
-            is_root: self.inner.is_root,
+            confinement: self.inner.confinement,
         };
 
         let mut cmd = child_spawner::build_command(&spec);
@@ -399,7 +403,7 @@ impl ExecManager {
             cwd,
             env,
             creds: self.inner.creds.clone(),
-            is_root: self.inner.is_root,
+            confinement: self.inner.confinement,
         };
 
         let size = initial_size.map(|s| (s.cols, s.rows)).unwrap_or((80, 24));
@@ -1106,7 +1110,7 @@ mod tests {
 
     fn manager() -> ExecManager {
         // No reaper in the unit tests — an unwired guard is a no-op.
-        ExecManager::new(None, false, PidGuard::default())
+        ExecManager::new(None, Confinement::Unprivileged, PidGuard::default())
     }
 
     fn channel() -> (
@@ -1197,8 +1201,12 @@ mod tests {
     }
 
     async fn stdout_through_marking_launcher(tty: bool) -> String {
-        let mgr =
-            ExecManager::with_launcher(None, false, PidGuard::default(), Arc::new(MarkingLauncher));
+        let mgr = ExecManager::with_launcher(
+            None,
+            Confinement::Unprivileged,
+            PidGuard::default(),
+            Arc::new(MarkingLauncher),
+        );
         let (tx, mut rx) = channel();
         mgr.handle(
             IncomingMessage::ExecAttach {

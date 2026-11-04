@@ -528,6 +528,28 @@ pub(crate) fn apply_cap_drop(cmd: &mut Command, gid: Option<nix::unistd::Gid>) {
     }
 }
 
+/// Who confines the workload's egress, which decides what a child must give up before `exec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confinement {
+    /// The root parent built the nftables cage; a root child drops its capabilities so it cannot leave it.
+    Guest,
+    /// The host judges egress at the virtual NIC; there is no cage, and a root child keeps what its parent has.
+    Host,
+    /// An unprivileged parent built no cage and has nothing to drop.
+    Unprivileged,
+}
+
+impl Confinement {
+    /// What this process can build: a root process cages the workload, any other cannot.
+    pub fn of_this_process() -> Self {
+        if nix::unistd::geteuid().is_root() {
+            Self::Guest
+        } else {
+            Self::Unprivileged
+        }
+    }
+}
+
 /// Which privilege drop a child earns before `exec`.
 ///
 /// Deciding this separately from applying it keeps the one rule that
@@ -594,15 +616,20 @@ pub enum PrivilegeDrop<'a> {
 /// one outcome with no defence is to accept a `USER:GROUP` and discard
 /// the group.
 ///
-/// `is_root` is the caller's word for whether the parent is privileged,
-/// and this function reads the real euid only to check that word. A
-/// caller that says `false` on a genuinely root parent would otherwise
-/// get an undropped uid-0 child holding `CAP_NET_ADMIN` inside the cage,
-/// and nothing would say so. The mismatch warns rather than reroutes:
-/// believing the kernel over the caller here would change which drop
-/// every existing spawn path gets, which is not a thing to do quietly.
-pub fn privilege_drop_for(creds: Option<&SandboxCredentials>, is_root: bool) -> PrivilegeDrop<'_> {
-    decide_privilege_drop(creds, is_root, nix::unistd::geteuid().is_root())
+/// `confinement` is the caller's word for who confines the workload, and
+/// this function reads the real euid only to check that word. A caller
+/// that says [`Confinement::Unprivileged`] on a genuinely root parent
+/// would otherwise get an undropped uid-0 child holding `CAP_NET_ADMIN`
+/// inside the cage, and nothing would say so. The mismatch warns rather
+/// than reroutes: believing the kernel over the caller here would change
+/// which drop every existing spawn path gets, which is not a thing to do
+/// quietly. [`Confinement::Host`] is the one legitimate way for a root
+/// parent to keep a root child whole: there is no cage to leave.
+pub fn privilege_drop_for(
+    creds: Option<&SandboxCredentials>,
+    confinement: Confinement,
+) -> PrivilegeDrop<'_> {
+    decide_privilege_drop(creds, confinement, nix::unistd::geteuid().is_root())
 }
 
 /// Give `cmd`'s child the privilege drop [`privilege_drop_for`] decides.
@@ -614,8 +641,12 @@ pub fn privilege_drop_for(creds: Option<&SandboxCredentials>, is_root: bool) -> 
 /// picks one by hand is re-deciding the rule this module exists to hold.
 /// Every spawn path in this crate goes through here, and a consumer that
 /// builds its own `Command` should too.
-pub fn apply_privilege_drop(cmd: &mut Command, creds: Option<&SandboxCredentials>, is_root: bool) {
-    match privilege_drop_for(creds, is_root) {
+pub fn apply_privilege_drop(
+    cmd: &mut Command,
+    creds: Option<&SandboxCredentials>,
+    confinement: Confinement,
+) {
+    match privilege_drop_for(creds, confinement) {
         PrivilegeDrop::Setuid(creds) => creds.apply(cmd),
         PrivilegeDrop::Capabilities { gid } => apply_cap_drop(cmd, gid),
         // No privilege to drop, but pdeathsig needs none and the orphan it
@@ -636,15 +667,16 @@ pub fn apply_privilege_drop(cmd: &mut Command, creds: Option<&SandboxCredentials
 /// differently there.
 fn decide_privilege_drop(
     creds: Option<&SandboxCredentials>,
-    is_root: bool,
+    confinement: Confinement,
     parent_euid_is_root: bool,
 ) -> PrivilegeDrop<'_> {
-    match creds {
-        Some(creds) if !creds.uid_gid().0.is_root() => PrivilegeDrop::Setuid(creds),
-        _ if is_root => PrivilegeDrop::Capabilities {
+    match (creds, confinement) {
+        (Some(creds), _) if !creds.uid_gid().0.is_root() => PrivilegeDrop::Setuid(creds),
+        (_, Confinement::Guest) => PrivilegeDrop::Capabilities {
             gid: creds.map(|creds| creds.uid_gid().1),
         },
-        _ => {
+        (_, Confinement::Host) => PrivilegeDrop::Nothing { requested: creds },
+        (_, Confinement::Unprivileged) => {
             if parent_euid_is_root {
                 tracing::warn!(
                     "parent is root but was flagged unprivileged: this child keeps CAP_NET_ADMIN and can leave the cage"
@@ -1034,7 +1066,7 @@ mod tests {
     #[test]
     fn root_credentials_take_the_capability_path_rather_than_a_setuid_no_op() {
         assert_eq!(
-            privilege_drop_for(Some(&creds_for(0, 0)), true),
+            privilege_drop_for(Some(&creds_for(0, 0)), Confinement::Guest),
             PrivilegeDrop::Capabilities {
                 gid: Some(nix::unistd::Gid::from_raw(0))
             },
@@ -1045,7 +1077,7 @@ mod tests {
     #[test]
     fn a_root_uid_under_a_non_root_group_still_takes_the_capability_path() {
         assert_eq!(
-            privilege_drop_for(Some(&creds_for(0, 20)), true),
+            privilege_drop_for(Some(&creds_for(0, 20)), Confinement::Guest),
             PrivilegeDrop::Capabilities {
                 gid: Some(nix::unistd::Gid::from_raw(20))
             },
@@ -1057,7 +1089,7 @@ mod tests {
     fn a_non_root_identity_is_a_setuid_target() {
         let creds = creds_for(65534, 65534);
         assert_eq!(
-            privilege_drop_for(Some(&creds), true),
+            privilege_drop_for(Some(&creds), Confinement::Guest),
             PrivilegeDrop::Setuid(&creds),
             "the kernel zeroes the capability sets for us here, so the uid drop is the whole drop"
         );
@@ -1066,7 +1098,7 @@ mod tests {
     #[test]
     fn a_root_parent_with_no_resolved_identity_drops_capabilities() {
         assert_eq!(
-            privilege_drop_for(None, true),
+            privilege_drop_for(None, Confinement::Guest),
             PrivilegeDrop::Capabilities { gid: None },
             "an image with no sandbox user still runs its workload as the supervisor's root, which must not keep CAP_NET_ADMIN; there is no resolved identity, so there is no group to adopt either"
         );
@@ -1075,9 +1107,40 @@ mod tests {
     #[test]
     fn an_unprivileged_parent_drops_nothing() {
         assert_eq!(
-            privilege_drop_for(None, false),
+            privilege_drop_for(None, Confinement::Unprivileged),
             PrivilegeDrop::Nothing { requested: None },
             "capset would EPERM, and there is no cage to break out of when the parent never had the capability"
+        );
+    }
+
+    /// A root parent whose egress the host judges built no cage, so the
+    /// root child it was asked for keeps every capability, and nothing
+    /// is reported: this is the one way to run a workload as a whole root.
+    #[test]
+    fn a_host_judged_root_parent_keeps_a_root_child_whole() {
+        let root = creds_for(0, 0);
+        let (decision, text) =
+            capturing_warnings(|| decide_privilege_drop(Some(&root), Confinement::Host, true));
+        assert_eq!(
+            decision,
+            PrivilegeDrop::Nothing {
+                requested: Some(&root)
+            }
+        );
+        assert_eq!(
+            text, "",
+            "a root child under the host's judgement is the design, not a mismatch to report"
+        );
+    }
+
+    /// The host judging egress changes nothing for a non-root identity:
+    /// the setuid is still the whole drop.
+    #[test]
+    fn a_host_judged_parent_still_setuids_to_a_non_root_identity() {
+        let creds = creds_for(65534, 65534);
+        assert_eq!(
+            privilege_drop_for(Some(&creds), Confinement::Host),
+            PrivilegeDrop::Setuid(&creds)
         );
     }
 
@@ -1088,7 +1151,7 @@ mod tests {
     fn an_unprivileged_parent_naming_root_reports_the_identity_it_dropped() {
         let root = creds_for(0, 0);
         assert_eq!(
-            privilege_drop_for(Some(&root), false),
+            privilege_drop_for(Some(&root), Confinement::Unprivileged),
             PrivilegeDrop::Nothing {
                 requested: Some(&root)
             },
@@ -1155,7 +1218,7 @@ mod tests {
     #[test]
     fn an_unprivileged_parent_says_which_identity_it_ignored() {
         let (_, text) = capturing_warnings(|| {
-            decide_privilege_drop(Some(&creds_for(0, 0)), false, false);
+            decide_privilege_drop(Some(&creds_for(0, 0)), Confinement::Unprivileged, false);
         });
         assert!(
             text.contains("requested identity ignored") && text.contains(r#"user="root""#),
@@ -1170,7 +1233,8 @@ mod tests {
     /// instead — a silent fail-open becomes something greppable.
     #[test]
     fn a_root_parent_flagged_unprivileged_says_so() {
-        let (decision, text) = capturing_warnings(|| decide_privilege_drop(None, false, true));
+        let (decision, text) =
+            capturing_warnings(|| decide_privilege_drop(None, Confinement::Unprivileged, true));
 
         assert_eq!(
             decision,
@@ -1188,7 +1252,7 @@ mod tests {
     #[test]
     fn a_root_parent_flagged_unprivileged_still_names_the_identity_it_ignored() {
         let (_, text) = capturing_warnings(|| {
-            decide_privilege_drop(Some(&creds_for(0, 0)), false, true);
+            decide_privilege_drop(Some(&creds_for(0, 0)), Confinement::Unprivileged, true);
         });
         assert!(
             text.contains("parent is root but was flagged unprivileged")
@@ -1206,7 +1270,7 @@ mod tests {
     /// appears exactly when this process is effectively root.
     #[test]
     fn the_public_decision_asks_the_kernel_who_the_parent_is() {
-        let (_, text) = capturing_warnings(|| privilege_drop_for(None, false));
+        let (_, text) = capturing_warnings(|| privilege_drop_for(None, Confinement::Unprivileged));
 
         assert_eq!(
             text.contains("parent is root but was flagged unprivileged"),
@@ -1218,9 +1282,11 @@ mod tests {
     #[test]
     fn every_other_decision_warns_about_nothing() {
         let (_, text) = capturing_warnings(|| {
-            decide_privilege_drop(Some(&creds_for(0, 0)), true, true);
-            decide_privilege_drop(Some(&creds_for(65534, 65534)), true, true);
-            decide_privilege_drop(None, false, false);
+            decide_privilege_drop(Some(&creds_for(0, 0)), Confinement::Guest, true);
+            decide_privilege_drop(Some(&creds_for(65534, 65534)), Confinement::Guest, true);
+            decide_privilege_drop(Some(&creds_for(0, 0)), Confinement::Host, true);
+            decide_privilege_drop(None, Confinement::Host, true);
+            decide_privilege_drop(None, Confinement::Unprivileged, false);
         });
 
         assert_eq!(

@@ -15,7 +15,6 @@ use crate::http_body::{BodyFraming, determine_body_framing};
 use crate::policy_schema::GraphqlMatcher;
 use crate::proxy::CredentialInjection;
 use crate::routing::{CONFLICT_REASON, HttpRule};
-use crate::sock_mark;
 
 /// How to reach the upstream server after terminating client TLS.
 pub enum UpstreamMode {
@@ -2023,6 +2022,7 @@ where
 /// requests (WebSocket/SPDY), the connection stays open after the header phase.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_tls_bridge(
+    egress: &dyn crate::egress::Egress,
     client: TcpStream,
     dial_addr: &str,
     tls_server_name: &str,
@@ -2075,7 +2075,8 @@ pub async fn handle_tls_bridge(
     };
 
     // Connect TCP to upstream
-    let upstream_stream = sock_mark::connect_tcp_resolve(
+    let upstream_stream = crate::egress::connect_tcp_resolve(
+        egress,
         &crate::proxy::extract_hostname(dial_addr),
         crate::proxy::extract_port(dial_addr, 443),
     )

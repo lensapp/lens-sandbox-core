@@ -342,7 +342,7 @@ mod tests {
                     cwd: None,
                     env: HashMap::new(),
                     creds: None,
-                    is_root: false,
+                    confinement: crate::privilege::Confinement::Unprivileged,
                 },
             })
             .collect()
@@ -580,7 +580,7 @@ mod tests {
                     cwd: None,
                     env: HashMap::new(),
                     creds: None,
-                    is_root: false,
+                    confinement: crate::privilege::Confinement::Unprivileged,
                 },
             }
         }

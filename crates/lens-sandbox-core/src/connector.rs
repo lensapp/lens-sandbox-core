@@ -9,9 +9,9 @@
 //!
 //! Two transports ship today:
 //!
-//!   - `ws://` / `wss://` → [`TcpConnector`]: DNS resolve + SO_MARK'd
-//!     TCP socket. Identical wire behaviour to the previous
-//!     `sock_mark::connect_tcp_resolve` call inside `connect_and_run`.
+//!   - `ws://` / `wss://` → [`TcpConnector`]: DNS resolve, then
+//!     [`crate::egress::connect_tcp_resolve`] through
+//!     [`crate::sock_mark::MarkedEgress`].
 //!   - `vsock://CID:PORT` (Linux) → [`VsockConnector`]: dial AF_VSOCK
 //!     directly. Used by Lens Sandbox to talk between the host's
 //!     `lns-service` and the in-guest supervisor without going
@@ -116,7 +116,7 @@ impl Connector for TcpConnector {
             "wss" | "https" => 443,
             _ => 80,
         });
-        let tcp = sock_mark::connect_tcp_resolve(host, port).await?;
+        let tcp = crate::egress::connect_tcp_resolve(&sock_mark::MarkedEgress, host, port).await?;
         Ok(Stream::Tcp(tcp))
     }
 }

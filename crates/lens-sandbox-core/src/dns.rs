@@ -54,7 +54,6 @@ use tokio::time::timeout;
 use crate::peer_process::{PeerProcess, resolve_udp_offloaded};
 use crate::proxy::{ProxyState, emit_deny_event, pin_dns_answers};
 use crate::routing::{HostnameMatch, PortScope, hostname_match_for_caller};
-use crate::sock_mark;
 
 /// Receive buffer for incoming DNS *queries*. 1232 is the EDNS0-recommended
 /// payload that fits in the smallest common path MTU (1280 for IPv6, less
@@ -483,7 +482,9 @@ async fn forward_upstream(
     } else {
         "[::]:0".parse().unwrap()
     };
-    let up = sock_mark::bind_udp(local)
+    let up = state
+        .egress
+        .bind_udp(local)
         .await
         .map_err(|e| format!("upstream bind: {e}"))?;
     up.connect(upstream)
@@ -530,7 +531,7 @@ fn pin_answer_ips(response: &[u8], state: &Arc<ProxyState>, qname: &str, generat
             // Defence in depth: never pin a loopback/link-local/unspecified
             // answer, so a poisoned DNS response can't even enter the store (the
             // egress connect guard rejects these too, but keep the store clean).
-            if crate::sock_mark::is_disallowed_egress_ip(ip) {
+            if crate::egress::is_disallowed_egress_ip(ip) {
                 continue;
             }
             ips.push(ip);

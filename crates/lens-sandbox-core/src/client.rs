@@ -512,6 +512,20 @@ enum PolicyResult {
     VersionMismatch { server_min: String, client: String },
 }
 
+/// A policy frame judged into the proxy, with what it leaves for whoever owns the workload's filesystem.
+enum JudgedPolicy {
+    Ok {
+        env: HashMap<String, String>,
+        files: Vec<crate::protocol::TempFile>,
+    },
+    VersionMismatch {
+        server_min: String,
+        client: String,
+    },
+    /// A frame this crate cannot read; nothing was applied and the files on disk stay.
+    Malformed(String),
+}
+
 /// The placeholders this credential's token answers hand out or match, once
 /// each, other than its own: another credential may own one of them, and then
 /// that credential gates it.
@@ -832,9 +846,43 @@ fn parse_upstream_plain_http_mode(value: &serde_json::Value) -> crate::proxy::Up
     }
 }
 
-/// Parse and apply a policy message. Returns the env vars for the session handler,
-/// or a version mismatch if the sandbox protocol date is too old.
+/// The guest's policy step: judge the frame, then place its files on the filesystem the proxy shares with the workload.
 async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> PolicyResult {
+    match judge_policy(raw_text, proxy_state).await {
+        JudgedPolicy::VersionMismatch { server_min, client } => {
+            PolicyResult::VersionMismatch { server_min, client }
+        }
+        JudgedPolicy::Malformed(_) => PolicyResult::Ok(HashMap::new()),
+        JudgedPolicy::Ok { env, files } => {
+            if let Some(state) = proxy_state {
+                write_policy_files(state, &files).await;
+            }
+            PolicyResult::Ok(env)
+        }
+    }
+}
+
+// Write persistent files from policy (e.g. AWS credential files, synthetic
+// kubeconfig). The ordering — prepare, then remove, then write — and the
+// bookkeeping for each outcome live in `temp_files` where a fake can drive
+// all three; see `refresh_policy_files_with`.
+async fn write_policy_files(state: &Arc<ProxyState>, files: &[crate::protocol::TempFile]) {
+    let old_paths = state.previous_policy_files.read().unwrap().clone();
+    // The roots — `/tmp` plus the sandbox user's home, so a `~/…` policy
+    // path resolves without opening the rest of the filesystem — come from
+    // these same credentials, inside the call.
+    if let Some(tracked) = crate::temp_files::refresh_policy_files(
+        &old_paths,
+        Some(files),
+        state.sandbox_creds.as_ref(),
+    )
+    .await
+    {
+        *state.previous_policy_files.write().unwrap() = tracked;
+    }
+}
+
+async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> JudgedPolicy {
     // Transport wrapper — adds server-only fields to the policy document.
     // NetworkPolicy is kept as serde_json::Value for fault-tolerant route parsing
     // (a single bad route should not reject the entire policy message).
@@ -973,7 +1021,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         Ok(h) => h,
         Err(e) => {
             tracing::error!("Failed to parse policy version header: {e}");
-            return PolicyResult::Ok(HashMap::new());
+            return JudgedPolicy::Malformed(e.to_string());
         }
     };
 
@@ -992,7 +1040,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
                 client = %client_date,
                 "sandbox protocol date too old"
             );
-            return PolicyResult::VersionMismatch {
+            return JudgedPolicy::VersionMismatch {
                 server_min: server_min.clone(),
                 client: client_date.to_string(),
             };
@@ -1015,7 +1063,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Failed to parse policy message: {e}");
-            return PolicyResult::Ok(HashMap::new());
+            return JudgedPolicy::Malformed(e.to_string());
         }
     };
 
@@ -1023,7 +1071,10 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
 
     let Some(state) = proxy_state else {
         tracing::debug!("proxy not enabled — skipping proxy config from policy");
-        return PolicyResult::Ok(policy_env);
+        return JudgedPolicy::Ok {
+            env: policy_env,
+            files: Vec::new(),
+        };
     };
 
     // Update upstream
@@ -1339,34 +1390,60 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         state.aws_resign.update(aws_config_map, aws_domains);
     }
 
-    // Write persistent files from policy (e.g. AWS credential files, synthetic
-    // kubeconfig). The ordering — prepare, then remove, then write — and the
-    // bookkeeping for each outcome live in `temp_files` where a fake can drive
-    // all three; see `refresh_policy_files_with`.
-    {
-        let old_paths = state.previous_policy_files.read().unwrap().clone();
-        // The roots — `/tmp` plus the sandbox user's home, so a `~/…` policy
-        // path resolves without opening the rest of the filesystem — come from
-        // these same credentials, inside the call.
-        if let Some(tracked) = crate::temp_files::refresh_policy_files(
-            &old_paths,
-            msg.files.as_deref(),
-            state.sandbox_creds.as_ref(),
-        )
-        .await
-        {
-            *state.previous_policy_files.write().unwrap() = tracked;
-        }
-    }
-
     if !policy_env.is_empty() {
         tracing::info!(
             count = policy_env.len(),
             "received project env vars from policy"
         );
     }
-    PolicyResult::Ok(policy_env)
+    JudgedPolicy::Ok {
+        env: policy_env,
+        files: msg.files.unwrap_or_default(),
+    }
 }
+
+/// Applies one `policy` frame, as the server sends it, to a proxy an embedder runs in its own process. The embedder wires the audit channel with [`ProxyState::connect_audit`] and answers the `*_pending` frames on it with [`crate::gate::resolve_pending`]; nothing here touches the audit channel, the trust store, the process or the filesystem — the frame's files come back for the embedder to place where the workload runs.
+pub async fn apply_policy_frame(
+    raw_frame: &str,
+    state: &Arc<ProxyState>,
+) -> Result<AppliedPolicy, PolicyFrameError> {
+    match judge_policy(raw_frame, &Some(state.clone())).await {
+        JudgedPolicy::Ok { env, files } => Ok(AppliedPolicy { env, files }),
+        JudgedPolicy::VersionMismatch { server_min, client } => {
+            Err(PolicyFrameError::VersionMismatch { server_min, client })
+        }
+        JudgedPolicy::Malformed(reason) => Err(PolicyFrameError::Malformed(reason)),
+    }
+}
+
+/// What a policy frame leaves for the embedder: the workload's env, and the files the workload expects on its filesystem.
+#[derive(Debug, Default)]
+pub struct AppliedPolicy {
+    pub env: HashMap<String, String>,
+    pub files: Vec<crate::protocol::TempFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyFrameError {
+    /// The frame's `minProtocolDate` is newer than this crate's protocol date.
+    VersionMismatch { server_min: String, client: String },
+    /// The frame is not a policy this crate can read; nothing was applied.
+    Malformed(String),
+}
+
+impl std::fmt::Display for PolicyFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VersionMismatch { server_min, client } => write!(
+                f,
+                "the policy needs protocol {server_min}, and this proxy speaks {client}"
+            ),
+            Self::Malformed(reason) => write!(f, "the policy frame is malformed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for PolicyFrameError {}
 
 /// Run in standalone mode: apply policy JSON to proxy, return env vars.
 /// The policy JSON is read from a Docker volume by the config loader and passed here.
@@ -1453,6 +1530,93 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     use tokio_tungstenite::tungstenite::http;
+
+    fn test_host_state() -> Arc<crate::proxy::ProxyState> {
+        let ca = Arc::new(crate::ca::EphemeralCa::new().unwrap());
+        crate::proxy::ProxyState::for_host(ca, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn apply_policy_frame_applies_the_network_policy_and_returns_its_env() {
+        let state = test_host_state();
+        let frame = serde_json::json!({
+            "type": "policy",
+            "network": {"allowedRoutes": [], "defaultVerdict": "allow", "defaultTransport": "direct"},
+            "env": {"PROJECT": "demo"}
+        });
+        let applied = apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap();
+        assert_eq!(applied.env.get("PROJECT").map(String::as_str), Some("demo"));
+        assert!(applied.files.is_empty());
+        assert_eq!(
+            state.policy.read().unwrap().default_verdict,
+            crate::routing::Verdict::Allow
+        );
+    }
+
+    /// The embedder's proxy shares no filesystem with the workload, so a file
+    /// the frame carries must come back to the embedder, and nothing may land
+    /// on the embedder's own disk.
+    #[tokio::test]
+    async fn apply_policy_frame_hands_the_files_back_instead_of_writing_them() {
+        let state = test_host_state();
+        let path = format!(
+            "/tmp/lens-sandbox-core-{}-{}",
+            std::process::id(),
+            "apply_policy_frame_hands_the_files_back"
+        );
+        let frame = serde_json::json!({
+            "type": "policy",
+            "files": [{"path": path, "content": "kubeconfig"}]
+        });
+        let applied = apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap();
+        assert_eq!(applied.files.len(), 1);
+        assert_eq!(applied.files[0].path, path);
+        assert_eq!(applied.files[0].content.as_deref(), Some("kubeconfig"));
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(state.previous_policy_files.read().unwrap().is_empty());
+    }
+
+    /// A frame that does not parse is an error to the embedder, not an empty
+    /// policy: an empty policy would remove every file the last frame placed.
+    #[tokio::test]
+    async fn apply_policy_frame_refuses_a_frame_it_cannot_read() {
+        let state = test_host_state();
+        let err = apply_policy_frame("{\"type\": \"policy\", \"network\": 7", &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PolicyFrameError::Malformed(_)), "{err:?}");
+    }
+
+    /// The guest path keeps the files of the last good frame when a frame
+    /// does not parse, as it did before the files step was split out.
+    #[tokio::test]
+    async fn a_malformed_frame_keeps_the_files_the_last_frame_placed() {
+        let state = test_host_state();
+        *state.previous_policy_files.write().unwrap() = vec!["/tmp/kept".into()];
+        let result = handle_policy("not json", &Some(state.clone())).await;
+        assert!(matches!(result, PolicyResult::Ok(env) if env.is_empty()));
+        assert_eq!(
+            *state.previous_policy_files.read().unwrap(),
+            vec!["/tmp/kept".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_policy_frame_refuses_a_policy_for_a_newer_protocol() {
+        let state = test_host_state();
+        let frame = serde_json::json!({"type": "policy", "minProtocolDate": "2999-01-01"});
+        let err = apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PolicyFrameError::VersionMismatch { ref server_min, .. } if server_min == "2999-01-01")
+        );
+        assert!(err.to_string().contains("2999-01-01"));
+    }
 
     #[test]
     fn runtime_default_verdict_parser_matches_the_schema_enum() {

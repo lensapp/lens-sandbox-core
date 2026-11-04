@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::io;
 
 use crate::ca_env::apply_ca_env;
-use crate::privilege::SandboxCredentials;
+use crate::privilege::{Confinement, SandboxCredentials};
 use tokio::process::{Child, Command};
 
 /// Forks a hardened `Command`. A runtime that confines its children further
@@ -49,7 +49,7 @@ pub struct ChildSpec {
     /// are clobbered by `apply_ca_env`.
     pub env: HashMap<String, String>,
     pub creds: Option<SandboxCredentials>,
-    pub is_root: bool,
+    pub confinement: Confinement,
 }
 
 /// Build a piped-stdio `Command` with full sandbox hardening.
@@ -94,7 +94,7 @@ pub fn build_command(spec: &ChildSpec) -> Command {
     // `killpg`, as `exec_manager::cancel` does.
     cmd.kill_on_drop(true);
 
-    crate::privilege::apply_privilege_drop(&mut cmd, spec.creds.as_ref(), spec.is_root);
+    crate::privilege::apply_privilege_drop(&mut cmd, spec.creds.as_ref(), spec.confinement);
 
     cmd
 }
@@ -122,13 +122,17 @@ mod tests {
     use super::*;
     use crate::ca_env::CA_BUNDLE;
 
-    fn spec_for(argv: Vec<String>, env: HashMap<String, String>, is_root: bool) -> ChildSpec {
+    fn spec_for(
+        argv: Vec<String>,
+        env: HashMap<String, String>,
+        confinement: Confinement,
+    ) -> ChildSpec {
         ChildSpec {
             argv,
             cwd: None,
             env,
             creds: None,
-            is_root,
+            confinement,
         }
     }
 
@@ -145,7 +149,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("FOO".into(), "bar".into());
 
-        let cmd = build_command(&spec_for(argv, env, false));
+        let cmd = build_command(&spec_for(argv, env, Confinement::Unprivileged));
         let envs = envs_of(&cmd);
 
         assert_eq!(envs.get("FOO").map(String::as_str), Some("bar"));
@@ -163,7 +167,7 @@ mod tests {
         env.insert("SSL_CERT_FILE".into(), "/tmp/evil.pem".into());
         env.insert("NODE_EXTRA_CA_CERTS".into(), "/tmp/evil.pem".into());
 
-        let cmd = build_command(&spec_for(argv, env, false));
+        let cmd = build_command(&spec_for(argv, env, Confinement::Unprivileged));
         let envs = envs_of(&cmd);
 
         assert_eq!(
@@ -185,7 +189,7 @@ mod tests {
         let argv = vec!["sleep".into(), "30".into()];
         let env = HashMap::new();
 
-        let mut cmd = build_command(&spec_for(argv, env, false));
+        let mut cmd = build_command(&spec_for(argv, env, Confinement::Unprivileged));
         let mut child = cmd.spawn().expect("sleep should spawn");
         let pid = child.id().expect("child must have a pid") as i32;
 
@@ -207,7 +211,7 @@ mod tests {
         let argv = vec!["sh".into(), "-c".into(), "exit 0".into()];
         let env = HashMap::new();
 
-        let mut cmd = build_command(&spec_for(argv, env, false));
+        let mut cmd = build_command(&spec_for(argv, env, Confinement::Unprivileged));
         let status = cmd.status().await.expect("command should run");
         assert!(status.success(), "child must exit 0, got {status}");
     }
@@ -230,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_childs_handle_kills_the_child() {
         let argv = vec!["sleep".into(), "30".into()];
-        let mut cmd = build_command(&spec_for(argv, HashMap::new(), false));
+        let mut cmd = build_command(&spec_for(argv, HashMap::new(), Confinement::Unprivileged));
         cmd.stdout(std::process::Stdio::piped());
 
         let mut child = cmd.spawn().expect("sh should spawn");
@@ -279,7 +283,7 @@ mod tests {
             "grep NoNewPrivs /proc/self/status".into(),
         ];
 
-        let out = build_command(&spec_for(argv, HashMap::new(), false))
+        let out = build_command(&spec_for(argv, HashMap::new(), Confinement::Unprivileged))
             .output()
             .await
             .expect("command should run");
@@ -361,7 +365,7 @@ mod tests {
             cwd: None,
             env: HashMap::new(),
             creds: Some(creds),
-            is_root: true,
+            confinement: Confinement::Guest,
         };
 
         let out = build_command(&spec)
@@ -401,7 +405,7 @@ mod tests {
             cwd: None,
             env: HashMap::new(),
             creds: Some(creds),
-            is_root: true,
+            confinement: Confinement::Guest,
         };
 
         let out = build_command(&spec)
@@ -440,7 +444,7 @@ mod tests {
             cwd: None,
             env: HashMap::new(),
             creds: Some(creds),
-            is_root: true,
+            confinement: Confinement::Guest,
         };
 
         let out = build_command(&spec)

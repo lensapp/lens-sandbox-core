@@ -1,3 +1,4 @@
+use crate::privilege::Confinement;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -82,8 +83,8 @@ pub struct CoreConfig {
     /// loopback, on the same ports. Empty unless `LENS_SANDBOX_EXTRA_LISTEN_IPS`
     /// names some — see that constant for why a nested namespace needs it.
     pub extra_listen_ips: Vec<IpAddr>,
-    /// True when running as root — local proxy + nftables enforcement is enabled.
-    pub is_root: bool,
+    /// Who confines the workload: a root supervisor cages it, an unprivileged one cannot, and a host embedder says so itself.
+    pub confinement: Confinement,
     /// Unix user to drop privileges to for child processes.
     pub sandbox_user: String,
 }
@@ -157,7 +158,7 @@ pub fn load_core_config() -> CoreConfig {
     let extra_listen_ips =
         parse_extra_listen_ips(std::env::var(EXTRA_LISTEN_IPS_ENV).ok().as_deref());
 
-    let is_root = nix::unistd::getuid().is_root();
+    let confinement = Confinement::of_this_process();
 
     let sandbox_user = std::env::var("LENS_SANDBOX_USER").unwrap_or_else(|_| "sandbox".to_string());
 
@@ -168,7 +169,7 @@ pub fn load_core_config() -> CoreConfig {
         transparent_listen_addr,
         dns_stub_listen_addr,
         extra_listen_ips,
-        is_root,
+        confinement,
         sandbox_user,
     }
 }
