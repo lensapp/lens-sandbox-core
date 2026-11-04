@@ -39,6 +39,8 @@ pub mod config;
 pub mod connector;
 #[cfg(feature = "proxy")]
 pub mod dns;
+#[cfg(feature = "proxy")]
+pub mod egress;
 pub mod exec_manager;
 pub mod exec_protocol;
 #[cfg(feature = "proxy")]

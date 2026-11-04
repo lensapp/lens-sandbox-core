@@ -60,7 +60,6 @@ use crate::peer_process::ActorContext;
 use crate::protocol::Treatment;
 use crate::proxy::{ProxyState, RawDecision};
 use crate::routing::Verdict;
-use crate::sock_mark;
 
 /// UDP's protocol number in an IPv4 `protocol` or IPv6 `next header` field.
 const IPPROTO_UDP: u8 = 17;
@@ -345,7 +344,7 @@ fn decide(
     // The floor every egress path shares, and not a policy question: an
     // accepted datagram leaves directly, so a link-local destination would
     // reach the host's own metadata surface. A rule cannot grant this.
-    if sock_mark::is_disallowed_egress_ip(datagram.dst.ip()) {
+    if crate::egress::is_disallowed_egress_ip(datagram.dst.ip()) {
         let actor = ActorContext::resolve_udp(datagram.src);
         crate::proxy::emit_policy_deny_connect(state, &target, "blocked-destination", &actor);
         cache.insert(datagram, Disposition::Reject, generation);
@@ -519,7 +518,7 @@ fn run(state: &Arc<ProxyState>, runtime: &tokio::runtime::Handle) -> std::io::Re
                 // Not a drop wearing a different name: the mark sends the packet
                 // back through the chain, where the reject rule answers the
                 // sender. See `sock_mark::REJECT_MARK`.
-                msg.set_nfmark(sock_mark::REJECT_MARK);
+                msg.set_nfmark(crate::sock_mark::REJECT_MARK);
                 msg.set_verdict(nfq::Verdict::Repeat);
             }
         }

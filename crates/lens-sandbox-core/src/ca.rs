@@ -51,8 +51,7 @@ impl TrustStore {
         }
     }
 
-    /// A store that writes nowhere, for a test whose CA nothing outside it trusts.
-    #[cfg(test)]
+    /// A store that writes nowhere: a test's, or a host's whose guest trusts the CA instead.
     pub(crate) fn nowhere() -> Self {
         Self {
             paths: None,

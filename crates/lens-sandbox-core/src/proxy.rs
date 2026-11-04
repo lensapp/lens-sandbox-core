@@ -13,7 +13,6 @@ use crate::routing::{
     HttpRule, RawTarget, RouteOutcome, RouteRule, Scheme, Transport, Verdict,
     find_matching_raw_egress, find_matching_route,
 };
-use crate::sock_mark;
 use crate::transparent::{self, Protocol};
 
 /// Type-erased stream used for the Lens Sandbox upstream tunnel. Either a raw
@@ -274,6 +273,8 @@ pub struct ProxyState {
     pub previous_policy_files: RwLock<Vec<String>>,
     /// Sandbox user credentials for chowning policy files.
     pub sandbox_creds: Option<crate::privilege::SandboxCredentials>,
+    /// How this judge dials upstream: marked past the guest's cage, or plain from a host.
+    pub egress: Arc<dyn crate::egress::Egress>,
     /// AWS SigV4 re-sign interceptor. Owns the placeholder → real-STS-creds
     /// map and the domain patterns that trigger re-signing. Real STS session
     /// credentials live only in this process memory — they never touch the
@@ -331,18 +332,15 @@ pub struct ProxyState {
     /// The product a block response names, if the embedder named one (see
     /// [`Self::set_block_label`]); unset, the response is product-neutral.
     block_label: std::sync::OnceLock<String>,
-    /// Where every egress dial looks up its name and opens its socket: this
-    /// host's network in production, a fake in unit tests.
-    pub(crate) egress_network: Box<dyn sock_mark::EgressNetwork>,
     /// Where this proxy's CAs are installed for the workload to trust: the
-    /// host's trust store in production, nowhere in unit tests.
+    /// host's trust store in production, nowhere in unit tests and on a host.
     pub(crate) trust_store: Arc<crate::ca::TrustStore>,
 }
 
 impl ProxyState {
     /// Wire the audit channel a new connection to the host opened, sending it
     /// first the refusal summaries no channel was connected to take.
-    pub(crate) fn connect_audit(&self, tx: mpsc::UnboundedSender<String>) {
+    pub fn connect_audit(&self, tx: mpsc::UnboundedSender<String>) {
         let mut audit_tx = self.audit_tx.lock().unwrap();
         for tally in self.deny_dedup.lock().unwrap().take_held() {
             let _ = tx.send(tally.summary().to_string());
@@ -687,6 +685,63 @@ async fn accept_loop(
     }
 }
 
+impl ProxyState {
+    /// The state a host embedder builds: it judges with [`crate::egress::HostEgress`], intercepts with a CA the embedder owns, and never installs it into the system trust store — the embedder hands the guest `ca_cert_pem` itself.
+    pub fn for_host(
+        ca: Arc<crate::ca::EphemeralCa>,
+        bootstrap_dns_allowlist: Vec<String>,
+    ) -> Arc<Self> {
+        let state = Self::new(
+            None,
+            bootstrap_dns_allowlist,
+            Arc::new(crate::egress::HostEgress),
+            Arc::new(crate::ca::TrustStore::nowhere()),
+        );
+        let _ = state.ephemeral_ca.set(ca);
+        state
+    }
+
+    pub(crate) fn new(
+        sandbox_creds: Option<crate::privilege::SandboxCredentials>,
+        bootstrap_dns_allowlist: Vec<String>,
+        egress: Arc<dyn crate::egress::Egress>,
+        trust_store: Arc<crate::ca::TrustStore>,
+    ) -> Arc<Self> {
+        Arc::new(ProxyState {
+            upstream: Mutex::new(None),
+            policy: RwLock::new(NetworkPolicy::default()),
+            audit_tx: std::sync::Mutex::new(None),
+            deny_dedup: std::sync::Mutex::default(),
+            queued_refusals: std::sync::Mutex::default(),
+            credential_injections: RwLock::new(HashMap::new()),
+            ephemeral_ca: std::sync::OnceLock::new(),
+            client_certs: RwLock::new(HashMap::new()),
+            uri_placeholder_injections: RwLock::new(HashMap::new()),
+            token_answers: RwLock::new(HashMap::new()),
+            extra_ca_certs: RwLock::new(Vec::new()),
+            sandbox_tls_connector: RwLock::new(None),
+            previous_policy_files: RwLock::new(Vec::new()),
+            sandbox_creds,
+            egress,
+            aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
+            pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
+            credential_pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
+            placeholder_index: RwLock::new(HashMap::new()),
+            unarmed_credential_domains: RwLock::new(Vec::new()),
+            decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
+            upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
+            denied_tunnel_timeout: std::sync::RwLock::new(crate::blocked::DENIED_TUNNEL_TIMEOUT),
+            bootstrap_dns_allowlist: bootstrap_dns_allowlist
+                .into_iter()
+                .map(|h| h.to_ascii_lowercase())
+                .collect(),
+            gate_resolved_hosts: RwLock::new(HashSet::new()),
+            block_label: std::sync::OnceLock::new(),
+            trust_store,
+        })
+    }
+}
+
 impl ProxyServer {
     /// A proxy whose CAs go into the host's trust store.
     pub fn new(
@@ -733,38 +788,12 @@ impl ProxyServer {
         bootstrap_dns_allowlist: Vec<String>,
         trust_store: Arc<crate::ca::TrustStore>,
     ) -> (Self, Arc<ProxyState>) {
-        let state = Arc::new(ProxyState {
-            upstream: Mutex::new(None),
-            policy: RwLock::new(NetworkPolicy::default()),
-            audit_tx: std::sync::Mutex::new(None),
-            deny_dedup: std::sync::Mutex::default(),
-            queued_refusals: std::sync::Mutex::default(),
-            credential_injections: RwLock::new(HashMap::new()),
-            ephemeral_ca: std::sync::OnceLock::new(),
-            client_certs: RwLock::new(HashMap::new()),
-            uri_placeholder_injections: RwLock::new(HashMap::new()),
-            token_answers: RwLock::new(HashMap::new()),
-            extra_ca_certs: RwLock::new(Vec::new()),
-            sandbox_tls_connector: RwLock::new(None),
-            previous_policy_files: RwLock::new(Vec::new()),
+        let state = ProxyState::new(
             sandbox_creds,
-            aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
-            pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
-            credential_pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
-            placeholder_index: RwLock::new(HashMap::new()),
-            unarmed_credential_domains: RwLock::new(Vec::new()),
-            decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
-            upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
-            denied_tunnel_timeout: std::sync::RwLock::new(crate::blocked::DENIED_TUNNEL_TIMEOUT),
-            bootstrap_dns_allowlist: bootstrap_dns_allowlist
-                .into_iter()
-                .map(|h| h.to_ascii_lowercase())
-                .collect(),
-            gate_resolved_hosts: RwLock::new(HashSet::new()),
-            block_label: std::sync::OnceLock::new(),
-            egress_network: Box::new(sock_mark::HostNetwork),
+            bootstrap_dns_allowlist,
+            Arc::new(crate::sock_mark::MarkedEgress),
             trust_store,
-        });
+        );
         let server = Self {
             listen_addr,
             transparent_listen_addr,
@@ -1825,6 +1854,7 @@ async fn handle_connect(
                 let hostname = extract_hostname(target_host);
                 let audit_tx = state.audit_tx.lock().unwrap().clone();
                 crate::mitm::handle_tls_bridge(
+                    state.egress.as_ref(),
                     client,
                     &cc.dial_addr,
                     &cc.tls_server_name,
@@ -2793,8 +2823,8 @@ pub(crate) async fn connect_egress_under_policy(
     already_gated: Gated,
 ) -> std::io::Result<TcpStream> {
     let port = extract_port(target_host, default_port);
-    sock_mark::connect_tcp_egress_on(
-        &*state.egress_network,
+    crate::egress::connect_tcp_egress_where(
+        state.egress.as_ref(),
         &extract_hostname(target_host),
         port,
         |ip| tcp_egress_admits(state, ip, port, caller, already_gated),
@@ -3108,11 +3138,10 @@ async fn handle_raw_passthrough(
 
     // Raw TCP always egresses directly: SO_MARK bypasses the nftables cage and
     // the bytes are spliced through untouched.
-    let mut upstream = match sock_mark::connect_tcp_egress_on(
-        &*state.egress_network,
+    let mut upstream = match crate::egress::connect_tcp_egress(
+        state.egress.as_ref(),
         &orig_dst.ip().to_string(),
         orig_dst.port(),
-        |_| true,
     )
     .await
     {
@@ -4301,7 +4330,7 @@ fn validate_connect_target(target: &str) -> Result<(), Box<dyn std::error::Error
     }
 
     if let Ok(ip) = hostname.parse::<std::net::IpAddr>()
-        && sock_mark::is_disallowed_egress_ip(ip)
+        && crate::egress::is_disallowed_egress_ip(ip)
     {
         return Err("CONNECT to loopback/link-local/unspecified denied".into());
     }
@@ -4545,7 +4574,7 @@ pub async fn connect_sandbox_upstream(
     let connect_timeout = *state.upstream_connect_timeout.read().unwrap();
     let tcp = match tokio::time::timeout(
         connect_timeout,
-        sock_mark::connect_tcp_resolve(&upstream.host, upstream.port),
+        crate::egress::connect_tcp_resolve(state.egress.as_ref(), &upstream.host, upstream.port),
     )
     .await
     {
@@ -4909,7 +4938,8 @@ pub(crate) mod tests {
     }
 
     /// What a unit test's egress dials meet in place of this host's network, so
-    /// no result depends on the host's resolver, routes, or firewall.
+    /// no result depends on the host's resolver, routes, or firewall; a dial to
+    /// loopback still reaches the test's own listener, as a trusted dial does.
     pub(crate) enum TestNetwork {
         /// Only an address literal resolves, and no dial is answered.
         Offline,
@@ -4922,42 +4952,40 @@ pub(crate) mod tests {
         },
     }
 
-    impl sock_mark::EgressNetwork for TestNetwork {
-        fn resolve<'a>(
-            &'a self,
-            host: &'a str,
-            port: u16,
-        ) -> futures_util::future::BoxFuture<'a, std::io::Result<SocketAddr>> {
+    #[async_trait::async_trait]
+    impl crate::egress::Egress for TestNetwork {
+        async fn resolve(&self, host: &str, port: u16) -> std::io::Result<SocketAddr> {
             let literal = host
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .parse::<IpAddr>();
-            Box::pin(async move {
-                literal.map(|ip| SocketAddr::new(ip, port)).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("resolve {host}: a unit test resolves no name"),
-                    )
-                })
+            literal.map(|ip| SocketAddr::new(ip, port)).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("resolve {host}: a unit test resolves no name"),
+                )
             })
         }
 
-        fn connect(
-            &self,
-            resolved: SocketAddr,
-        ) -> futures_util::future::BoxFuture<'_, std::io::Result<TcpStream>> {
-            Box::pin(async move {
-                match self {
-                    Self::Reaching { target, origin } if *target == resolved => {
-                        TcpStream::connect(origin).await
-                    }
-                    Self::Refusing => Err(std::io::ErrorKind::ConnectionRefused.into()),
-                    _ => Err(std::io::Error::new(
-                        std::io::ErrorKind::NetworkUnreachable,
-                        format!("a unit test reaches no network, so not {resolved}"),
-                    )),
+        async fn connect(&self, resolved: SocketAddr) -> std::io::Result<TcpStream> {
+            match self {
+                Self::Reaching { target, origin } if *target == resolved => {
+                    TcpStream::connect(origin).await
                 }
-            })
+                _ if resolved.ip().is_loopback() => TcpStream::connect(resolved).await,
+                Self::Refusing => Err(std::io::ErrorKind::ConnectionRefused.into()),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::NetworkUnreachable,
+                    format!("a unit test reaches no network, so not {resolved}"),
+                )),
+            }
+        }
+
+        async fn bind_udp(&self, _local: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NetworkUnreachable,
+                "a unit test reaches no network",
+            ))
         }
     }
 
@@ -4966,7 +4994,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_state_on(
-        network: impl sock_mark::EgressNetwork + 'static,
+        network: impl crate::egress::Egress + 'static,
     ) -> (Arc<ProxyState>, mpsc::UnboundedReceiver<String>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let state = Arc::new(ProxyState {
@@ -4984,6 +5012,7 @@ pub(crate) mod tests {
             sandbox_tls_connector: RwLock::new(None),
             previous_policy_files: RwLock::new(Vec::new()),
             sandbox_creds: None,
+            egress: Arc::new(network),
             aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
             pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
             credential_pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
@@ -4995,10 +5024,36 @@ pub(crate) mod tests {
             bootstrap_dns_allowlist: Vec::new(),
             gate_resolved_hosts: RwLock::new(HashSet::new()),
             block_label: std::sync::OnceLock::new(),
-            egress_network: Box::new(network),
             trust_store: Arc::new(crate::ca::TrustStore::nowhere()),
         });
         (state, rx)
+    }
+
+    #[test]
+    fn a_host_embedder_keeps_the_ca_it_gives() {
+        let ca = Arc::new(crate::ca::EphemeralCa::new().unwrap());
+        let state = ProxyState::for_host(ca.clone(), Vec::new());
+        assert_eq!(
+            get_or_init_ca(&state).unwrap().ca_cert_pem(),
+            ca.ca_cert_pem()
+        );
+    }
+
+    #[test]
+    fn a_state_without_a_ca_generates_one_on_first_use() {
+        let state = ProxyState::new(
+            None,
+            Vec::new(),
+            Arc::new(crate::sock_mark::MarkedEgress),
+            Arc::new(crate::ca::TrustStore::nowhere()),
+        );
+        assert!(state.ephemeral_ca.get().is_none());
+        assert!(
+            get_or_init_ca(&state)
+                .unwrap()
+                .ca_cert_pem()
+                .contains("BEGIN CERTIFICATE")
+        );
     }
 
     /// One `egress.tcp` rule, built through the real parser so a test can only
@@ -7599,13 +7654,13 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_dial_this_host_refuses_is_answered_502() {
-        let (state, _rx) = test_state_on(sock_mark::HostNetwork);
+        let (state, _rx) = test_state_on(crate::sock_mark::MarkedEgress);
         let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         probe
             .connect("192.0.2.1:9")
             .expect("this test needs a route off the host");
         let ip = probe.local_addr().unwrap().ip();
-        assert!(!sock_mark::is_disallowed_egress_ip(ip), "{ip}");
+        assert!(!crate::egress::is_disallowed_egress_ip(ip), "{ip}");
         let closed = std::net::TcpListener::bind((ip, 0)).unwrap();
         let target = closed.local_addr().unwrap().to_string();
         drop(closed);

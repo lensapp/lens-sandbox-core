@@ -1,7 +1,7 @@
 //! A workload `connect()` that a runtime holds: the proxy judges and serves
 //! it as it serves a redirected connection.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -11,15 +11,6 @@ use lens_sandbox_core::proxy::{ProxyState, serve_egress};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tonic::Streaming;
-
-/// The supervisor dials for the workload, so an address of the supervisor
-/// host would reach the supervisor's own services. Only a local address can
-/// be bound, so a bind decides it; loopback also without IPv6. A service
-/// address that forwards to the supervisor is not local: the network policy
-/// of the consumer must close that one.
-pub(crate) fn is_own_address(ip: IpAddr) -> bool {
-    ip.to_canonical().is_loopback() || UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
-}
 
 /// Replies with the decision. After `Allowed`, the exchange carries the
 /// bytes of the connection, and the proxy can still close it.
@@ -81,19 +72,5 @@ async fn loopback_pair() -> std::io::Result<(TcpStream, TcpStream)> {
         if peer == expected {
             return Ok((proxy_side, relay_side));
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_supervisor_host_is_its_own_address() {
-        assert!(is_own_address("127.0.0.1".parse().unwrap()));
-        assert!(is_own_address("::1".parse().unwrap()));
-        assert!(is_own_address("::ffff:127.0.0.1".parse().unwrap()));
-        assert!(is_own_address("0.0.0.0".parse().unwrap()));
-        assert!(!is_own_address("192.0.2.10".parse().unwrap()));
     }
 }

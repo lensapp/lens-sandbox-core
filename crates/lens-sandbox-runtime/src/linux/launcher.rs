@@ -63,6 +63,7 @@ mod tests {
     use lens_sandbox_core::exec_manager::ExecManager;
     use lens_sandbox_core::exec_protocol::IncomingMessage;
     use lens_sandbox_core::lifecycle::PidGuard;
+    use lens_sandbox_core::privilege::Confinement;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -123,10 +124,10 @@ mod tests {
     }
 
     /// The stdout of `script` in one exec session of the runtime launcher.
-    async fn exec_stdout(is_root: bool, script: &str) -> Vec<u8> {
+    async fn exec_stdout(confinement: Confinement, script: &str) -> Vec<u8> {
         let manager = ExecManager::with_launcher(
             None,
-            is_root,
+            confinement,
             PidGuard::default(),
             Arc::new(runtime_launcher()),
         );
@@ -170,7 +171,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_exec_session_runs_through_the_runtime_launcher() {
-        let stdout = exec_stdout(false, "printf %s \"$SSL_CERT_FILE\"").await;
+        let stdout = exec_stdout(Confinement::Unprivileged, "printf %s \"$SSL_CERT_FILE\"").await;
         assert_eq!(stdout, b"/tmp/lens-sandbox/ca-bundle.pem");
     }
 
@@ -189,7 +190,7 @@ mod tests {
         const LEVEL_B: u64 = 0xfb;
         let own = std::fs::read_to_string("/proc/self/status").unwrap();
         let permitted = u64::from_str_radix(status_field(&own, "CapPrm:"), 16).unwrap();
-        let stdout = exec_stdout(true, "cat /proc/self/status").await;
+        let stdout = exec_stdout(Confinement::Guest, "cat /proc/self/status").await;
         let status = String::from_utf8(stdout).unwrap();
         let effective = u64::from_str_radix(status_field(&status, "CapEff:"), 16).unwrap();
         assert_eq!(effective, LEVEL_B & permitted, "{status}");

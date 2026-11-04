@@ -5,7 +5,7 @@ use nix::libc;
 
 use crate::ca_env::apply_ca_env;
 use crate::child_spawner::{ChildSpec, DirectLauncher, Launcher};
-use crate::privilege::SandboxCredentials;
+use crate::privilege::{Confinement, SandboxCredentials};
 
 /// Owns a raw file descriptor and closes it on drop.
 pub struct OwnedRawFd(RawFd);
@@ -39,7 +39,7 @@ pub fn spawn_pty(
     cwd: Option<&str>,
     env: Option<&HashMap<String, String>>,
     creds: Option<&SandboxCredentials>,
-    is_root: bool,
+    confinement: Confinement,
     initial_size: Option<(u16, u16)>,
 ) -> Result<PtyProcess, String> {
     let spec = ChildSpec {
@@ -49,7 +49,7 @@ pub fn spawn_pty(
         cwd: cwd.map(str::to_string),
         env: env.cloned().unwrap_or_default(),
         creds: creds.cloned(),
-        is_root,
+        confinement,
     };
     spawn_spec(&spec, initial_size, &DirectLauncher)
 }
@@ -103,7 +103,7 @@ pub(crate) fn spawn_spec(
     // pre_exec: set up PTY as controlling terminal + privilege drop
     // Same rule as the piped path, from the same function: root reaches the
     // capability drop rather than a `setuid(0)` that would keep CAP_NET_ADMIN.
-    let privilege = crate::privilege::privilege_drop_for(spec.creds.as_ref(), spec.is_root);
+    let privilege = crate::privilege::privilege_drop_for(spec.creds.as_ref(), spec.confinement);
     let creds_info = match privilege {
         crate::privilege::PrivilegeDrop::Setuid(creds) => Some(creds.uid_gid()),
         _ => None,
@@ -231,7 +231,7 @@ mod tests {
             Some("/tmp"),
             None,
             None,
-            false,
+            Confinement::Unprivileged,
             Some((80, 24)),
         )
         .expect("spawn should succeed");
@@ -255,8 +255,16 @@ mod tests {
 
     #[tokio::test]
     async fn pty_echo() {
-        let mut proc = spawn_pty("/bin/cat", &[], Some("/tmp"), None, None, false, None)
-            .expect("spawn should succeed");
+        let mut proc = spawn_pty(
+            "/bin/cat",
+            &[],
+            Some("/tmp"),
+            None,
+            None,
+            Confinement::Unprivileged,
+            None,
+        )
+        .expect("spawn should succeed");
 
         proc.writer
             .write_all(b"test\n")
@@ -286,7 +294,7 @@ mod tests {
             Some("/tmp"),
             None,
             None,
-            false,
+            Confinement::Unprivileged,
             Some((80, 24)),
         )
         .expect("spawn should succeed");
@@ -308,7 +316,7 @@ mod tests {
             Some("/tmp"),
             None,
             None,
-            false,
+            Confinement::Unprivileged,
             Some((80, 24)),
         )
         .expect("spawn should succeed");
@@ -334,7 +342,7 @@ mod tests {
             Some("/tmp"),
             None,
             None,
-            true,
+            Confinement::Guest,
             Some((80, 24)),
         )
         .expect("spawn should succeed");
@@ -381,7 +389,7 @@ mod tests {
             Some("/tmp"),
             None,
             Some(&creds),
-            true,
+            Confinement::Guest,
             Some((80, 24)),
         )
         .expect("spawn should succeed");

@@ -13,7 +13,6 @@ use tokio::task::AbortHandle;
 use tonic::{Status, Streaming};
 
 use crate::dial::{self, RuntimeAddress};
-use crate::egress;
 use crate::link::{self, Client, Link};
 
 const FORWARD_BUFFER: usize = 64 * 1024;
@@ -73,7 +72,11 @@ impl Supervisor {
     /// [`lens_sandbox_core::dns::discover_upstream`]. The process must
     /// install a rustls crypto provider first.
     pub fn new(state: Arc<ProxyState>, dns_upstream: SocketAddr) -> Self {
-        Self::with_own_address(state, dns_upstream, egress::is_own_address)
+        Self::with_own_address(
+            state,
+            dns_upstream,
+            lens_sandbox_core::egress::is_own_address,
+        )
     }
 
     fn with_own_address(
@@ -326,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_supervisor_says_hello_and_trusts_the_proxy_before_it_mediates() {
-        let mut harness = harness(state(), egress::is_own_address);
+        let mut harness = harness(state(), lens_sandbox_core::egress::is_own_address);
         harness.supervisor.trust("proxy ca".into());
         let order: Vec<_> = [
             harness.next(|_| true).await.open,
@@ -356,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_supervisor_dials_again_after_a_loss() {
-        let mut harness = harness(state(), egress::is_own_address);
+        let mut harness = harness(state(), lens_sandbox_core::egress::is_own_address);
         let hello = Open::Hello {
             protocol: channel::PROTOCOL,
         };
@@ -367,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_forward_and_an_exec_reach_the_runtime() {
-        let mut harness = harness(state(), egress::is_own_address);
+        let mut harness = harness(state(), lens_sandbox_core::egress::is_own_address);
         harness.connected().await;
         let echo = |call: Call| {
             tokio::spawn(async move {
@@ -402,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_runtime_is_not_used_before_it_is_connected() {
-        let harness = harness(state(), egress::is_own_address);
+        let harness = harness(state(), lens_sandbox_core::egress::is_own_address);
         let Err(early) = harness.supervisor.open_exec("agent").await else {
             panic!("an exec reached a runtime before its hello");
         };
@@ -437,7 +440,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_connect_to_the_supervisor_itself_is_denied() {
-        let mut harness = harness(state(), egress::is_own_address);
+        let mut harness = harness(state(), lens_sandbox_core::egress::is_own_address);
         let own = harness.addr;
         let (reply, _) = hand_over(&mut harness, own).await;
         assert_eq!(reply, ConnectReply::Denied);
@@ -499,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_denied_name_gets_an_answer_on_the_mediate_stream() {
-        let mut harness = harness(state(), egress::is_own_address);
+        let mut harness = harness(state(), lens_sandbox_core::egress::is_own_address);
         let mut mediation = harness.mediation().await;
         let mut query = Message::new(0x1234, MessageType::Query, OpCode::Query);
         let mut question = Query::new();

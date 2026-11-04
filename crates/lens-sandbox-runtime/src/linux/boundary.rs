@@ -94,6 +94,7 @@ mod tests {
     use lens_sandbox_core::channel::boundary::isolation_boundary_server::IsolationBoundaryServer;
     use lens_sandbox_core::channel::{ConnectReply, Held};
     use lens_sandbox_core::lifecycle::PidGuard;
+    use lens_sandbox_core::privilege::Confinement;
     use std::io::{Read as _, Write as _};
     use std::net::{SocketAddr, TcpStream, UdpSocket};
     use std::sync::Arc;
@@ -123,7 +124,7 @@ mod tests {
         std::fs::write(dir.path().join("system.pem"), "roots\n").unwrap();
         let ca_bundle = dir.path().join("bundle/ca.pem");
         let boundary = Boundary {
-            exec: ExecManager::new(None, false, PidGuard::default()),
+            exec: ExecManager::new(None, Confinement::Unprivileged, PidGuard::default()),
             broker,
             mediation: Mediation::default(),
             ca_bundle: ca_bundle.clone(),
