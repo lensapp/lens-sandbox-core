@@ -62,13 +62,13 @@ jobs:
       # home and the crate home itself, because the sudo on newer runner images
       # drops them even under `-E`, and root would then fetch them again.
       - run: >
-          sudo -E env "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" cargo test -p lens-sandbox-core --tests --
+          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" cargo test -p lens-sandbox-core --tests --
           --ignored --test-threads=1
           --skip the_supervisors_own_lookup_never_reaches_the_stub
       # That one test needs a namespace of its own, and `lo` as the only way
       # out — see its module doc for what a shared namespace hides.
       - run: >
-          sudo -E env "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" unshare -n -- sh -c
+          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" unshare -n -- sh -c
           'ip link set lo up && ip route add default dev lo &&
           cargo test -p lens-sandbox-core --test supervisor_lookup_over_the_cage -- --ignored'
       # The runtime binds its resolver on 127.0.0.53:53, which systemd-resolved
@@ -77,7 +77,7 @@ jobs:
       # each test starts a runtime on that one resolver address. The ignored
       # unit tests are the ones that need root.
       - run: >
-          sudo -E env "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" unshare -n -- sh -c
+          sudo -E env "PATH=$PATH" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" unshare -n -- sh -c
           'ip link set lo up && ip link add probe type dummy &&
           ip addr add 192.0.2.7/32 dev probe && ip link set probe up &&
           ip route add default dev probe &&
