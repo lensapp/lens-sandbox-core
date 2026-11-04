@@ -269,10 +269,6 @@ pub struct ProxyState {
     /// changes so the next CONNECT picks up the updated CA bundle. `TlsConnector`
     /// holds `Arc<ClientConfig>` so cloning is cheap.
     pub(crate) sandbox_tls_connector: RwLock<Option<tokio_rustls::TlsConnector>>,
-    /// Paths of files written by the last policy message — cleaned up before writing new ones.
-    pub previous_policy_files: RwLock<Vec<String>>,
-    /// Sandbox user credentials for chowning policy files.
-    pub sandbox_creds: Option<crate::privilege::SandboxCredentials>,
     /// How this judge dials upstream: marked past the guest's cage, or plain from a host.
     pub egress: Arc<dyn crate::egress::Egress>,
     /// AWS SigV4 re-sign interceptor. Owns the placeholder → real-STS-creds
@@ -692,7 +688,6 @@ impl ProxyState {
         bootstrap_dns_allowlist: Vec<String>,
     ) -> Arc<Self> {
         let state = Self::new(
-            None,
             bootstrap_dns_allowlist,
             Arc::new(crate::egress::HostEgress),
             Arc::new(crate::ca::TrustStore::nowhere()),
@@ -702,7 +697,6 @@ impl ProxyState {
     }
 
     pub(crate) fn new(
-        sandbox_creds: Option<crate::privilege::SandboxCredentials>,
         bootstrap_dns_allowlist: Vec<String>,
         egress: Arc<dyn crate::egress::Egress>,
         trust_store: Arc<crate::ca::TrustStore>,
@@ -720,8 +714,6 @@ impl ProxyState {
             token_answers: RwLock::new(HashMap::new()),
             extra_ca_certs: RwLock::new(Vec::new()),
             sandbox_tls_connector: RwLock::new(None),
-            previous_policy_files: RwLock::new(Vec::new()),
-            sandbox_creds,
             egress,
             aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
             pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
@@ -748,14 +740,12 @@ impl ProxyServer {
         listen_addr: SocketAddr,
         transparent_listen_addr: SocketAddr,
         dns_stub_listen_addr: SocketAddr,
-        sandbox_creds: Option<crate::privilege::SandboxCredentials>,
         bootstrap_dns_allowlist: Vec<String>,
     ) -> (Self, Arc<ProxyState>) {
         Self::new_with_trust_store(
             listen_addr,
             transparent_listen_addr,
             dns_stub_listen_addr,
-            sandbox_creds,
             bootstrap_dns_allowlist,
             crate::ca::TrustStore::host(),
         )
@@ -767,14 +757,12 @@ impl ProxyServer {
         listen_addr: SocketAddr,
         transparent_listen_addr: SocketAddr,
         dns_stub_listen_addr: SocketAddr,
-        sandbox_creds: Option<crate::privilege::SandboxCredentials>,
         bootstrap_dns_allowlist: Vec<String>,
     ) -> (Self, Arc<ProxyState>) {
         Self::new_with_trust_store(
             listen_addr,
             transparent_listen_addr,
             dns_stub_listen_addr,
-            sandbox_creds,
             bootstrap_dns_allowlist,
             Arc::new(crate::ca::TrustStore::nowhere()),
         )
@@ -784,12 +772,10 @@ impl ProxyServer {
         listen_addr: SocketAddr,
         transparent_listen_addr: SocketAddr,
         dns_stub_listen_addr: SocketAddr,
-        sandbox_creds: Option<crate::privilege::SandboxCredentials>,
         bootstrap_dns_allowlist: Vec<String>,
         trust_store: Arc<crate::ca::TrustStore>,
     ) -> (Self, Arc<ProxyState>) {
         let state = ProxyState::new(
-            sandbox_creds,
             bootstrap_dns_allowlist,
             Arc::new(crate::sock_mark::MarkedEgress),
             trust_store,
@@ -4699,7 +4685,6 @@ pub(crate) mod tests {
             "127.0.0.1:3128".parse().unwrap(),
             "127.0.0.1:3129".parse().unwrap(),
             "127.0.0.1:5355".parse().unwrap(),
-            None,
             Vec::new(),
         );
         server = server.with_extra_listen_ips(vec!["169.254.32.1".parse().unwrap()]);
@@ -5010,8 +4995,6 @@ pub(crate) mod tests {
             token_answers: RwLock::new(HashMap::new()),
             extra_ca_certs: RwLock::new(Vec::new()),
             sandbox_tls_connector: RwLock::new(None),
-            previous_policy_files: RwLock::new(Vec::new()),
-            sandbox_creds: None,
             egress: Arc::new(network),
             aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
             pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
@@ -5042,7 +5025,6 @@ pub(crate) mod tests {
     #[test]
     fn a_state_without_a_ca_generates_one_on_first_use() {
         let state = ProxyState::new(
-            None,
             Vec::new(),
             Arc::new(crate::sock_mark::MarkedEgress),
             Arc::new(crate::ca::TrustStore::nowhere()),

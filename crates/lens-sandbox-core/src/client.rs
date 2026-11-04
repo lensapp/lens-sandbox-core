@@ -50,6 +50,7 @@ pub trait SessionHandler: Send + Sync {
 pub async fn run(
     config: &CoreConfig,
     proxy_state: &Option<Arc<ProxyState>>,
+    placed: &PlacedFiles,
     dispatcher: &dyn SandboxDispatcher,
 ) {
     let (ws_url, token) = match &config.mode {
@@ -82,7 +83,7 @@ pub async fn run(
 
     loop {
         let session = dispatcher.new_session();
-        match connect_and_run(ws_url, token, &last_activity, proxy_state, session).await {
+        match connect_and_run(ws_url, token, &last_activity, proxy_state, placed, session).await {
             ConnectionResult::Rejected => {
                 tracing::error!("Connection rejected before handshake, exiting");
                 std::process::exit(1);
@@ -119,6 +120,7 @@ async fn connect_and_run(
     token: &str,
     last_activity: &Arc<Mutex<Instant>>,
     proxy_state: &Option<Arc<ProxyState>>,
+    placed: &PlacedFiles,
     session: Box<dyn SessionHandler>,
 ) -> ConnectionResult {
     tracing::info!("Connecting to Lens Sandbox: {}", ws_url);
@@ -247,7 +249,7 @@ async fn connect_and_run(
                 };
 
                 match msg_type.as_str() {
-                    "policy" => match handle_policy(&text, proxy_state).await {
+                    "policy" => match handle_policy(&text, proxy_state, placed).await {
                         // Policy messages (initial policy on connect + periodic
                         // credential refresh) are deliberately NOT counted as activity
                         // so idle sandboxes still hit the shutdown timer.
@@ -846,17 +848,40 @@ fn parse_upstream_plain_http_mode(value: &serde_json::Value) -> crate::proxy::Up
     }
 }
 
-/// The guest's policy step: judge the frame, then place its files on the filesystem the proxy shares with the workload.
-async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> PolicyResult {
+/// The files the last policy placed on this process's filesystem, and whose they are; the next policy replaces them, with or without a proxy in this process.
+#[derive(Default)]
+pub struct PlacedFiles {
+    paths: std::sync::RwLock<Vec<String>>,
+    creds: Option<crate::privilege::SandboxCredentials>,
+}
+
+impl PlacedFiles {
+    /// The files are owned by the sandbox user, and `~/…` paths resolve in its home.
+    pub fn for_sandbox(creds: Option<crate::privilege::SandboxCredentials>) -> Self {
+        Self {
+            paths: std::sync::RwLock::new(Vec::new()),
+            creds,
+        }
+    }
+
+    pub fn paths(&self) -> Vec<String> {
+        self.paths.read().unwrap().clone()
+    }
+}
+
+/// The workload owner's policy step: judge the frame, then place its files on the filesystem this process shares with the workload.
+async fn handle_policy(
+    raw_text: &str,
+    proxy_state: &Option<Arc<ProxyState>>,
+    placed: &PlacedFiles,
+) -> PolicyResult {
     match judge_policy(raw_text, proxy_state).await {
         JudgedPolicy::VersionMismatch { server_min, client } => {
             PolicyResult::VersionMismatch { server_min, client }
         }
         JudgedPolicy::Malformed(_) => PolicyResult::Ok(HashMap::new()),
         JudgedPolicy::Ok { env, files } => {
-            if let Some(state) = proxy_state {
-                write_policy_files(state, &files).await;
-            }
+            write_policy_files(placed, &files).await;
             PolicyResult::Ok(env)
         }
     }
@@ -866,19 +891,16 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
 // kubeconfig). The ordering — prepare, then remove, then write — and the
 // bookkeeping for each outcome live in `temp_files` where a fake can drive
 // all three; see `refresh_policy_files_with`.
-async fn write_policy_files(state: &Arc<ProxyState>, files: &[crate::protocol::TempFile]) {
-    let old_paths = state.previous_policy_files.read().unwrap().clone();
+async fn write_policy_files(placed: &PlacedFiles, files: &[crate::protocol::TempFile]) {
+    let old_paths = placed.paths();
     // The roots — `/tmp` plus the sandbox user's home, so a `~/…` policy
     // path resolves without opening the rest of the filesystem — come from
     // these same credentials, inside the call.
-    if let Some(tracked) = crate::temp_files::refresh_policy_files(
-        &old_paths,
-        Some(files),
-        state.sandbox_creds.as_ref(),
-    )
-    .await
+    if let Some(tracked) =
+        crate::temp_files::refresh_policy_files(&old_paths, Some(files), placed.creds.as_ref())
+            .await
     {
-        *state.previous_policy_files.write().unwrap() = tracked;
+        *placed.paths.write().unwrap() = tracked;
     }
 }
 
@@ -1073,7 +1095,7 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
         tracing::debug!("proxy not enabled — skipping proxy config from policy");
         return JudgedPolicy::Ok {
             env: policy_env,
-            files: Vec::new(),
+            files: msg.files.unwrap_or_default(),
         };
     };
 
@@ -1450,6 +1472,7 @@ impl std::error::Error for PolicyFrameError {}
 pub async fn apply_local_policy(
     policy_json: &str,
     proxy_state: &Option<Arc<ProxyState>>,
+    placed: &PlacedFiles,
 ) -> HashMap<String, String> {
     // Parse, add type field, re-serialize (safe regardless of whitespace)
     let mut policy: serde_json::Value =
@@ -1474,7 +1497,7 @@ pub async fn apply_local_policy(
         });
     }
 
-    match handle_policy(&msg, proxy_state).await {
+    match handle_policy(&msg, proxy_state, placed).await {
         PolicyResult::Ok(env) => env,
         PolicyResult::VersionMismatch { server_min, client } => {
             // Standalone mode — version mismatch shouldn't happen (no server),
@@ -1577,7 +1600,6 @@ mod tests {
         assert_eq!(applied.files[0].path, path);
         assert_eq!(applied.files[0].content.as_deref(), Some("kubeconfig"));
         assert!(!std::path::Path::new(&path).exists());
-        assert!(state.previous_policy_files.read().unwrap().is_empty());
     }
 
     /// A frame that does not parse is an error to the embedder, not an empty
@@ -1596,13 +1618,40 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_frame_keeps_the_files_the_last_frame_placed() {
         let state = test_host_state();
-        *state.previous_policy_files.write().unwrap() = vec!["/tmp/kept".into()];
-        let result = handle_policy("not json", &Some(state.clone())).await;
+        let placed = PlacedFiles::default();
+        *placed.paths.write().unwrap() = vec!["/tmp/kept".into()];
+        let result = handle_policy("not json", &Some(state.clone()), &placed).await;
         assert!(matches!(result, PolicyResult::Ok(env) if env.is_empty()));
-        assert_eq!(
-            *state.previous_policy_files.read().unwrap(),
-            vec!["/tmp/kept".to_string()]
+        assert_eq!(placed.paths(), vec!["/tmp/kept".to_string()]);
+    }
+
+    /// With the judge outside this process there is no proxy here, but the workload's files are still this process's to place.
+    #[tokio::test]
+    async fn a_policy_places_its_files_without_a_proxy_in_this_process() {
+        let creds = crate::privilege::SandboxCredentials::resolve_by_uid(
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+        .unwrap();
+        let name = format!(
+            "lens-sandbox-core-{}-placed-without-a-proxy",
+            std::process::id()
         );
+        let on_disk = std::path::Path::new(creds.home()).join(&name);
+        let _ = std::fs::remove_file(&on_disk);
+        let frame = serde_json::json!({
+            "type": "policy",
+            "files": [{"path": format!("~/{name}"), "content": "kubeconfig"}]
+        });
+        let placed = PlacedFiles::for_sandbox(Some(creds));
+        let result = handle_policy(&frame.to_string(), &None, &placed).await;
+        assert!(matches!(result, PolicyResult::Ok(_)));
+        assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), "kubeconfig");
+        assert_eq!(placed.paths().len(), 1);
+        let empty = serde_json::json!({"type": "policy", "files": []});
+        handle_policy(&empty.to_string(), &None, &placed).await;
+        assert!(!on_disk.exists());
+        assert!(placed.paths().is_empty());
     }
 
     #[tokio::test]
@@ -1727,8 +1776,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
 
-        let result =
-            connect_and_run("not a url %%", "test-token", &last_activity, &None, session).await;
+        let result = connect_and_run(
+            "not a url %%",
+            "test-token",
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert!(matches!(result, ConnectionResult::Rejected));
     }
@@ -1744,6 +1800,7 @@ mod tests {
             "test-token",
             &last_activity,
             &None,
+            &PlacedFiles::default(),
             session,
         )
         .await;
@@ -1767,6 +1824,7 @@ mod tests {
             "test-token",
             &last_activity,
             &None,
+            &PlacedFiles::default(),
             session,
         )
         .await;
@@ -1788,6 +1846,7 @@ mod tests {
             "test-token",
             &last_activity,
             &None,
+            &PlacedFiles::default(),
             session,
         )
         .await;
@@ -1815,7 +1874,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
 
-        let result = connect_and_run(&ws_url, &token, &last_activity, &None, session).await;
+        let result = connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert!(matches!(result, ConnectionResult::Rejected));
     }
@@ -1840,7 +1907,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
 
-        let result = connect_and_run(&ws_url, &token, &last_activity, &None, session).await;
+        let result = connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert!(matches!(result, ConnectionResult::Rejected));
     }
@@ -1865,7 +1940,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
 
-        let result = connect_and_run(&ws_url, &token, &last_activity, &None, session).await;
+        let result = connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert!(matches!(result, ConnectionResult::Disconnected(None)));
     }
@@ -1895,7 +1978,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
 
-        let result = connect_and_run(&ws_url, &token, &last_activity, &None, session).await;
+        let result = connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         // CloseCode::Normal = 1000
         assert!(matches!(result, ConnectionResult::Disconnected(Some(1000))));
@@ -1915,7 +2006,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
 
-        let result = connect_and_run(&ws_url, &token, &last_activity, &None, session).await;
+        let result = connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert!(matches!(result, ConnectionResult::Disconnected(None)));
     }
@@ -1957,7 +2056,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
 
-        connect_and_run(&ws_url, &token, &last_activity, &None, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let reply = server.await.unwrap();
         assert_eq!(reply["type"], "exec_result");
@@ -1982,7 +2089,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
 
-        let result = connect_and_run(&ws_url, &token, &last_activity, &None, session).await;
+        let result = connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert!(matches!(result, ConnectionResult::Disconnected(None)));
     }
@@ -2008,7 +2123,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        let result = connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        let result = connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert!(matches!(result, ConnectionResult::Disconnected(_)));
         assert!(
@@ -2045,7 +2168,15 @@ mod tests {
         let (ws_url, token) = make_config(addr);
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
-        connect_and_run(&ws_url, &token, &last_activity, &Some(state), session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &Some(state),
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let first: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
         assert_eq!(first, summary);
@@ -2409,7 +2540,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let session = TestDispatcher.new_session();
 
-        connect_and_run(&ws_url, &token, &last_activity, &None, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let reply = server.await.unwrap();
         assert_eq!(reply["type"], "exec_result");
@@ -2425,7 +2564,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -2465,7 +2603,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let injections = state.credential_injections.read().unwrap();
         assert!(injections.contains_key("api.github.com"));
@@ -2488,7 +2634,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -2528,7 +2673,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         // The declared domain is intercepted; an unrelated host is not.
         assert!(state.intercept_for_unarmed("api.github.com"));
@@ -2562,7 +2715,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -2611,7 +2763,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let head = "POST /v3/conversations HTTP/1.1\r\nHost: api.example.com\r\n\
                     Authorization: Bearer placeholder-token\r\n\r\n";
@@ -2635,7 +2795,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -2668,7 +2827,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert!(!state.intercept_for_unarmed("api.github.com"));
         assert!(state.unarmed_credential_domains.read().unwrap().is_empty());
@@ -2683,7 +2850,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -2746,7 +2912,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert!(!state.intercept_for_unarmed("api.github.com"));
     }
@@ -2758,7 +2932,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -2812,7 +2985,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let injections = state.credential_injections.read().unwrap();
         let entries = &injections["lens.example.com"];
@@ -2827,7 +3008,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -2883,7 +3063,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let configs = state.aws_resign.configs_snapshot();
         assert_eq!(configs.len(), 1, "rotation must overwrite, not append");
@@ -2903,7 +3091,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -2929,7 +3116,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let injections = state.credential_injections.read().unwrap();
         assert!(injections.is_empty());
@@ -2943,7 +3138,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -2989,7 +3183,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let injections = state.credential_injections.read().unwrap();
         assert!(injections.contains_key("api.github.com"));
@@ -3014,7 +3216,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -3044,7 +3245,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert_eq!(
             state.policy.read().unwrap().default_verdict,
@@ -3064,7 +3273,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -3094,7 +3302,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert_eq!(
             state.policy.read().unwrap().default_verdict,
@@ -3110,7 +3326,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -3138,7 +3353,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         assert_eq!(
             state.policy.read().unwrap().default_verdict,
@@ -3154,7 +3377,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -3202,7 +3424,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         // Client certs should be populated
         let certs = state.client_certs.read().unwrap();
@@ -3246,7 +3476,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3275,7 +3504,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         let certs = state.client_certs.read().unwrap();
         assert_eq!(
@@ -3300,7 +3534,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3320,7 +3553,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         // http rule landed in routes; tcp rule landed in the tcp policy.
         assert_eq!(state.policy.read().unwrap().routes.len(), 1);
@@ -3339,7 +3577,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3358,7 +3595,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         let policy = state.policy.read().unwrap();
         assert_eq!(policy.tcp_egress.len(), 1);
@@ -3373,7 +3615,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3394,7 +3635,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         let policy = state.policy.read().unwrap();
         assert!(policy.routes.is_empty());
@@ -3414,7 +3660,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3431,7 +3676,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         // tcp rule kept, no http rules, and the operator's default verdict applied
         // (NOT force-denied by a spurious "malformed policy" path).
@@ -3449,7 +3699,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3465,7 +3714,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         assert_eq!(state.policy.read().unwrap().routes.len(), 1);
         assert!(state.policy.read().unwrap().tcp_egress.is_empty());
@@ -3477,7 +3731,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3499,7 +3752,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         assert_eq!(
             state.policy.read().unwrap().routes.len(),
@@ -3517,7 +3775,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3535,7 +3792,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         let policy = state.policy.read().unwrap();
         assert!(
@@ -3556,7 +3818,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3571,7 +3832,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         let policy = state.policy.read().unwrap();
         assert_eq!(
@@ -3589,7 +3855,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3609,7 +3874,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         assert!(state.policy.read().unwrap().routes.is_empty());
         assert!(state.policy.read().unwrap().tcp_egress.is_empty());
@@ -3626,7 +3896,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3644,7 +3913,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         assert!(state.policy.read().unwrap().routes.is_empty());
         assert_eq!(
@@ -3660,7 +3934,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3677,7 +3950,7 @@ mod tests {
                 "defaultTransport": "upstream"
             }
         });
-        apply_local_policy(&good.to_string(), &proxy_state).await;
+        apply_local_policy(&good.to_string(), &proxy_state, &PlacedFiles::default()).await;
         assert_eq!(state.policy.read().unwrap().routes.len(), 1);
 
         // Now a policy whose `egress` is a non-object (operator typo). It must
@@ -3690,7 +3963,12 @@ mod tests {
                 "defaultTransport": "upstream"
             }
         });
-        apply_local_policy(&malformed.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &malformed.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         assert!(
             state.policy.read().unwrap().routes.is_empty(),
@@ -3709,7 +3987,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3730,7 +4007,12 @@ mod tests {
             }
         });
 
-        apply_local_policy(&policy_json.to_string(), &proxy_state).await;
+        apply_local_policy(
+            &policy_json.to_string(),
+            &proxy_state,
+            &PlacedFiles::default(),
+        )
+        .await;
 
         let policy = state.policy.read().unwrap();
         assert_eq!(policy.tcp_egress.len(), 2);
@@ -3753,7 +4035,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         let proxy_state = Some(state.clone());
@@ -3770,7 +4051,7 @@ mod tests {
             serde_json::to_string(&key_pem).unwrap(),
         );
 
-        let env = apply_local_policy(&policy_json, &proxy_state).await;
+        let env = apply_local_policy(&policy_json, &proxy_state, &PlacedFiles::default()).await;
 
         // Verify env vars from policy
         assert_eq!(
@@ -3820,7 +4101,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -3850,7 +4130,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         // defaultVerdict should be forced to Deny, NOT "allow" from the policy
         assert_eq!(
@@ -3868,7 +4156,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -3910,7 +4197,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         // The domain route with forward should be denied, not allow
         let policy = state.policy.read().unwrap();
@@ -3940,7 +4235,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
 
@@ -3982,7 +4276,15 @@ mod tests {
         let session = TestDispatcher.new_session();
         let proxy_state = Some(state.clone());
 
-        connect_and_run(&ws_url, &token, &last_activity, &proxy_state, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &proxy_state,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         // The malformed cert should have overridden the route verdict to Deny
         let policy = state.policy.read().unwrap();
@@ -4043,7 +4345,14 @@ mod tests {
         // Should return well within 2 seconds, not wait 10 seconds for the exec.
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            connect_and_run(&ws_url, &token, &last_activity, &None, session),
+            connect_and_run(
+                &ws_url,
+                &token,
+                &last_activity,
+                &None,
+                &PlacedFiles::default(),
+                session,
+            ),
         )
         .await;
 
@@ -4129,7 +4438,7 @@ mod tests {
             "type": "policy",
             "minProtocolDate": crate::protocol::SANDBOX_PROTOCOL_DATE,
         });
-        let result = handle_policy(&raw.to_string(), &None).await;
+        let result = handle_policy(&raw.to_string(), &None, &PlacedFiles::default()).await;
         assert!(matches!(result, PolicyResult::Ok(_)));
     }
 
@@ -4140,7 +4449,7 @@ mod tests {
             "type": "policy",
             "minProtocolDate": "2020-01-01",
         });
-        let result = handle_policy(&raw.to_string(), &None).await;
+        let result = handle_policy(&raw.to_string(), &None, &PlacedFiles::default()).await;
         assert!(matches!(result, PolicyResult::Ok(_)));
     }
 
@@ -4151,7 +4460,7 @@ mod tests {
             "type": "policy",
             "minProtocolDate": "2099-01-01",
         });
-        let result = handle_policy(&raw.to_string(), &None).await;
+        let result = handle_policy(&raw.to_string(), &None, &PlacedFiles::default()).await;
         match result {
             PolicyResult::VersionMismatch { server_min, client } => {
                 assert_eq!(server_min, "2099-01-01");
@@ -4168,7 +4477,7 @@ mod tests {
             "type": "policy",
             "env": { "FOO": "bar" },
         });
-        let result = handle_policy(&raw.to_string(), &None).await;
+        let result = handle_policy(&raw.to_string(), &None, &PlacedFiles::default()).await;
         match result {
             PolicyResult::Ok(env) => {
                 assert_eq!(env.get("FOO").map(|s| s.as_str()), Some("bar"));
@@ -4195,7 +4504,7 @@ mod tests {
                 }]
             }]
         });
-        let result = handle_policy(&raw.to_string(), &None).await;
+        let result = handle_policy(&raw.to_string(), &None, &PlacedFiles::default()).await;
         match result {
             PolicyResult::VersionMismatch { server_min, client } => {
                 assert_eq!(server_min, "2099-01-01");
@@ -4212,7 +4521,7 @@ mod tests {
             "type": "policy",
             "minProtocolDate": "not-a-date",
         });
-        let result = handle_policy(&raw.to_string(), &None).await;
+        let result = handle_policy(&raw.to_string(), &None, &PlacedFiles::default()).await;
         assert!(matches!(result, PolicyResult::Ok(_)));
     }
 
@@ -4249,7 +4558,15 @@ mod tests {
         let last_activity = Arc::new(Mutex::new(stale));
         let session = TestDispatcher.new_session();
 
-        connect_and_run(&ws_url, &token, &last_activity, &None, session).await;
+        connect_and_run(
+            &ws_url,
+            &token,
+            &last_activity,
+            &None,
+            &PlacedFiles::default(),
+            session,
+        )
+        .await;
 
         let observed = *last_activity.lock().await;
         assert_eq!(
@@ -4267,7 +4584,6 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
-            None,
             Vec::new(),
         );
         state
@@ -4290,9 +4606,15 @@ mod tests {
             policy.to_string()
         };
         if let Some(value) = previous {
-            handle_policy(&frame(Some(serde_json::json!(value))), &Some(state.clone())).await;
+            handle_policy(
+                &frame(Some(serde_json::json!(value))),
+                &Some(state.clone()),
+                &PlacedFiles::default(),
+            )
+            .await;
         }
-        let result = handle_policy(&frame(field), &Some(state.clone())).await;
+        let result =
+            handle_policy(&frame(field), &Some(state.clone()), &PlacedFiles::default()).await;
         assert!(matches!(result, PolicyResult::Ok(_)));
         state
             .upstream
@@ -4355,7 +4677,12 @@ mod tests {
                 }]
             }]
         });
-        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        let result = handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert!(matches!(result, PolicyResult::Ok(_)));
 
         // URI placeholder injections should be domain-scoped
@@ -4410,7 +4737,12 @@ mod tests {
                 ]
             }]
         });
-        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        let result = handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert!(matches!(result, PolicyResult::Ok(_)));
 
         {
@@ -4444,7 +4776,12 @@ mod tests {
 
         // The next policy replaces the answers like every other injection.
         let cleared = serde_json::json!({ "type": "policy", "credentials": [] });
-        handle_policy(&cleared.to_string(), &Some(state.clone())).await;
+        handle_policy(
+            &cleared.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert!(state.token_answers.read().unwrap().is_empty());
         assert!(!state.intercept_for_token_answer("login.example.com"));
     }
@@ -4478,7 +4815,12 @@ mod tests {
                 ]
             }]
         });
-        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        let result = handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert!(matches!(result, PolicyResult::Ok(_)));
 
         {
@@ -4527,7 +4869,12 @@ mod tests {
                 }]
             }]
         });
-        handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
 
         {
             let answers = state.token_answers.read().unwrap();
@@ -4584,7 +4931,12 @@ mod tests {
                 }]
             }]
         });
-        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        let result = handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert!(matches!(result, PolicyResult::Ok(_)));
 
         assert_eq!(
@@ -4625,7 +4977,12 @@ mod tests {
         for credentials in [vec![answer.clone(), access.clone()], vec![access, answer]] {
             let state = test_proxy_state();
             let policy = serde_json::json!({"type": "policy", "credentials": credentials});
-            let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+            let result = handle_policy(
+                &policy.to_string(),
+                &Some(state.clone()),
+                &PlacedFiles::default(),
+            )
+            .await;
             assert!(matches!(result, PolicyResult::Ok(_)));
 
             let index = state.placeholder_index.read().unwrap();
@@ -4658,7 +5015,12 @@ mod tests {
                 }]
             }]
         });
-        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        let result = handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert!(matches!(result, PolicyResult::Ok(_)));
 
         // Header injections should be in credential_injections
@@ -4691,7 +5053,12 @@ mod tests {
                 }]
             }]
         });
-        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        let result = handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert!(matches!(result, PolicyResult::Ok(_)));
 
         let header_map = state.credential_injections.read().unwrap();
@@ -4721,7 +5088,12 @@ mod tests {
                 }]
             }]
         });
-        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        let result = handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert!(matches!(result, PolicyResult::Ok(_)));
 
         let header_map = state.credential_injections.read().unwrap();
@@ -4758,7 +5130,12 @@ mod tests {
                 }
             ]
         });
-        let result = handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        let result = handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert!(matches!(result, PolicyResult::Ok(_)));
 
         let header_map = state.credential_injections.read().unwrap();
@@ -4781,7 +5158,12 @@ mod tests {
                 "defaultTransport": "upstream",
             },
         });
-        handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert_eq!(
             state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Ask,
@@ -4801,7 +5183,12 @@ mod tests {
                 "defaultVerdict": "ask",
             },
         });
-        handle_policy(&policy.to_string(), &Some(state.clone())).await;
+        handle_policy(
+            &policy.to_string(),
+            &Some(state.clone()),
+            &PlacedFiles::default(),
+        )
+        .await;
         assert_eq!(
             state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Deny,

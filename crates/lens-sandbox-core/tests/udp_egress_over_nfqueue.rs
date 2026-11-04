@@ -108,7 +108,6 @@ async fn the_kernel_and_the_relay_agree_on_accept_and_on_refusal() {
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".parse().unwrap(),
-        None,
         Vec::new(),
     );
     let (audit_tx, mut audit) = mpsc::unbounded_channel();

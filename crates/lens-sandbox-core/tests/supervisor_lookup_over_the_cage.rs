@@ -90,7 +90,6 @@ fn fenced_state() -> Arc<ProxyState> {
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".parse().unwrap(),
-        None,
         Vec::new(),
     );
     state.policy.write().unwrap().routes = vec![RouteRule {
