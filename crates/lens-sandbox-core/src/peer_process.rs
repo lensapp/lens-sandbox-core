@@ -48,9 +48,8 @@ impl PeerProcess {
 /// event it produces.
 #[derive(Debug, Clone)]
 pub struct ActorContext {
-    /// `None` when the connection reached the proxy through the runtime
-    /// channel: the workload socket's own address is then a loopback relay
-    /// port, which names nothing.
+    /// `None` when the address names nothing: a loopback relay port on the
+    /// runtime channel, or a guest address a host judges for.
     peer: Option<SocketAddr>,
     process: Option<PeerProcess>,
 }
@@ -63,6 +62,14 @@ impl ActorContext {
         Self {
             peer: Some(peer),
             process: resolve(peer),
+        }
+    }
+
+    /// A guest flow a host judges: no peer or process is visible to the host.
+    pub fn unattributed() -> Self {
+        Self {
+            peer: None,
+            process: None,
         }
     }
 
@@ -501,6 +508,14 @@ mod tests {
             json!({"ip": "10.0.0.5", "port": 54321})
         );
         assert!(!event.contains_key("actor"));
+    }
+
+    #[test]
+    fn augment_writes_nothing_for_an_unattributed_actor() {
+        let mut event = Map::new();
+        ActorContext::unattributed().augment(&mut event);
+        assert!(event.is_empty());
+        assert!(ActorContext::unattributed().process().is_none());
     }
 
     #[test]
