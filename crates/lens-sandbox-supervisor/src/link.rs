@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn only_a_policy_with_udp_rules_has_udp_egress() {
         let any = "127.0.0.1:0".parse().unwrap();
-        let state = ProxyServer::new(any, any, any, None, Vec::new()).1;
+        let state = ProxyServer::new(any, any, any, Vec::new()).1;
         assert!(!has_udp_egress(&state));
         let syslog = serde_json::json!([{ "match": "192.0.2.10:514", "verdict": "allow" }]);
         state.policy.write().unwrap().udp_egress = parse_udp_egress(&syslog).unwrap();

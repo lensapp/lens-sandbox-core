@@ -92,7 +92,6 @@ fn state_with_tcp_hostname(host: &str) -> Arc<ProxyState> {
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".parse().unwrap(),
-        None,
         Vec::new(),
     );
     // Through the real parser: `egress.tcp` rules always carry a port, so a
@@ -113,7 +112,6 @@ fn state_with_allow(patterns: &[&str]) -> Arc<ProxyState> {
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".parse().unwrap(),
         "127.0.0.1:0".parse().unwrap(),
-        None,
         Vec::new(),
     );
     let rules: Vec<RouteRule> = patterns

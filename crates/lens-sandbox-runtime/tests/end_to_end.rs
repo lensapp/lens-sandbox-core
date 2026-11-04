@@ -41,7 +41,7 @@ struct Sandbox {
 
 fn state() -> Arc<ProxyState> {
     let any = "127.0.0.1:0".parse().unwrap();
-    ProxyServer::new(any, any, any, None, Vec::new()).1
+    ProxyServer::new(any, any, any, Vec::new()).1
 }
 
 async fn sandbox() -> Sandbox {
