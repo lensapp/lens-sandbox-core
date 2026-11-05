@@ -22,7 +22,7 @@ pub trait Egress: Send + Sync {
     async fn bind_udp(&self, local: SocketAddr) -> io::Result<UdpSocket>;
 }
 
-/// A host that judges for a guest: plain sockets, and nothing that reaches the host's own services.
+/// A host that judges for a guest with plain sockets and refuses only the host's own addresses, so the embedder's network policy must close an address that forwards to the host.
 pub struct HostEgress;
 
 #[async_trait]
