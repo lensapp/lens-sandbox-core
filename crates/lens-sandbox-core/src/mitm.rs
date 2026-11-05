@@ -1628,6 +1628,17 @@ where
             )
             .await);
     }
+    // The placeholder signature is matched to its real key before the credential
+    // gate, so a request the signer must refuse is refused at once, not held
+    // for a prompt whose answer cannot make it signable.
+    let signature = if signed {
+        match ctx.state.aws_signer.signature_for(&head) {
+            Ok(signature) => Some(signature),
+            Err(refusal) => return Err(facts.refuse_signing(&mut tls_client, refusal).await),
+        }
+    } else {
+        None
+    };
     // The signer consumes the placeholder in the signature headers, so the
     // credential gate looks only at the rest of the head.
     let gate_view = |head: String| {
@@ -1953,18 +1964,20 @@ where
         None => (modified, body_mode),
     };
 
-    let (modified, body_mode, signed_service) = if signed {
-        let (head, body_mode, service) = sign_request(
-            &mut tls_client,
-            &facts,
-            &modified,
-            body_mode,
-            &mut buffered_body,
-        )
-        .await?;
-        (head, body_mode, Some(service))
-    } else {
-        (modified, body_mode, None)
+    let (modified, body_mode, signed_service) = match signature {
+        Some(signature) => {
+            let (head, body_mode) = sign_request(
+                &mut tls_client,
+                &facts,
+                &signature,
+                &modified,
+                body_mode,
+                &mut buffered_body,
+            )
+            .await?;
+            (head, body_mode, Some(signature.service().to_string()))
+        }
+        None => (modified, body_mode, None),
     };
 
     let mut audit = crate::upstream_answer::PendingAudit::none();
@@ -2036,23 +2049,20 @@ where
 /// Re-sign a request the pipeline has decided to forward, with the real key its
 /// placeholder signature stands for.
 ///
-/// Returns the signed head, the framing the relay still has to forward, and the
-/// AWS service the request was signed for. A body the signature covers is read
-/// here when no earlier step read it, and replayed from `buffered_body`.
+/// Returns the signed head and the framing the relay still has to forward. A
+/// body the signature covers is read here when no earlier step read it, and
+/// replayed from `buffered_body`.
 async fn sign_request<C>(
     tls_client: &mut C,
     facts: &RequestFacts<'_, '_>,
+    signature: &crate::signing::PendingSignature,
     head: &str,
     body_mode: BodyFraming,
     buffered_body: &mut Option<Vec<u8>>,
-) -> Result<(String, BodyFraming, String), Box<dyn std::error::Error + Send + Sync>>
+) -> Result<(String, BodyFraming), Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let signature = match facts.ctx.state.aws_signer.signature_for(head) {
-        Ok(signature) => signature,
-        Err(refusal) => return Err(facts.refuse_signing(tls_client, refusal).await),
-    };
     // A request that declares no length has no body (RFC 9112 §6.3). It is
     // signed for an empty one, and its head is left as the client wrote it.
     let unread_body = buffered_body.is_none() && body_mode != BodyFraming::None;
@@ -2061,14 +2071,14 @@ where
             Ok(len) => len,
             Err(refusal) => return Err(facts.refuse_signing(tls_client, refusal).await),
         };
-        if let Err(reason) = crate::http_body::answer_continue_if_expected(tls_client, head).await {
-            return Err(facts.deny(tls_client, "signing_refused", &reason).await);
-        }
-        let body = match crate::http_body::read_body(tls_client, body_mode, len).await {
+        // A client that cannot deliver the body it declared made a bad
+        // request; no policy turned it away.
+        let body = match read_signed_body(tls_client, head, body_mode, len).await {
             Ok(body) => body,
-            Err(e) => {
+            Err(reason) => {
+                tracing::debug!(reason, "aws resign: request body not read");
                 return Err(facts
-                    .deny(tls_client, "signing_refused", &e.to_string())
+                    .refuse_signing(tls_client, crate::signing::Refusal::BAD_REQUEST)
                     .await);
             }
         };
@@ -2080,9 +2090,24 @@ where
     };
     let body = buffered_body.as_deref().unwrap_or_default();
     match signature.sign(&head, body) {
-        Ok(signed) => Ok((signed, body_mode, signature.service().to_string())),
+        Ok(signed) => Ok((signed, body_mode)),
         Err(refusal) => Err(facts.refuse_signing(tls_client, refusal).await),
     }
+}
+
+async fn read_signed_body<C>(
+    tls_client: &mut C,
+    head: &str,
+    body_mode: BodyFraming,
+    len: usize,
+) -> Result<Vec<u8>, String>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    crate::http_body::answer_continue_if_expected(tls_client, head).await?;
+    crate::http_body::read_body(tls_client, body_mode, len)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Upstream TLS phase: wrap a TCP stream (direct or tunnel) with TLS.
@@ -3226,6 +3251,9 @@ mod tests {
             let mut tls = connector.connect(server_name, stream).await.unwrap();
 
             tls.write_all(&request).await.unwrap();
+            // The client has nothing more to send, so a body shorter than its
+            // head declares ends here rather than waiting forever.
+            tls.shutdown().await.unwrap();
 
             let mut response = Vec::new();
             let _ = tls.read_to_end(&mut response).await;

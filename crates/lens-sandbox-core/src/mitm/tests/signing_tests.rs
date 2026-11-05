@@ -357,6 +357,32 @@ async fn a_chunked_non_s3_body_is_refused_with_411() {
 }
 
 #[tokio::test]
+async fn a_body_that_ends_before_its_length_is_refused_with_400_not_a_policy_block() {
+    let mut request = placeholder_signed_head("POST", "dynamodb", "Content-Length: 20\r\n");
+    request.push_str("{\"Table");
+    let (client, audits) = refusal_of(request.into_bytes()).await;
+    assert!(client.starts_with("HTTP/1.1 400 "), "{client}");
+    assert_eq!(audits[0]["status_code"], 400);
+    assert_eq!(audits[0]["metadata"]["signing_refused"], true);
+}
+
+#[tokio::test]
+async fn a_presigned_url_is_refused_with_401_without_asking_about_its_placeholder() {
+    // A presigned URL carries the placeholder key in its query, outside the
+    // signature headers the credential gate is told to skip. The signer cannot
+    // sign it, so no answer to a prompt would let it through.
+    let request = format!(
+        "GET /my-bucket/my-object?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+         &X-Amz-Credential={PLACEHOLDER}%2F20230101%2Fus-east-1%2Fs3%2Faws4_request\
+         &X-Amz-Date=20230101T000000Z&X-Amz-SignedHeaders=host&X-Amz-Signature=00 HTTP/1.1\r\n\
+         Host: {TEST_HOSTNAME}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (client, _) = refusal_of(request.into_bytes()).await;
+    assert!(client.starts_with("HTTP/1.1 401 "), "{client}");
+}
+
+#[tokio::test]
 async fn s3_streaming_payload_signing_is_refused_with_501() {
     // `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` embeds per-chunk signatures inside
     // the body framing, seeded by the outer signature, which re-signing cannot
