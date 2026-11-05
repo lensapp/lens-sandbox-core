@@ -227,13 +227,15 @@ where
 /// Refuse a `CONNECT` to `target_host` inside the tunnel: open it, and if the
 /// client speaks TLS, complete the handshake with `config`, which serves a
 /// certificate for the host, and answer the request it sends (see [`answer_tls`]). A client that does not
-/// speak TLS is disconnected. Returns the request it answered, if any.
+/// speak TLS is disconnected, and a session that outlasts `session_bound` is
+/// dropped. Returns the request it answered, if any.
 pub(crate) async fn answer_in_tunnel(
     mut client: TcpStream,
     config: std::sync::Arc<rustls::ServerConfig>,
     label: Option<&str>,
     target_host: &str,
     reason: BlockReason,
+    session_bound: Duration,
 ) -> Result<Option<SeenRequest>, Box<dyn std::error::Error + Send + Sync>> {
     let hostname = crate::proxy::extract_hostname(target_host);
     client
@@ -246,7 +248,7 @@ pub(crate) async fn answer_in_tunnel(
         Ok(Ok(1)) if first[0] == 0x16 => {}
         _ => return Ok(None),
     }
-    let seen = tokio::time::timeout(DENIED_TUNNEL_TIMEOUT, async {
+    let seen = tokio::time::timeout(session_bound, async {
         let tls = tokio_rustls::TlsAcceptor::from(config)
             .accept(client)
             .await
