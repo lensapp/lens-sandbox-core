@@ -192,7 +192,7 @@ pub fn parse_idle_timeout(raw: Option<String>) -> Option<Duration> {
 }
 
 /// Whether `ip` is in `169.254.0.0/16`. Narrower than
-/// [`crate::sock_mark::is_link_local`], which also covers `fe80::/10` — see
+/// [`crate::egress::is_link_local`], which also covers `fe80::/10` — see
 /// the reasoning in [`parse_extra_listen_ips`] for why v6 is excluded here.
 fn is_v4_link_local(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V4(v4) if v4.is_link_local())

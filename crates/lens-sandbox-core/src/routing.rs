@@ -1885,7 +1885,7 @@ mod tests {
     fn cidr_deny_matches_an_ipv4_mapped_ipv6_literal() {
         // `::ffff:10.0.0.5` is the same host on the wire as `10.0.0.5` — the
         // kernel emits real IPv4 packets for it. The SSRF floor canonicalizes
-        // (sock_mark::is_disallowed_egress_ip), so if the policy layer does not,
+        // (egress::is_disallowed_egress_ip), so if the policy layer does not,
         // a CIDR deny is evaded while the dial still succeeds.
         let routes = parse_routes(
             r#"[{"match": "10.0.0.0/8", "verdict": "deny", "transport": "direct"},
