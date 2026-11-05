@@ -9,9 +9,9 @@
 //!
 //! Two transports ship today:
 //!
-//!   - `ws://` / `wss://` → [`TcpConnector`]: DNS resolve, then
+//!   - `ws://` / `wss://` → [`TcpConnector`]:
 //!     [`crate::egress::connect_tcp_resolve`] through
-//!     [`crate::sock_mark::MarkedEgress`].
+//!     [`crate::sock_mark::MarkedEgress`], which resolves and dials.
 //!   - `vsock://CID:PORT` (Linux) → [`VsockConnector`]: dial AF_VSOCK
 //!     directly. Used by Lens Sandbox to talk between the host's
 //!     `lns-service` and the in-guest supervisor without going
