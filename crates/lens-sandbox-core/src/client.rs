@@ -1199,7 +1199,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
     // Install proxy CA cert into system trust store (once per process)
     // and store parsed DER certs for MITM upstream TLS verification.
     if let Some(pem) = msg.proxy_ca_cert {
-        crate::ca::install_ca_cert(&pem);
+        state.trust_store.install(&pem);
         if let Ok(certs) =
             CertificateDer::pem_slice_iter(pem.as_bytes()).collect::<Result<Vec<_>, _>>()
         {
@@ -1224,7 +1224,7 @@ async fn handle_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) ->
         .ephemeral_ca
         .get_or_init(|| match crate::ca::EphemeralCa::new() {
             Ok(ca) => {
-                crate::ca::install_ca_cert(ca.ca_cert_pem());
+                state.trust_store.install(ca.ca_cert_pem());
                 tracing::info!("ephemeral CA generated and installed");
                 Arc::new(ca)
             }
@@ -2257,7 +2257,7 @@ mod tests {
     #[tokio::test]
     async fn policy_credentials_populate_proxy_state() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2320,7 +2320,7 @@ mod tests {
     #[tokio::test]
     async fn policy_unarmed_injection_scopes_mitm_to_its_domain() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2394,7 +2394,7 @@ mod tests {
     #[tokio::test]
     async fn policy_indexes_an_answered_token_under_its_credential() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2467,7 +2467,7 @@ mod tests {
     #[tokio::test]
     async fn policy_credential_with_no_injections_intercepts_nothing() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2515,7 +2515,7 @@ mod tests {
     #[tokio::test]
     async fn policy_arming_credential_clears_unarmed_domains() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2590,7 +2590,7 @@ mod tests {
     #[tokio::test]
     async fn policy_rotation_replaces_credentials() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2659,7 +2659,7 @@ mod tests {
     #[tokio::test]
     async fn policy_rotation_replaces_aws_sigv4_configs() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2735,7 +2735,7 @@ mod tests {
     #[tokio::test]
     async fn policy_without_credentials_leaves_injections_empty() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2775,7 +2775,7 @@ mod tests {
     #[tokio::test]
     async fn policy_credentials_multiple_domains() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2846,7 +2846,7 @@ mod tests {
     #[tokio::test]
     async fn policy_default_allow_direct() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2896,7 +2896,7 @@ mod tests {
     #[tokio::test]
     async fn policy_unknown_default_verdict_falls_back_to_deny() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2942,7 +2942,7 @@ mod tests {
     #[tokio::test]
     async fn policy_missing_default_verdict_falls_back_to_deny() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2986,7 +2986,7 @@ mod tests {
     #[tokio::test]
     async fn policy_valid_forward_cert_populates_state() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3078,7 +3078,7 @@ mod tests {
     // apply_local_policy with forward config populates client_certs (standalone path)
     #[tokio::test]
     async fn apply_local_policy_forward_cert_populates_state() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3132,7 +3132,7 @@ mod tests {
 
     #[tokio::test]
     async fn egress_tcp_populates_tcp_egress_list() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3171,7 +3171,7 @@ mod tests {
 
     #[tokio::test]
     async fn egress_udp_populates_its_own_list_and_leaves_the_others_alone() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3205,7 +3205,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_egress_udp_fails_the_whole_policy_closed() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3246,7 +3246,7 @@ mod tests {
     async fn tcp_only_policy_keeps_tcp_rules_and_applies_defaults() {
         // A pure IP-based DB policy (egress.tcp, no http) must stay live — this is
         // the first-class "connect by IP, no DNS" case the schema advertises.
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3281,7 +3281,7 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_routes_still_works_as_http_alias() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3309,7 +3309,7 @@ mod tests {
 
     #[tokio::test]
     async fn egress_http_wins_over_allowed_routes() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3349,7 +3349,7 @@ mod tests {
         // An `egress` block is the operator saying "this is the policy now". A
         // tcp-only one grants no http routes — reading the deprecated list back
         // in would silently restore access the new policy never mentions.
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3388,7 +3388,7 @@ mod tests {
         // legitimate tcp-only policy has. Accepting it publishes no routes and
         // lets `defaultVerdict: allow` govern the whole table — an operator typo
         // turning into allow-all.
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3421,7 +3421,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_egress_tcp_fails_closed() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3458,7 +3458,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_egress_http_fails_closed_even_with_default_allow() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3492,7 +3492,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_egress_shape_fails_closed_and_does_not_retain_prior_policy() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3541,7 +3541,7 @@ mod tests {
 
     #[tokio::test]
     async fn egress_tcp_preserves_hostname_and_ip_rules_in_one_ordered_list() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3585,7 +3585,7 @@ mod tests {
     // This is the end-to-end standalone path test.
     #[tokio::test]
     async fn apply_local_policy_real_kube_json_populates_state() {
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3652,7 +3652,7 @@ mod tests {
     #[tokio::test]
     async fn policy_invalid_routes_forces_deny_default() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3700,7 +3700,7 @@ mod tests {
     #[tokio::test]
     async fn policy_forward_on_domain_route_is_denied() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -3772,7 +3772,7 @@ mod tests {
     #[tokio::test]
     async fn policy_malformed_client_cert_adds_deny_route() {
         let (listener, addr) = bind_server().await;
-        let (_proxy_server, state) = crate::proxy::ProxyServer::new(
+        let (_proxy_server, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -4099,7 +4099,7 @@ mod tests {
     // --- handle_policy unit tests with real ProxyState ---
 
     fn test_proxy_state() -> Arc<ProxyState> {
-        let (_, state) = crate::proxy::ProxyServer::new(
+        let (_, state) = crate::proxy::ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),

@@ -672,12 +672,12 @@ mod tests {
         msg.to_vec().unwrap()
     }
 
-    /// Build a state via the public constructor, then overwrite `routes`.
-    /// Using `ProxyServer::new` here (rather than hand-rolling every field)
+    /// Build a state via the constructor, then overwrite `routes`.
+    /// Using a `ProxyServer` constructor here (rather than hand-rolling every field)
     /// keeps the unit tests in lockstep with production — adding a field
     /// to `ProxyState` doesn't break this block.
     fn state_with_routes(routes: Vec<RouteRule>) -> Arc<ProxyState> {
-        let (_srv, state) = ProxyServer::new(
+        let (_srv, state) = ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -773,7 +773,7 @@ mod tests {
     fn bootstrap_allowlist_resolves_before_policy_arrives() {
         // Empty routes, but bootstrap allowlist has the Lens Sandbox host — the
         // supervisor's first DNS lookup at startup has to succeed.
-        let (_srv, state) = ProxyServer::new(
+        let (_srv, state) = ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -1515,7 +1515,7 @@ mod tests {
         // Bootstrap hosts resolve before policy, but they're reached over the
         // proxy's marked sockets just like everything else — so their AAAA is
         // downgraded too, keeping all egress on the interceptable IPv4 path.
-        let (_srv, state) = ProxyServer::new(
+        let (_srv, state) = ProxyServer::new_trusting_nowhere(
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
             "127.0.0.1:0".parse().unwrap(),
