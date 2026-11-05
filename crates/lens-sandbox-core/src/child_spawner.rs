@@ -458,4 +458,49 @@ mod tests {
             "a non-root identity is what the uid drop is for, and the kernel zeroes the capability sets on the way"
         );
     }
+
+    /// Root only, like its neighbours, because only root can adopt another group and keep its capabilities.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root holding CAP_NET_ADMIN: an unprivileged parent adopts no group"]
+    async fn a_root_child_under_host_confinement_takes_its_group_and_keeps_its_capabilities() {
+        assert!(
+            our_cap_eff() >> CAP_NET_ADMIN_BIT & 1 == 1,
+            "this parent is not root with CAP_NET_ADMIN, so a kept capability set and a dropped one would look alike"
+        );
+        let ours = nix::unistd::getgid().as_raw();
+        let other = if ours == 1 { 2 } else { 1 };
+        let creds = SandboxCredentials::resolve_by_uid(0, other)
+            .expect("resolve_by_uid never fails on a host");
+        let spec = ChildSpec {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "id -g; cat /proc/self/status".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            creds: Some(creds),
+            confinement: Confinement::Host,
+        };
+
+        let out = build_command(&spec)
+            .output()
+            .await
+            .expect("command should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (gid, status) = stdout.split_once('\n').expect("id -g prints a line");
+
+        assert_eq!(
+            gid,
+            other.to_string(),
+            "a step staged as root:{other} writes group-{other} files"
+        );
+        let child = cap_eff_of(status);
+        let parent = our_cap_eff();
+        assert_eq!(
+            child, parent,
+            "with no cage to leave, a root child keeps every capability its parent has. Child {child:#x}, parent {parent:#x}"
+        );
+    }
 }
