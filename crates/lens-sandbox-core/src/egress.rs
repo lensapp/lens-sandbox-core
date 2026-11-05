@@ -127,19 +127,62 @@ pub async fn connect_tcp_egress_where(
     if is_disallowed_egress_ip(resolved.ip()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "egress to {} (loopback/link-local/unspecified) denied",
-                resolved.ip()
-            ),
+            EgressRefused::Floor(resolved),
         ));
     }
     if !admits(resolved.ip()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("egress to {} denied by policy", resolved.ip()),
+            EgressRefused::Rule(resolved),
         ));
     }
-    egress.connect(resolved).await
+    dial_within(DIAL_TIMEOUT, egress.connect(resolved)).await
+}
+
+/// How long an egress dial waits for the destination to answer before it fails as timed out.
+pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn dial_within<T>(
+    limit: std::time::Duration,
+    dial: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    tokio::time::timeout(limit, dial).await.unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no answer within {} s", limit.as_secs()),
+        ))
+    })
+}
+
+/// A dial refused before it was made, with the address the name resolved to.
+/// A door tells a refusal from a failed dial by this type alone, never by the
+/// error kind: `connect` itself can fail with `PermissionDenied`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressRefused {
+    /// Loopback, link-local or unspecified, which no sandbox egress reaches.
+    Floor(SocketAddr),
+    /// An address the caller's `admits` check refused, such as an `egress.tcp` rule.
+    Rule(SocketAddr),
+}
+
+impl std::fmt::Display for EgressRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Floor(resolved) => write!(
+                f,
+                "egress to {} (loopback/link-local/unspecified) denied",
+                resolved.ip()
+            ),
+            Self::Rule(resolved) => write!(f, "egress to {} denied by policy", resolved.ip()),
+        }
+    }
+}
+
+impl std::error::Error for EgressRefused {}
+
+/// The refusal `error` carries, if it is one.
+pub fn refusal_of(error: &io::Error) -> Option<EgressRefused> {
+    error.get_ref()?.downcast_ref::<EgressRefused>().copied()
 }
 
 #[cfg(test)]
@@ -182,6 +225,42 @@ mod tests {
         .unwrap_err();
         assert_eq!(seen, Some("10.0.0.5".parse().unwrap()));
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            refusal_of(&err),
+            Some(EgressRefused::Rule("10.0.0.5:22".parse().unwrap())),
+            "the refusal names the address it refused, for the door to audit: {err:?}"
+        );
+        assert_eq!(err.to_string(), "egress to 10.0.0.5 denied by policy");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_nothing_answers_fails_as_timed_out_once_its_limit_passes() {
+        let limit = std::time::Duration::from_secs(30);
+        let outcome = tokio::time::timeout(
+            limit * 2,
+            dial_within(limit, std::future::pending::<io::Result<()>>()),
+        )
+        .await
+        .expect("the dial gives up at its own limit");
+        let error = outcome.expect_err("nothing answered");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_floor_refusal_says_it_is_the_floor() {
+        let error = connect_tcp_egress(&MarkedEgress, "127.0.0.1", 9)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            refusal_of(&error),
+            Some(EgressRefused::Floor("127.0.0.1:9".parse().unwrap())),
+            "a door tells the floor from a policy refusal by type: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "egress to 127.0.0.1 (loopback/link-local/unspecified) denied"
+        );
     }
 
     #[tokio::test]

@@ -133,12 +133,17 @@ pub async fn resolve_first(host: &str, port: u16) -> io::Result<SocketAddr> {
     let answer = resolver()?
         .lookup_ip(host)
         .await
-        .map_err(|e| io::Error::other(format!("resolve {host}: {e}")))?;
+        .map_err(|e| io::Error::other(ResolveFailed(format!("resolve {host}: {e}"))))?;
     answer
         .iter()
         .next()
         .map(|ip| SocketAddr::new(ip, port))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no addrs for {host}")))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                ResolveFailed(format!("no addrs for {host}")),
+            )
+        })
 }
 
 /// The process-wide resolver, built on first use. One instance shares one
@@ -171,9 +176,38 @@ fn build_resolver() -> Result<Resolver<MarkedRuntime>, String> {
     builder.build().map_err(|e| format!("build resolver: {e}"))
 }
 
+/// A name did not resolve to an address.
+#[derive(Debug)]
+pub struct ResolveFailed(pub String);
+
+impl std::fmt::Display for ResolveFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ResolveFailed {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_name_that_does_not_resolve_says_so_by_type() {
+        let error = resolve_first("nonexistent.invalid", 443).await.unwrap_err();
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<ResolveFailed>()),
+            "a door tells a DNS failure from a dial failure by type: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("resolve nonexistent.invalid: "),
+            "{error}"
+        );
+    }
 
     #[tokio::test]
     async fn an_address_literal_needs_no_nameserver() {
