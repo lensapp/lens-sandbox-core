@@ -4931,9 +4931,9 @@ pub(crate) mod tests {
     /// no result depends on the host's resolver, routes, or firewall; a dial to
     /// loopback still reaches the test's own listener, as a trusted dial does.
     pub(crate) enum TestNetwork {
-        /// Only an address literal resolves, and no dial is answered.
+        /// Only an address literal resolves, and no dial off loopback is answered.
         Offline,
-        /// Only an address literal resolves, and every dial is refused at once.
+        /// Only an address literal resolves, and every dial off loopback is refused at once.
         Refusing,
         /// A dial to `target` reaches `origin`, a loopback listener the test owns.
         Reaching {
@@ -4987,33 +4987,12 @@ pub(crate) mod tests {
         network: impl crate::egress::Egress + 'static,
     ) -> (Arc<ProxyState>, mpsc::UnboundedReceiver<String>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let state = Arc::new(ProxyState {
-            upstream: Mutex::new(None),
-            policy: RwLock::new(NetworkPolicy::default()),
-            audit_tx: std::sync::Mutex::new(Some(tx)),
-            deny_dedup: std::sync::Mutex::default(),
-            queued_refusals: std::sync::Mutex::default(),
-            credential_injections: RwLock::new(HashMap::new()),
-            ephemeral_ca: std::sync::OnceLock::new(),
-            client_certs: RwLock::new(HashMap::new()),
-            uri_placeholder_injections: RwLock::new(HashMap::new()),
-            token_answers: RwLock::new(HashMap::new()),
-            extra_ca_certs: RwLock::new(Vec::new()),
-            sandbox_tls_connector: RwLock::new(None),
-            egress: Arc::new(network),
-            aws_resign: Arc::new(crate::aws_resign::AwsResignInterceptor::new()),
-            pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
-            credential_pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
-            placeholder_index: RwLock::new(HashMap::new()),
-            unarmed_credential_domains: RwLock::new(Vec::new()),
-            decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
-            upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
-            denied_tunnel_timeout: std::sync::RwLock::new(crate::blocked::DENIED_TUNNEL_TIMEOUT),
-            bootstrap_dns_allowlist: Vec::new(),
-            gate_resolved_hosts: RwLock::new(HashSet::new()),
-            block_label: std::sync::OnceLock::new(),
-            trust_store: Arc::new(crate::ca::TrustStore::nowhere()),
-        });
+        let state = ProxyState::new(
+            Vec::new(),
+            Arc::new(network),
+            Arc::new(crate::ca::TrustStore::nowhere()),
+        );
+        state.connect_audit(tx);
         (state, rx)
     }
 
