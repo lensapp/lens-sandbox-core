@@ -994,18 +994,88 @@ const BAD_GATEWAY_RESPONSE: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// What a `CONNECT` client is told when the dial to an admitted destination
-/// fails: a 502 that names the target and the reason, sent before any tunnel
-/// opens, so the client reports why rather than a connection that closed.
-fn connect_dial_failure_response(target_host: &str, error: &std::io::Error) -> Vec<u8> {
+/// fails, sent before any tunnel opens, and the reason its refusal is audited
+/// with when the dial was refused rather than failed.
+fn connect_dial_failure_response(
+    label: Option<&str>,
+    target_host: &str,
+    error: &std::io::Error,
+) -> (Vec<u8>, Option<DialRefusal>) {
+    if let Some(refused) = crate::egress::refusal_of(error) {
+        let audited = match refused {
+            crate::egress::EgressRefused::Floor(_) => DialRefusal {
+                reason: "blocked-destination",
+                destination: target_host.to_string(),
+            },
+            crate::egress::EgressRefused::Rule(resolved) => DialRefusal {
+                reason: "policy-deny",
+                destination: resolved.to_string(),
+            },
+        };
+        let refusal = crate::blocked::response(
+            label,
+            crate::blocked::BlockReason::PolicyDeny,
+            "CONNECT",
+            target_host,
+            "",
+        );
+        return (refusal, Some(audited));
+    }
     let body = format!("Sandbox proxy could not connect to {target_host}: {error}\n");
-    format!(
+    let response = format!(
         "HTTP/1.1 502 Bad Gateway\r\n\
+         Proxy-Status: sandbox; error={}\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
+        dial_proxy_status_error(error),
         body.len()
     )
-    .into_bytes()
+    .into_bytes();
+    (response, None)
+}
+
+/// How a dial refused before it was made is audited: the reason, and the
+/// destination the event names.
+#[derive(Debug, PartialEq, Eq)]
+struct DialRefusal {
+    reason: &'static str,
+    destination: String,
+}
+
+/// The RFC 9209 `Proxy-Status` error type of a dial that failed.
+fn dial_proxy_status_error(error: &std::io::Error) -> &'static str {
+    if caused_by::<crate::resolver::ResolveFailed>(error) {
+        return "dns_error";
+    }
+    match error.kind() {
+        std::io::ErrorKind::TimedOut => "connection_timeout",
+        std::io::ErrorKind::ConnectionRefused => "connection_refused",
+        _ => "destination_unavailable",
+    }
+}
+
+fn caused_by<E: std::error::Error + 'static>(error: &std::io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<E>())
+}
+
+/// Tell a `CONNECT` client its dial failed, and audit it as a refusal or as an error.
+async fn answer_failed_connect_dial(
+    client: &mut TcpStream,
+    state: &Arc<ProxyState>,
+    target_host: &str,
+    error: &std::io::Error,
+    actor: &crate::peer_process::ActorContext,
+) -> std::io::Result<()> {
+    let (response, refused) =
+        connect_dial_failure_response(state.block_label(), target_host, error);
+    match refused {
+        Some(refusal) => {
+            emit_policy_deny_connect(state, &refusal.destination, refusal.reason, actor)
+        }
+        None => emit_audit(state, target_host, "error", 502, actor),
+    }
+    client.write_all(&response).await
 }
 
 /// The facts every refusal on this door records, collected once.
@@ -1769,9 +1839,7 @@ async fn handle_connect(
                             error = %e,
                             "proxy DIRECT dial failed"
                         );
-                        emit_audit(state, target_host, "error", 502, actor);
-                        client
-                            .write_all(&connect_dial_failure_response(target_host, &e))
+                        answer_failed_connect_dial(&mut client, state, target_host, &e, actor)
                             .await?;
                         return Err(format!("direct connect to {target_host}: {e}").into());
                     }
@@ -3320,10 +3388,7 @@ async fn connect_raw_passthrough(
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target = %target_host, error = %e, "proxy RAW dial failed");
-                emit_audit(state, target_host, "error", 502, actor);
-                client
-                    .write_all(&connect_dial_failure_response(target_host, &e))
-                    .await?;
+                answer_failed_connect_dial(&mut client, state, target_host, &e, actor).await?;
                 return Err(format!("raw passthrough connect to {target_host}: {e}").into());
             }
         };
@@ -4940,19 +5005,26 @@ pub(crate) mod tests {
             target: SocketAddr,
             origin: SocketAddr,
         },
+        /// `name` resolves to `to` as well as any literal, and no dial is answered.
+        Resolving { name: &'static str, to: IpAddr },
     }
 
     #[async_trait::async_trait]
     impl crate::egress::Egress for TestNetwork {
         async fn resolve(&self, host: &str, port: u16) -> std::io::Result<SocketAddr> {
-            let literal = host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<IpAddr>();
+            let literal = match self {
+                Self::Resolving { name, to } if *name == host => Ok(*to),
+                _ => host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<IpAddr>(),
+            };
             literal.map(|ip| SocketAddr::new(ip, port)).map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!("resolve {host}: a unit test resolves no name"),
+                    crate::resolver::ResolveFailed(format!(
+                        "resolve {host}: a unit test resolves no name"
+                    )),
                 )
             })
         }
@@ -7602,6 +7674,10 @@ pub(crate) mod tests {
             body.starts_with(&format!("Sandbox proxy could not connect to {target}: ")),
             "the client is told what failed: {body:?}"
         );
+        assert!(
+            response.contains("\r\nProxy-Status: sandbox; error=connection_refused\r\n"),
+            "a client reads why from Proxy-Status: {response}"
+        );
         let reason = handler.await.unwrap().expect_err("the dial failed");
         assert!(reason.to_string().contains(&target), "{reason}");
         let events = drain_audit_lines(&mut rx);
@@ -7658,10 +7734,150 @@ pub(crate) mod tests {
             response.contains("could not connect to nonexistent.invalid:443"),
             "{response}"
         );
+        assert!(
+            response.contains("\r\nProxy-Status: sandbox; error=dns_error\r\n"),
+            "{response}"
+        );
         handler
             .await
             .unwrap()
             .expect_err("the name did not resolve");
+    }
+
+    #[test]
+    fn a_connect_the_egress_floor_refuses_at_the_dial_is_answered_as_a_refusal() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            crate::egress::EgressRefused::Floor("127.0.0.1:443".parse().unwrap()),
+        );
+        let (response, refused) =
+            connect_dial_failure_response(None, "127.0.0.1.nip.io:443", &error);
+        assert_eq!(
+            refused,
+            Some(DialRefusal {
+                reason: "blocked-destination",
+                destination: "127.0.0.1.nip.io:443".to_string(),
+            }),
+            "audited as a literal loopback CONNECT is"
+        );
+        assert_blocked(
+            &String::from_utf8(response).unwrap(),
+            BlockReason::PolicyDeny,
+            "Blocked by sandbox egress policy: CONNECT 127.0.0.1.nip.io:443 \
+             (reason: policy-deny). This is not a response from 127.0.0.1.nip.io.",
+        );
+    }
+
+    #[test]
+    fn a_connect_a_tcp_rule_refuses_at_the_dial_is_answered_as_a_refusal() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            crate::egress::EgressRefused::Rule("10.1.2.3:443".parse().unwrap()),
+        );
+        let (response, refused) = connect_dial_failure_response(None, "db.internal:443", &error);
+        assert_eq!(
+            refused,
+            Some(DialRefusal {
+                reason: "policy-deny",
+                destination: "10.1.2.3:443".to_string(),
+            }),
+            "audited by the address the rule refused, which a CIDR rule can match and the name cannot"
+        );
+        assert_blocked(
+            &String::from_utf8(response).unwrap(),
+            BlockReason::PolicyDeny,
+            "Blocked by sandbox egress policy: CONNECT db.internal:443 \
+             (reason: policy-deny). This is not a response from db.internal.",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_a_tcp_cidr_rule_refuses_at_the_dial_is_audited_by_the_address_it_refused() {
+        // Audited by the name, the refusal read as the `egress.http` allow that
+        // admitted it, because a CIDR rule never matches a name.
+        let (state, mut rx) = test_state_on(TestNetwork::Resolving {
+            name: "db.internal",
+            to: "10.1.2.3".parse().unwrap(),
+        });
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "10.0.0.0/8:443", "verdict": "deny"}]"#,
+        );
+
+        let (mut client, handler) = connect_direct(&state, "db.internal:443".to_string()).await;
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden by sandbox policy\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains("CONNECT db.internal:443"),
+            "the client is told the target it sent: {response}"
+        );
+        let _ = handler.await.unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "10.1.2.3:443",
+                Some("policy-deny"),
+                &test_actor()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_dial_the_os_refused_is_a_failed_dial_not_a_policy_refusal() {
+        // `connect` can fail with EACCES or EPERM, from an LSM or for a
+        // broadcast address; no rule refused it.
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let (response, refused) = connect_dial_failure_response(None, "x.example:443", &error);
+        let response = String::from_utf8(response).unwrap();
+        assert_eq!(refused, None, "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains("\r\nProxy-Status: sandbox; error=destination_unavailable\r\n"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn a_connect_dial_that_failed_names_its_proxy_status_error() {
+        let failures = [
+            (
+                std::io::Error::from(std::io::ErrorKind::TimedOut),
+                "connection_timeout",
+            ),
+            (
+                std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                "connection_refused",
+            ),
+            (
+                std::io::Error::other(crate::resolver::ResolveFailed(
+                    "resolve x.example: no record".into(),
+                )),
+                "dns_error",
+            ),
+            (
+                std::io::Error::from(std::io::ErrorKind::HostUnreachable),
+                "destination_unavailable",
+            ),
+        ];
+        for (error, expected) in failures {
+            let (response, refused) = connect_dial_failure_response(None, "x.example:443", &error);
+            let response = String::from_utf8(response).unwrap();
+            assert_eq!(refused, None, "{error}: a failure is not a refusal");
+            assert!(
+                response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+                "{response}"
+            );
+            assert!(
+                response.contains(&format!("\r\nProxy-Status: sandbox; error={expected}\r\n")),
+                "{error}: {response}"
+            );
+        }
     }
 
     #[tokio::test]
