@@ -310,6 +310,10 @@ pub struct ProxyState {
     /// handshake to the forward-proxy upstream before returning an error.
     /// Mutable for tests; production callers leave it at `UPSTREAM_CONNECT_TIMEOUT`.
     pub(crate) upstream_connect_timeout: std::sync::RwLock<Duration>,
+    /// How long a refused TLS session may take, from its ClientHello to the
+    /// answer. Mutable for tests; production callers leave it at
+    /// `blocked::DENIED_TUNNEL_TIMEOUT`.
+    pub(crate) denied_tunnel_timeout: std::sync::RwLock<Duration>,
     /// Hostnames the supervisor itself needs to resolve before any policy
     /// arrives — chiefly the Lens Sandbox host. The DNS stub checks this list
     /// before the policy-driven `routes`, so the supervisor's bootstrap
@@ -710,6 +714,7 @@ impl ProxyServer {
             unarmed_credential_domains: RwLock::new(Vec::new()),
             decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
             upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
+            denied_tunnel_timeout: std::sync::RwLock::new(crate::blocked::DENIED_TUNNEL_TIMEOUT),
             bootstrap_dns_allowlist: bootstrap_dns_allowlist
                 .into_iter()
                 .map(|h| h.to_ascii_lowercase())
@@ -2020,6 +2025,7 @@ async fn refuse_connect(
     state: &Arc<ProxyState>,
     actor: &crate::peer_process::ActorContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let session_bound = *state.denied_tunnel_timeout.read().unwrap();
     let answered = match get_or_init_ca(state).and_then(|ca| {
         crate::mitm::build_ephemeral_server_config(ca, &extract_hostname(target_host))
     }) {
@@ -2030,6 +2036,7 @@ async fn refuse_connect(
                 state.block_label(),
                 target_host,
                 reason,
+                session_bound,
             )
             .await
         }
@@ -3620,8 +3627,9 @@ async fn handle_transparent_tls(
                     Ok(tunnel) => crate::mitm::UpstreamMode::TunnelTls(tunnel),
                     Err(e) if e.is::<crate::blocked::UpstreamBlocked>() => {
                         let reason = crate::blocked::BlockReason::UpstreamPolicy;
+                        let session_bound = *state.denied_tunnel_timeout.read().unwrap();
                         let seen = tokio::time::timeout(
-                            crate::blocked::DENIED_TUNNEL_TIMEOUT,
+                            session_bound,
                             crate::blocked::answer_tls(
                                 tls_client,
                                 state.block_label(),
@@ -3670,7 +3678,8 @@ async fn refuse_transparent_tls(
                 let tls = start.into_stream(config).await.ok()?;
                 crate::blocked::answer_tls(tls, state.block_label(), &sni, reason).await
             };
-            let seen = tokio::time::timeout(crate::blocked::DENIED_TUNNEL_TIMEOUT, answer).await;
+            let bound = *state.denied_tunnel_timeout.read().unwrap();
+            let seen = tokio::time::timeout(bound, answer).await;
             Ok(seen.ok().flatten())
         }
         Err(e) => Err(e),
@@ -4940,6 +4949,7 @@ pub(crate) mod tests {
             unarmed_credential_domains: RwLock::new(Vec::new()),
             decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
             upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
+            denied_tunnel_timeout: std::sync::RwLock::new(crate::blocked::DENIED_TUNNEL_TIMEOUT),
             bootstrap_dns_allowlist: Vec::new(),
             gate_resolved_hosts: RwLock::new(HashSet::new()),
             block_label: std::sync::OnceLock::new(),
@@ -9693,14 +9703,20 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_refused_tunnel_whose_handshake_stalls_is_audited_by_its_target() {
-        let (_state, mut rx, mut client, handler) =
-            refused_connect_to("api.example.test:443").await;
+        // On a paused clock the bound fired while a real socket still carried
+        // the client's bytes, so this runs on the real one with a short bound.
+        let (state, mut rx, mut client, handler) = refused_connect_to("api.example.test:443").await;
+        *state.denied_tunnel_timeout.write().unwrap() = Duration::from_millis(200);
         read_established(&mut client).await;
         // A handshake record header, and then nothing.
         client.write_all(&[0x16, 0x03, 0x01]).await.unwrap();
-        handler.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("the stalled handshake is cut off at its bound")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             refusal_events(&mut rx),
             [host_only_refusal(
