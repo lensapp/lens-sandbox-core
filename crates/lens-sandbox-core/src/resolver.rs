@@ -120,7 +120,7 @@ impl RuntimeProvider for MarkedRuntime {
 /// address that is down.
 ///
 /// UNCHECKED: the answer may be loopback, link-local, or unspecified. Callers
-/// dialing sandbox egress must use [`crate::sock_mark::connect_tcp_egress`],
+/// dialing sandbox egress must use [`crate::egress::connect_tcp_egress`],
 /// which applies the floor.
 pub async fn resolve_first(host: &str, port: u16) -> io::Result<SocketAddr> {
     let unbracketed = host

@@ -519,6 +519,7 @@ enum JudgedPolicy {
     Ok {
         env: HashMap<String, String>,
         files: Vec<crate::protocol::TempFile>,
+        upstream_ca: Option<String>,
     },
     VersionMismatch {
         server_min: String,
@@ -888,7 +889,14 @@ async fn handle_policy(
             PolicyResult::VersionMismatch { server_min, client }
         }
         JudgedPolicy::Malformed(_) => PolicyResult::Ok(HashMap::new()),
-        JudgedPolicy::Ok { env, files } => {
+        JudgedPolicy::Ok {
+            env,
+            files,
+            upstream_ca,
+        } => {
+            if let (Some(pem), Some(state)) = (upstream_ca, proxy_state) {
+                state.trust_store.install(&pem);
+            }
             write_policy_files(placed, &files).await;
             PolicyResult::Ok(env)
         }
@@ -1108,6 +1116,7 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
         return JudgedPolicy::Ok {
             env: policy_env,
             files: msg.files.unwrap_or_default(),
+            upstream_ca: None,
         };
     };
 
@@ -1281,23 +1290,19 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
         }
     }
 
-    // Install proxy CA cert into system trust store (once per process)
-    // and store parsed DER certs for MITM upstream TLS verification.
-    if let Some(pem) = msg.proxy_ca_cert {
-        state.trust_store.install(&pem);
-        if let Ok(certs) =
+    if let Some(pem) = &msg.proxy_ca_cert
+        && let Ok(certs) =
             CertificateDer::pem_slice_iter(pem.as_bytes()).collect::<Result<Vec<_>, _>>()
-        {
-            tracing::info!(
-                count = certs.len(),
-                "parsed extra CA certs from proxy CA PEM"
-            );
-            if !certs.is_empty() {
-                *state.extra_ca_certs.write().unwrap() = certs;
-                // Drop the cached Lens Sandbox TlsConnector so the next CONNECT
-                // rebuilds it against the freshly-installed CA bundle.
-                *state.sandbox_tls_connector.write().unwrap() = None;
-            }
+    {
+        tracing::info!(
+            count = certs.len(),
+            "parsed extra CA certs from proxy CA PEM"
+        );
+        if !certs.is_empty() {
+            *state.extra_ca_certs.write().unwrap() = certs;
+            // Drop the cached Lens Sandbox TlsConnector so the next CONNECT
+            // rebuilds it against the new upstream CA.
+            *state.sandbox_tls_connector.write().unwrap() = None;
         }
     }
 
@@ -1433,6 +1438,7 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
     JudgedPolicy::Ok {
         env: policy_env,
         files: msg.files.unwrap_or_default(),
+        upstream_ca: msg.proxy_ca_cert,
     }
 }
 
@@ -1442,7 +1448,7 @@ pub async fn apply_policy_frame(
     state: &Arc<ProxyState>,
 ) -> Result<AppliedPolicy, PolicyFrameError> {
     match judge_policy(raw_frame, &Some(state.clone())).await {
-        JudgedPolicy::Ok { env, files } => Ok(AppliedPolicy { env, files }),
+        JudgedPolicy::Ok { env, files, .. } => Ok(AppliedPolicy { env, files }),
         JudgedPolicy::VersionMismatch { server_min, client } => {
             Err(PolicyFrameError::VersionMismatch { server_min, client })
         }
@@ -1612,6 +1618,37 @@ mod tests {
         assert_eq!(applied.files[0].path, path);
         assert_eq!(applied.files[0].content.as_deref(), Some("kubeconfig"));
         assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn apply_policy_frame_trusts_the_upstream_ca_inside_the_proxy() {
+        let state = test_host_state();
+        let upstream_ca = crate::ca::EphemeralCa::new().unwrap();
+        let frame = serde_json::json!({
+            "type": "policy",
+            "proxyCaCert": upstream_ca.ca_cert_pem()
+        });
+        apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap();
+        assert_eq!(state.extra_ca_certs.read().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn judging_a_policy_hands_the_upstream_ca_back_to_the_caller() {
+        let upstream_ca = crate::ca::EphemeralCa::new().unwrap();
+        let frame = serde_json::json!({
+            "type": "policy",
+            "proxyCaCert": upstream_ca.ca_cert_pem()
+        });
+        let JudgedPolicy::Ok {
+            upstream_ca: handed_back,
+            ..
+        } = judge_policy(&frame.to_string(), &Some(test_host_state())).await
+        else {
+            panic!("the frame is a valid policy");
+        };
+        assert_eq!(handed_back.as_deref(), Some(upstream_ca.ca_cert_pem()));
     }
 
     /// A frame that does not parse is an error to the embedder, not an empty
