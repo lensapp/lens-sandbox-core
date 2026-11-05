@@ -116,6 +116,10 @@ pub(crate) fn spawn_spec(
         crate::privilege::PrivilegeDrop::Capabilities { gid } => Some(gid),
         _ => None,
     };
+    let keep_root = match privilege {
+        crate::privilege::PrivilegeDrop::KeepRoot { gid } => Some(gid),
+        _ => None,
+    };
     unsafe {
         cmd.pre_exec(move || {
             // New session so this process becomes session leader
@@ -159,13 +163,11 @@ pub(crate) fn spawn_spec(
                 // or set SO_MARK to bypass the proxy redirect. The gid, if the
                 // caller resolved one, decides what group owns the files this
                 // child writes; it confines nothing.
-                if let Some(gid) = gid {
-                    nix::unistd::setgid(gid).map_err(|e| {
-                        std::io::Error::other(format!("setgid {}: {e}", gid.as_raw()))
-                    })?;
-                }
+                crate::privilege::adopt_gid_in_child(gid)?;
                 crate::privilege::drop_capabilities_in_child()?;
                 crate::privilege::set_pdeathsig_sigterm()?;
+            } else if let Some(gid) = keep_root {
+                crate::privilege::keep_root_in_child(gid)?;
             } else {
                 // Unprivileged supervisor: no privilege to drop, and
                 // NO_NEW_PRIVS would guard a cage this parent never built.

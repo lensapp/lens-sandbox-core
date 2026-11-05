@@ -516,16 +516,33 @@ pub fn lock_down_after_setuid() -> io::Result<()> {
 pub(crate) fn apply_cap_drop(cmd: &mut Command, gid: Option<nix::unistd::Gid>) {
     unsafe {
         cmd.pre_exec(move || {
-            if let Some(gid) = gid {
-                nix::unistd::setgid(gid)
-                    .map_err(|e| std::io::Error::other(format!("setgid {}: {e}", gid.as_raw())))?;
-            }
+            adopt_gid_in_child(gid)?;
             drop_capabilities_in_child()?;
             // Make the agent die if we die — see set_pdeathsig_sigterm.
             set_pdeathsig_sigterm()?;
             Ok(())
         });
     }
+}
+
+fn apply_keep_root(cmd: &mut Command, gid: Option<nix::unistd::Gid>) {
+    unsafe {
+        cmd.pre_exec(move || keep_root_in_child(gid));
+    }
+}
+
+/// `setgid` comes first, because the kernel zeroes `pdeath_signal` whenever the egid changes.
+pub(crate) fn keep_root_in_child(gid: Option<nix::unistd::Gid>) -> io::Result<()> {
+    adopt_gid_in_child(gid)?;
+    set_pdeathsig_sigterm()
+}
+
+pub(crate) fn adopt_gid_in_child(gid: Option<nix::unistd::Gid>) -> io::Result<()> {
+    if let Some(gid) = gid {
+        nix::unistd::setgid(gid)
+            .map_err(|e| io::Error::other(format!("setgid {}: {e}", gid.as_raw())))?;
+    }
+    Ok(())
 }
 
 /// Who confines the workload's egress, which decides what a child must give up before `exec`.
@@ -567,6 +584,8 @@ pub enum PrivilegeDrop<'a> {
     /// `apply_cap_drop` — but it decides what group owns the files the
     /// child writes.
     Capabilities { gid: Option<nix::unistd::Gid> },
+    /// Stay root with every capability, because the host judges egress and there is no cage to leave; `gid` is the group the caller asked for.
+    KeepRoot { gid: Option<nix::unistd::Gid> },
     /// An unprivileged parent has neither a uid to drop nor a capability
     /// to lose, and `capset` would `EPERM`.
     ///
@@ -649,6 +668,7 @@ pub fn apply_privilege_drop(
     match privilege_drop_for(creds, confinement) {
         PrivilegeDrop::Setuid(creds) => creds.apply(cmd),
         PrivilegeDrop::Capabilities { gid } => apply_cap_drop(cmd, gid),
+        PrivilegeDrop::KeepRoot { gid } => apply_keep_root(cmd, gid),
         // No privilege to drop, but pdeathsig needs none and the orphan it
         // prevents is real. `NO_NEW_PRIVS` is deliberately absent — see
         // `PrivilegeDrop::Nothing`.
@@ -675,7 +695,9 @@ fn decide_privilege_drop(
         (_, Confinement::Guest) => PrivilegeDrop::Capabilities {
             gid: creds.map(|creds| creds.uid_gid().1),
         },
-        (_, Confinement::Host) => PrivilegeDrop::Nothing { requested: creds },
+        (_, Confinement::Host) => PrivilegeDrop::KeepRoot {
+            gid: creds.map(|creds| creds.uid_gid().1),
+        },
         (_, Confinement::Unprivileged) => {
             if parent_euid_is_root {
                 tracing::warn!(
@@ -1123,13 +1145,24 @@ mod tests {
             capturing_warnings(|| decide_privilege_drop(Some(&root), Confinement::Host, true));
         assert_eq!(
             decision,
-            PrivilegeDrop::Nothing {
-                requested: Some(&root)
+            PrivilegeDrop::KeepRoot {
+                gid: Some(nix::unistd::Gid::from_raw(0))
             }
         );
         assert_eq!(
             text, "",
             "a root child under the host's judgement is the design, not a mismatch to report"
+        );
+    }
+
+    #[test]
+    fn a_host_judged_root_child_still_takes_the_group_it_asked_for() {
+        assert_eq!(
+            privilege_drop_for(Some(&creds_for(0, 1000)), Confinement::Host),
+            PrivilegeDrop::KeepRoot {
+                gid: Some(nix::unistd::Gid::from_raw(1000))
+            },
+            "a step written as root:1000 asked for the group that owns the files it writes, whoever confines its egress"
         );
     }
 
