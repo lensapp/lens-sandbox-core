@@ -329,7 +329,7 @@ pub struct ProxyState {
     /// [`Self::set_block_label`]); unset, the response is product-neutral.
     block_label: std::sync::OnceLock<String>,
     /// Where this proxy's CAs are installed for the workload to trust: the
-    /// host's trust store in production, nowhere in unit tests and on a host.
+    /// system trust store in the guest, nowhere in unit tests and on a host.
     pub(crate) trust_store: Arc<crate::ca::TrustStore>,
 }
 
