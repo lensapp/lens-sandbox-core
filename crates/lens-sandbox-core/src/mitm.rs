@@ -1628,17 +1628,12 @@ where
             )
             .await);
     }
-    // The placeholder signature is matched to its real key before the credential
-    // gate, so a request the signer must refuse is refused at once, not held
-    // for a prompt whose answer cannot make it signable.
-    let signature = if signed {
-        match ctx.state.aws_signer.signature_for(&head) {
-            Ok(signature) => Some(signature),
-            Err(refusal) => return Err(facts.refuse_signing(&mut tls_client, refusal).await),
-        }
-    } else {
-        None
-    };
+    // A request the signer must refuse is refused before the credential gate,
+    // not held for a prompt whose answer cannot make it signable. The keys are
+    // read again at signing time, so a policy update during a hold is used.
+    if signed && let Err(refusal) = ctx.state.aws_signer.signature_for(&head) {
+        return Err(facts.refuse_signing(&mut tls_client, refusal).await);
+    }
     // The signer consumes the placeholder in the signature headers, so the
     // credential gate looks only at the rest of the head.
     let gate_view = |head: String| {
@@ -1964,20 +1959,18 @@ where
         None => (modified, body_mode),
     };
 
-    let (modified, body_mode, signed_service) = match signature {
-        Some(signature) => {
-            let (head, body_mode) = sign_request(
-                &mut tls_client,
-                &facts,
-                &signature,
-                &modified,
-                body_mode,
-                &mut buffered_body,
-            )
-            .await?;
-            (head, body_mode, Some(signature.service().to_string()))
-        }
-        None => (modified, body_mode, None),
+    let (modified, body_mode, signed_service) = if signed {
+        let (head, body_mode, service) = sign_request(
+            &mut tls_client,
+            &facts,
+            &modified,
+            body_mode,
+            &mut buffered_body,
+        )
+        .await?;
+        (head, body_mode, Some(service))
+    } else {
+        (modified, body_mode, None)
     };
 
     let mut audit = crate::upstream_answer::PendingAudit::none();
@@ -2049,20 +2042,23 @@ where
 /// Re-sign a request the pipeline has decided to forward, with the real key its
 /// placeholder signature stands for.
 ///
-/// Returns the signed head and the framing the relay still has to forward. A
-/// body the signature covers is read here when no earlier step read it, and
-/// replayed from `buffered_body`.
+/// Returns the signed head, the framing the relay still has to forward, and the
+/// AWS service the request was signed for. A body the signature covers is read
+/// here when no earlier step read it, and replayed from `buffered_body`.
 async fn sign_request<C>(
     tls_client: &mut C,
     facts: &RequestFacts<'_, '_>,
-    signature: &crate::signing::PendingSignature,
     head: &str,
     body_mode: BodyFraming,
     buffered_body: &mut Option<Vec<u8>>,
-) -> Result<(String, BodyFraming), Box<dyn std::error::Error + Send + Sync>>
+) -> Result<(String, BodyFraming, String), Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
+    let signature = match facts.ctx.state.aws_signer.signature_for(head) {
+        Ok(signature) => signature,
+        Err(refusal) => return Err(facts.refuse_signing(tls_client, refusal).await),
+    };
     // A request that declares no length has no body (RFC 9112 §6.3). It is
     // signed for an empty one, and its head is left as the client wrote it.
     let unread_body = buffered_body.is_none() && body_mode != BodyFraming::None;
@@ -2090,7 +2086,7 @@ where
     };
     let body = buffered_body.as_deref().unwrap_or_default();
     match signature.sign(&head, body) {
-        Ok(signed) => Ok((signed, body_mode)),
+        Ok(signed) => Ok((signed, body_mode, signature.service().to_string())),
         Err(refusal) => Err(facts.refuse_signing(tls_client, refusal).await),
     }
 }

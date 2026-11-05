@@ -315,6 +315,68 @@ async fn the_credential_gate_does_not_ask_about_the_placeholder_the_signer_repla
 }
 
 #[tokio::test]
+async fn a_request_held_at_the_credential_gate_is_signed_with_the_keys_policy_sent_meanwhile() {
+    const OTHER_PLACEHOLDER: &str = "LNS_OTHER_PLACEHOLDER";
+    let (state, audit_rx) = signing_state(TEST_HOSTNAME);
+    state.placeholder_index.write().unwrap().insert(
+        OTHER_PLACEHOLDER.to_string(),
+        "other:credential".to_string(),
+    );
+    let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+    state.connect_audit(host_tx);
+
+    // The host allows the other credential, and its policy arms that
+    // credential and renews the AWS keys before the request moves on.
+    let renewed = AwsSigv4Config {
+        access_key_id: "ASIARENEWEDEXAMPLE".to_string(),
+        ..real_config()
+    };
+    let host_state = state.clone();
+    tokio::spawn(async move {
+        while let Some(raw) = host_rx.recv().await {
+            let event: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if event["type"] != "credential_pending" {
+                continue;
+            }
+            host_state.aws_signer.update(
+                std::collections::HashMap::from([(PLACEHOLDER.to_string(), renewed.clone())]),
+                vec![TEST_HOSTNAME.to_string()],
+            );
+            host_state.credential_injections.write().unwrap().insert(
+                TEST_HOSTNAME.to_string(),
+                vec![CredentialInjection {
+                    header: "X-Api-Key".to_string(),
+                    value: "real-api-key".to_string(),
+                    body: None,
+                    rules: vec![],
+                }],
+            );
+            let id = event["id"].as_str().unwrap();
+            crate::gate::resolve_credential_pending(
+                &host_state,
+                id,
+                crate::protocol::CredentialDecisionKind::Allow,
+            );
+        }
+    });
+
+    let request = String::from_utf8(sandbox_signed_request(&HarnessRequest::default()))
+        .unwrap()
+        .replacen(
+            "\r\n",
+            &format!("\r\nX-Api-Key: {OTHER_PLACEHOLDER}\r\n"),
+            1,
+        );
+    let (upstream, _, _) =
+        run_signed(state, audit_rx, TEST_HOSTNAME, vec![], request.into_bytes()).await;
+    assert!(upstream.contains("X-Api-Key: real-api-key"), "{upstream}");
+    assert!(
+        upstream.contains("Credential=ASIARENEWEDEXAMPLE/"),
+        "{upstream}"
+    );
+}
+
+#[tokio::test]
 async fn a_token_request_to_a_host_whose_requests_are_re_signed_is_answered() {
     let (state, audit_rx) = signing_state(TEST_HOSTNAME);
     state
