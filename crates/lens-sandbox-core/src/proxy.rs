@@ -327,6 +327,9 @@ pub struct ProxyState {
     /// The product a block response names, if the embedder named one (see
     /// [`Self::set_block_label`]); unset, the response is product-neutral.
     block_label: std::sync::OnceLock<String>,
+    /// Where every egress dial looks up its name and opens its socket: this
+    /// host's network in production, a fake in unit tests.
+    pub(crate) egress_network: Box<dyn sock_mark::EgressNetwork>,
 }
 
 impl ProxyState {
@@ -713,6 +716,7 @@ impl ProxyServer {
                 .collect(),
             gate_resolved_hosts: RwLock::new(HashSet::new()),
             block_label: std::sync::OnceLock::new(),
+            egress_network: Box::new(sock_mark::HostNetwork),
         });
         let server = Self {
             listen_addr,
@@ -2740,9 +2744,12 @@ pub(crate) async fn connect_egress_under_policy(
     already_gated: Gated,
 ) -> std::io::Result<TcpStream> {
     let port = extract_port(target_host, default_port);
-    sock_mark::connect_tcp_egress_where(&extract_hostname(target_host), port, |ip| {
-        tcp_egress_admits(state, ip, port, caller, already_gated)
-    })
+    sock_mark::connect_tcp_egress_on(
+        &*state.egress_network,
+        &extract_hostname(target_host),
+        port,
+        |ip| tcp_egress_admits(state, ip, port, caller, already_gated),
+    )
     .await
 }
 
@@ -3052,14 +3059,20 @@ async fn handle_raw_passthrough(
 
     // Raw TCP always egresses directly: SO_MARK bypasses the nftables cage and
     // the bytes are spliced through untouched.
-    let mut upstream =
-        match sock_mark::connect_tcp_egress(&orig_dst.ip().to_string(), orig_dst.port()).await {
-            Ok(s) => s,
-            Err(e) => {
-                emit_audit(state, &raw_target, "error", 502, actor);
-                return Err(format!("passthrough connect to {raw_target}: {e}").into());
-            }
-        };
+    let mut upstream = match sock_mark::connect_tcp_egress_on(
+        &*state.egress_network,
+        &orig_dst.ip().to_string(),
+        orig_dst.port(),
+        |_| true,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            emit_audit(state, &raw_target, "error", 502, actor);
+            return Err(format!("passthrough connect to {raw_target}: {e}").into());
+        }
+    };
     tracing::debug!(target = %raw_target, "transparent passthrough DIRECT");
     emit_audit(state, &raw_target, "success", 200, actor);
     tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
@@ -4844,7 +4857,66 @@ pub(crate) mod tests {
         assert_eq!(gate_key("api.evil.com:443"), gate_key("api.evil.com"));
     }
 
+    /// What a unit test's egress dials meet in place of this host's network, so
+    /// no result depends on the host's resolver, routes, or firewall.
+    pub(crate) enum TestNetwork {
+        /// Only an address literal resolves, and no dial is answered.
+        Offline,
+        /// Only an address literal resolves, and every dial is refused at once.
+        Refusing,
+        /// A dial to `target` reaches `origin`, a loopback listener the test owns.
+        Reaching {
+            target: SocketAddr,
+            origin: SocketAddr,
+        },
+    }
+
+    impl sock_mark::EgressNetwork for TestNetwork {
+        fn resolve<'a>(
+            &'a self,
+            host: &'a str,
+            port: u16,
+        ) -> futures_util::future::BoxFuture<'a, std::io::Result<SocketAddr>> {
+            let literal = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>();
+            Box::pin(async move {
+                literal.map(|ip| SocketAddr::new(ip, port)).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("resolve {host}: a unit test resolves no name"),
+                    )
+                })
+            })
+        }
+
+        fn connect(
+            &self,
+            resolved: SocketAddr,
+        ) -> futures_util::future::BoxFuture<'_, std::io::Result<TcpStream>> {
+            Box::pin(async move {
+                match self {
+                    Self::Reaching { target, origin } if *target == resolved => {
+                        TcpStream::connect(origin).await
+                    }
+                    Self::Refusing => Err(std::io::ErrorKind::ConnectionRefused.into()),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::NetworkUnreachable,
+                        format!("a unit test reaches no network, so not {resolved}"),
+                    )),
+                }
+            })
+        }
+    }
+
     pub(crate) fn test_state() -> (Arc<ProxyState>, mpsc::UnboundedReceiver<String>) {
+        test_state_on(TestNetwork::Offline)
+    }
+
+    pub(crate) fn test_state_on(
+        network: impl sock_mark::EgressNetwork + 'static,
+    ) -> (Arc<ProxyState>, mpsc::UnboundedReceiver<String>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let state = Arc::new(ProxyState {
             upstream: Mutex::new(None),
@@ -4871,6 +4943,7 @@ pub(crate) mod tests {
             bootstrap_dns_allowlist: Vec::new(),
             gate_resolved_hosts: RwLock::new(HashSet::new()),
             block_label: std::sync::OnceLock::new(),
+            egress_network: Box::new(network),
         });
         (state, rx)
     }
@@ -7414,18 +7487,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// An address of this host that the egress floor lets a dial reach: the one
-    /// it would send from, which is never loopback. Finding it sends nothing.
-    fn an_address_of_this_host_off_loopback() -> IpAddr {
-        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-        probe
-            .connect("192.0.2.1:9")
-            .expect("these tests need a route off the host");
-        let ip = probe.local_addr().unwrap().ip();
-        assert!(!sock_mark::is_disallowed_egress_ip(ip), "{ip}");
-        ip
-    }
-
     /// Drive the CONNECT door at `target` on a direct route and return the
     /// client end once the handler has started.
     async fn connect_direct(
@@ -7445,15 +7506,16 @@ pub(crate) mod tests {
         (client, handler)
     }
 
+    /// A documentation address (RFC 5737) the egress floor admits, which no test
+    /// network routes anywhere.
+    const DIRECT_TARGET: &str = "203.0.113.7:443";
+
     #[tokio::test]
     async fn a_refused_direct_dial_is_answered_502_not_200() {
         // Dialling after the 200 left the client holding a tunnel that closed
         // empty, which it reported as a broken pipe or a TLS EOF.
-        let (state, mut rx) = test_state();
-        let ip = an_address_of_this_host_off_loopback();
-        let closed = std::net::TcpListener::bind((ip, 0)).unwrap();
-        let target = closed.local_addr().unwrap().to_string();
-        drop(closed);
+        let (state, mut rx) = test_state_on(TestNetwork::Refusing);
+        let target = DIRECT_TARGET.to_string();
 
         let (mut client, handler) = connect_direct(&state, target.clone()).await;
         let response = read_response(&mut client).await;
@@ -7475,6 +7537,37 @@ pub(crate) mod tests {
                 .any(|ev| ev["result"] == "error" && ev["status_code"] == 502),
             "{events:?}"
         );
+    }
+
+    /// The tests around this one dial a [`TestNetwork`]; this one checks that a
+    /// refusal from a real kernel takes the same path. Only Linux answers a dial
+    /// to a closed port on its own address at once: a Mac whose firewall is in
+    /// stealth mode never answers it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_dial_this_host_refuses_is_answered_502() {
+        let (state, _rx) = test_state_on(sock_mark::HostNetwork);
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        probe
+            .connect("192.0.2.1:9")
+            .expect("this test needs a route off the host");
+        let ip = probe.local_addr().unwrap().ip();
+        assert!(!sock_mark::is_disallowed_egress_ip(ip), "{ip}");
+        let closed = std::net::TcpListener::bind((ip, 0)).unwrap();
+        let target = closed.local_addr().unwrap().to_string();
+        drop(closed);
+
+        let (mut client, handler) = connect_direct(&state, target.clone()).await;
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains(&format!("could not connect to {target}: ")),
+            "{response}"
+        );
+        handler.await.unwrap().expect_err("the dial was refused");
     }
 
     #[tokio::test]
@@ -7500,10 +7593,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_direct_connect_opens_once_the_dial_succeeds() {
         use tokio::io::AsyncReadExt;
-        let (state, _rx) = test_state();
-        let ip = an_address_of_this_host_off_loopback();
-        let origin = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
-        let target = origin.local_addr().unwrap().to_string();
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (state, _rx) = test_state_on(TestNetwork::Reaching {
+            target: DIRECT_TARGET.parse().unwrap(),
+            origin: origin.local_addr().unwrap(),
+        });
         tokio::spawn(async move {
             let (mut conn, _) = origin.accept().await.unwrap();
             let mut buf = [0u8; 4];
@@ -7511,7 +7605,7 @@ pub(crate) mod tests {
             conn.write_all(&buf).await.unwrap();
         });
 
-        let (mut client, _handler) = connect_direct(&state, target).await;
+        let (mut client, _handler) = connect_direct(&state, DIRECT_TARGET.to_string()).await;
         let mut established = [0u8; 39];
         tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut established))
             .await
