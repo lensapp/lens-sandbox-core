@@ -29,6 +29,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsFd;
 
+use futures_util::future::BoxFuture;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 /// Lens Sandbox-internal mark applied to every outbound socket from proxy/MITM/DNS.
@@ -142,7 +143,38 @@ pub async fn connect_tcp_egress_where(
     port: u16,
     admits: impl FnOnce(IpAddr) -> bool,
 ) -> io::Result<TcpStream> {
-    let resolved = crate::resolver::resolve_first(host, port).await?;
+    connect_tcp_egress_on(&HostNetwork, host, port, admits).await
+}
+
+/// The two steps of an egress dial that reach the network: looking up the name
+/// and opening the socket. The floor and the policy check between them are not
+/// part of it, so a test that replaces the network still runs both.
+pub(crate) trait EgressNetwork: Send + Sync {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<SocketAddr>>;
+    fn connect(&self, resolved: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>>;
+}
+
+/// This host's resolver and marked sockets: what every production dial uses.
+pub(crate) struct HostNetwork;
+
+impl EgressNetwork for HostNetwork {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<SocketAddr>> {
+        Box::pin(crate::resolver::resolve_first(host, port))
+    }
+
+    fn connect(&self, resolved: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>> {
+        Box::pin(connect_marked(resolved))
+    }
+}
+
+/// [`connect_tcp_egress_where`] over `network` instead of this host's.
+pub(crate) async fn connect_tcp_egress_on(
+    network: &dyn EgressNetwork,
+    host: &str,
+    port: u16,
+    admits: impl FnOnce(IpAddr) -> bool,
+) -> io::Result<TcpStream> {
+    let resolved = network.resolve(host, port).await?;
     if is_disallowed_egress_ip(resolved.ip()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -158,7 +190,7 @@ pub async fn connect_tcp_egress_where(
             format!("egress to {} denied by policy", resolved.ip()),
         ));
     }
-    connect_marked(resolved).await
+    network.connect(resolved).await
 }
 
 async fn connect_marked(resolved: SocketAddr) -> io::Result<TcpStream> {
