@@ -126,7 +126,7 @@ pub(crate) struct Refusal {
 }
 
 impl Refusal {
-    const BAD_REQUEST: Self = Self::new(400, "Bad Request");
+    pub(crate) const BAD_REQUEST: Self = Self::new(400, "Bad Request");
     const UNKNOWN_CREDENTIALS: Self = Self::new(401, "Unknown credentials");
 
     const fn new(status: u16, reason: &'static str) -> Self {
