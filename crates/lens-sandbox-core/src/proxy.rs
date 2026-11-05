@@ -1001,28 +1001,41 @@ fn connect_dial_failure_response(
     target_host: &str,
     error: &std::io::Error,
 ) -> (Vec<u8>, Option<DialRefusal>) {
-    if let Some(refused) = crate::egress::refusal_of(error) {
-        let audited = match refused {
-            crate::egress::EgressRefused::Floor(_) => DialRefusal {
-                reason: "blocked-destination",
-                destination: target_host.to_string(),
-            },
-            crate::egress::EgressRefused::Rule(resolved) => DialRefusal {
-                reason: "policy-deny",
-                destination: resolved.to_string(),
-            },
-        };
-        let refusal = crate::blocked::response(
-            label,
-            crate::blocked::BlockReason::PolicyDeny,
-            "CONNECT",
-            target_host,
-            "",
-        );
-        return (refusal, Some(audited));
+    match dial_refusal(error, target_host) {
+        Some(audited) => {
+            let refusal = crate::blocked::response(
+                label,
+                crate::blocked::BlockReason::PolicyDeny,
+                "CONNECT",
+                target_host,
+                "",
+            );
+            (refusal, Some(audited))
+        }
+        None => (failed_dial_response(target_host, error), None),
     }
+}
+
+/// How a dial to `target_host` that the egress floor or an `egress.tcp` rule
+/// refused is audited on every door, or `None` when `error` is no such refusal.
+fn dial_refusal(error: &std::io::Error, target_host: &str) -> Option<DialRefusal> {
+    Some(match crate::egress::refusal_of(error)? {
+        crate::egress::EgressRefused::Floor(_) => DialRefusal {
+            reason: "blocked-destination",
+            destination: target_host.to_string(),
+        },
+        crate::egress::EgressRefused::Rule(resolved) => DialRefusal {
+            reason: "policy-deny",
+            destination: resolved.to_string(),
+        },
+    })
+}
+
+/// The `502` a client is told when its dial to `target_host` failed, naming why
+/// in `Proxy-Status`.
+fn failed_dial_response(target_host: &str, error: &std::io::Error) -> Vec<u8> {
     let body = format!("Sandbox proxy could not connect to {target_host}: {error}\n");
-    let response = format!(
+    format!(
         "HTTP/1.1 502 Bad Gateway\r\n\
          Proxy-Status: sandbox; error={}\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
@@ -1031,8 +1044,7 @@ fn connect_dial_failure_response(
         dial_proxy_status_error(error),
         body.len()
     )
-    .into_bytes();
-    (response, None)
+    .into_bytes()
 }
 
 /// How a dial refused before it was made is audited: the reason, and the
@@ -1069,12 +1081,8 @@ async fn answer_failed_connect_dial(
 ) -> std::io::Result<()> {
     let (response, refused) =
         connect_dial_failure_response(state.block_label(), target_host, error);
-    match refused {
-        Some(refusal) => {
-            emit_policy_deny_connect(state, &refusal.destination, refusal.reason, actor)
-        }
-        None => emit_audit(state, target_host, "error", 502, actor),
-    }
+    let audit = refused.map_or(DialAudit::Error(502), DialAudit::Refused);
+    audit_failed_dial(state, target_host, audit, actor);
     client.write_all(&response).await
 }
 
@@ -2444,39 +2452,71 @@ async fn handle_https_forward(
     if let Err(e) = &result
         && !client.answered
     {
-        let (response, status) =
+        let (response, audit) =
             dial_failure_response(state.block_label(), e.as_ref(), target_host, &header_str);
         client.write_all(&response).await.ok();
-        emit_audit(state, target_host, "error", status, actor);
+        audit_failed_dial(state, target_host, audit, actor);
     }
     result
 }
 
 /// What a client is told when the dial to an admitted destination, or the TLS
-/// setup over it, fails: a policy refusal of the request in `head` when the dial
-/// guard refused the address the name resolved to, or the upstream proxy
-/// refused the destination by its policy, else 502.
+/// setup over it, fails, and how it is audited: a policy refusal of the request
+/// in `head` when the dial guard refused the address the name resolved to, as on
+/// the `CONNECT` door, or the upstream proxy refused the destination by its
+/// policy, else 502.
 fn dial_failure_response(
     label: Option<&str>,
     error: &(dyn std::error::Error + 'static),
     target_host: &str,
     head: &str,
-) -> (Vec<u8>, u16) {
+) -> (Vec<u8>, DialAudit) {
     if error.is::<crate::blocked::UpstreamBlocked>() {
         let reason = crate::blocked::BlockReason::UpstreamPolicy;
-        return (refusal_for_head(label, reason, target_host, head), 403);
+        return (
+            refusal_for_head(label, reason, target_host, head),
+            DialAudit::Error(403),
+        );
     }
-    match error.downcast_ref::<std::io::Error>() {
-        Some(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (
+    let Some(error) = error.downcast_ref::<std::io::Error>() else {
+        return (BAD_GATEWAY_RESPONSE.to_vec(), DialAudit::Error(502));
+    };
+    match dial_refusal(error, target_host) {
+        Some(refusal) => (
             refusal_for_head(
                 label,
                 crate::blocked::BlockReason::PolicyDeny,
                 target_host,
                 head,
             ),
-            403,
+            DialAudit::Refused(refusal),
         ),
-        _ => (BAD_GATEWAY_RESPONSE.to_vec(), 502),
+        None => (
+            failed_dial_response(target_host, error),
+            DialAudit::Error(502),
+        ),
+    }
+}
+
+/// How a failed dial is audited: as the refusal it was, or as an error with
+/// the status the client was told.
+#[derive(Debug, PartialEq, Eq)]
+enum DialAudit {
+    Refused(DialRefusal),
+    Error(u16),
+}
+
+fn audit_failed_dial(
+    state: &Arc<ProxyState>,
+    target_host: &str,
+    audit: DialAudit,
+    actor: &crate::peer_process::ActorContext,
+) {
+    match audit {
+        DialAudit::Refused(refusal) => {
+            emit_policy_deny_connect(state, &refusal.destination, refusal.reason, actor)
+        }
+        DialAudit::Error(status) => emit_audit(state, target_host, "error", status, actor),
     }
 }
 
@@ -3447,9 +3487,9 @@ async fn https_forward_raw_passthrough(
     let mut upstream = match dialled {
         Ok(s) => s,
         Err(e) => {
-            let (response, status) =
+            let (response, audit) =
                 dial_failure_response(state.block_label(), e.as_ref(), target_host, request_head);
-            emit_audit(state, target_host, "error", status, actor);
+            audit_failed_dial(state, target_host, audit, actor);
             client.write_all(&response).await?;
             return Err(format!("raw passthrough connect to {target_host}: {e}").into());
         }
@@ -11122,6 +11162,10 @@ pub(crate) mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&response);
         assert!(response.starts_with("HTTP/1.1 502"), "{response:?}");
+        assert!(
+            response.contains("\r\nProxy-Status: sandbox; error=dns_error\r\n"),
+            "the client is told why, as on the CONNECT door: {response:?}"
+        );
         assert!(handler.await.unwrap().is_err());
         assert!(
             drain_audit_lines(&mut rx)
@@ -11134,17 +11178,21 @@ pub(crate) mod tests {
     fn a_dial_the_guard_refused_is_answered_as_a_refusal() {
         let refused: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "egress to 10.0.0.5 denied by policy",
+            crate::egress::EgressRefused::Rule("10.0.0.5:443".parse().unwrap()),
         ));
-        let (response, status) = dial_failure_response(
+        let (response, audit) = dial_failure_response(
             None,
             refused.as_ref(),
             "203.0.113.80:443",
             "GET /v1/x?q=1 HTTP/1.1",
         );
         assert_eq!(
-            status, 403,
-            "a policy refusal is a 403, not a gateway failure"
+            audit,
+            DialAudit::Refused(DialRefusal {
+                reason: "policy-deny",
+                destination: "10.0.0.5:443".to_string(),
+            }),
+            "a rule refusal is audited by the address the rule refused, as on the CONNECT door"
         );
         crate::blocked::tests::assert_blocked(
             &String::from_utf8(response).unwrap(),
@@ -11167,7 +11215,100 @@ pub(crate) mod tests {
         let failed: Box<dyn std::error::Error + Send + Sync> = "handshake failed".into();
         assert_eq!(
             dial_failure_response(None, failed.as_ref(), "h:443", "GET / HTTP/1.1").1,
-            502
+            DialAudit::Error(502)
+        );
+    }
+
+    #[test]
+    fn a_dial_the_floor_refused_on_the_https_forward_door_is_a_blocked_destination() {
+        let refused: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            crate::egress::EgressRefused::Floor("127.0.0.1:443".parse().unwrap()),
+        ));
+        let (response, audit) = dial_failure_response(
+            None,
+            refused.as_ref(),
+            "127.0.0.1.nip.io:443",
+            "GET https://127.0.0.1.nip.io/ HTTP/1.1",
+        );
+        assert_eq!(
+            audit,
+            DialAudit::Refused(DialRefusal {
+                reason: "blocked-destination",
+                destination: "127.0.0.1.nip.io:443".to_string(),
+            }),
+            "audited as the door audits a literal loopback target"
+        );
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 403 "),
+        );
+    }
+
+    #[test]
+    fn a_dial_the_os_refused_on_the_https_forward_door_is_a_failed_dial() {
+        // `connect` itself can fail with EACCES or EPERM; no rule refused it.
+        let failed: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let (response, audit) =
+            dial_failure_response(None, failed.as_ref(), "x.example:443", "GET / HTTP/1.1");
+        let response = String::from_utf8(response).unwrap();
+        assert_eq!(audit, DialAudit::Error(502), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains("\r\nProxy-Status: sandbox; error=destination_unavailable\r\n"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_https_forward_a_tcp_cidr_rule_refuses_at_the_dial_is_audited_by_the_address_it_refused()
+     {
+        // Audited by the name as an error, the refusal was never listed as one,
+        // and a CIDR rule could not have matched it anyway.
+        let (state, mut rx) = test_state_on(TestNetwork::Resolving {
+            name: "db.internal",
+            to: "10.1.2.3".parse().unwrap(),
+        });
+        install_catch_all_allow(&state);
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "10.0.0.0/8:443", "verdict": "deny"}]"#,
+        );
+        let (mut client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_https_forward(
+                server,
+                "db.internal:443",
+                b"GET https://db.internal/v1 HTTP/1.1\r\nHost: db.internal\r\n\r\n".to_vec(),
+                &state_for_handler,
+                &test_actor(),
+            )
+            .await
+        });
+
+        let response = read_response(&mut client).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden by sandbox policy\r\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains("GET db.internal/v1"),
+            "the client is told the request it sent: {response}"
+        );
+        let _ = handler.await.unwrap();
+        assert_eq!(
+            refusal_events(&mut rx),
+            [host_only_refusal(
+                "10.1.2.3:443",
+                Some("policy-deny"),
+                &test_actor()
+            )]
         );
     }
 
@@ -11227,8 +11368,11 @@ pub(crate) mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e["host"] == "203.0.113.80" && e["status_code"] == 403),
-            "the refusal must be audited as a 403; got {events:#?}"
+                .any(|e| e["action"] == "CONNECT 203.0.113.80:443"
+                    && e["result"] == "failure"
+                    && e["status_code"] == 403
+                    && e["metadata"]["reason"] == "policy-deny"),
+            "the refusal must be audited as one, by the address the rule refused; got {events:#?}"
         );
         assert!(
             !events.iter().any(|e| e["status_code"] == 502),
