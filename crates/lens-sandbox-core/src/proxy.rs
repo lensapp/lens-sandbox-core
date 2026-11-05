@@ -334,6 +334,9 @@ pub struct ProxyState {
     /// Where every egress dial looks up its name and opens its socket: this
     /// host's network in production, a fake in unit tests.
     pub(crate) egress_network: Box<dyn sock_mark::EgressNetwork>,
+    /// Where this proxy's CAs are installed for the workload to trust: the
+    /// host's trust store in production, nowhere in unit tests.
+    pub(crate) trust_store: Arc<crate::ca::TrustStore>,
 }
 
 impl ProxyState {
@@ -531,7 +534,7 @@ pub(crate) fn get_or_init_ca(
             crate::ca::EphemeralCa::new()
                 .unwrap_or_else(|e| panic!("failed to create ephemeral CA: {e}")),
         );
-        crate::ca::install_ca_cert(ca.ca_cert_pem());
+        state.trust_store.install(ca.ca_cert_pem());
         tracing::info!("ephemeral CA generated and installed for MITM (proxy path)");
         ca
     }))
@@ -685,12 +688,50 @@ async fn accept_loop(
 }
 
 impl ProxyServer {
+    /// A proxy whose CAs go into the host's trust store.
     pub fn new(
         listen_addr: SocketAddr,
         transparent_listen_addr: SocketAddr,
         dns_stub_listen_addr: SocketAddr,
         sandbox_creds: Option<crate::privilege::SandboxCredentials>,
         bootstrap_dns_allowlist: Vec<String>,
+    ) -> (Self, Arc<ProxyState>) {
+        Self::new_with_trust_store(
+            listen_addr,
+            transparent_listen_addr,
+            dns_stub_listen_addr,
+            sandbox_creds,
+            bootstrap_dns_allowlist,
+            crate::ca::TrustStore::host(),
+        )
+    }
+
+    /// [`Self::new`] for a unit test, whose CAs go nowhere outside it.
+    #[cfg(test)]
+    pub(crate) fn new_trusting_nowhere(
+        listen_addr: SocketAddr,
+        transparent_listen_addr: SocketAddr,
+        dns_stub_listen_addr: SocketAddr,
+        sandbox_creds: Option<crate::privilege::SandboxCredentials>,
+        bootstrap_dns_allowlist: Vec<String>,
+    ) -> (Self, Arc<ProxyState>) {
+        Self::new_with_trust_store(
+            listen_addr,
+            transparent_listen_addr,
+            dns_stub_listen_addr,
+            sandbox_creds,
+            bootstrap_dns_allowlist,
+            Arc::new(crate::ca::TrustStore::nowhere()),
+        )
+    }
+
+    fn new_with_trust_store(
+        listen_addr: SocketAddr,
+        transparent_listen_addr: SocketAddr,
+        dns_stub_listen_addr: SocketAddr,
+        sandbox_creds: Option<crate::privilege::SandboxCredentials>,
+        bootstrap_dns_allowlist: Vec<String>,
+        trust_store: Arc<crate::ca::TrustStore>,
     ) -> (Self, Arc<ProxyState>) {
         let state = Arc::new(ProxyState {
             upstream: Mutex::new(None),
@@ -722,6 +763,7 @@ impl ProxyServer {
             gate_resolved_hosts: RwLock::new(HashSet::new()),
             block_label: std::sync::OnceLock::new(),
             egress_network: Box::new(sock_mark::HostNetwork),
+            trust_store,
         });
         let server = Self {
             listen_addr,
@@ -4624,7 +4666,7 @@ pub(crate) mod tests {
     /// nested namespace with a green suite.
     #[test]
     fn the_explicit_lane_never_takes_an_extra_address() {
-        let (mut server, _state) = ProxyServer::new(
+        let (mut server, _state) = ProxyServer::new_trusting_nowhere(
             "127.0.0.1:3128".parse().unwrap(),
             "127.0.0.1:3129".parse().unwrap(),
             "127.0.0.1:5355".parse().unwrap(),
@@ -4954,6 +4996,7 @@ pub(crate) mod tests {
             gate_resolved_hosts: RwLock::new(HashSet::new()),
             block_label: std::sync::OnceLock::new(),
             egress_network: Box::new(network),
+            trust_store: Arc::new(crate::ca::TrustStore::nowhere()),
         });
         (state, rx)
     }
