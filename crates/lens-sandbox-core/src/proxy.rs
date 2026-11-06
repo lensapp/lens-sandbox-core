@@ -215,7 +215,7 @@ pub struct ClientCertConfig {
     pub ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     pub dial_addr: String,
     pub tls_server_name: String,
-    /// Original Host header to send to upstream. When set, the TLS bridge
+    /// Original Host header to send to upstream. When set, the MITM
     /// rewrites the Host header in the first HTTP request to this value.
     /// Used for path-based gateways (e.g. Rancher) that route by Host.
     pub upstream_host_header: Option<String>,
@@ -484,6 +484,17 @@ pub(crate) fn collect_header_injections(
         }
     }
     matched
+}
+
+/// The upstream and client certificate a `forward` route sends `target_host`
+/// (`host:port`) to, when a route has one.
+pub(crate) fn forward_route(state: &ProxyState, target_host: &str) -> Option<ClientCertConfig> {
+    state
+        .client_certs
+        .read()
+        .unwrap()
+        .get(&target_host.to_lowercase())
+        .cloned()
 }
 
 /// The HTTP rules that govern a destination the proxy is about to dial on its
@@ -989,11 +1000,6 @@ fn resolve_route(
         } => None,
     }
 }
-
-/// What a client is told when a destination is refused for a reason that is
-/// not policy: an interceptor that needs the client's own TLS.
-const FORBIDDEN_RESPONSE: &[u8] =
-    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// What a client is told when the proxy cannot read its request as one it serves.
 const BAD_REQUEST_RESPONSE: &[u8] =
@@ -1781,11 +1787,7 @@ async fn handle_connect(
 
     let hostname = extract_hostname(target_host);
 
-    // Check if this target has a client cert config for mTLS upstream
-    let client_cert = {
-        let map = state.client_certs.read().unwrap();
-        map.get(&target_host.to_lowercase()).cloned()
-    };
+    let forward = forward_route(state, target_host);
 
     // Collect credential injections AFTER the gate resolves: accepting an integration
     // offer during a Verdict::Ask hold arms a credential mid-connection, and the resumed
@@ -1802,8 +1804,11 @@ async fn handle_connect(
         Transport::Direct => {
             let uri_placeholders = collect_uri_placeholders(state, target_host);
             // A deferred door has a question to ask before anything leaves, which
-            // only the MITM can ask, however the policy has changed since.
+            // only the MITM can ask, however the policy has changed since. A
+            // forward route's client certificate goes on the connection the MITM
+            // opens.
             let needs_mitm = deferred
+                || forward.is_some()
                 || needs_interception(
                     state,
                     target_host,
@@ -1811,14 +1816,13 @@ async fn handle_connect(
                     &domain_http_rules,
                     &uri_placeholders,
                 );
-            let bridged = client_cert.is_some() && state.ephemeral_ca.get().is_some();
 
-            // The interceptors below accept the client's TLS inside the tunnel
-            // and dial only once they have read and judged the request, so the
-            // tunnel has to open first. A plain relay has nothing to read, so it
-            // dials first: a destination it cannot reach is told as a 502, not
-            // as a tunnel that closes empty.
-            let relay = if needs_mitm || bridged {
+            // The MITM accepts the client's TLS inside the tunnel and dials only
+            // once it has read and judged the request, so the tunnel has to open
+            // first. A plain relay has nothing to read, so it dials first: a
+            // destination it cannot reach is told as a 502, not as a tunnel that
+            // closes empty.
+            let relay = if needs_mitm {
                 None
             } else {
                 match connect_egress_under_policy(
@@ -1851,7 +1855,7 @@ async fn handle_connect(
             tracing::debug!(
                 target = %target_host,
                 has_injections = injections.is_some(),
-                has_client_cert = client_cert.is_some(),
+                has_forward = forward.is_some(),
                 has_http_rules = !domain_http_rules.is_empty(),
                 has_ephemeral_ca = state.ephemeral_ca.get().is_some(),
                 client_cert_keys = ?state.client_certs.read().unwrap().keys().collect::<Vec<_>>(),
@@ -1867,6 +1871,7 @@ async fn handle_connect(
                 let mode = crate::mitm::UpstreamMode::DirectTls {
                     host: hostname.to_string(),
                     port,
+                    forward,
                 };
                 let extra_certs = state.extra_ca_certs.read().unwrap().clone();
                 let ctx = crate::mitm::MitmContext {
@@ -1882,23 +1887,6 @@ async fn handle_connect(
                     gate_deferred: deferred,
                 };
                 crate::mitm::handle_mitm(client, &hostname, mode, &ctx).await?;
-            } else if let (Some(cc), Some(ca)) = (&client_cert, state.ephemeral_ca.get()) {
-                // Has client cert (no header injections) → TLS bridge (mTLS to upstream)
-                tracing::debug!(target = %target_host, dial_addr = %cc.dial_addr, "proxy DIRECT+TLS_BRIDGE");
-                let hostname = extract_hostname(target_host);
-                let audit_tx = state.audit_tx.lock().unwrap().clone();
-                crate::mitm::handle_tls_bridge(
-                    state.egress.as_ref(),
-                    client,
-                    &cc.dial_addr,
-                    &cc.tls_server_name,
-                    cc,
-                    ca,
-                    &hostname,
-                    &audit_tx,
-                    actor,
-                )
-                .await?;
             } else if let Some(mut target) = relay {
                 // Neither → plain TCP relay, dialled above
                 tracing::debug!(target = %target_host, "proxy DIRECT");
@@ -2372,29 +2360,6 @@ async fn handle_https_forward(
     let injections = collect_header_injections(state, target_host);
     let placeholders = collect_uri_placeholders(state, target_host);
 
-    // The mTLS bridge for a host with a client certificate accepts the client's
-    // TLS itself. Here there is no TLS to accept, and relaying around it would
-    // reach the host without the certificate it exists to add, so such a host
-    // is refused.
-    if transport == Transport::Direct {
-        let bridged = state.ephemeral_ca.get().is_some()
-            && state
-                .client_certs
-                .read()
-                .unwrap()
-                .contains_key(&target_host.to_lowercase())
-            && !needs_interception(state, target_host, &injections, &http_rules, &placeholders);
-        if bridged {
-            client.write_all(FORBIDDEN_RESPONSE).await?;
-            emit_audit(state, target_host, "error", 403, actor);
-            return Err(format!(
-                "{target_host} is served by an interceptor that needs the client's own TLS; \
-                 reach it with CONNECT"
-            )
-            .into());
-        }
-    }
-
     let ca = match get_or_init_ca(state) {
         Ok(ca) => ca,
         Err(e) => {
@@ -2408,6 +2373,7 @@ async fn handle_https_forward(
         Transport::Direct => crate::mitm::UpstreamMode::DirectTls {
             host: hostname.clone(),
             port,
+            forward: forward_route(state, target_host),
         },
         // The proxy answers this host's token requests itself, so its tunnel
         // opens only for a request that is forwarded — as on the CONNECT door.
@@ -3669,23 +3635,6 @@ async fn handle_transparent_tls(
         Verdict::Allow => transport,
     };
 
-    // The mTLS bridge in the explicit-CONNECT path (`handle_connect`) takes a
-    // RAW TcpStream and runs its own TLS accept to present a client cert to the
-    // upstream (kubeconfig mTLS). The transparent path has already consumed the
-    // ClientHello via `LazyConfigAcceptor`, so that handler can't be reused
-    // as-is. Until it learns to accept a pre-accepted TLS stream, deny the
-    // connection with a specific reason so the operator is alerted instead of
-    // silently getting missing-cert upstream failures.
-    let has_client_cert = {
-        let map = state.client_certs.read().unwrap();
-        map.contains_key(&target_host.to_lowercase())
-    };
-    if has_client_cert {
-        emit_transparent_deny(state, orig_dst, "transparent-not-supported:client-cert");
-        drop(start);
-        return Ok(());
-    }
-
     // Non-denied: complete the TLS handshake with an ephemeral cert and
     // run the MITM pipeline. Unlike the CONNECT path, transparent TLS is
     // always MITM'd — we've already committed to TLS termination by the
@@ -3733,6 +3682,7 @@ async fn handle_transparent_tls(
             let mode = crate::mitm::UpstreamMode::DirectTls {
                 host: hostname.clone(),
                 port: orig_dst.port(),
+                forward: forward_route(state, &target_host),
             };
             crate::mitm::handle_mitm_pre_accepted(tls_client, &hostname, mode, &ctx).await?;
         }
@@ -4245,7 +4195,7 @@ fn emit_policy_deny_http(
 /// Emit a decision audit event the moment the gate resolves on the
 /// *allow* path. This is a policy-decision marker — "user-allowed-once"
 /// / "user-allowed-persisted" — not a request-outcome event. The
-/// downstream dispatch arm (MITM, TLS bridge, plain relay) is
+/// downstream dispatch arm (MITM, plain relay) is
 /// responsible for the request's own audit event when the transport
 /// actually completes; emitting `result`/`status_code` here would
 /// double-count allows and paint false successes when the upstream
@@ -4696,6 +4646,10 @@ pub(crate) fn extract_port(target: &str, default: u16) -> u16 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A `forward` route, end to end. Its own file: this one is long enough.
+    #[path = "forward_tests.rs"]
+    mod forward;
     use crate::blocked::BlockReason;
     use crate::blocked::tests::assert_blocked;
 
