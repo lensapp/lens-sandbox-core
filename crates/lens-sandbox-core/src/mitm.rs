@@ -1633,24 +1633,28 @@ where
     let target = destination
         .as_ref()
         .map_or_else(|| RequestTarget::from_context(ctx), LlmDestination::target);
+    // A host whose credential is a signing key has its request signed last,
+    // after every step below has written the head the signature covers. A
+    // redirect drops the signature the sandbox made with its other credentials,
+    // and the backend answers to its own, so a redirected request is not signed.
+    let signed = destination.is_none() && ctx.state.aws_signer.matches(ctx.match_host);
     let head = match &destination {
         Some(destination) => {
             crate::llm::head::rewrite_for_backend(&header_str, &destination.redirect)
         }
         // A `forward` route's gateway routes by the Host it names. Every step
         // below writes on this head, so a credential is injected or signed for
-        // the head the gateway gets.
+        // the head the gateway gets. A signed request keeps its `Authorization`:
+        // it holds the placeholder signature the signer replaces.
         None => match gateway_host {
-            Some(gateway_host) => rewrite_host_header(&header_str, gateway_host),
+            Some(gateway_host) if signed => rewrite_host_header(&header_str, gateway_host),
+            Some(gateway_host) => {
+                without_authorization(&rewrite_host_header(&header_str, gateway_host))
+            }
             None => header_str.to_string(),
         },
     };
 
-    // A host whose credential is a signing key has its request signed last,
-    // after every step below has written the head the signature covers. A
-    // redirect drops the signature the sandbox made with its other credentials,
-    // and the backend answers to its own, so a redirected request is not signed.
-    let signed = destination.is_none() && ctx.state.aws_signer.matches(ctx.match_host);
     if signed && is_upgrade {
         return Err(facts
             .deny(
@@ -2207,9 +2211,19 @@ async fn dial_forward(
     connect_upstream_tls(upstream, &forward.tls_server_name, None, Some(forward), &[]).await
 }
 
+/// `header_block` without its `Authorization` header: the synthetic
+/// kubeconfig's dummy token (e.g. `Bearer lens-sandbox-proxy-auth`), which the
+/// client certificate stands in for, and which could confuse a gateway.
+fn without_authorization(header_block: &str) -> String {
+    header_block
+        .split("\r\n")
+        .filter(|line| !line.to_ascii_lowercase().starts_with("authorization:"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
 /// Rewrite headers for a `forward` route: replace Host with the original
-/// upstream hostname, strip the dummy Authorization header (real auth is mTLS
-/// via client certificates), and manage Connection semantics.
+/// upstream hostname, and manage Connection semantics.
 ///
 /// For non-upgrade requests, forces `Connection: close` so each request on a
 /// keep-alive socket gets the correct Host. For upgrade requests
@@ -2227,11 +2241,6 @@ fn rewrite_host_header(header_block: &str, new_host: &str) -> String {
         if lower.starts_with("host:") {
             lines.push(format!("Host: {new_host}"));
             host_found = true;
-        } else if lower.starts_with("authorization:") {
-            // Strip the dummy bearer token from the synthetic kubeconfig
-            // (e.g. "Bearer lens-sandbox-proxy-auth"). Real auth is mTLS —
-            // forwarding this token could confuse gateways or auth proxies.
-            continue;
         } else if lower.starts_with("connection:") && lower.contains("upgrade") {
             is_upgrade = true;
             lines.push(line.to_string());
@@ -2978,10 +2987,10 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_host_header_strips_authorization() {
+    fn the_dummy_token_is_dropped_and_the_rest_kept() {
         let headers = "GET /api/v1/nodes HTTP/1.1\r\nHost: host.docker.internal\r\nAuthorization: Bearer lens-sandbox-proxy-auth\r\nAccept: application/json";
-        let result = rewrite_host_header(headers, "rancher.example.com:443");
-        assert!(result.contains("Host: rancher.example.com:443"), "{result}");
+        let result = without_authorization(headers);
+        assert!(result.contains("Host: host.docker.internal"), "{result}");
         assert!(
             !result.contains("Authorization"),
             "dummy bearer token should be stripped: {result}"
@@ -3001,10 +3010,7 @@ mod tests {
             !result.contains("Connection: close"),
             "should not add Connection: close for upgrades: {result}"
         );
-        assert!(
-            !result.contains("Authorization"),
-            "dummy bearer token should be stripped even for upgrades: {result}"
-        );
+        assert!(result.contains("Host: rancher.example.com:443"), "{result}");
     }
 
     /// Build a TLS server config using a cert from the ephemeral CA for the given hostname.
