@@ -31,7 +31,7 @@ impl Egress for HostEgress {
         if is_own_address(addr.ip()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("egress to {} (the host's own address) denied", addr.ip()),
+                EgressRefused::OwnAddress(addr),
             ));
         }
         plain_socket(addr)?.connect(addr).await
@@ -163,6 +163,8 @@ pub enum EgressRefused {
     Floor(SocketAddr),
     /// An address the caller's `admits` check refused, such as an `egress.tcp` rule.
     Rule(SocketAddr),
+    /// The host's own address, which a host judging for a guest never dials.
+    OwnAddress(SocketAddr),
 }
 
 impl std::fmt::Display for EgressRefused {
@@ -174,6 +176,11 @@ impl std::fmt::Display for EgressRefused {
                 resolved.ip()
             ),
             Self::Rule(resolved) => write!(f, "egress to {} denied by policy", resolved.ip()),
+            Self::OwnAddress(resolved) => write!(
+                f,
+                "egress to {} (the host's own address) denied",
+                resolved.ip()
+            ),
         }
     }
 }

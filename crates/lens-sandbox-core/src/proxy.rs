@@ -1020,10 +1020,12 @@ fn connect_dial_failure_response(
 /// refused is audited on every door, or `None` when `error` is no such refusal.
 fn dial_refusal(error: &std::io::Error, target_host: &str) -> Option<DialRefusal> {
     Some(match crate::egress::refusal_of(error)? {
-        crate::egress::EgressRefused::Floor(_) => DialRefusal {
-            reason: "blocked-destination",
-            destination: target_host.to_string(),
-        },
+        crate::egress::EgressRefused::Floor(_) | crate::egress::EgressRefused::OwnAddress(_) => {
+            DialRefusal {
+                reason: "blocked-destination",
+                destination: target_host.to_string(),
+            }
+        }
         crate::egress::EgressRefused::Rule(resolved) => DialRefusal {
             reason: "policy-deny",
             destination: resolved.to_string(),
@@ -11244,6 +11246,40 @@ pub(crate) mod tests {
                 .unwrap()
                 .starts_with("HTTP/1.1 403 "),
         );
+    }
+
+    #[tokio::test]
+    async fn a_dial_host_egress_refuses_for_the_hosts_own_address_names_no_address_on_either_door()
+    {
+        use crate::egress::Egress;
+        let own = || async {
+            crate::egress::HostEgress
+                .connect("127.0.0.1:443".parse().unwrap())
+                .await
+                .expect_err("the host's own address is refused before any dial")
+        };
+        let blocked = || DialRefusal {
+            reason: "blocked-destination",
+            destination: "host.docker.internal:443".to_string(),
+        };
+
+        let (connect, refused) =
+            connect_dial_failure_response(None, "host.docker.internal:443", &own().await);
+        let connect = String::from_utf8(connect).unwrap();
+        assert_eq!(refused, Some(blocked()));
+        assert!(!connect.contains("127.0.0.1"), "{connect}");
+
+        let failed: Box<dyn std::error::Error + Send + Sync> = Box::new(own().await);
+        let (forward, audit) = dial_failure_response(
+            None,
+            failed.as_ref(),
+            "host.docker.internal:443",
+            "GET https://host.docker.internal/ HTTP/1.1",
+        );
+        let forward = String::from_utf8(forward).unwrap();
+        assert_eq!(audit, DialAudit::Refused(blocked()));
+        assert!(forward.starts_with("HTTP/1.1 403 "), "{forward}");
+        assert!(!forward.contains("127.0.0.1"), "{forward}");
     }
 
     #[test]
