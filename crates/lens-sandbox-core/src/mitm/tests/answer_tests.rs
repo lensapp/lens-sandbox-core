@@ -160,7 +160,7 @@ async fn run_under(
     };
     let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, HOST).unwrap());
     let tls_client = acceptor.accept(client_stream).await.unwrap();
-    let (tls_client, head, meta) = mitm_inject_after_accept(tls_client, HOST, &ctx, false)
+    let (tls_client, head, meta) = mitm_inject_after_accept(tls_client, HOST, &ctx, false, None)
         .await
         .unwrap();
 
