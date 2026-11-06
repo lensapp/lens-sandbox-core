@@ -2480,7 +2480,10 @@ fn dial_failure_response(
             DialAudit::Error(403),
         );
     }
-    let Some(error) = error.downcast_ref::<std::io::Error>() else {
+    let Some(error) = error
+        .downcast_ref::<std::io::Error>()
+        .filter(|error| !is_tls_setup_failure(error))
+    else {
         return (BAD_GATEWAY_RESPONSE.to_vec(), DialAudit::Error(502));
     };
     match dial_refusal(error, target_host) {
@@ -2498,6 +2501,13 @@ fn dial_failure_response(
             DialAudit::Error(502),
         ),
     }
+}
+
+/// Whether `error` is a TLS handshake that failed after the TCP dial succeeded, which tokio-rustls returns as an `io::Error`.
+fn is_tls_setup_failure(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<rustls::Error>())
 }
 
 /// How a failed dial is audited: as the refusal it was, or as an error with
@@ -11246,6 +11256,23 @@ pub(crate) mod tests {
                 .unwrap()
                 .starts_with("HTTP/1.1 403 "),
         );
+    }
+
+    #[test]
+    fn a_tls_setup_that_failed_after_the_dial_is_a_plain_bad_gateway() {
+        // tokio-rustls returns a handshake failure as an io::Error that wraps the rustls::Error.
+        let handshake: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        ));
+        let (response, audit) = dial_failure_response(
+            None,
+            handshake.as_ref(),
+            "x.example:443",
+            "GET https://x.example/ HTTP/1.1",
+        );
+        assert_eq!(audit, DialAudit::Error(502));
+        assert_eq!(response, BAD_GATEWAY_RESPONSE);
     }
 
     #[tokio::test]
