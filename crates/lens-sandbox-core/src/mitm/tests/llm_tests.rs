@@ -300,7 +300,8 @@ async fn run_on(
 
     let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, FRONT_HOST).unwrap());
     let tls_client_stream = acceptor.accept(client_stream).await.unwrap();
-    let result = mitm_inject_after_accept(tls_client_stream, FRONT_HOST, &ctx, is_tunnel).await;
+    let result =
+        mitm_inject_after_accept(tls_client_stream, FRONT_HOST, &ctx, is_tunnel, None).await;
 
     let drain = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>| {
         let mut events = Vec::new();
