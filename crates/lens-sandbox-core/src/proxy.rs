@@ -891,11 +891,21 @@ impl ProxyServer {
 }
 
 async fn handle_connection(
-    mut client: TcpStream,
+    client: TcpStream,
     peer: SocketAddr,
     state: &Arc<ProxyState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let actor = crate::peer_process::ActorContext::resolve_offloaded(peer).await;
+    serve_explicit(client, actor, state.clone()).await
+}
+
+/// Judge and serve one explicit-proxy connection whose caller is already known.
+pub async fn serve_explicit(
+    mut client: TcpStream,
+    actor: crate::peer_process::ActorContext,
+    state: Arc<ProxyState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let state = &state;
     // Read unbuffered: for a CONNECT the bytes right after the header are the
     // client's TLS ClientHello, which the tunnel must forward verbatim — a
     // buffered reader would consume and drop them. The timeout is slow-loris defense.
@@ -10787,6 +10797,43 @@ pub(crate) mod tests {
         tokio::spawn(async move { handle_connection(server, peer, &state_for_handler).await });
         client.write_all(request).await.unwrap();
         read_response(&mut client).await
+    }
+
+    #[tokio::test]
+    async fn a_caller_with_no_known_process_is_judged_at_the_proxy_door() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (state, mut rx) = test_state();
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                default_verdict: Verdict::Deny,
+                ..Default::default()
+            },
+        );
+        let (mut client, server) = socket_pair().await;
+        tokio::spawn(serve_explicit(
+            server,
+            crate::peer_process::ActorContext::unattributed(),
+            state,
+        ));
+        client
+            .write_all(
+                b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let refusal: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the refusal is audited")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refusal["action"], "CONNECT api.example.test:443");
+        assert_eq!(refusal["metadata"]["reason"], "policy-deny");
     }
 
     #[tokio::test]
