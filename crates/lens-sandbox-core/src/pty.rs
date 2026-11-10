@@ -105,7 +105,10 @@ pub(crate) fn spawn_spec(
     // capability drop rather than a `setuid(0)` that would keep CAP_NET_ADMIN.
     let privilege = crate::privilege::privilege_drop_for(spec.creds.as_ref(), spec.confinement);
     let creds_info = match privilege {
-        crate::privilege::PrivilegeDrop::Setuid(creds) => Some(creds.uid_gid()),
+        crate::privilege::PrivilegeDrop::Setuid(creds) => Some((creds.uid_gid(), true)),
+        crate::privilege::PrivilegeDrop::SetuidAllowingEscalation(creds) => {
+            Some((creds.uid_gid(), false))
+        }
         _ => None,
     };
     // `Some(gid)` means drop capabilities; the inner option is the group to
@@ -144,19 +147,12 @@ pub(crate) fn spawn_spec(
             // Close master in child — only the parent needs it
             libc::close(master_raw);
 
-            // Privilege drop + post-exec hardening. Mirrors the piped path
-            // (build_agent_command -> creds.apply / apply_cap_drop) so a PTY
-            // agent (e.g. Claude Code with TERM=xterm-256color) can't keep
-            // CAP_NET_ADMIN or skip NO_NEW_PRIVS / pdeathsig.
-            if let Some((uid, gid)) = creds_info {
-                #[cfg(target_os = "linux")]
-                nix::unistd::setgroups(&[])
-                    .map_err(|e| std::io::Error::other(format!("setgroups: {e}")))?;
-                nix::unistd::setgid(gid)
-                    .map_err(|e| std::io::Error::other(format!("setgid: {e}")))?;
-                nix::unistd::setuid(uid)
-                    .map_err(|e| std::io::Error::other(format!("setuid: {e}")))?;
-                crate::privilege::lock_down_after_setuid()?;
+            // Privilege drop: mirrors the piped path, as `privilege_drop_for` decides it.
+            if let Some(((uid, gid), pin_no_new_privs)) = creds_info {
+                crate::privilege::become_in_child(uid, gid)?;
+                if pin_no_new_privs {
+                    crate::privilege::lock_down_after_setuid()?;
+                }
                 crate::privilege::set_pdeathsig_sigterm()?;
             } else if let Some(gid) = drop_capabilities {
                 // No UID drop — drop caps so the agent can't rewrite iptables
@@ -362,6 +358,57 @@ mod tests {
         let status = proc.child.wait().await.expect("wait");
         assert!(status.success(), "exit: {status:?}");
         assert!(output.contains("NoNewPrivs:\t1"), "got: {output:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root: only root may setuid to another identity"]
+    async fn a_pty_child_the_host_judges_may_run_sudo_and_a_caged_one_may_not() {
+        assert!(
+            nix::unistd::geteuid().is_root(),
+            "this test runs as root only. As anyone else the setuid it observes would EPERM"
+        );
+        let creds = SandboxCredentials::resolve_by_uid(65534, 65534)
+            .expect("resolve_by_uid never fails on a host");
+        let no_new_privs = |confinement| {
+            let creds = creds.clone();
+            async move {
+                let mut proc = spawn_pty(
+                    "/bin/sh",
+                    &["-c".into(), "grep NoNewPrivs /proc/self/status".into()],
+                    Some("/tmp"),
+                    None,
+                    Some(&creds),
+                    confinement,
+                    Some((80, 24)),
+                )
+                .expect("spawn should succeed");
+                let mut output = String::new();
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match proc.reader.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => output.push_str(&String::from_utf8_lossy(&buf[..n])),
+                        Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                        Err(e) => panic!("read: {e}"),
+                    }
+                }
+                proc.child.wait().await.expect("wait");
+                output
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("NoNewPrivs:"))
+                    .expect("status names NoNewPrivs")
+                    .trim()
+                    .to_string()
+            }
+        };
+
+        assert_eq!(
+            no_new_privs(Confinement::Host).await,
+            "0",
+            "a terminal session must get the same sudo as the piped path"
+        );
+        assert_eq!(no_new_privs(Confinement::Guest).await, "1");
     }
 
     /// The PTY sibling of `child_spawner`'s group assertion: the group a
