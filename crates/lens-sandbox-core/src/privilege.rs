@@ -443,14 +443,10 @@ impl SandboxCredentials {
     /// [`privilege_drop_for`] exists to prevent. A doc note asking
     /// callers not to is weaker than a compiler that will not let them.
     pub(crate) fn apply(&self, cmd: &mut Command) {
-        let uid = self.uid;
-        let gid = self.gid;
+        let (uid, gid) = (self.uid, self.gid);
         unsafe {
             cmd.pre_exec(move || {
-                #[cfg(target_os = "linux")]
-                nix::unistd::setgroups(&[]).map_err(|e| std::io::Error::other(e.to_string()))?;
-                nix::unistd::setgid(gid).map_err(|e| std::io::Error::other(e.to_string()))?;
-                nix::unistd::setuid(uid).map_err(|e| std::io::Error::other(e.to_string()))?;
+                become_in_child(uid, gid)?;
                 // setuid(non-root) already zeroed effective/permitted/inheritable
                 // and the ambient set; bounding-set drop now requires
                 // CAP_SETPCAP we no longer have. Pinning NO_NEW_PRIVS is
@@ -463,6 +459,25 @@ impl SandboxCredentials {
             });
         }
     }
+
+    /// [`SandboxCredentials::apply`] without `NO_NEW_PRIVS`; only [`privilege_drop_for`] may choose it.
+    pub(crate) fn apply_allowing_escalation(&self, cmd: &mut Command) {
+        let (uid, gid) = (self.uid, self.gid);
+        unsafe {
+            cmd.pre_exec(move || {
+                become_in_child(uid, gid)?;
+                set_pdeathsig_sigterm()
+            });
+        }
+    }
+}
+
+pub(crate) fn become_in_child(uid: nix::unistd::Uid, gid: nix::unistd::Gid) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    nix::unistd::setgroups(&[]).map_err(|e| io::Error::other(format!("setgroups: {e}")))?;
+    nix::unistd::setgid(gid).map_err(|e| io::Error::other(format!("setgid: {e}")))?;
+    nix::unistd::setuid(uid).map_err(|e| io::Error::other(format!("setuid: {e}")))?;
+    Ok(())
 }
 
 /// Post-setuid hardening: pin `NO_NEW_PRIVS` so subsequent `execve` cannot
@@ -550,7 +565,7 @@ pub(crate) fn adopt_gid_in_child(gid: Option<nix::unistd::Gid>) -> io::Result<()
 pub enum Confinement {
     /// The root parent built the nftables cage; a root child drops its capabilities so it cannot leave it.
     Guest,
-    /// The host judges egress at the virtual NIC; there is no cage, and a root child keeps what its parent has.
+    /// The host judges egress at the virtual NIC; there is no cage, so a root child keeps what its parent has and any child may run `sudo`.
     Host,
     /// An unprivileged parent built no cage and has nothing to drop.
     Unprivileged,
@@ -577,6 +592,8 @@ pub enum PrivilegeDrop<'a> {
     /// Become this identity. The kernel zeroes the capability sets on a
     /// `setuid` to a non-zero uid, so nothing else is needed.
     Setuid(&'a SandboxCredentials),
+    /// Become this identity, but leave `NO_NEW_PRIVS` off so a setuid binary such as `sudo` works: the host judges egress, so a child that regains root has no cage to leave.
+    SetuidAllowingEscalation(&'a SandboxCredentials),
     /// Stay root and drop the capabilities by hand.
     ///
     /// `gid` is the group the caller resolved, or `None` where it
@@ -667,6 +684,7 @@ pub fn apply_privilege_drop(
 ) {
     match privilege_drop_for(creds, confinement) {
         PrivilegeDrop::Setuid(creds) => creds.apply(cmd),
+        PrivilegeDrop::SetuidAllowingEscalation(creds) => creds.apply_allowing_escalation(cmd),
         PrivilegeDrop::Capabilities { gid } => apply_cap_drop(cmd, gid),
         PrivilegeDrop::KeepRoot { gid } => apply_keep_root(cmd, gid),
         // No privilege to drop, but pdeathsig needs none and the orphan it
@@ -691,6 +709,9 @@ fn decide_privilege_drop(
     parent_euid_is_root: bool,
 ) -> PrivilegeDrop<'_> {
     match (creds, confinement) {
+        (Some(creds), Confinement::Host) if !creds.uid_gid().0.is_root() => {
+            PrivilegeDrop::SetuidAllowingEscalation(creds)
+        }
         (Some(creds), _) if !creds.uid_gid().0.is_root() => PrivilegeDrop::Setuid(creds),
         (_, Confinement::Guest) => PrivilegeDrop::Capabilities {
             gid: creds.map(|creds| creds.uid_gid().1),
@@ -721,10 +742,11 @@ fn decide_privilege_drop(
 /// orphaned agent would survive its supervisor and run outside the
 /// netfilter cage.
 ///
-/// Survives the upcoming `execve` because [`drop_capabilities_in_child`]
-/// and [`lock_down_after_setuid`] both pin `NO_NEW_PRIVS`, which
+/// Survives the upcoming `execve` on the arms that pin `NO_NEW_PRIVS`
+/// ([`drop_capabilities_in_child`] and [`lock_down_after_setuid`]), which
 /// suppresses the only conditions under which the kernel clears
-/// pdeathsig at exec (setuid / setgid / file-caps binaries).
+/// pdeathsig at exec (setuid / setgid / file-caps binaries). A child the
+/// host judges may exec `sudo` and lose it, because it has no cage to leave.
 #[cfg(target_os = "linux")]
 pub fn set_pdeathsig_sigterm() -> io::Result<()> {
     use nix::libc;
@@ -1166,14 +1188,23 @@ mod tests {
         );
     }
 
-    /// The host judging egress changes nothing for a non-root identity:
-    /// the setuid is still the whole drop.
     #[test]
-    fn a_host_judged_parent_still_setuids_to_a_non_root_identity() {
+    fn a_host_judged_non_root_child_may_regain_root_through_a_setuid_binary() {
         let creds = creds_for(65534, 65534);
         assert_eq!(
             privilege_drop_for(Some(&creds), Confinement::Host),
-            PrivilegeDrop::Setuid(&creds)
+            PrivilegeDrop::SetuidAllowingEscalation(&creds),
+            "with no cage in the guest, NO_NEW_PRIVS guards nothing and only breaks the sudo a workload calls"
+        );
+    }
+
+    #[test]
+    fn a_caged_non_root_child_cannot_regain_root_through_a_setuid_binary() {
+        let creds = creds_for(65534, 65534);
+        assert_eq!(
+            privilege_drop_for(Some(&creds), Confinement::Guest),
+            PrivilegeDrop::Setuid(&creds),
+            "a setuid root would regain CAP_NET_ADMIN and could flush the cage"
         );
     }
 

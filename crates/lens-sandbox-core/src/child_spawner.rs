@@ -459,6 +459,48 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root: only root may setuid to another identity"]
+    async fn a_non_root_child_the_host_judges_may_run_sudo_and_a_caged_one_may_not() {
+        assert!(
+            nix::unistd::geteuid().is_root(),
+            "this test runs as root only. As anyone else the setuid it observes would EPERM"
+        );
+        let no_new_privs = |confinement| async move {
+            let spec = ChildSpec {
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "grep NoNewPrivs /proc/self/status".into(),
+                ],
+                cwd: None,
+                env: HashMap::new(),
+                creds: Some(
+                    SandboxCredentials::resolve_by_uid(65534, 65534)
+                        .expect("resolve_by_uid never fails on a host"),
+                ),
+                confinement,
+            };
+            let out = build_command(&spec)
+                .output()
+                .await
+                .expect("command should run");
+            no_new_privs_of(&String::from_utf8_lossy(&out.stdout))
+        };
+
+        assert_eq!(
+            no_new_privs(Confinement::Host).await,
+            "0",
+            "with the judge on the host, a setuid binary such as sudo must work as on a real machine"
+        );
+        assert_eq!(
+            no_new_privs(Confinement::Guest).await,
+            "1",
+            "in the cage, a setuid root would regain CAP_NET_ADMIN and could flush it"
+        );
+    }
+
     /// Root only, like its neighbours, because only root can adopt another group and keep its capabilities.
     #[cfg(target_os = "linux")]
     #[tokio::test]
