@@ -2841,8 +2841,10 @@ fn tcp_egress_verdict_for_hostport(
 /// `already_gated` carries whether a developer has already answered for this
 /// connection — see [`tcp_egress_admits`] for what that changes.
 ///
-/// Every outbound dial goes through here — the raw doors and the MITM
-/// upstream — so no path reaches the network with the tcp table unread.
+/// Every dial to a destination the workload names goes through here — the raw
+/// doors and the MITM upstream. A `forward` route's address goes through
+/// [`connect_forward_under_policy`], so no path reaches the network with the
+/// tcp table unread.
 pub(crate) async fn connect_egress_under_policy(
     state: &Arc<ProxyState>,
     target_host: &str,
@@ -2856,6 +2858,26 @@ pub(crate) async fn connect_egress_under_policy(
         &extract_hostname(target_host),
         port,
         |ip| tcp_egress_admits(state, ip, port, caller, already_gated),
+    )
+    .await
+}
+
+/// Dial the address a `forward` route names under the `egress.tcp` table, but
+/// not the SSRF floor: the server chose that address, not the workload, and the
+/// route's CA and `tlsServerName` authenticate the peer before any request byte
+/// is sent. A gateway on the developer's host can be link-local, such as
+/// rootless Podman's `169.254.1.2`.
+pub(crate) async fn connect_forward_under_policy(
+    state: &Arc<ProxyState>,
+    dial_addr: &str,
+    caller: Option<&crate::peer_process::PeerProcess>,
+) -> std::io::Result<TcpStream> {
+    let port = extract_port(dial_addr, 443);
+    crate::egress::connect_tcp_resolve_where(
+        state.egress.as_ref(),
+        &extract_hostname(dial_addr),
+        port,
+        |ip| tcp_egress_admits(state, ip, port, caller, Gated::NotAsked),
     )
     .await
 }

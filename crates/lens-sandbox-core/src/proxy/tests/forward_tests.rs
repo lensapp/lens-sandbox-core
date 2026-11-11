@@ -207,6 +207,7 @@ async fn a_forwarded_request_reaches_the_route_address_with_its_client_certifica
         "{event}"
     );
     assert_eq!(event["metadata"]["mitm"], true, "{event}");
+    assert_eq!(event["metadata"]["tls_bridge"], true, "{event}");
     assert_eq!(event["upstream_status_code"], 200, "{event}");
 }
 
@@ -329,8 +330,10 @@ async fn an_upgrade_on_a_forwarded_host_is_relayed_both_ways() {
 }
 
 /// A policy that sends `HOST` direct, through `forward`.
-fn forwarding_state(forward: ClientCertConfig) -> Arc<ProxyState> {
-    let (state, _rx) = test_state();
+fn forwarding_state(
+    forward: ClientCertConfig,
+) -> (Arc<ProxyState>, mpsc::UnboundedReceiver<String>) {
+    let (state, audits) = test_state();
     install_catch_all_allow(&state);
     state
         .client_certs
@@ -338,7 +341,7 @@ fn forwarding_state(forward: ClientCertConfig) -> Arc<ProxyState> {
         .unwrap()
         .insert(TARGET.to_string(), forward);
     get_or_init_ca(&state).unwrap();
-    state
+    (state, audits)
 }
 
 #[tokio::test]
@@ -346,7 +349,7 @@ async fn a_connect_to_a_forwarded_host_gets_its_credentials_and_its_client_certi
     // The injected credential replaces the kubeconfig's dummy token, and the
     // client certificate goes on the same connection.
     let (forward, served) = origin(OK).await;
-    let state = forwarding_state(forward);
+    let (state, _audits) = forwarding_state(forward);
     state.credential_injections.write().unwrap().insert(
         HOST.to_string(),
         vec![CredentialInjection {
@@ -382,7 +385,7 @@ async fn a_connect_to_a_forwarded_host_gets_its_credentials_and_its_client_certi
 #[tokio::test]
 async fn an_absolute_https_request_to_a_forwarded_host_is_forwarded() {
     let (forward, served) = origin(OK).await;
-    let state = forwarding_state(forward);
+    let (state, _audits) = forwarding_state(forward);
     let (mut client, server) = socket_pair().await;
     let head =
         b"GET https://api.example.test/api/v1/pods HTTP/1.1\r\nHost: api.example.test\r\n\r\n";
@@ -397,10 +400,59 @@ async fn an_absolute_https_request_to_a_forwarded_host_is_forwarded() {
     assert!(String::from_utf8_lossy(&answer).ends_with("ok"));
 }
 
+/// What the client of an absolute-form `https://` request to a forwarded host
+/// reads while `verdict` covers the route address in the `egress.tcp` table,
+/// the audit, and whether the origin was dialled.
+async fn forward_under_tcp(verdict: &str) -> (String, Vec<serde_json::Value>, bool) {
+    let (forward, listener, _) = mtls_origin().await;
+    let (state, mut audits) = forwarding_state(forward);
+    let rule = format!(
+        r#"[{{"match": "127.0.0.0/8:{}", "verdict": "{verdict}"}}]"#,
+        listener.local_addr().unwrap().port()
+    );
+    install_tcp_rules(&state, &rule);
+    let (mut client, server) = socket_pair().await;
+    let head =
+        b"GET https://api.example.test/api/v1/pods HTTP/1.1\r\nHost: api.example.test\r\n\r\n";
+    let _ = handle_https_forward(server, TARGET, head.to_vec(), &state, &test_actor()).await;
+
+    let mut answer = Vec::new();
+    let _ = client.read_to_end(&mut answer).await;
+    let dialled = tokio::time::timeout(Duration::from_millis(200), listener.accept())
+        .await
+        .is_ok();
+    (
+        String::from_utf8(answer).unwrap(),
+        drain_audit_lines(&mut audits),
+        dialled,
+    )
+}
+
+#[tokio::test]
+async fn a_tcp_deny_on_the_route_address_refuses_the_forward() {
+    let (answer, audits, dialled) = forward_under_tcp("deny").await;
+    assert!(answer.starts_with("HTTP/1.1 403 "), "{answer}");
+    assert!(
+        audits
+            .iter()
+            .any(|e| e["metadata"]["reason"] == "policy-deny"),
+        "{audits:?}"
+    );
+    assert!(!dialled);
+}
+
+#[tokio::test]
+async fn a_tcp_ask_on_the_route_address_refuses_the_forward() {
+    // No gate can run inside the dial, as on every other MITM upstream.
+    let (answer, _, dialled) = forward_under_tcp("ask").await;
+    assert!(answer.starts_with("HTTP/1.1 403 "), "{answer}");
+    assert!(!dialled);
+}
+
 #[tokio::test]
 async fn a_transparent_tls_connection_to_a_forwarded_host_is_forwarded() {
     let (forward, served) = origin(OK).await;
-    let state = forwarding_state(forward);
+    let (state, _audits) = forwarding_state(forward);
     let (stream, _handler) = transparent_tls_connection(&state).await;
     let mut tls = sandbox_tls_client(&state, stream, HOST).await;
     tls.write_all(KUBECONFIG_GET.as_bytes()).await.unwrap();
