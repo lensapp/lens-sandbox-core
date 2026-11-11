@@ -306,21 +306,12 @@ where
 
     // Read/inject headers BEFORE connecting upstream, so a stalling client
     // doesn't hold open upstream connections.
-    let gateway_host = match &upstream_mode {
-        UpstreamMode::DirectTls {
-            forward: Some(forward),
-            ..
-        } => forward.upstream_host_header.clone(),
+    let forward = match &upstream_mode {
+        UpstreamMode::DirectTls { forward, .. } => forward.as_ref(),
         _ => None,
     };
-    let (mut tls_client, modified, meta) = mitm_inject_after_accept(
-        tls_client,
-        target_host,
-        ctx,
-        is_tunnel,
-        gateway_host.as_deref(),
-    )
-    .await?;
+    let (mut tls_client, modified, meta) =
+        mitm_inject_after_accept(tls_client, target_host, ctx, is_tunnel, forward).await?;
 
     match upstream_mode {
         UpstreamMode::DirectTls {
@@ -337,7 +328,7 @@ where
             };
             let dial = async || {
                 if let Some(forward) = &forward {
-                    return dial_forward(ctx.state.egress.as_ref(), forward).await;
+                    return dial_forward(ctx, forward).await;
                 }
                 // Through the policy-aware dial, not a bare one: an `egress.tcp`
                 // CIDR rule binds by address, so this is the first point at which
@@ -1394,7 +1385,7 @@ async fn mitm_inject_after_accept<C>(
     target_host: &str,
     ctx: &MitmContext<'_>,
     is_tunnel: bool,
-    gateway_host: Option<&str>,
+    forward: Option<&crate::proxy::ClientCertConfig>,
 ) -> Result<(C, String, RequestMeta), Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -1646,7 +1637,7 @@ where
         // below writes on this head, so a credential is injected or signed for
         // the head the gateway gets. A signed request keeps its `Authorization`:
         // it holds the placeholder signature the signer replaces.
-        None => match gateway_host {
+        None => match forward.and_then(|f| f.upstream_host_header.as_deref()) {
             Some(gateway_host) if signed => rewrite_host_header(&header_str, gateway_host),
             Some(gateway_host) => {
                 without_authorization(&rewrite_host_header(&header_str, gateway_host))
@@ -2014,6 +2005,12 @@ where
         let mut metadata = serde_json::json!({
             "host": target_host, "mitm": true, "tunnel": is_tunnel
         });
+        if destination.is_none()
+            && forward.is_some()
+            && let Some(object) = metadata.as_object_mut()
+        {
+            object.insert("tls_bridge".into(), true.into());
+        }
         if let (Some(service), Some(object)) = (&signed_service, metadata.as_object_mut()) {
             object.insert("aws_resign".into(), true.into());
             object.insert("service".into(), service.clone().into());
@@ -2194,20 +2191,16 @@ where
 }
 
 /// Reach the upstream a `forward` route names, with its client certificate.
-///
-/// The route names the address itself, so it is dialled as named, not judged
-/// as a destination the sandbox chose.
 async fn dial_forward(
-    egress: &dyn crate::egress::Egress,
+    ctx: &MitmContext<'_>,
     forward: &crate::proxy::ClientCertConfig,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
-    let upstream = crate::egress::connect_tcp_resolve(
-        egress,
-        &crate::proxy::extract_hostname(&forward.dial_addr),
-        crate::proxy::extract_port(&forward.dial_addr, 443),
+    let upstream = crate::proxy::connect_forward_under_policy(
+        ctx.state,
+        &forward.dial_addr,
+        ctx.actor.process(),
     )
-    .await
-    .map_err(|e| format!("forward to {}: {e}", forward.dial_addr))?;
+    .await?;
     connect_upstream_tls(upstream, &forward.tls_server_name, None, Some(forward), &[]).await
 }
 
