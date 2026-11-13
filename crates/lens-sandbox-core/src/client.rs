@@ -867,12 +867,25 @@ fn parse_upstream_plain_http_mode(value: &serde_json::Value) -> crate::proxy::Up
     }
 }
 
+/// Places a policy frame's files for an embedder whose workload does not share this process's filesystem, such as a guest that a host process boots.
+///
+/// Each call is the whole set: the frame's `files` replace what the last call placed, so a path the frame no longer names is removed, and `None` or an empty list removes everything. The client makes the calls in frame order, one at a time, never for a frame it could not read, and reports the results to the host as it does for the files it writes itself.
+#[async_trait]
+pub trait PlacePolicyFiles: Send + Sync {
+    /// One result per requested file, in the frame's order; empty when the frame named no files.
+    async fn refresh(
+        &self,
+        files: Option<&[crate::protocol::TempFile]>,
+    ) -> Vec<crate::protocol::PolicyFileResult>;
+}
+
 /// The files the last policy placed on this process's filesystem, and whose they are; the next policy replaces them, with or without a proxy in this process.
 #[derive(Default)]
 pub struct PlacedFiles {
     paths: std::sync::RwLock<Vec<String>>,
     creds: Option<crate::privilege::SandboxCredentials>,
     mounts: Option<Arc<crate::mount_points::MountPoints>>,
+    placer: Option<Arc<dyn PlacePolicyFiles>>,
 }
 
 impl PlacedFiles {
@@ -882,7 +895,14 @@ impl PlacedFiles {
             paths: std::sync::RwLock::new(Vec::new()),
             creds,
             mounts: None,
+            placer: None,
         }
+    }
+
+    /// The files are placed by `placer` instead, where the workload runs, and nothing lands on this process's filesystem; [`Self::paths`] stays empty, as the placer tracks its own set.
+    pub fn placed_by(mut self, placer: Arc<dyn PlacePolicyFiles>) -> Self {
+        self.placer = Some(placer);
+        self
     }
 
     /// Files land only on these mounts, so a mount made or moved later cannot redirect them.
@@ -946,6 +966,9 @@ async fn write_policy_files(
     placed: &PlacedFiles,
     files: Option<&[crate::protocol::TempFile]>,
 ) -> Vec<crate::protocol::PolicyFileResult> {
+    if let Some(placer) = &placed.placer {
+        return placer.refresh(files).await;
+    }
     let old_paths = placed.paths();
     // The roots — `/tmp`, `/run/secrets`, and the sandbox user's home, so a
     // `~/…` policy path resolves without opening the rest of the filesystem —
@@ -1749,6 +1772,90 @@ mod tests {
         handle_policy(&empty.to_string(), &None, &placed).await;
         assert!(!on_disk.exists());
         assert!(placed.paths().is_empty());
+    }
+
+    /// Records each set it is asked to place, and answers with a result of its own choosing.
+    struct RecordingPlacer {
+        calls: std::sync::Mutex<Vec<Option<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl PlacePolicyFiles for RecordingPlacer {
+        async fn refresh(
+            &self,
+            files: Option<&[crate::protocol::TempFile]>,
+        ) -> Vec<crate::protocol::PolicyFileResult> {
+            let paths = files.map(|files| files.iter().map(|f| f.path.clone()).collect::<Vec<_>>());
+            self.calls.lock().unwrap().push(paths.clone());
+            paths
+                .unwrap_or_default()
+                .into_iter()
+                .map(|path| crate::protocol::PolicyFileResult::failed(path, "the guest is full"))
+                .collect()
+        }
+    }
+
+    /// A placer takes the frame's files instead of this process's filesystem, and its results are what the host is told.
+    #[tokio::test]
+    async fn a_placer_places_the_files_and_its_results_are_reported() {
+        let name = format!(
+            "/tmp/lens-sandbox-core-{}-placed-elsewhere",
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&name);
+        let placer = Arc::new(RecordingPlacer {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let placed = PlacedFiles::default().placed_by(placer.clone());
+        let frame = serde_json::json!({
+            "type": "policy",
+            "filesId": "f1",
+            "files": [{"path": &name, "content": "kubeconfig"}]
+        });
+
+        let result = handle_policy(&frame.to_string(), &None, &placed).await;
+
+        let PolicyResult::Ok(applied) = result else {
+            panic!("the frame is a valid policy");
+        };
+        assert_eq!(
+            applied.files,
+            Some(crate::protocol::PolicyFilesReport {
+                files_id: Some("f1".into()),
+                results: vec![crate::protocol::PolicyFileResult::failed(
+                    &name,
+                    "the guest is full"
+                )],
+            })
+        );
+        assert_eq!(
+            *placer.calls.lock().unwrap(),
+            vec![Some(vec![name.clone()])]
+        );
+        assert!(
+            !std::path::Path::new(&name).exists(),
+            "nothing lands on this process's filesystem"
+        );
+        assert!(placed.paths().is_empty());
+    }
+
+    /// A frame without files reaches the placer too, as the set that removes everything; a frame that cannot be read does not.
+    #[tokio::test]
+    async fn a_placer_is_told_to_remove_everything_but_never_about_a_malformed_frame() {
+        let placer = Arc::new(RecordingPlacer {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let placed = PlacedFiles::default().placed_by(placer.clone());
+
+        handle_policy("not json", &None, &placed).await;
+        handle_policy(
+            &serde_json::json!({"type": "policy"}).to_string(),
+            &None,
+            &placed,
+        )
+        .await;
+
+        assert_eq!(*placer.calls.lock().unwrap(), vec![None]);
     }
 
     #[tokio::test]
