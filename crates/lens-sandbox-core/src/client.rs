@@ -909,9 +909,9 @@ async fn handle_policy(
 // all three; see `refresh_policy_files_with`.
 async fn write_policy_files(placed: &PlacedFiles, files: &[crate::protocol::TempFile]) {
     let old_paths = placed.paths();
-    // The roots — `/tmp` plus the sandbox user's home, so a `~/…` policy
-    // path resolves without opening the rest of the filesystem — come from
-    // these same credentials, inside the call.
+    // The roots — `/tmp`, `/run/secrets`, and the sandbox user's home, so a
+    // `~/…` policy path resolves without opening the rest of the filesystem —
+    // come from these same credentials, inside the call.
     if let Some(tracked) = crate::temp_files::refresh_policy_files(
         &old_paths,
         Some(files),

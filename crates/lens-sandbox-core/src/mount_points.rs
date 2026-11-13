@@ -61,6 +61,12 @@ impl MountPoints {
             .get(&mount_id)
             .is_some_and(|point| path.starts_with(point))
     }
+
+    pub(crate) fn sits_at(&self, mount_id: u64, path: &[OsString]) -> bool {
+        self.points
+            .get(&mount_id)
+            .is_some_and(|point| point.as_slice() == path)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -190,6 +196,21 @@ mod tests {
             mounts.points.keys().all(|id| pinned.contains(id)),
             "an id with no open fd can be freed by an unmount and given to a new mount at the same place"
         );
+    }
+
+    #[test]
+    fn a_mount_sits_only_at_the_place_it_was_made() {
+        let mounts = MountPoints::parse(MOUNTINFO);
+        assert!(mounts.sits_at(22, &path("/tmp")));
+        assert!(
+            !mounts.sits_at(22, &path("/tmp/a")),
+            "below it is not at it"
+        );
+        assert!(
+            !mounts.sits_at(21, &path("/tmp")),
+            "the root filesystem holds /tmp's path but was not made there"
+        );
+        assert!(!mounts.sits_at(99, &path("/tmp")));
     }
 
     #[test]

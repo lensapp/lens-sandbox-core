@@ -6,6 +6,7 @@ This project will use versioned releases once public releases begin. Until then,
 
 ## [Unreleased]
 
+- A policy file may land directly under `/run/secrets` (`/run/secrets/<name>`, one level, no directories), but only while `/run/secrets` opens without following a symlink, is owned by root, and is a mount made at exactly that place among the trusted mounts (`client::PlacedFiles::only_on`). Otherwise each such file is refused, and `/run/secrets` is never created or chowned.
 - `Debug` of a `protocol::TempFile` no longer prints its `content` or `contentB64`, so a secret a policy file carries never reaches a log.
 - `proxy::serve_explicit` judges and serves one connection from a client that was told to use a proxy, with the caller given, as `proxy::serve_egress` does for a transparent one.
 - A policy's files are placed by whoever owns the workload's filesystem, with or without a proxy in that process: `client::PlacedFiles` replaces `ProxyState::previous_policy_files` and `sandbox_creds`; `client::run` and `apply_local_policy` take a `&PlacedFiles`, `ProxyServer::new` no longer takes the credentials, and `temp_files::refresh_policy_files` takes the mounts it may place a file on.
