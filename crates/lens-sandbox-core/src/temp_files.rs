@@ -12,6 +12,8 @@ use crate::privilege::SandboxCredentials;
 use crate::protocol::{FileOwner, Redacted, TempFile};
 
 const DEFAULT_ROOT: &str = "/tmp";
+/// The guest init mounts a root-owned tmpfs here, so the workload that owns `/run` cannot rename it away.
+const SECRETS_ROOT: &str = "/run/secrets";
 const DEFAULT_FILE_MODE: u32 = 0o600;
 /// A directory the root supervisor creates under the shared `/tmp` root is only
 /// a path-prefix waypoint to a file that gets chowned to the unprivileged
@@ -35,6 +37,15 @@ enum NewDirs {
     Waypoint,
     /// Chowned to the sandbox user and `0o700`, so the workload can use it.
     WorkloadOwned,
+}
+
+/// What a root lets a policy file do beneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootKind {
+    /// Any depth, with the directories the walk creates finished per [`NewDirs`].
+    Tree(NewDirs),
+    /// One level only, and only while the root is a root-owned mount made at exactly that place.
+    Secrets,
 }
 
 impl NewDirs {
@@ -68,7 +79,7 @@ fn warn_once(key: String, warn: impl FnOnce()) {
 #[derive(Debug, Clone)]
 struct Root {
     components: Vec<OsString>,
-    new_dirs: NewDirs,
+    kind: RootKind,
     /// Set only on the root `with_home` pushed, so refusing the home removes
     /// that one root and never a same-valued root somebody else added.
     from_home: bool,
@@ -77,10 +88,10 @@ struct Root {
 /// Where policy files may land. Every requested path must resolve inside one of
 /// the allowed roots; anything else is refused before a single syscall runs.
 ///
-/// The default is `/tmp` alone, which is the whole path policy this module used
-/// to hardcode. The only widening is the sandbox home, whose created directories
-/// are handed to the workload, while the default `/tmp` keeps them root-owned
-/// and traverse-only. A path binds to the longest root that contains it, and to
+/// The default is `/tmp`, plus `/run/secrets` for files directly beneath it
+/// while it is a root-owned mount made at that place. The only other widening is
+/// the sandbox home, whose created directories are handed to the workload, while
+/// `/tmp` keeps them root-owned and traverse-only. A path binds to the longest root that contains it, and to
 /// the last-added of two equal ones, so a home nested inside another root — or
 /// duplicating one — still gets its own policy.
 #[derive(Debug, Clone)]
@@ -93,17 +104,26 @@ struct FileRoots {
 impl Default for FileRoots {
     fn default() -> Self {
         Self {
-            roots: vec![Root {
-                components: DEFAULT_ROOT
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .map(OsString::from)
-                    .collect(),
-                new_dirs: NewDirs::Waypoint,
-                from_home: false,
-            }],
+            roots: vec![
+                Root::fixed(DEFAULT_ROOT, RootKind::Tree(NewDirs::Waypoint)),
+                Root::fixed(SECRETS_ROOT, RootKind::Secrets),
+            ],
             home: None,
             mounts: None,
+        }
+    }
+}
+
+impl Root {
+    fn fixed(path: &str, kind: RootKind) -> Self {
+        Self {
+            components: path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(OsString::from)
+                .collect(),
+            kind,
+            from_home: false,
         }
     }
 }
@@ -155,7 +175,7 @@ impl FileRoots {
         self.home = Some(components.clone());
         self.roots.push(Root {
             components,
-            new_dirs: NewDirs::WorkloadOwned,
+            kind: RootKind::Tree(NewDirs::WorkloadOwned),
             from_home: true,
         });
         Ok(self)
@@ -253,11 +273,17 @@ impl FileRoots {
 
         let root = best
             .ok_or_else(|| format!("temp file path is outside the allowed roots: {requested}"))?;
+        let components = absolute[root.components.len()..].to_vec();
+        if root.kind == RootKind::Secrets && components.len() != 1 {
+            return Err(format!(
+                "temp file path must name a file directly under {SECRETS_ROOT}: {requested}"
+            ));
+        }
 
         Ok(ResolvedPath {
             root: root.components.clone(),
-            components: absolute[root.components.len()..].to_vec(),
-            new_dirs: root.new_dirs,
+            components,
+            kind: root.kind,
             mounts: self.mounts.clone(),
         })
     }
@@ -298,7 +324,7 @@ impl FileRoots {
 struct ResolvedPath {
     root: Vec<OsString>,
     components: Vec<OsString>,
-    new_dirs: NewDirs,
+    kind: RootKind,
     mounts: Option<Arc<MountPoints>>,
 }
 
@@ -325,6 +351,39 @@ impl ResolvedPath {
             .cloned()
             .collect();
         dir.mount_id().is_ok_and(|id| mounts.holds(id, &path))
+    }
+
+    /// The secrets root fails closed unless it is still the root-owned mount the guest init made at that place.
+    fn refuse_unless_secrets_root(&self, dir: &dyn DirHandle) -> Result<(), String> {
+        let refuse = |why: String| {
+            Err(format!(
+                "refusing to write under {}: {why}",
+                self.root_path().display()
+            ))
+        };
+        let Some(mounts) = &self.mounts else {
+            return refuse("no trusted mounts to check it against".to_string());
+        };
+        match dir.mount_id() {
+            Err(e) => return refuse(format!("its mount cannot be read ({e})")),
+            Ok(id) if !mounts.sits_at(id, &self.root) => {
+                return refuse("it is not a mount made at that place".to_string());
+            }
+            Ok(_) => {}
+        }
+        match dir.owner_uid() {
+            Ok(0) => Ok(()),
+            Ok(uid) => refuse(format!("it is owned by uid {uid}, not root")),
+            Err(e) => refuse(format!("its owner cannot be read ({e})")),
+        }
+    }
+
+    /// Whether the directory holding the file, reached at `depth`, is still one this module may unlink from.
+    fn removable_from(&self, dir: &dyn DirHandle, depth: usize) -> bool {
+        match self.kind {
+            RootKind::Secrets => self.refuse_unless_secrets_root(dir).is_ok(),
+            RootKind::Tree(_) => self.admits(dir, depth),
+        }
     }
 
     fn refuse_unless_admitted(&self, dir: &dyn DirHandle, depth: usize) -> Result<(), String> {
@@ -728,7 +787,7 @@ fn remove_one(fs: &dyn TempFs, resolved: &ResolvedPath) {
             Err(_) => return,
         }
     }
-    if resolved.admits(dir.as_ref(), dir_components.len()) {
+    if resolved.removable_from(dir.as_ref(), dir_components.len()) {
         let _ = dir.unlink_child(file_name);
     }
 }
@@ -748,7 +807,19 @@ fn walk_to_parent(
         .open_root(&root)
         .map_err(|e| format!("open root {}: {e}", root.display()))?;
 
-    let dir_mode = resolved.new_dirs.mode();
+    let new_dirs = match resolved.kind {
+        RootKind::Secrets if dir_components.is_empty() => {
+            resolved.refuse_unless_secrets_root(dir.as_ref())?;
+            return Ok(dir);
+        }
+        RootKind::Secrets => {
+            return Err(format!(
+                "refusing to create a directory under {SECRETS_ROOT}"
+            ));
+        }
+        RootKind::Tree(new_dirs) => new_dirs,
+    };
+    let dir_mode = new_dirs.mode();
 
     for (depth, comp) in dir_components.iter().enumerate() {
         resolved.refuse_unless_admitted(dir.as_ref(), depth)?;
@@ -768,7 +839,7 @@ fn walk_to_parent(
                 )
             })
             .and_then(|child| {
-                if created && resolved.new_dirs == NewDirs::WorkloadOwned {
+                if created && new_dirs == NewDirs::WorkloadOwned {
                     hand_dir_to_workload(child.as_ref(), comp, dir_mode, workload)?;
                 }
                 Ok(child)
@@ -1461,10 +1532,11 @@ mod tests {
         write_err: Option<Errno>,
         // If set, opening a child directory returns this error.
         open_err: Option<Errno>,
-        // Roots that cannot be opened at all, as an absent home would be.
-        unopenable_roots: Vec<String>,
-        // The uid every directory reports as its owner.
+        // Roots that cannot be opened, and the errno each fails with.
+        root_errs: std::collections::HashMap<String, Errno>,
+        // The uid every directory not in `dir_uids` reports as its owner.
         dir_uid: u32,
+        dir_uids: std::collections::HashMap<String, u32>,
         // If set, reading a directory's owner returns this error.
         owner_uid_err: Option<Errno>,
         // The mount each named directory sits on; any other is on mount 1.
@@ -1481,8 +1553,9 @@ mod tests {
                 chown_err: None,
                 write_err: None,
                 open_err: None,
-                unopenable_roots: Vec::new(),
+                root_errs: std::collections::HashMap::new(),
                 dir_uid: 1000,
+                dir_uids: std::collections::HashMap::new(),
                 owner_uid_err: None,
                 mount_ids: std::collections::HashMap::new(),
             }
@@ -1499,6 +1572,7 @@ mod tests {
         write_err: Option<Errno>,
         open_err: Option<Errno>,
         dir_uid: u32,
+        dir_uids: std::collections::HashMap<String, u32>,
         owner_uid_err: Option<Errno>,
         mount_ids: std::collections::HashMap<String, u64>,
     }
@@ -1513,8 +1587,8 @@ mod tests {
     impl TempFs for FakeTempFs {
         fn open_root(&self, root: &Path) -> Result<Box<dyn DirHandle>, Errno> {
             let n = root.to_string_lossy().to_string();
-            if self.unopenable_roots.contains(&n) {
-                return Err(Errno::ENOENT);
+            if let Some(e) = self.root_errs.get(&n) {
+                return Err(*e);
             }
             self.recorder.borrow_mut().events.push(Event::OpenRoot(n));
             Ok(Box::new(FakeDir {
@@ -1527,6 +1601,7 @@ mod tests {
                 write_err: self.write_err,
                 open_err: self.open_err,
                 dir_uid: self.dir_uid,
+                dir_uids: self.dir_uids.clone(),
                 owner_uid_err: self.owner_uid_err,
                 mount_ids: self.mount_ids.clone(),
             }))
@@ -1556,6 +1631,7 @@ mod tests {
                 write_err: self.write_err,
                 open_err: self.open_err,
                 dir_uid: self.dir_uid,
+                dir_uids: self.dir_uids.clone(),
                 owner_uid_err: self.owner_uid_err,
                 mount_ids: self.mount_ids.clone(),
             }))
@@ -1599,7 +1675,11 @@ mod tests {
         fn owner_uid(&self) -> Result<u32, Errno> {
             match self.owner_uid_err {
                 Some(e) => Err(e),
-                None => Ok(self.dir_uid),
+                None => Ok(self
+                    .dir_uids
+                    .get(&self.name)
+                    .copied()
+                    .unwrap_or(self.dir_uid)),
             }
         }
 
@@ -1690,7 +1770,7 @@ mod tests {
     /// The root filesystem on mount 1 and a share on mount 7 at `/work`, as they sat when they were trusted.
     fn trusted_mounts() -> Option<Arc<MountPoints>> {
         Some(Arc::new(MountPoints::parse(
-            b"1 0 0:1 / / rw - overlay overlay rw\n7 1 0:7 / /work rw - virtiofs share rw\n",
+            b"1 0 0:1 / / rw - overlay overlay rw\n7 1 0:7 / /work rw - virtiofs share rw\n9 1 0:9 / /run/secrets rw - tmpfs tmpfs rw\n",
         )))
     }
 
@@ -2289,7 +2369,8 @@ mod tests {
         // outcome described far less usefully.
         let rec = Rc::new(RefCell::new(Recorder::default()));
         let mut fs = FakeTempFs::new(rec.clone());
-        fs.unopenable_roots = vec!["/home/sandbox".to_string()];
+        fs.root_errs
+            .insert("/home/sandbox".to_string(), Errno::ENOENT);
         let roots = FileRoots::default().with_home("/home/sandbox").unwrap();
         let files = vec![file("~/.claude/creds", "tok", None)];
 
@@ -2503,6 +2584,145 @@ mod tests {
         assert!(unresolved[0].contains("/var/old.json"), "{unresolved:?}");
         let events = rec.borrow().events.clone();
         assert!(events.contains(&Event::Unlink("a.json".to_string())));
+    }
+
+    /// `/run/secrets` as the guest init leaves it: a root-owned tmpfs mounted at exactly that place.
+    fn secrets_fs(rec: &Rc<RefCell<Recorder>>) -> FakeTempFs {
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.mount_ids.insert("/run/secrets".to_string(), 9);
+        fs.dir_uids.insert("/run/secrets".to_string(), 0);
+        fs
+    }
+
+    fn write_secret(fs: &FakeTempFs, path: &str) -> Result<Vec<String>, String> {
+        write_temp_files_with(
+            fs,
+            &[file(path, "hunter2", Some(0o400))],
+            Some((1000, 2000)),
+            &tmp().on_mounts(trusted_mounts()),
+        )
+    }
+
+    fn assert_refused_secret(fs: &FakeTempFs, rec: &Rc<RefCell<Recorder>>, reason: &str) {
+        let err = write_secret(fs, "/run/secrets/db").unwrap_err();
+        assert!(err.contains("/run/secrets"), "{err}");
+        assert!(err.contains(reason), "want {reason:?}: {err}");
+        assert_nothing_created(rec);
+    }
+
+    #[test]
+    fn a_secret_lands_directly_under_its_root_owned_mount() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = secrets_fs(&rec);
+
+        let written = write_secret(&fs, "/run/secrets/db").unwrap();
+
+        assert_eq!(written, vec!["/run/secrets/db"]);
+        let events = rec.borrow().events.clone();
+        assert!(
+            events.contains(&Event::Chmod("db".to_string(), 0o400)),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&Event::Chown("db".to_string(), 1000, 2000)),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ChmodDir(..) | Event::ChownDir(..))),
+            "the secrets mount itself is never handed over: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_secret_is_refused_when_its_root_is_missing() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = secrets_fs(&rec);
+        fs.root_errs
+            .insert("/run/secrets".to_string(), Errno::ENOENT);
+        assert_refused_secret(&fs, &rec, "open root /run/secrets: ENOENT");
+    }
+
+    #[test]
+    fn a_secret_is_refused_when_its_root_is_a_symlink() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = secrets_fs(&rec);
+        fs.root_errs
+            .insert("/run/secrets".to_string(), Errno::ELOOP);
+        assert_refused_secret(&fs, &rec, "open root /run/secrets: ELOOP");
+    }
+
+    #[test]
+    fn a_secret_is_refused_when_the_workload_owns_its_root() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = secrets_fs(&rec);
+        fs.dir_uids.insert("/run/secrets".to_string(), 1000);
+        assert_refused_secret(&fs, &rec, "owned by uid 1000");
+    }
+
+    #[test]
+    fn a_secret_is_refused_when_its_root_is_not_a_mount_made_there() {
+        // The workload owns /run, so a plain directory it made at /run/secrets sits on the root filesystem's mount.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = secrets_fs(&rec);
+        fs.mount_ids.insert("/run/secrets".to_string(), 1);
+        assert_refused_secret(&fs, &rec, "not a mount made at that place");
+    }
+
+    #[test]
+    fn a_secret_is_refused_when_no_mounts_were_trusted() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = secrets_fs(&rec);
+        let err = write_temp_files_with(
+            &fs,
+            &[file("/run/secrets/db", "hunter2", None)],
+            Some((1000, 2000)),
+            &tmp(),
+        )
+        .unwrap_err();
+        assert!(err.contains("no trusted mounts"), "{err}");
+        assert_nothing_created(&rec);
+    }
+
+    #[test]
+    fn a_secret_must_sit_directly_under_its_root() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = secrets_fs(&rec);
+        let err = write_secret(&fs, "/run/secrets/db/password").unwrap_err();
+        assert!(err.contains("directly under /run/secrets"), "{err}");
+        assert!(tmp().resolve("/run/secrets").is_err());
+        assert!(tmp().resolve("/run/other").is_err());
+        assert_nothing_created(&rec);
+    }
+
+    #[test]
+    fn a_secret_is_not_removed_through_a_root_that_is_no_longer_trusted() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = secrets_fs(&rec);
+        fs.dir_uids.insert("/run/secrets".to_string(), 1000);
+        let roots = tmp().on_mounts(trusted_mounts());
+        remove_temp_files_with(&fs, &["/run/secrets/db".to_string()], &roots);
+        assert!(
+            !rec.borrow()
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Unlink(..))),
+            "a root the workload owns is not the one the secret was written to"
+        );
+    }
+
+    #[test]
+    fn a_secret_is_removed_from_its_trusted_root() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = secrets_fs(&rec);
+        let roots = tmp().on_mounts(trusted_mounts());
+        remove_temp_files_with(&fs, &["/run/secrets/db".to_string()], &roots);
+        assert!(
+            rec.borrow()
+                .events
+                .contains(&Event::Unlink("db".to_string()))
+        );
     }
 
     #[test]
