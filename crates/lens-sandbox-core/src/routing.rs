@@ -3933,3 +3933,183 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod most_specific_rule_decides {
+    use super::*;
+
+    fn routes(json: &str) -> Vec<RouteRule> {
+        let value = serde_json::from_str(json).expect("test policy is JSON");
+        parse_proxy_routes(&value)
+            .expect("test policy parses")
+            .into_iter()
+            .map(|parsed| parsed.rule)
+            .collect()
+    }
+
+    fn tcp_rules(json: &str) -> Vec<RouteRule> {
+        let value = serde_json::from_str(json).expect("test policy is JSON");
+        parse_tcp_egress(&value).expect("test policy parses")
+    }
+
+    /// The gate's decision for one HTTPS request: the route for its host, then that route's rules.
+    fn allowed(routes: &[RouteRule], host: &str, method: &str, path: &str) -> bool {
+        match find_matching_route(routes, host, Scheme::Https, None) {
+            RouteOutcome::Matched(rule) => {
+                rule.verdict == Verdict::Allow
+                    && classify_http_request(&rule.http_rules, method, path)
+                        == HttpRuleOutcome::Allow
+            }
+            RouteOutcome::NoMatch { .. } => false,
+        }
+    }
+
+    fn tcp_allowed(rules: &[RouteRule], host: &str, port: u16) -> bool {
+        match find_matching_raw_egress(rules, RawTarget::at(host, &[]), port, None).outcome {
+            RouteOutcome::Matched(rule) => rule.verdict == Verdict::Allow,
+            RouteOutcome::NoMatch { .. } => false,
+        }
+    }
+
+    const READ_ONLY_EVERYWHERE: &str = r#"{"match": "*", "verdict": "allow", "transport": "direct",
+        "rules": [{"method": "GET"}, {"method": "HEAD"}]}"#;
+    const POST_ROOT_ON_ACME: &str = r#"{"match": "acme.org", "verdict": "allow", "transport": "direct",
+        "rules": [{"method": "POST", "path": "/"}]}"#;
+
+    #[test]
+    fn a_specific_allow_adds_to_a_wildcard_limit_whatever_the_order() {
+        for table in [
+            format!("[{READ_ONLY_EVERYWHERE}, {POST_ROOT_ON_ACME}]"),
+            format!("[{POST_ROOT_ON_ACME}, {READ_ONLY_EVERYWHERE}]"),
+        ] {
+            let routes = routes(&table);
+            assert!(allowed(&routes, "acme.org:443", "POST", "/"), "{table}");
+            assert!(allowed(&routes, "acme.org:443", "GET", "/"), "{table}");
+            assert!(allowed(&routes, "acme.org:443", "HEAD", "/x"), "{table}");
+            assert!(!allowed(&routes, "acme.org:443", "POST", "/x"), "{table}");
+            assert!(!allowed(&routes, "example.com:443", "POST", "/"), "{table}");
+        }
+    }
+
+    #[test]
+    fn a_host_deny_beats_a_wildcard_allow_listed_above_it() {
+        let routes = routes(
+            r#"[{"match": "*", "verdict": "allow", "transport": "direct"},
+                {"match": "tracker.example.com", "verdict": "deny", "transport": "direct"}]"#,
+        );
+        assert!(!allowed(&routes, "tracker.example.com:443", "GET", "/"));
+        assert!(allowed(&routes, "example.com:443", "GET", "/"));
+    }
+
+    #[test]
+    fn a_narrower_wildcard_beats_a_wider_one_listed_above_it() {
+        let routes = routes(
+            r#"[{"match": "*.org", "verdict": "deny", "transport": "direct"},
+                {"match": "*.acme.org", "verdict": "allow", "transport": "direct"}]"#,
+        );
+        assert!(allowed(&routes, "api.acme.org:443", "GET", "/"));
+        assert!(!allowed(&routes, "example.org:443", "GET", "/"));
+    }
+
+    #[test]
+    fn a_deny_with_a_method_and_path_refuses_only_those() {
+        let routes = routes(
+            r#"[{"match": "*", "verdict": "allow", "transport": "direct"},
+                {"match": "acme.org", "verdict": "deny", "transport": "direct",
+                 "rules": [{"method": "POST", "path": "/admin"}]}]"#,
+        );
+        assert!(!allowed(&routes, "acme.org:443", "POST", "/admin"));
+        assert!(allowed(&routes, "acme.org:443", "GET", "/admin"));
+        assert!(allowed(&routes, "acme.org:443", "POST", "/"));
+    }
+
+    #[test]
+    fn a_rule_with_a_method_and_path_beats_a_host_deny() {
+        let routes = routes(
+            r#"[{"match": "acme.org", "verdict": "deny", "transport": "direct"},
+                {"match": "acme.org", "verdict": "allow", "transport": "direct",
+                 "rules": [{"method": "GET", "path": "/v1"}]}]"#,
+        );
+        assert!(allowed(&routes, "acme.org:443", "GET", "/v1"));
+        assert!(!allowed(&routes, "acme.org:443", "POST", "/v1"));
+        assert!(!allowed(&routes, "acme.org:443", "GET", "/"));
+    }
+
+    #[test]
+    fn a_named_method_beats_any_method_on_the_same_path() {
+        let routes = routes(
+            r#"[{"match": "acme.org", "verdict": "allow", "transport": "direct",
+                 "rules": [{"path": "/v1"}]},
+                {"match": "acme.org", "verdict": "deny", "transport": "direct",
+                 "rules": [{"method": "DELETE", "path": "/v1"}]}]"#,
+        );
+        assert!(!allowed(&routes, "acme.org:443", "DELETE", "/v1"));
+        assert!(allowed(&routes, "acme.org:443", "GET", "/v1"));
+    }
+
+    #[test]
+    fn an_exact_path_beats_a_glob() {
+        let routes = routes(
+            r#"[{"match": "acme.org", "verdict": "allow", "transport": "direct",
+                 "rules": [{"path": "/v1/**"}]},
+                {"match": "acme.org", "verdict": "deny", "transport": "direct",
+                 "rules": [{"path": "/v1/secret"}]}]"#,
+        );
+        assert!(!allowed(&routes, "acme.org:443", "GET", "/v1/secret"));
+        assert!(allowed(&routes, "acme.org:443", "GET", "/v1/public"));
+    }
+
+    #[test]
+    fn a_longer_cidr_prefix_beats_a_shorter_one() {
+        let routes = routes(
+            r#"[{"match": "10.0.0.0/8", "verdict": "deny", "transport": "direct"},
+                {"match": "10.1.2.0/24", "verdict": "allow", "transport": "direct"}]"#,
+        );
+        assert!(allowed(&routes, "10.1.2.3:443", "GET", "/"));
+        assert!(!allowed(&routes, "10.9.9.9:443", "GET", "/"));
+    }
+
+    #[test]
+    fn a_host_with_a_port_beats_the_same_host_without() {
+        let routes = routes(
+            r#"[{"match": "registry.internal", "verdict": "deny", "transport": "direct"},
+                {"match": "registry.internal:5000", "verdict": "allow", "transport": "direct"}]"#,
+        );
+        assert!(allowed(&routes, "registry.internal:5000", "GET", "/v2/"));
+        assert!(!allowed(&routes, "registry.internal:443", "GET", "/v2/"));
+    }
+
+    #[test]
+    fn equally_specific_rules_keep_their_order() {
+        let allow_first = routes(
+            r#"[{"match": "acme.org", "verdict": "allow", "transport": "direct"},
+                {"match": "acme.org", "verdict": "deny", "transport": "direct"}]"#,
+        );
+        let deny_first = routes(
+            r#"[{"match": "acme.org", "verdict": "deny", "transport": "direct"},
+                {"match": "acme.org", "verdict": "allow", "transport": "direct"}]"#,
+        );
+        assert!(allowed(&allow_first, "acme.org:443", "GET", "/"));
+        assert!(!allowed(&deny_first, "acme.org:443", "GET", "/"));
+    }
+
+    #[test]
+    fn a_tcp_host_beats_a_tcp_wildcard_listed_above_it() {
+        let rules = tcp_rules(
+            r#"[{"match": "*.acme.org:5432", "verdict": "allow"},
+                {"match": "db.acme.org:5432", "verdict": "deny"}]"#,
+        );
+        assert!(!tcp_allowed(&rules, "db.acme.org", 5432));
+        assert!(tcp_allowed(&rules, "replica.acme.org", 5432));
+    }
+
+    #[test]
+    fn a_longer_tcp_cidr_prefix_beats_a_shorter_one() {
+        let rules = tcp_rules(
+            r#"[{"match": "10.0.0.0/8:5432", "verdict": "deny"},
+                {"match": "10.1.2.0/24:5432", "verdict": "allow"}]"#,
+        );
+        assert!(tcp_allowed(&rules, "10.1.2.3", 5432));
+        assert!(!tcp_allowed(&rules, "10.9.9.9", 5432));
+    }
+}
