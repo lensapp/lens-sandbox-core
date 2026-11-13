@@ -147,6 +147,48 @@ impl TryFrom<PolicyFileResultWire> for PolicyFileResult {
     }
 }
 
+/// Guest-to-host frame answering a `policy` frame that carried `files`, with one
+/// result per file in the frame's order. A frame without `files` gets no answer,
+/// and frames are answered in the order they arrived; `filesId` echoes the
+/// frame's own when it set one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(
+    tag = "type",
+    rename = "policy_files",
+    rename_all = "camelCase",
+    try_from = "PolicyFilesReportWire"
+)]
+pub struct PolicyFilesReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_id: Option<String>,
+    pub results: Vec<PolicyFileResult>,
+}
+
+/// Serde ignores a struct's `tag` when reading, so the type is checked here.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PolicyFilesReportWire {
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(default)]
+    files_id: Option<String>,
+    results: Vec<PolicyFileResult>,
+}
+
+impl TryFrom<PolicyFilesReportWire> for PolicyFilesReport {
+    type Error = String;
+
+    fn try_from(wire: PolicyFilesReportWire) -> Result<Self, String> {
+        if wire.msg_type != "policy_files" {
+            return Err(format!("not a policy_files frame: {}", wire.msg_type));
+        }
+        Ok(Self {
+            files_id: wire.files_id,
+            results: wire.results,
+        })
+    }
+}
+
 /// Check strict YYYY-MM-DD format: length 10, dashes at positions 4 and 7, digits elsewhere.
 pub fn is_valid_protocol_date(s: &str) -> bool {
     let b = s.as_bytes();
@@ -573,6 +615,48 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn a_policy_files_report_serializes_with_its_envelope_type() {
+        let report = PolicyFilesReport {
+            files_id: Some("f-1".to_string()),
+            results: vec![
+                PolicyFileResult::written("/run/secrets/db"),
+                PolicyFileResult::failed("/run/secrets/x", "why"),
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({
+                "type": "policy_files",
+                "filesId": "f-1",
+                "results": [
+                    {"path": "/run/secrets/db", "written": true},
+                    {"path": "/run/secrets/x", "error": "why"},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn a_policy_files_report_without_an_id_leaves_it_out() {
+        let report = PolicyFilesReport {
+            files_id: None,
+            results: Vec::new(),
+        };
+        let text = serde_json::to_string(&report).unwrap();
+        assert_eq!(text, r#"{"type":"policy_files","results":[]}"#);
+        assert_eq!(
+            serde_json::from_str::<PolicyFilesReport>(&text).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn a_frame_of_another_type_is_not_a_policy_files_report() {
+        let raw = r#"{"type":"audit_event","results":[]}"#;
+        assert!(serde_json::from_str::<PolicyFilesReport>(raw).is_err());
     }
 
     #[test]

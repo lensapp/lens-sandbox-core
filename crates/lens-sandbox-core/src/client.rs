@@ -43,6 +43,10 @@ pub trait SessionHandler: Send + Sync {
     /// Default is a no-op.
     async fn on_policy(&self, _env: HashMap<String, String>) {}
 
+    /// Called before [`Self::on_policy`] when the policy frame carried `files`,
+    /// with what became of each, as the host is told. Default is a no-op.
+    async fn on_policy_files(&self, _report: &crate::protocol::PolicyFilesReport) {}
+
     /// Cleanup on session end (kill processes, abort tasks).
     async fn shutdown(&self);
 }
@@ -253,7 +257,13 @@ async fn connect_and_run(
                         // Policy messages (initial policy on connect + periodic
                         // credential refresh) are deliberately NOT counted as activity
                         // so idle sandboxes still hit the shutdown timer.
-                        PolicyResult::Ok(env) => session.on_policy(env).await,
+                        PolicyResult::Ok(applied) => {
+                            if let Some(report) = &applied.files {
+                                send_policy_files(&tx, report);
+                                session.on_policy_files(report).await;
+                            }
+                            session.on_policy(applied.env).await;
+                        }
                         PolicyResult::VersionMismatch { server_min, client } => {
                             tracing::error!(
                                 %server_min, %client,
@@ -510,15 +520,23 @@ async fn handle_watch(
 }
 
 enum PolicyResult {
-    Ok(HashMap<String, String>),
+    Ok(GuestPolicy),
     VersionMismatch { server_min: String, client: String },
+}
+
+/// What a policy frame left for the session: its env, and what became of its files when it carried any.
+#[derive(Default)]
+struct GuestPolicy {
+    env: HashMap<String, String>,
+    files: Option<crate::protocol::PolicyFilesReport>,
 }
 
 /// A policy frame judged into the proxy, with what it leaves for whoever owns the workload's filesystem.
 enum JudgedPolicy {
     Ok {
         env: HashMap<String, String>,
-        files: Vec<crate::protocol::TempFile>,
+        files: Option<Vec<crate::protocol::TempFile>>,
+        files_id: Option<String>,
         upstream_ca: Option<String>,
     },
     VersionMismatch {
@@ -888,18 +906,35 @@ async fn handle_policy(
         JudgedPolicy::VersionMismatch { server_min, client } => {
             PolicyResult::VersionMismatch { server_min, client }
         }
-        JudgedPolicy::Malformed(_) => PolicyResult::Ok(HashMap::new()),
+        JudgedPolicy::Malformed(_) => PolicyResult::Ok(GuestPolicy::default()),
         JudgedPolicy::Ok {
             env,
             files,
+            files_id,
             upstream_ca,
         } => {
             if let (Some(pem), Some(state)) = (upstream_ca, proxy_state) {
                 state.trust_store.install(&pem);
             }
-            write_policy_files(placed, &files).await;
-            PolicyResult::Ok(env)
+            let results = write_policy_files(placed, files.as_deref()).await;
+            PolicyResult::Ok(GuestPolicy {
+                env,
+                files: files.map(|_| crate::protocol::PolicyFilesReport { files_id, results }),
+            })
         }
+    }
+}
+
+/// Tell the host what became of the files a policy frame carried; the channel being gone is the disconnect the read loop handles.
+fn send_policy_files(
+    tx: &mpsc::UnboundedSender<String>,
+    report: &crate::protocol::PolicyFilesReport,
+) {
+    match serde_json::to_string(report) {
+        Ok(text) => {
+            let _ = tx.send(text);
+        }
+        Err(e) => tracing::warn!(error = %e, "could not encode the policy file results"),
     }
 }
 
@@ -907,22 +942,25 @@ async fn handle_policy(
 // kubeconfig). The ordering — prepare, then place each file, then remove the
 // paths the frame dropped — and the bookkeeping for each outcome live in
 // `temp_files` where a fake can drive them; see `refresh_policy_files_with`.
-async fn write_policy_files(placed: &PlacedFiles, files: &[crate::protocol::TempFile]) {
+async fn write_policy_files(
+    placed: &PlacedFiles,
+    files: Option<&[crate::protocol::TempFile]>,
+) -> Vec<crate::protocol::PolicyFileResult> {
     let old_paths = placed.paths();
     // The roots — `/tmp`, `/run/secrets`, and the sandbox user's home, so a
     // `~/…` policy path resolves without opening the rest of the filesystem —
     // come from these same credentials, inside the call.
-    if let Some(tracked) = crate::temp_files::refresh_policy_files(
+    let refresh = crate::temp_files::refresh_policy_files(
         &old_paths,
-        Some(files),
+        files,
         placed.creds.as_ref(),
         placed.mounts.clone(),
     )
-    .await
-    .tracked
-    {
+    .await;
+    if let Some(tracked) = refresh.tracked {
         *placed.paths.write().unwrap() = tracked;
     }
+    refresh.results
 }
 
 async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> JudgedPolicy {
@@ -952,6 +990,8 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
         llm: serde_json::Value,
         #[serde(default)]
         files: Option<Vec<crate::protocol::TempFile>>,
+        #[serde(default)]
+        files_id: Option<String>,
     }
 
     // Loose deserialization — route lists stay as Value so individual route
@@ -1116,7 +1156,8 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
         tracing::debug!("proxy not enabled — skipping proxy config from policy");
         return JudgedPolicy::Ok {
             env: policy_env,
-            files: msg.files.unwrap_or_default(),
+            files: msg.files,
+            files_id: msg.files_id,
             upstream_ca: None,
         };
     };
@@ -1438,7 +1479,8 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
     }
     JudgedPolicy::Ok {
         env: policy_env,
-        files: msg.files.unwrap_or_default(),
+        files: msg.files,
+        files_id: msg.files_id,
         upstream_ca: msg.proxy_ca_cert,
     }
 }
@@ -1449,7 +1491,10 @@ pub async fn apply_policy_frame(
     state: &Arc<ProxyState>,
 ) -> Result<AppliedPolicy, PolicyFrameError> {
     match judge_policy(raw_frame, &Some(state.clone())).await {
-        JudgedPolicy::Ok { env, files, .. } => Ok(AppliedPolicy { env, files }),
+        JudgedPolicy::Ok { env, files, .. } => Ok(AppliedPolicy {
+            env,
+            files: files.unwrap_or_default(),
+        }),
         JudgedPolicy::VersionMismatch { server_min, client } => {
             Err(PolicyFrameError::VersionMismatch { server_min, client })
         }
@@ -1517,7 +1562,7 @@ pub async fn apply_local_policy(
     }
 
     match handle_policy(&msg, proxy_state, placed).await {
-        PolicyResult::Ok(env) => env,
+        PolicyResult::Ok(applied) => applied.env,
         PolicyResult::VersionMismatch { server_min, client } => {
             // Standalone mode — version mismatch shouldn't happen (no server),
             // but if the policy JSON somehow includes minProtocolDate, log and continue.
@@ -1671,7 +1716,9 @@ mod tests {
         let placed = PlacedFiles::default();
         *placed.paths.write().unwrap() = vec!["/tmp/kept".into()];
         let result = handle_policy("not json", &Some(state.clone()), &placed).await;
-        assert!(matches!(result, PolicyResult::Ok(env) if env.is_empty()));
+        assert!(
+            matches!(result, PolicyResult::Ok(applied) if applied.env.is_empty() && applied.files.is_none())
+        );
         assert_eq!(placed.paths(), vec!["/tmp/kept".to_string()]);
     }
 
@@ -1808,6 +1855,127 @@ mod tests {
         }
 
         async fn shutdown(&self) {}
+    }
+
+    /// Records the policy callbacks in the order they arrive.
+    struct RecordingSession {
+        activity: ActivityStream,
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl SessionHandler for RecordingSession {
+        fn activity(&self) -> &ActivityStream {
+            &self.activity
+        }
+
+        async fn dispatch(&self, _raw_text: &str, _tx: &mpsc::UnboundedSender<String>) {}
+
+        async fn on_policy_files(&self, report: &crate::protocol::PolicyFilesReport) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(report).unwrap());
+        }
+
+        async fn on_policy(&self, _env: HashMap<String, String>) {
+            self.calls.lock().unwrap().push("on_policy".to_string());
+        }
+
+        async fn shutdown(&self) {}
+    }
+
+    /// Serves `frames` to one client, then returns the first text message the client sends back.
+    async fn first_reply_to(frames: Vec<serde_json::Value>) -> (serde_json::Value, Vec<String>) {
+        let (listener, addr) = bind_server().await;
+        let server = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for frame in frames {
+                ws.send(Message::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            let first = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match ws.next().await.unwrap().unwrap() {
+                        Message::Text(text) => break text.to_string(),
+                        _ => continue,
+                    }
+                }
+            })
+            .await;
+            ws.send(Message::Close(None)).await.ok();
+            first.expect("the client answers a frame that carried files")
+        });
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ws_url, token) = make_config(addr);
+        connect_and_run(
+            &ws_url,
+            &token,
+            &Arc::new(Mutex::new(Instant::now())),
+            &None,
+            &PlacedFiles::default(),
+            Box::new(RecordingSession {
+                activity: ActivityStream::new(),
+                calls: calls.clone(),
+            }),
+        )
+        .await;
+
+        let first = serde_json::from_str(&server.await.unwrap()).unwrap();
+        let calls = calls.lock().unwrap().clone();
+        (first, calls)
+    }
+
+    #[tokio::test]
+    async fn a_policy_frame_with_files_is_answered_with_what_became_of_each() {
+        let (reply, _) = first_reply_to(vec![serde_json::json!({
+            "type": "policy",
+            "filesId": "f-1",
+            "files": [{"path": "/etc/not-a-root", "content": "hunter2"}],
+        })])
+        .await;
+
+        assert_eq!(reply["type"], "policy_files");
+        assert_eq!(reply["filesId"], "f-1");
+        assert_eq!(reply["results"][0]["path"], "/etc/not-a-root");
+        assert!(
+            reply["results"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("outside the allowed roots"),
+            "{reply}"
+        );
+        assert!(!reply.to_string().contains("hunter2"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn only_a_frame_that_carried_files_is_answered() {
+        let (reply, _) = first_reply_to(vec![
+            serde_json::json!({"type": "policy", "env": {"A": "1"}}),
+            serde_json::json!({"type": "policy", "filesId": "second", "files": []}),
+        ])
+        .await;
+
+        assert_eq!(
+            reply,
+            serde_json::json!({"type": "policy_files", "filesId": "second", "results": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn the_session_hears_the_file_results_before_the_policy_env() {
+        let (_, calls) = first_reply_to(vec![serde_json::json!({
+            "type": "policy",
+            "files": [{"path": "/etc/not-a-root", "content": "x"}],
+        })])
+        .await;
+
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].contains("/etc/not-a-root"), "{calls:?}");
+        assert_eq!(calls[1], "on_policy");
     }
 
     async fn bind_server() -> (TcpListener, SocketAddr) {
@@ -4529,8 +4697,12 @@ mod tests {
         });
         let result = handle_policy(&raw.to_string(), &None, &PlacedFiles::default()).await;
         match result {
-            PolicyResult::Ok(env) => {
-                assert_eq!(env.get("FOO").map(|s| s.as_str()), Some("bar"));
+            PolicyResult::Ok(applied) => {
+                assert_eq!(applied.env.get("FOO").map(|s| s.as_str()), Some("bar"));
+                assert!(
+                    applied.files.is_none(),
+                    "a frame without files gets no report"
+                );
             }
             _ => panic!("expected Ok"),
         }
