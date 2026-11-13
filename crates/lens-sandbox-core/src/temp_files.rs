@@ -92,9 +92,9 @@ struct Root {
 /// The default is `/tmp`, plus `/run/secrets` for files directly beneath it
 /// while it is a root-owned mount made at that place. The only other widening is
 /// the sandbox home, whose created directories are handed to the workload, while
-/// `/tmp` keeps them root-owned and traverse-only. A path binds to the longest root that contains it, and to
-/// the last-added of two equal ones, so a home nested inside another root — or
-/// duplicating one — still gets its own policy.
+/// `/tmp` keeps them root-owned and traverse-only. A path at or under `/run/secrets` binds only that root, and is
+/// refused where it is absent. Any other path binds to the longest root that contains it, and to the last-added of
+/// two equal ones, so a home nested inside another root — or duplicating one — still gets its own policy.
 #[derive(Debug, Clone)]
 struct FileRoots {
     roots: Vec<Root>,
@@ -163,9 +163,12 @@ impl FileRoots {
 
     /// A request file never lands under `/run/secrets`, which holds only what a policy frame delivers.
     fn for_requests(sandbox_creds: Option<&SandboxCredentials>) -> Self {
-        let mut roots = Self::for_sandbox(sandbox_creds);
-        roots.roots.retain(|r| r.kind != RootKind::Secrets);
-        roots
+        Self::for_sandbox(sandbox_creds).without_secrets()
+    }
+
+    fn without_secrets(mut self) -> Self {
+        self.roots.retain(|r| r.kind != RootKind::Secrets);
+        self
     }
 
     fn on_mounts(mut self, mounts: Option<Arc<MountPoints>>) -> Self {
@@ -179,6 +182,11 @@ impl FileRoots {
         let components = root_components(home.as_ref())?;
         if components.is_empty() {
             return Err("sandbox home must not be the filesystem root".to_string());
+        }
+        if components.starts_with(&secrets_components()) {
+            return Err(format!(
+                "sandbox home must not be at or inside {SECRETS_ROOT}, which takes only policy-frame files"
+            ));
         }
         self.home = Some(components.clone());
         self.roots.push(Root {
@@ -254,33 +262,36 @@ impl FileRoots {
     /// Every separator-delimited segment must be a normal name; `..` and `.` are
     /// rejected so no component can redirect the directory walk. A leading `~/`
     /// expands against the sandbox home. A relative path resolves under the
-    /// primary root. An absolute path must sit strictly inside one of the roots,
-    /// and binds to the longest of them — the last added, where two are equal, so
-    /// a home that duplicates an existing root still gets its own policy.
+    /// primary root. An absolute path must sit strictly inside one of the roots.
+    /// One at or under `/run/secrets` binds that root whatever else covers it;
+    /// any other binds to the longest root — the last added, where two are
+    /// equal, so a home that duplicates an existing root still gets its own policy.
     fn resolve(&self, requested: &str) -> Result<ResolvedPath, String> {
         if requested.is_empty() {
             return Err("temp file path is empty".to_string());
         }
         let absolute = self.to_absolute(requested)?;
-        if self.roots.iter().any(|r| r.components == absolute) {
+        let root = if absolute.starts_with(&secrets_components()) {
+            self.roots
+                .iter()
+                .find(|r| r.kind == RootKind::Secrets)
+                .ok_or_else(|| {
+                    format!(
+                        "temp file path is outside the allowed roots: {requested} ({SECRETS_ROOT} takes only policy-frame files)"
+                    )
+                })?
+        } else {
+            self.longest_root_holding(&absolute).ok_or_else(|| {
+                format!("temp file path is outside the allowed roots: {requested}")
+            })?
+        };
+
+        let components = absolute[root.components.len()..].to_vec();
+        if components.is_empty() {
             return Err(format!(
                 "temp file path names no file under it: {requested}"
             ));
         }
-
-        let mut best: Option<&Root> = None;
-        for root in &self.roots {
-            let len = root.components.len();
-            if absolute.len() > len
-                && absolute[..len] == root.components[..]
-                && best.is_none_or(|b| len >= b.components.len())
-            {
-                best = Some(root);
-            }
-        }
-
-        let root = best.ok_or_else(|| outside_the_roots(&absolute, requested))?;
-        let components = absolute[root.components.len()..].to_vec();
         if root.kind == RootKind::Secrets && components.len() != 1 {
             return Err(format!(
                 "temp file path must name a file directly under {SECRETS_ROOT}: {requested}"
@@ -293,6 +304,13 @@ impl FileRoots {
             kind: root.kind,
             mounts: self.mounts.clone(),
         })
+    }
+
+    fn longest_root_holding(&self, absolute: &[OsString]) -> Option<&Root> {
+        self.roots
+            .iter()
+            .filter(|root| absolute.starts_with(&root.components))
+            .max_by_key(|root| root.components.len())
     }
 
     fn to_absolute(&self, requested: &str) -> Result<Vec<OsString>, String> {
@@ -326,14 +344,8 @@ impl FileRoots {
     }
 }
 
-fn outside_the_roots(absolute: &[OsString], requested: &str) -> String {
-    let secrets = Root::fixed(SECRETS_ROOT, RootKind::Secrets).components;
-    if absolute.starts_with(&secrets) {
-        return format!(
-            "temp file path is outside the allowed roots: {requested} ({SECRETS_ROOT} takes only policy-frame files)"
-        );
-    }
-    format!("temp file path is outside the allowed roots: {requested}")
+fn secrets_components() -> Vec<OsString> {
+    Root::fixed(SECRETS_ROOT, RootKind::Secrets).components
 }
 
 /// An allowed root plus the safe, root-relative component sequence beneath it.
@@ -2975,6 +2987,96 @@ mod tests {
         );
         assert_nothing_created(&rec);
         assert!(roots.resolve("/tmp/db").is_ok());
+    }
+
+    /// A passwd home of `/run` that the sandbox user owns, so `usable` keeps it as a root covering `/run/secrets`.
+    fn requests_under_a_run_home(rec: &Rc<RefCell<Recorder>>) -> (FakeTempFs, FileRoots) {
+        let mut fs = secrets_fs(rec);
+        fs.dir_uids.insert("/run".to_string(), 1000);
+        let roots = FileRoots::default()
+            .with_home("/run")
+            .unwrap()
+            .without_secrets()
+            .on_mounts(trusted_mounts());
+        (fs, roots)
+    }
+
+    #[test]
+    fn a_request_file_is_refused_under_secrets_when_the_home_covers_it() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let (fs, roots) = requests_under_a_run_home(&rec);
+
+        for path in ["/run/secrets/db", "~/secrets/db", "/run/secrets"] {
+            let err = write_temp_files_with(
+                &fs,
+                &[file(path, "hunter2", None)],
+                Some((1000, 2000)),
+                &roots,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("/run/secrets takes only policy-frame files"),
+                "{path}: {err}"
+            );
+        }
+        assert_nothing_created(&rec);
+        assert!(roots.resolve("~/other").is_ok());
+    }
+
+    #[test]
+    fn a_request_file_removal_never_unlinks_a_secret_when_the_home_covers_it() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let (fs, roots) = requests_under_a_run_home(&rec);
+
+        let unresolved = remove_temp_files_with(
+            &fs,
+            &["/run/secrets/db".to_string(), "~/secrets/db".to_string()],
+            &roots,
+        );
+
+        assert_eq!(unresolved.len(), 2, "{unresolved:?}");
+        assert!(
+            !rec.borrow()
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Unlink(..))),
+            "a delivered secret must never be unlinked as a request file"
+        );
+    }
+
+    #[test]
+    fn a_home_at_or_inside_secrets_is_refused() {
+        for home in ["/run/secrets", "/run/secrets/sandbox"] {
+            let err = FileRoots::default().with_home(home).unwrap_err();
+            assert!(err.contains("/run/secrets"), "{home}: {err}");
+        }
+        assert!(
+            FileRoots::rooted_at_home(Some("/run/secrets"))
+                .home
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_policy_frame_file_under_secrets_binds_the_secrets_root_over_an_equal_home() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = secrets_fs(&rec);
+        fs.dir_uids.insert("/run/secrets".to_string(), 1000);
+        let mut roots = FileRoots::default().on_mounts(trusted_mounts());
+        roots.home = Some(Root::fixed(SECRETS_ROOT, RootKind::Secrets).components);
+        roots.roots.push(Root {
+            components: Root::fixed(SECRETS_ROOT, RootKind::Secrets).components,
+            kind: RootKind::Tree(NewDirs::WorkloadOwned),
+            from_home: true,
+        });
+
+        assert_eq!(
+            roots.resolve("/run/secrets/db").unwrap().kind,
+            RootKind::Secrets
+        );
+        let err = place_secret(&fs, "/run/secrets/db", &roots).unwrap_err();
+        assert!(err.contains("owned by uid 1000, not root"), "{err}");
+        assert_nothing_created(&rec);
     }
 
     #[test]
