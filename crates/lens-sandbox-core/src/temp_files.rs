@@ -9,7 +9,7 @@ use nix::errno::Errno;
 
 use crate::mount_points::MountPoints;
 use crate::privilege::SandboxCredentials;
-use crate::protocol::{FileOwner, TempFile};
+use crate::protocol::{FileOwner, Redacted, TempFile};
 
 const DEFAULT_ROOT: &str = "/tmp";
 const DEFAULT_FILE_MODE: u32 = 0o600;
@@ -518,12 +518,22 @@ struct Prepared {
     workload: Option<(u32, u32)>,
 }
 
-#[derive(Debug)]
 struct PreparedFile {
     resolved: ResolvedPath,
     bytes: Vec<u8>,
     mode: Option<u32>,
     file_owner: Option<(u32, u32)>,
+}
+
+impl std::fmt::Debug for PreparedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedFile")
+            .field("resolved", &self.resolved)
+            .field("bytes", &Redacted)
+            .field("mode", &self.mode)
+            .field("file_owner", &self.file_owner)
+            .finish()
+    }
 }
 
 /// Resolve and decode a whole batch without touching the filesystem, so a
@@ -2493,6 +2503,23 @@ mod tests {
         assert!(unresolved[0].contains("/var/old.json"), "{unresolved:?}");
         let events = rec.borrow().events.clone();
         assert!(events.contains(&Event::Unlink("a.json".to_string())));
+    }
+
+    #[test]
+    fn a_prepared_batch_never_prints_the_bytes_it_carries() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let files = vec![file("/tmp/db", "hunter2", None)];
+
+        let prepared = prepare_with(&fs, &files, Some((1000, 2000)), &tmp()).unwrap();
+        let shown = format!("{prepared:?}");
+
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(
+            !shown.contains("104, 117, 110"),
+            "nor as a byte list: {shown}"
+        );
+        assert!(shown.contains("db"), "{shown}");
     }
 
     #[test]
