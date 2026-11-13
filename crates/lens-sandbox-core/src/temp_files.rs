@@ -509,7 +509,9 @@ trait FileHandle {
 /// Each file of the new set is written to a staging sibling and renamed over
 /// its path, so it holds either its previous content or the new one, never
 /// neither. A file that fails keeps its previous content, and stays tracked if
-/// it was. Only then are the tracked paths the new set no longer lists removed.
+/// it was. Only then are the tracked paths the new set no longer lists removed,
+/// and the files that failed are tried once more, since a removed path may have
+/// been in their way.
 /// A frame none of whose entries can be prepared leaves the last good set
 /// exactly where it was and returns `tracked: None`.
 fn refresh_policy_files_with(
@@ -541,12 +543,36 @@ fn refresh_policy_files_with(
         };
     }
 
+    let mut placed: Vec<Placement> = prepared
+        .into_iter()
+        .map(|entry| {
+            entry.map(|entry| {
+                let landed = place_one(fs, &entry, creds);
+                (entry, landed)
+            })
+        })
+        .collect();
+    let listed: HashSet<String> = placed
+        .iter()
+        .flatten()
+        .map(|(entry, _)| entry.resolved.display())
+        .collect();
+
+    let dropped: Vec<String> = old_paths
+        .iter()
+        .filter(|path| !listed.contains(path.as_str()))
+        .cloned()
+        .collect();
+    warn_unremovable(remove_temp_files_with(fs, &dropped, roots));
+    if !dropped.is_empty() {
+        retry_failed(fs, &mut placed, creds);
+    }
+
     let mut tracked: Vec<String> = Vec::new();
-    let mut listed: HashSet<String> = HashSet::new();
-    let mut results = Vec::with_capacity(prepared.len());
-    for entry in prepared {
-        let entry = match entry {
-            Ok(entry) => entry,
+    let mut results = Vec::with_capacity(placed.len());
+    for entry in placed {
+        let (entry, landed) = match entry {
+            Ok(placed) => placed,
             Err(refused) => {
                 tracing::warn!(
                     reason = refused.reason,
@@ -557,10 +583,9 @@ fn refresh_policy_files_with(
             }
         };
         let display = entry.resolved.display();
-        let landed = place_one(fs, &entry, creds);
         let keep = landed.is_ok() || old_paths.contains(&display);
         if keep && !tracked.contains(&display) {
-            tracked.push(display.clone());
+            tracked.push(display);
         }
         results.push(match landed {
             Ok(()) => PolicyFileResult::written(entry.requested),
@@ -569,19 +594,24 @@ fn refresh_policy_files_with(
                 PolicyFileResult::failed(entry.requested, reason)
             }
         });
-        listed.insert(display);
     }
 
-    let dropped: Vec<String> = old_paths
-        .iter()
-        .filter(|path| !listed.contains(path.as_str()))
-        .cloned()
-        .collect();
-    warn_unremovable(remove_temp_files_with(fs, &dropped, roots));
     tracing::info!(count = tracked.len(), "placed policy files");
     PolicyRefresh {
         tracked: Some(tracked),
         results,
+    }
+}
+
+/// An entry with the outcome of placing it, or the reason it could not be prepared.
+type Placement = Result<(PreparedFile, Result<(), String>), Refused>;
+
+/// A removed path can be what stood in a failed file's way, as a file does where the new set wants a directory, so each failure gets one more try.
+fn retry_failed(fs: &dyn TempFs, placed: &mut [Placement], creds: Option<(u32, u32)>) {
+    for (entry, landed) in placed.iter_mut().flatten() {
+        if landed.is_err() {
+            *landed = place_one(fs, entry, creds);
+        }
     }
 }
 
@@ -1688,6 +1718,8 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         events: Vec<Event>,
+        // Names a rename left as plain files, so a later walk through one finds a file in its way.
+        plain_files: Vec<String>,
     }
 
     struct FakeTempFs {
@@ -1802,6 +1834,9 @@ mod tests {
             if self.symlink_dirs.contains(&n) {
                 return Err(Errno::ELOOP);
             }
+            if self.recorder.borrow().plain_files.contains(&n) {
+                return Err(Errno::ENOTDIR);
+            }
             if let Some(e) = self.open_err {
                 return Err(e);
             }
@@ -1830,7 +1865,7 @@ mod tests {
 
         fn make_child_dir(&self, name: &OsStr, mode: u32) -> Result<(), Errno> {
             let n = name.to_string_lossy().to_string();
-            if self.existing_dirs.contains(&n) {
+            if self.existing_dirs.contains(&n) || self.recorder.borrow().plain_files.contains(&n) {
                 return Err(Errno::EEXIST);
             }
             self.recorder
@@ -1871,10 +1906,13 @@ mod tests {
             if let Some(e) = self.rename_err {
                 return Err(e);
             }
-            self.recorder.borrow_mut().events.push(Event::Rename(
+            let to = to.to_string_lossy().to_string();
+            let mut recorder = self.recorder.borrow_mut();
+            recorder.events.push(Event::Rename(
                 from.to_string_lossy().to_string(),
-                to.to_string_lossy().to_string(),
+                to.clone(),
             ));
+            recorder.plain_files.push(to);
             Ok(())
         }
 
@@ -1895,7 +1933,9 @@ mod tests {
 
         fn unlink_child(&self, name: &OsStr) -> Result<(), Errno> {
             let n = name.to_string_lossy().to_string();
-            self.recorder.borrow_mut().events.push(Event::Unlink(n));
+            let mut recorder = self.recorder.borrow_mut();
+            recorder.plain_files.retain(|f| f != &n);
+            recorder.events.push(Event::Unlink(n));
             Ok(())
         }
 
@@ -3039,6 +3079,47 @@ mod tests {
         let events = rec.borrow().events.clone();
         assert!(events.contains(&Event::Unlink("dropped.json".to_string())));
         assert!(!events.contains(&Event::Unlink("kept.json".to_string())));
+    }
+
+    #[test]
+    fn a_file_that_becomes_a_directory_lands_once_the_old_file_is_removed() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let first = refresh(&fs, &[], &[file("/tmp/creds", "v1", None)]);
+        let first = first.tracked.unwrap();
+        assert_eq!(first, vec!["/tmp/creds".to_string()]);
+
+        let old: Vec<&str> = first.iter().map(String::as_str).collect();
+        let second = refresh(&fs, &old, &[file("/tmp/creds/db", "v2", None)]);
+
+        assert_eq!(
+            second.results,
+            vec![PolicyFileResult::written("/tmp/creds/db")]
+        );
+        assert_eq!(second.tracked, Some(vec!["/tmp/creds/db".to_string()]));
+        let events = rec.borrow().events.clone();
+        let unlinked = events
+            .iter()
+            .position(|e| *e == Event::Unlink("creds".to_string()))
+            .expect("the old file is removed");
+        let landed = events
+            .iter()
+            .position(|e| matches!(e, Event::Rename(_, to) if to == "db"))
+            .expect("the new file lands");
+        assert!(unlinked < landed, "{events:?}");
+    }
+
+    #[test]
+    fn a_file_that_still_fails_after_the_removal_is_tried_once_more_and_reported() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.failing_writes.push(b"x".to_vec());
+
+        let result = refresh(&fs, &["/tmp/old"], &[file("/tmp/db", "x", None)]);
+
+        assert_eq!(result.tracked, Some(Vec::new()));
+        assert!(!result.results[0].is_written());
+        assert_eq!(staged_names(&rec).len(), 2, "one try, then one retry");
     }
 
     #[test]
