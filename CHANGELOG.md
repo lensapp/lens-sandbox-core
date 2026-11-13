@@ -6,6 +6,7 @@ This project will use versioned releases once public releases begin. Until then,
 
 ## [Unreleased]
 
+- `Debug` of a `protocol::TempFile` no longer prints its `content` or `contentB64`, so a secret a policy file carries never reaches a log.
 - `proxy::serve_explicit` judges and serves one connection from a client that was told to use a proxy, with the caller given, as `proxy::serve_egress` does for a transparent one.
 - A policy's files are placed by whoever owns the workload's filesystem, with or without a proxy in that process: `client::PlacedFiles` replaces `ProxyState::previous_policy_files` and `sandbox_creds`; `client::run` and `apply_local_policy` take a `&PlacedFiles`, `ProxyServer::new` no longer takes the credentials, and `temp_files::refresh_policy_files` takes the mounts it may place a file on.
 - Add a host mode for an embedder that judges a guest's egress from its own process. `ProxyState::for_host(ca, bootstrap_dns_allowlist)` builds the state without listeners; it intercepts with the CA the embedder owns and never installs it, or a frame's `proxyCaCert`, into the system trust store, so the embedder hands the guest `ca_cert_pem` itself. `connect_audit` is public. An embedder that writes the audit itself calls `ProxyState::audit_written` for each message it wrote or discarded, so the state stops holding it, and `ProxyState::unwritten_refusals` counts what it still holds. `dns::MAX_INFLIGHT_QUERIES` is public, so an embedder can size its own DNS path to it.

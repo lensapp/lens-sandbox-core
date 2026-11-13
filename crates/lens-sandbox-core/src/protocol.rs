@@ -13,7 +13,7 @@ pub const SANDBOX_PROTOCOL_DATE: &str = "2026-10-25";
 /// Exactly one of [`content`](Self::content) and
 /// [`content_b64`](Self::content_b64) must be set; an entry setting both is
 /// rejected and the whole batch fails closed.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TempFile {
     /// Path inside the sandbox. Absolute, relative to the primary allowed
@@ -32,6 +32,27 @@ pub struct TempFile {
     /// Who owns the delivered file. Absent means `workload`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<FileOwner>,
+}
+
+impl std::fmt::Debug for TempFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TempFile")
+            .field("path", &self.path)
+            .field("content", &self.content.as_ref().map(|_| Redacted))
+            .field("content_b64", &self.content_b64.as_ref().map(|_| Redacted))
+            .field("mode", &self.mode)
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
+/// Stands in for a value that may be a secret wherever it would be printed.
+pub(crate) struct Redacted;
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 /// Who a [`TempFile`] is chowned to after the root supervisor creates it.
@@ -413,6 +434,22 @@ mod tests {
             json.get("content_b64").is_none(),
             "rust ident leaked: {json}"
         );
+    }
+
+    #[test]
+    fn temp_file_debug_names_the_path_and_never_the_content() {
+        let f = TempFile {
+            path: "/run/secrets/db".to_string(),
+            content: Some("hunter2".to_string()),
+            content_b64: Some("aHVudGVyMg==".to_string()),
+            mode: Some(0o400),
+            owner: Some(FileOwner::Workload),
+        };
+        let shown = format!("{f:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("aHVudGVyMg=="), "{shown}");
+        assert!(shown.contains("/run/secrets/db"), "{shown}");
+        assert!(shown.contains("256"), "the mode still shows: {shown}");
     }
 
     #[test]
