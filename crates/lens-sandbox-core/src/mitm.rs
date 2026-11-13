@@ -18,8 +18,13 @@ use crate::routing::{CONFLICT_REASON, HttpRule};
 
 /// How to reach the upstream server after terminating client TLS.
 pub enum UpstreamMode {
-    /// Direct TCP + TLS to target (used for `action: "direct"` routes).
-    DirectTls { host: String, port: u16 },
+    /// Direct TCP + TLS to target (used for `action: "direct"` routes), or
+    /// to the upstream a `forward` route names, with its client certificate.
+    DirectTls {
+        host: String,
+        port: u16,
+        forward: Option<crate::proxy::ClientCertConfig>,
+    },
     /// Pre-established tunnel + TLS (for HTTPS services behind a tunnel).
     /// The inner stream is type-erased so plain TCP and TLS-wrapped tunnels
     /// (when the Lens Sandbox HTTPS port fronts the proxy) share the same path.
@@ -301,23 +306,34 @@ where
 
     // Read/inject headers BEFORE connecting upstream, so a stalling client
     // doesn't hold open upstream connections.
+    let forward = match &upstream_mode {
+        UpstreamMode::DirectTls { forward, .. } => forward.as_ref(),
+        _ => None,
+    };
     let (mut tls_client, modified, meta) =
-        mitm_inject_after_accept(tls_client, target_host, ctx, is_tunnel).await?;
+        mitm_inject_after_accept(tls_client, target_host, ctx, is_tunnel, forward).await?;
 
     match upstream_mode {
-        UpstreamMode::DirectTls { host, port } => {
+        UpstreamMode::DirectTls {
+            host,
+            port,
+            forward,
+        } => {
             // An `llm` route sends this request to a host the sandbox never
             // named. Everything below treats that host as the destination, so
             // the dial, the SNI, and the certificate check are the backend's.
-            let (host, port) = match &meta.redirect {
-                Some(redirect) => (redirect.host.clone(), redirect.port),
-                None => (host, port),
+            let (host, port, forward) = match &meta.redirect {
+                Some(redirect) => (redirect.host.clone(), redirect.port, None),
+                None => (host, port, forward),
             };
-            // Through the policy-aware dial, not a bare one: an `egress.tcp`
-            // CIDR rule binds by address, so this is the first point at which it
-            // can be applied to a target the client named. Skipping it would let
-            // a CIDR deny hold on the transparent door and not here.
             let dial = async || {
+                if let Some(forward) = &forward {
+                    return dial_forward(ctx, forward).await;
+                }
+                // Through the policy-aware dial, not a bare one: an `egress.tcp`
+                // CIDR rule binds by address, so this is the first point at which
+                // it can be applied to a target the client named. Skipping it
+                // would let a CIDR deny hold on the transparent door and not here.
                 let target_stream = crate::proxy::connect_egress_under_policy(
                     ctx.state,
                     &format!("{host}:{port}"),
@@ -1369,6 +1385,7 @@ async fn mitm_inject_after_accept<C>(
     target_host: &str,
     ctx: &MitmContext<'_>,
     is_tunnel: bool,
+    forward: Option<&crate::proxy::ClientCertConfig>,
 ) -> Result<(C, String, RequestMeta), Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -1607,18 +1624,28 @@ where
     let target = destination
         .as_ref()
         .map_or_else(|| RequestTarget::from_context(ctx), LlmDestination::target);
-    let head = match &destination {
-        Some(destination) => {
-            crate::llm::head::rewrite_for_backend(&header_str, &destination.redirect)
-        }
-        None => header_str.to_string(),
-    };
-
     // A host whose credential is a signing key has its request signed last,
     // after every step below has written the head the signature covers. A
     // redirect drops the signature the sandbox made with its other credentials,
     // and the backend answers to its own, so a redirected request is not signed.
     let signed = destination.is_none() && ctx.state.aws_signer.matches(ctx.match_host);
+    let head = match &destination {
+        Some(destination) => {
+            crate::llm::head::rewrite_for_backend(&header_str, &destination.redirect)
+        }
+        // A `forward` route's gateway routes by the Host it names. Every step
+        // below writes on this head, so a credential is injected or signed for
+        // the head the gateway gets. A signed request keeps its `Authorization`:
+        // it holds the placeholder signature the signer replaces.
+        None => match forward.and_then(|f| f.upstream_host_header.as_deref()) {
+            Some(gateway_host) if signed => rewrite_host_header(&header_str, gateway_host),
+            Some(gateway_host) => {
+                without_authorization(&rewrite_host_header(&header_str, gateway_host))
+            }
+            None => header_str.to_string(),
+        },
+    };
+
     if signed && is_upgrade {
         return Err(facts
             .deny(
@@ -1978,6 +2005,12 @@ where
         let mut metadata = serde_json::json!({
             "host": target_host, "mitm": true, "tunnel": is_tunnel
         });
+        if destination.is_none()
+            && forward.is_some()
+            && let Some(object) = metadata.as_object_mut()
+        {
+            object.insert("tls_bridge".into(), true.into());
+        }
         if let (Some(service), Some(object)) = (&signed_service, metadata.as_object_mut()) {
             object.insert("aws_resign".into(), true.into());
             object.insert("service".into(), service.clone().into());
@@ -2157,113 +2190,33 @@ where
     Ok(connector.connect(server_name, upstream).await?)
 }
 
-/// Handle a TLS bridge connection: terminate TLS from the agent using an ephemeral
-/// cert, then connect to the upstream with mTLS (real client certificates).
-///
-/// Reads the first HTTP/1.1 request headers to rewrite the Host header to the
-/// original upstream hostname (for path-based gateways like Rancher). After
-/// forwarding the rewritten headers + `Connection: close`, switches to raw
-/// bidirectional byte copy for the remainder of the connection. For upgrade
-/// requests (WebSocket/SPDY), the connection stays open after the header phase.
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_tls_bridge(
-    egress: &dyn crate::egress::Egress,
-    client: TcpStream,
-    dial_addr: &str,
-    tls_server_name: &str,
-    client_cert: &crate::proxy::ClientCertConfig,
-    ca: &EphemeralCa,
-    hostname_for_cert: &str,
-    audit_tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    actor: &crate::peer_process::ActorContext,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Generate ephemeral cert for the hostname the agent connects to
-    let certified_key = ca
-        .certified_key_for_domain(hostname_for_cert)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
-
-    let mut server_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(SingleCertResolver(certified_key)));
-    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-    // Accept TLS from agent
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let mut tls_client = acceptor.accept(client).await?;
-
-    // Read the first HTTP/1.1 request headers byte-by-byte (same pattern as
-    // mitm_inject_after_accept) so we can rewrite the Host header.
-    let mut header_buf = Vec::with_capacity(4096);
-    let mut byte = [0u8; 1];
-    loop {
-        let n = tls_client.read(&mut byte).await?;
-        if n == 0 {
-            return Err("client closed before sending request headers".into());
-        }
-        header_buf.push(byte[0]);
-        if header_buf.len() >= 4 && header_buf[header_buf.len() - 4..] == *b"\r\n\r\n" {
-            break;
-        }
-        if header_buf.len() > 65536 {
-            return Err("HTTP request headers too large".into());
-        }
-    }
-
-    let header_str = String::from_utf8_lossy(&header_buf[..header_buf.len() - 4]);
-
-    // Rewrite Host header to the original upstream hostname if configured.
-    // For direct API servers (no upstream_host_header), leave Host unchanged.
-    let modified = if let Some(ref upstream_host) = client_cert.upstream_host_header {
-        rewrite_host_header(&header_str, upstream_host)
-    } else {
-        header_str.to_string()
-    };
-
-    // Connect TCP to upstream
-    let upstream_stream = crate::egress::connect_tcp_resolve(
-        egress,
-        &crate::proxy::extract_hostname(dial_addr),
-        crate::proxy::extract_port(dial_addr, 443),
-    )
-    .await
-    .map_err(|e| format!("TLS bridge: failed to connect to upstream {dial_addr}: {e}"))?;
-
-    // Wrap upstream in TLS with mTLS client cert
-    let mut tls_upstream = connect_upstream_tls(
-        upstream_stream,
-        tls_server_name,
-        None,
-        Some(client_cert),
-        &[],
+/// Reach the upstream a `forward` route names, with its client certificate.
+async fn dial_forward(
+    ctx: &MitmContext<'_>,
+    forward: &crate::proxy::ClientCertConfig,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
+    let upstream = crate::proxy::connect_forward_under_policy(
+        ctx.state,
+        &forward.dial_addr,
+        ctx.actor.process(),
     )
     .await?;
-
-    // Send the (possibly rewritten) headers to upstream
-    tls_upstream.write_all(modified.as_bytes()).await?;
-    tls_upstream.write_all(b"\r\n\r\n").await?;
-
-    if let Some(tx) = audit_tx {
-        let event = serde_json::json!({
-            "type": "audit_event",
-            "source": "sandbox-proxy",
-            "action": format!("TLS_BRIDGE {hostname_for_cert} -> {dial_addr}"),
-            "host": hostname_for_cert,
-            "result": "success",
-            "metadata": { "host": hostname_for_cert, "tls_bridge": true }
-        });
-        send_audit(tx, event, actor);
-    }
-
-    // Bidirectional byte copy for the rest of the connection.
-    // Supports WebSocket upgrades, SPDY, chunked streaming — all happen
-    // after the initial header exchange.
-    tokio::io::copy_bidirectional(&mut tls_client, &mut tls_upstream).await?;
-    Ok(())
+    connect_upstream_tls(upstream, &forward.tls_server_name, None, Some(forward), &[]).await
 }
 
-/// Rewrite headers for the TLS bridge path: replace Host with the original
-/// upstream hostname, strip the dummy Authorization header (real auth is mTLS
-/// via client certificates), and manage Connection semantics.
+/// `header_block` without its `Authorization` header: the synthetic
+/// kubeconfig's dummy token (e.g. `Bearer lens-sandbox-proxy-auth`), which the
+/// client certificate stands in for, and which could confuse a gateway.
+fn without_authorization(header_block: &str) -> String {
+    header_block
+        .split("\r\n")
+        .filter(|line| !line.to_ascii_lowercase().starts_with("authorization:"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+/// Rewrite headers for a `forward` route: replace Host with the original
+/// upstream hostname, and manage Connection semantics.
 ///
 /// For non-upgrade requests, forces `Connection: close` so each request on a
 /// keep-alive socket gets the correct Host. For upgrade requests
@@ -2281,11 +2234,6 @@ fn rewrite_host_header(header_block: &str, new_host: &str) -> String {
         if lower.starts_with("host:") {
             lines.push(format!("Host: {new_host}"));
             host_found = true;
-        } else if lower.starts_with("authorization:") {
-            // Strip the dummy bearer token from the synthetic kubeconfig
-            // (e.g. "Bearer lens-sandbox-proxy-auth"). Real auth is mTLS —
-            // forwarding this token could confuse gateways or auth proxies.
-            continue;
         } else if lower.starts_with("connection:") && lower.contains("upgrade") {
             is_upgrade = true;
             lines.push(line.to_string());
@@ -3032,10 +2980,10 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_host_header_strips_authorization() {
+    fn the_dummy_token_is_dropped_and_the_rest_kept() {
         let headers = "GET /api/v1/nodes HTTP/1.1\r\nHost: host.docker.internal\r\nAuthorization: Bearer lens-sandbox-proxy-auth\r\nAccept: application/json";
-        let result = rewrite_host_header(headers, "rancher.example.com:443");
-        assert!(result.contains("Host: rancher.example.com:443"), "{result}");
+        let result = without_authorization(headers);
+        assert!(result.contains("Host: host.docker.internal"), "{result}");
         assert!(
             !result.contains("Authorization"),
             "dummy bearer token should be stripped: {result}"
@@ -3055,10 +3003,7 @@ mod tests {
             !result.contains("Connection: close"),
             "should not add Connection: close for upgrades: {result}"
         );
-        assert!(
-            !result.contains("Authorization"),
-            "dummy bearer token should be stripped even for upgrades: {result}"
-        );
+        assert!(result.contains("Host: rancher.example.com:443"), "{result}");
     }
 
     /// Build a TLS server config using a cert from the ephemeral CA for the given hostname.
@@ -3276,7 +3221,7 @@ mod tests {
         let acceptor = TlsAcceptor::from(mitm_server_config);
         let tls_client_stream = acceptor.accept(client_stream).await.unwrap();
         let mitm_result =
-            mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, is_tunnel).await;
+            mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, is_tunnel, None).await;
 
         // If MITM denied the request (HTTP rules), collect audit events and return
         let (tls_client, modified, meta) = match mitm_result {
@@ -3602,7 +3547,7 @@ mod tests {
         };
         let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, hostname).unwrap());
         let tls_client = acceptor.accept(client_stream).await.unwrap();
-        let outcome = match mitm_inject_after_accept(tls_client, hostname, &ctx, true).await {
+        let outcome = match mitm_inject_after_accept(tls_client, hostname, &ctx, true, None).await {
             Ok((mut tls_client, head, meta)) => {
                 tls_client.shutdown().await.ok();
                 Ok((head, meta.buffered_body))
@@ -3696,7 +3641,7 @@ mod tests {
         }
         let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, hostname).unwrap());
         let tls_client = acceptor.accept(client_stream).await.unwrap();
-        let outcome = match mitm_inject_after_accept(tls_client, hostname, &ctx, true).await {
+        let outcome = match mitm_inject_after_accept(tls_client, hostname, &ctx, true, None).await {
             Ok((mut tls_client, head, meta)) => {
                 tls_client.shutdown().await.ok();
                 Ok((head, meta.buffered_body))
@@ -3916,7 +3861,7 @@ mod tests {
             };
             let acceptor = TlsAcceptor::from(build_ephemeral_server_config(&ca, hostname).unwrap());
             let tls_client = acceptor.accept(client_stream).await.unwrap();
-            match mitm_inject_after_accept(tls_client, hostname, &ctx, true).await {
+            match mitm_inject_after_accept(tls_client, hostname, &ctx, true, None).await {
                 Ok((mut tls_client, _, _)) => {
                     tls_client.shutdown().await.ok();
                     true
@@ -6390,7 +6335,7 @@ mod tests {
             let acceptor = TlsAcceptor::from(mitm_server_config);
             let tls_client_stream = acceptor.accept(client_stream).await.unwrap();
             let mitm_result =
-                mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, true).await;
+                mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, true, None).await;
             // test_ctx and audit_tx fall out of scope at the end of this
             // block, which releases the borrow and lets the channel close.
 
@@ -6778,7 +6723,7 @@ mod tests {
         let acceptor = TlsAcceptor::from(mitm_server_config);
         let tls_client_stream = acceptor.accept(client_stream).await.unwrap();
         let (tls_client, modified, meta) =
-            mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, true)
+            mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, true, None)
                 .await
                 .expect("mitm_inject_after_accept should succeed on Allow + armed");
 
@@ -6947,7 +6892,7 @@ mod tests {
             let acceptor = TlsAcceptor::from(mitm_server_config);
             let tls_client_stream = acceptor.accept(client_stream).await.unwrap();
             let (tls_client, modified, meta) =
-                mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, true)
+                mitm_inject_after_accept(tls_client_stream, hostname, &test_ctx, true, None)
                     .await
                     .expect("multi-cred allow + arm should succeed");
 
@@ -7054,6 +6999,7 @@ mod tests {
             UpstreamMode::DirectTls {
                 host: "203.0.113.9".to_string(),
                 port: 443,
+                forward: None,
             },
             &ctx,
         )

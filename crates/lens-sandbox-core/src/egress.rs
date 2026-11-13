@@ -83,10 +83,10 @@ pub fn is_disallowed_egress_ip(ip: IpAddr) -> bool {
 /// Unchecked by the SSRF floor: connects to whatever `host` resolves to,
 /// including loopback and link-local, though the port can still refuse
 /// ([`HostEgress`] refuses this host's own addresses). Use only for trusted
-/// infra dials (the Lens upstream relay, the control-plane socket, a
-/// server-injected forward bridge). For sandbox egress — where `host` is a
-/// policy/SNI/Host hostname whose resolution an attacker may influence — use
-/// [`connect_tcp_egress`], which rejects those addresses.
+/// infra dials (the Lens upstream relay, the control-plane socket). For
+/// sandbox egress — where `host` is a policy/SNI/Host hostname whose
+/// resolution an attacker may influence — use [`connect_tcp_egress`], which
+/// rejects those addresses.
 pub async fn connect_tcp_resolve(
     egress: &dyn Egress,
     host: &str,
@@ -130,6 +130,26 @@ pub async fn connect_tcp_egress_where(
             EgressRefused::Floor(resolved),
         ));
     }
+    dial_admitted(egress, resolved, admits).await
+}
+
+/// [`connect_tcp_egress_where`] without the SSRF floor, for an address the
+/// server names and the workload cannot influence.
+pub(crate) async fn connect_tcp_resolve_where(
+    egress: &dyn Egress,
+    host: &str,
+    port: u16,
+    admits: impl FnOnce(IpAddr) -> bool + Send,
+) -> io::Result<TcpStream> {
+    let resolved = egress.resolve(host, port).await?;
+    dial_admitted(egress, resolved, admits).await
+}
+
+async fn dial_admitted(
+    egress: &dyn Egress,
+    resolved: SocketAddr,
+    admits: impl FnOnce(IpAddr) -> bool + Send,
+) -> io::Result<TcpStream> {
     if !admits(resolved.ip()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
