@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Bump to today's date in the same commit as any change to `policy_schema.rs`
 /// or the wire types in this file — an older sandbox must not accept a policy it
 /// cannot enforce.
-pub const SANDBOX_PROTOCOL_DATE: &str = "2026-10-25";
+pub const SANDBOX_PROTOCOL_DATE: &str = "2026-11-12";
 
 /// A file to write before executing a command.
 ///
@@ -68,6 +68,83 @@ pub enum FileOwner {
     /// from the parent directory, so a workload that owns the parent can still
     /// delete the file or put its own file at that path.
     Root,
+}
+
+/// Whether one file a policy frame's `files` asked for landed, keyed by the path as the frame spelled it.
+///
+/// On the wire it is `{"path": …, "written": true}` or `{"path": …, "error": …}`;
+/// the error says why in a short sentence and never carries the content.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(into = "PolicyFileResultWire", try_from = "PolicyFileResultWire")]
+pub struct PolicyFileResult {
+    pub path: String,
+    pub outcome: PolicyFileOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyFileOutcome {
+    /// The file holds the content this frame sent.
+    Written,
+    /// The file was not written; one that was there before keeps its previous content.
+    Failed(String),
+}
+
+impl PolicyFileResult {
+    pub fn written(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            outcome: PolicyFileOutcome::Written,
+        }
+    }
+
+    pub fn failed(path: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            outcome: PolicyFileOutcome::Failed(reason.into()),
+        }
+    }
+
+    pub fn is_written(&self) -> bool {
+        self.outcome == PolicyFileOutcome::Written
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct PolicyFileResultWire {
+    path: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    written: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl From<PolicyFileResult> for PolicyFileResultWire {
+    fn from(result: PolicyFileResult) -> Self {
+        let (written, error) = match result.outcome {
+            PolicyFileOutcome::Written => (true, None),
+            PolicyFileOutcome::Failed(reason) => (false, Some(reason)),
+        };
+        Self {
+            path: result.path,
+            written,
+            error,
+        }
+    }
+}
+
+impl TryFrom<PolicyFileResultWire> for PolicyFileResult {
+    type Error = String;
+
+    fn try_from(wire: PolicyFileResultWire) -> Result<Self, String> {
+        match (wire.written, wire.error) {
+            (true, None) => Ok(Self::written(wire.path)),
+            (false, Some(reason)) => Ok(Self::failed(wire.path, reason)),
+            _ => Err(format!(
+                "a policy file result is either written or carries an error: {}",
+                wire.path
+            )),
+        }
+    }
 }
 
 /// Check strict YYYY-MM-DD format: length 10, dashes at positions 4 and 7, digits elsewhere.
@@ -450,6 +527,52 @@ mod tests {
         assert!(!shown.contains("aHVudGVyMg=="), "{shown}");
         assert!(shown.contains("/run/secrets/db"), "{shown}");
         assert!(shown.contains("256"), "the mode still shows: {shown}");
+    }
+
+    #[test]
+    fn a_policy_file_result_is_written_or_carries_an_error() {
+        let written = serde_json::to_value(PolicyFileResult::written("/run/secrets/db")).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({"path": "/run/secrets/db", "written": true})
+        );
+        let failed = serde_json::to_value(PolicyFileResult::failed(
+            "/run/secrets/x",
+            "open root: ENOENT",
+        ))
+        .unwrap();
+        assert_eq!(
+            failed,
+            serde_json::json!({"path": "/run/secrets/x", "error": "open root: ENOENT"})
+        );
+    }
+
+    #[test]
+    fn a_policy_file_result_reads_back_as_it_was_written() {
+        for result in [
+            PolicyFileResult::written("~/a"),
+            PolicyFileResult::failed("~/b", "why"),
+        ] {
+            let text = serde_json::to_string(&result).unwrap();
+            assert_eq!(
+                serde_json::from_str::<PolicyFileResult>(&text).unwrap(),
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn a_policy_file_result_that_is_both_or_neither_is_refused() {
+        for raw in [
+            r#"{"path":"/x","written":true,"error":"e"}"#,
+            r#"{"path":"/x"}"#,
+            r#"{"path":"/x","written":false}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PolicyFileResult>(raw).is_err(),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

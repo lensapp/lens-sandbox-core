@@ -904,9 +904,9 @@ async fn handle_policy(
 }
 
 // Write persistent files from policy (e.g. AWS credential files, synthetic
-// kubeconfig). The ordering — prepare, then remove, then write — and the
-// bookkeeping for each outcome live in `temp_files` where a fake can drive
-// all three; see `refresh_policy_files_with`.
+// kubeconfig). The ordering — prepare, then place each file, then remove the
+// paths the frame dropped — and the bookkeeping for each outcome live in
+// `temp_files` where a fake can drive them; see `refresh_policy_files_with`.
 async fn write_policy_files(placed: &PlacedFiles, files: &[crate::protocol::TempFile]) {
     let old_paths = placed.paths();
     // The roots — `/tmp`, `/run/secrets`, and the sandbox user's home, so a
@@ -919,6 +919,7 @@ async fn write_policy_files(placed: &PlacedFiles, files: &[crate::protocol::Temp
         placed.mounts.clone(),
     )
     .await
+    .tracked
     {
         *placed.paths.write().unwrap() = tracked;
     }

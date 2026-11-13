@@ -9,12 +9,13 @@ use nix::errno::Errno;
 
 use crate::mount_points::MountPoints;
 use crate::privilege::SandboxCredentials;
-use crate::protocol::{FileOwner, Redacted, TempFile};
+use crate::protocol::{FileOwner, PolicyFileResult, Redacted, TempFile};
 
 const DEFAULT_ROOT: &str = "/tmp";
 /// The guest init mounts a root-owned tmpfs here, so the workload that owns `/run` cannot rename it away.
 const SECRETS_ROOT: &str = "/run/secrets";
 const DEFAULT_FILE_MODE: u32 = 0o600;
+const STAGING_PREFIX: &str = ".lns-policy-";
 /// A directory the root supervisor creates under the shared `/tmp` root is only
 /// a path-prefix waypoint to a file that gets chowned to the unprivileged
 /// sandbox user. `0o711` (execute, no read) lets that user *traverse* to its
@@ -471,6 +472,8 @@ trait DirHandle {
     /// Remove an empty child directory. Only ever called on one this walk just
     /// created, to undo an open or a hand-over that failed after the mkdir.
     fn remove_child_dir(&self, name: &OsStr) -> Result<(), Errno>;
+    /// Rename a child over another child of this same directory, replacing (never following) whatever `to` names.
+    fn rename_child(&self, from: &OsStr, to: &OsStr) -> Result<(), Errno>;
     /// The uid owning this directory, read from the open fd rather than the
     /// path, so the answer describes the inode the caller already holds.
     fn owner_uid(&self) -> Result<u32, Errno>;
@@ -485,59 +488,103 @@ trait FileHandle {
     fn chmod(&self, mode: u32) -> Result<(), Errno>;
 }
 
-/// Replace the policy files on disk, and say what the caller should now track.
+/// Replace the policy files on disk, one file at a time, and say what landed.
 ///
-/// The order is the whole point and is why this is one function rather than
-/// three calls at the call site: the batch is resolved and decoded first, and
-/// the previous set is removed only once the new one is known to be
-/// well-formed. A frame that cannot be prepared leaves the last good set
-/// exactly where it was.
-///
-/// `None` means "leave the tracked set alone" — nothing was removed, so the
-/// paths the caller already holds still describe what is on disk. `Some(paths)`
-/// means "the tracked set is now this", empty included.
+/// Each file of the new set is written to a staging sibling and renamed over
+/// its path, so it holds either its previous content or the new one, never
+/// neither. A file that fails keeps its previous content, and stays tracked if
+/// it was. Only then are the tracked paths the new set no longer lists removed.
+/// A frame none of whose entries can be prepared leaves the last good set
+/// exactly where it was and returns `tracked: None`.
 fn refresh_policy_files_with(
     fs: &dyn TempFs,
     old_paths: &[String],
     files: Option<&[TempFile]>,
     creds: Option<(u32, u32)>,
     roots: &FileRoots,
-) -> Option<Vec<String>> {
-    let prepared = match files.filter(|f| !f.is_empty()) {
-        None => None,
-        Some(files) => match prepare_with(fs, files, creds, roots) {
-            Ok(prepared) => Some(prepared),
-            Err(e) => {
-                tracing::warn!(
-                    "refusing a malformed policy file set; keeping the previous one: {e}"
-                );
-                return None;
-            }
-        },
+) -> PolicyRefresh {
+    let Some(files) = files.filter(|f| !f.is_empty()) else {
+        warn_unremovable(remove_temp_files_with(fs, old_paths, roots));
+        return PolicyRefresh {
+            tracked: Some(Vec::new()),
+            results: Vec::new(),
+        };
     };
 
-    for reason in remove_temp_files_with(fs, old_paths, roots) {
+    let prepared = prepare_each(fs, files, creds, roots);
+    if prepared.iter().all(Result::is_err) {
+        let results = prepared
+            .into_iter()
+            .filter_map(Result::err)
+            .map(Refused::into_result)
+            .collect();
+        tracing::warn!("refusing a malformed policy file set; keeping the previous one");
+        return PolicyRefresh {
+            tracked: None,
+            results,
+        };
+    }
+
+    let mut tracked: Vec<String> = Vec::new();
+    let mut listed: HashSet<String> = HashSet::new();
+    let mut results = Vec::with_capacity(prepared.len());
+    for entry in prepared {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(refused) => {
+                tracing::warn!(
+                    reason = refused.reason,
+                    "skipping one policy file; the rest of the batch still lands"
+                );
+                results.push(refused.into_result());
+                continue;
+            }
+        };
+        let display = entry.resolved.display();
+        let landed = place_one(fs, &entry, creds);
+        let keep = landed.is_ok() || old_paths.contains(&display);
+        if keep && !tracked.contains(&display) {
+            tracked.push(display.clone());
+        }
+        results.push(match landed {
+            Ok(()) => PolicyFileResult::written(entry.requested),
+            Err(reason) => {
+                tracing::warn!(reason, "policy file not written; any previous one stays");
+                PolicyFileResult::failed(entry.requested, reason)
+            }
+        });
+        listed.insert(display);
+    }
+
+    let dropped: Vec<String> = old_paths
+        .iter()
+        .filter(|path| !listed.contains(path.as_str()))
+        .cloned()
+        .collect();
+    warn_unremovable(remove_temp_files_with(fs, &dropped, roots));
+    tracing::info!(count = tracked.len(), "placed policy files");
+    PolicyRefresh {
+        tracked: Some(tracked),
+        results,
+    }
+}
+
+fn warn_unremovable(reasons: Vec<String>) {
+    for reason in reasons {
         tracing::warn!(
             reason,
             "policy file left in place: it is no longer removable"
         );
     }
+}
 
-    let Some(prepared) = prepared else {
-        return Some(Vec::new());
-    };
-    match write_prepared_with(fs, &prepared) {
-        Ok(paths) => {
-            tracing::info!(count = paths.len(), "wrote policy files");
-            Some(paths)
-        }
-        Err(e) => {
-            // All-or-nothing: the rollback removed whatever this batch created,
-            // and the previous set went above, so nothing policy-written remains.
-            tracing::warn!("Failed to write policy files: {e}");
-            Some(Vec::new())
-        }
-    }
+/// What a policy refresh left on disk, and what became of each file the frame asked for.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PolicyRefresh {
+    /// `None` keeps the tracked set as it was; `Some` replaces it, empty included.
+    pub tracked: Option<Vec<String>>,
+    /// One per requested file, in the frame's order; empty when the frame named no files.
+    pub results: Vec<PolicyFileResult>,
 }
 
 /// The real-filesystem entry point for the refresh described below.
@@ -551,7 +598,7 @@ pub async fn refresh_policy_files(
     files: Option<&[TempFile]>,
     sandbox_creds: Option<&SandboxCredentials>,
     mounts: Option<Arc<MountPoints>>,
-) -> Option<Vec<String>> {
+) -> PolicyRefresh {
     refresh_policy_files_with(
         &RealTempFs,
         old_paths,
@@ -578,6 +625,7 @@ struct Prepared {
 }
 
 struct PreparedFile {
+    requested: String,
     resolved: ResolvedPath,
     bytes: Vec<u8>,
     mode: Option<u32>,
@@ -587,6 +635,7 @@ struct PreparedFile {
 impl std::fmt::Debug for PreparedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedFile")
+            .field("requested", &self.requested)
             .field("resolved", &self.resolved)
             .field("bytes", &Redacted)
             .field("mode", &self.mode)
@@ -611,22 +660,21 @@ impl std::fmt::Debug for PreparedFile {
 /// survives is refused, which is what keeps the previous set on disk.
 ///
 /// A dropped entry still costs its own previous file: [`refresh_policy_files_with`]
-/// removes the whole tracked set before it writes. That is the fail-closed side
-/// of the trade — a credential the new policy could not restate is deleted
-/// rather than left behind stale.
+/// lists it nowhere, so it is removed with the paths the new set dropped. That
+/// is the fail-closed side of the trade — a credential the new policy could not
+/// restate is deleted rather than left behind stale.
 fn prepare_with(
     fs: &dyn TempFs,
     files: &[TempFile],
     creds: Option<(u32, u32)>,
     roots: &FileRoots,
 ) -> Result<Prepared, String> {
-    let roots = roots.usable(fs, creds.map(|(uid, _)| uid));
     let mut entries = Vec::with_capacity(files.len());
     let mut refused = Vec::new();
-    for f in files {
-        match prepare_one(&roots, f, creds) {
+    for entry in prepare_each(fs, files, creds, roots) {
+        match entry {
             Ok(entry) => entries.push(entry),
-            Err(reason) => refused.push(reason),
+            Err(Refused { reason, .. }) => refused.push(reason),
         }
     }
 
@@ -645,12 +693,44 @@ fn prepare_with(
     })
 }
 
+/// An entry that could not be prepared, under the path the frame spelled.
+struct Refused {
+    requested: String,
+    reason: String,
+}
+
+impl Refused {
+    fn into_result(self) -> PolicyFileResult {
+        PolicyFileResult::failed(self.requested, self.reason)
+    }
+}
+
+/// Each entry of a batch prepared on its own, in the batch's order.
+fn prepare_each(
+    fs: &dyn TempFs,
+    files: &[TempFile],
+    creds: Option<(u32, u32)>,
+    roots: &FileRoots,
+) -> Vec<Result<PreparedFile, Refused>> {
+    let roots = roots.usable(fs, creds.map(|(uid, _)| uid));
+    files
+        .iter()
+        .map(|f| {
+            prepare_one(&roots, f, creds).map_err(|reason| Refused {
+                requested: f.path.clone(),
+                reason,
+            })
+        })
+        .collect()
+}
+
 fn prepare_one(
     roots: &FileRoots,
     f: &TempFile,
     creds: Option<(u32, u32)>,
 ) -> Result<PreparedFile, String> {
     Ok(PreparedFile {
+        requested: f.path.clone(),
         resolved: roots.resolve(&f.path)?,
         bytes: file_bytes(f)?,
         mode: f.mode,
@@ -711,7 +791,8 @@ fn write_temp_files_with(
 /// malformed batch keeps the previous set and returns nothing to the caller.
 /// Request files are tracked by the caller, live for one child process, and a
 /// malformed entry is that request's error to report — so this returns it.
-/// Same roots, same ownership hand-over, same all-or-nothing write.
+/// Same roots and ownership hand-over; unlike a policy refresh, the write is
+/// all-or-nothing and never replaces a file already at a path.
 pub fn write_temp_files(
     files: &[TempFile],
     sandbox_creds: Option<&SandboxCredentials>,
@@ -751,7 +832,7 @@ fn file_bytes(f: &TempFile) -> Result<Vec<u8>, String> {
         (Some(text), None) => Ok(text.as_bytes().to_vec()),
         (None, Some(encoded)) => base64::engine::general_purpose::STANDARD
             .decode(encoded)
-            .map_err(|e| format!("temp file contentB64 is not valid base64: {}: {e}", f.path)),
+            .map_err(|_| format!("temp file contentB64 is not valid base64: {}", f.path)),
         (None, None) => Err(format!(
             "temp file sets neither content nor contentB64: {}",
             f.path
@@ -903,21 +984,78 @@ fn write_one(
     let dir = walk_to_parent(fs, resolved, dir_components, workload)?;
 
     let file_mode = mode.unwrap_or(DEFAULT_FILE_MODE);
-    let mut file = dir
+    let file = dir
         .create_child_file(file_name, file_mode)
         .map_err(|e| format!("create {display}: {e}"))?;
+    fill(file, content, file_mode, file_owner, &display)?;
+    Ok(display)
+}
 
+/// Write a policy file to a staging sibling and rename it over its path.
+fn place_one(
+    fs: &dyn TempFs,
+    entry: &PreparedFile,
+    workload: Option<(u32, u32)>,
+) -> Result<(), String> {
+    let resolved = &entry.resolved;
+    let display = resolved.display();
+    let (file_name, dir_components) = resolved
+        .components
+        .split_last()
+        .ok_or_else(|| format!("temp file path is empty: {display}"))?;
+
+    let dir = walk_to_parent(fs, resolved, dir_components, workload)?;
+
+    let file_mode = entry.mode.unwrap_or(DEFAULT_FILE_MODE);
+    let (staged, file) = create_staged(dir.as_ref(), file_mode)
+        .map_err(|e| format!("create a staging file beside {display}: {e}"))?;
+    let landed = fill(file, &entry.bytes, file_mode, entry.file_owner, &display).and_then(|()| {
+        dir.rename_child(&staged, file_name)
+            .map_err(|e| format!("rename over {display}: {e}"))
+    });
+    if landed.is_err()
+        && let Err(e) = dir.unlink_child(&staged)
+    {
+        tracing::warn!(
+            staged = %staged.to_string_lossy(),
+            error = %e,
+            "could not remove the staging file of a policy file that did not land"
+        );
+    }
+    landed
+}
+
+/// Bounds the retries when a staging name is taken, as one the workload planted would be.
+const STAGING_ATTEMPTS: usize = 8;
+
+fn create_staged(dir: &dyn DirHandle, mode: u32) -> Result<(OsString, Box<dyn FileHandle>), Errno> {
+    for _ in 0..STAGING_ATTEMPTS {
+        let name = OsString::from(format!("{STAGING_PREFIX}{:016x}", rand::random::<u64>()));
+        match dir.create_child_file(&name, mode) {
+            Ok(file) => return Ok((name, file)),
+            Err(Errno::EEXIST) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Errno::EEXIST)
+}
+
+fn fill(
+    mut file: Box<dyn FileHandle>,
+    content: &[u8],
+    mode: u32,
+    file_owner: Option<(u32, u32)>,
+    display: &str,
+) -> Result<(), String> {
     file.write_all(content)
         .map_err(|e| format!("write {display}: {e}"))?;
-    file.chmod(file_mode)
+    file.chmod(mode)
         .map_err(|e| format!("chmod {display}: {e}"))?;
-
     if let Some((uid, gid)) = file_owner {
         file.chown(uid, gid)
             .map_err(|e| format!("chown {display}: {e}"))?;
     }
-
-    Ok(display)
+    Ok(())
 }
 
 /// Deliberately does not call [`FileRoots::usable`]: these paths are ones the
@@ -991,6 +1129,10 @@ impl DirHandle for RealDir {
             name.as_bytes(),
             nix::unistd::UnlinkatFlags::RemoveDir,
         )
+    }
+
+    fn rename_child(&self, from: &OsStr, to: &OsStr) -> Result<(), Errno> {
+        nix::fcntl::renameat(&self.0, from.as_bytes(), &self.0, to.as_bytes())
     }
 
     fn owner_uid(&self) -> Result<u32, Errno> {
@@ -1208,7 +1350,7 @@ mod tests {
             owner: None,
         }];
 
-        let tracked = refresh_policy_files_with(
+        let refresh = refresh_policy_files_with(
             &fs,
             &["/tmp/old.json".to_string()],
             Some(&malformed),
@@ -1217,9 +1359,12 @@ mod tests {
         );
 
         assert!(
-            tracked.is_none(),
+            refresh.tracked.is_none(),
             "a refused batch must not retrack anything"
         );
+        assert_eq!(refresh.results.len(), 1, "{:?}", refresh.results);
+        assert_eq!(refresh.results[0].path, "/tmp/bad.json");
+        assert!(!refresh.results[0].is_written());
         let events = rec.borrow().events.clone();
         assert!(
             !events.iter().any(|e| matches!(e, Event::Unlink(_))),
@@ -1229,11 +1374,8 @@ mod tests {
 
     #[test]
     fn a_dropped_entry_still_costs_its_previous_file() {
-        // The fail-closed half of the per-entry refusal. The batch restates
-        // aws.json and drops kube.json, and the removal runs over the whole
-        // tracked set before the write. Removing only what the new batch
-        // restates would leave a superseded credential on disk with nothing
-        // tracking it, so nothing would ever clean it up.
+        // The fail-closed half of the per-entry refusal: a credential the new
+        // policy could not restate is removed rather than left behind stale.
         let rec = Rc::new(RefCell::new(Recorder::default()));
         let fs = FakeTempFs::new(rec.clone());
         let files = vec![
@@ -1241,7 +1383,7 @@ mod tests {
             no_content("/tmp/kube.json"),
         ];
 
-        let tracked = refresh_policy_files_with(
+        let refresh = refresh_policy_files_with(
             &fs,
             &["/tmp/aws.json".to_string(), "/tmp/kube.json".to_string()],
             Some(&files),
@@ -1249,7 +1391,9 @@ mod tests {
             &tmp(),
         );
 
-        assert_eq!(tracked, Some(vec!["/tmp/aws.json".to_string()]));
+        assert_eq!(refresh.tracked, Some(vec!["/tmp/aws.json".to_string()]));
+        assert!(refresh.results[0].is_written());
+        assert!(!refresh.results[1].is_written());
         let unlinked: Vec<String> = rec
             .borrow()
             .events
@@ -1264,21 +1408,19 @@ mod tests {
             "the dropped entry's previous file must go too: {unlinked:?}"
         );
         assert!(
-            unlinked.contains(&"aws.json".to_string()),
-            "the restated entry is removed before it is rewritten: {unlinked:?}"
+            !unlinked.contains(&"aws.json".to_string()),
+            "the restated entry is replaced, never removed first: {unlinked:?}"
         );
     }
 
     #[test]
-    fn a_batch_that_fails_to_write_clears_the_tracked_set() {
-        // Here the removal did happen, and the rollback took back what this
-        // batch created, so nothing policy-written is left to track.
+    fn a_new_file_that_fails_to_write_is_not_tracked_and_a_dropped_one_still_goes() {
         let rec = Rc::new(RefCell::new(Recorder::default()));
         let mut fs = FakeTempFs::new(rec.clone());
         fs.write_err = Some(Errno::ENOSPC);
         let files = vec![file("/tmp/new.json", "x", None)];
 
-        let tracked = refresh_policy_files_with(
+        let refresh = refresh_policy_files_with(
             &fs,
             &["/tmp/old.json".to_string()],
             Some(&files),
@@ -1286,11 +1428,11 @@ mod tests {
             &tmp(),
         );
 
-        assert_eq!(tracked, Some(Vec::new()));
+        assert_eq!(refresh.tracked, Some(Vec::new()));
         let events = rec.borrow().events.clone();
         assert!(
-            events.iter().any(|e| matches!(e, Event::Unlink(_))),
-            "the previous set is removed before the write is attempted: {events:?}"
+            events.contains(&Event::Unlink("old.json".to_string())),
+            "a path the new set no longer lists is removed: {events:?}"
         );
     }
 
@@ -1300,7 +1442,7 @@ mod tests {
         let fs = FakeTempFs::new(rec.clone());
         let files = vec![file("/tmp/new.json", "x", None)];
 
-        let tracked = refresh_policy_files_with(
+        let refresh = refresh_policy_files_with(
             &fs,
             &["/tmp/old.json".to_string()],
             Some(&files),
@@ -1308,7 +1450,11 @@ mod tests {
             &tmp(),
         );
 
-        assert_eq!(tracked, Some(vec!["/tmp/new.json".to_string()]));
+        assert_eq!(refresh.tracked, Some(vec!["/tmp/new.json".to_string()]));
+        assert_eq!(
+            refresh.results,
+            vec![PolicyFileResult::written("/tmp/new.json")]
+        );
     }
 
     #[test]
@@ -1320,14 +1466,21 @@ mod tests {
         let fs = FakeTempFs::new(rec.clone());
 
         for files in [None, Some(&[][..])] {
-            let tracked = refresh_policy_files_with(
+            let refresh = refresh_policy_files_with(
                 &fs,
                 &["/tmp/old.json".to_string()],
                 files,
                 Some((1000, 2000)),
                 &tmp(),
             );
-            assert_eq!(tracked, Some(Vec::new()), "for {files:?}");
+            assert_eq!(
+                refresh,
+                PolicyRefresh {
+                    tracked: Some(Vec::new()),
+                    results: Vec::new(),
+                },
+                "for {files:?}"
+            );
         }
     }
 
@@ -1342,7 +1495,7 @@ mod tests {
         let fs = FakeTempFs::new(rec.clone());
         let files = vec![file("/tmp/new.json", "x", None)];
 
-        let tracked = refresh_policy_files_with(
+        let refresh = refresh_policy_files_with(
             &fs,
             &["/etc/passwd".to_string()],
             Some(&files),
@@ -1350,7 +1503,7 @@ mod tests {
             &tmp(),
         );
 
-        assert_eq!(tracked, Some(vec!["/tmp/new.json".to_string()]));
+        assert_eq!(refresh.tracked, Some(vec!["/tmp/new.json".to_string()]));
         let events = rec.borrow().events.clone();
         assert!(
             !events.iter().any(|e| matches!(e, Event::Unlink(_))),
@@ -1510,6 +1663,7 @@ mod tests {
         ChownDir(String, u32, u32),
         Unlink(String),
         RemoveDir(String),
+        Rename(String, String),
         OpenRoot(String),
     }
 
@@ -1530,6 +1684,12 @@ mod tests {
         chown_err: Option<Errno>,
         // If set, write returns this error.
         write_err: Option<Errno>,
+        // Writes of exactly these bytes fail with ENOSPC.
+        failing_writes: Vec<Vec<u8>>,
+        // If set, every file create returns this error.
+        create_err: Option<Errno>,
+        // If set, rename returns this error.
+        rename_err: Option<Errno>,
         // If set, opening a child directory returns this error.
         open_err: Option<Errno>,
         // Roots that cannot be opened, and the errno each fails with.
@@ -1552,6 +1712,9 @@ mod tests {
                 existing_dirs: Vec::new(),
                 chown_err: None,
                 write_err: None,
+                failing_writes: Vec::new(),
+                create_err: None,
+                rename_err: None,
                 open_err: None,
                 root_errs: std::collections::HashMap::new(),
                 dir_uid: 1000,
@@ -1570,6 +1733,9 @@ mod tests {
         existing_dirs: Vec<String>,
         chown_err: Option<Errno>,
         write_err: Option<Errno>,
+        failing_writes: Vec<Vec<u8>>,
+        create_err: Option<Errno>,
+        rename_err: Option<Errno>,
         open_err: Option<Errno>,
         dir_uid: u32,
         dir_uids: std::collections::HashMap<String, u32>,
@@ -1582,6 +1748,7 @@ mod tests {
         name: String,
         chown_err: Option<Errno>,
         write_err: Option<Errno>,
+        failing_writes: Vec<Vec<u8>>,
     }
 
     impl TempFs for FakeTempFs {
@@ -1599,6 +1766,9 @@ mod tests {
                 existing_dirs: self.existing_dirs.clone(),
                 chown_err: self.chown_err,
                 write_err: self.write_err,
+                failing_writes: self.failing_writes.clone(),
+                create_err: self.create_err,
+                rename_err: self.rename_err,
                 open_err: self.open_err,
                 dir_uid: self.dir_uid,
                 dir_uids: self.dir_uids.clone(),
@@ -1629,6 +1799,9 @@ mod tests {
                 existing_dirs: self.existing_dirs.clone(),
                 chown_err: self.chown_err,
                 write_err: self.write_err,
+                failing_writes: self.failing_writes.clone(),
+                create_err: self.create_err,
+                rename_err: self.rename_err,
                 open_err: self.open_err,
                 dir_uid: self.dir_uid,
                 dir_uids: self.dir_uids.clone(),
@@ -1654,6 +1827,9 @@ mod tests {
             if self.existing_files.contains(&n) {
                 return Err(Errno::EEXIST);
             }
+            if let Some(e) = self.create_err {
+                return Err(e);
+            }
             self.recorder
                 .borrow_mut()
                 .events
@@ -1663,12 +1839,24 @@ mod tests {
                 name: n,
                 chown_err: self.chown_err,
                 write_err: self.write_err,
+                failing_writes: self.failing_writes.clone(),
             }))
         }
 
         fn remove_child_dir(&self, name: &OsStr) -> Result<(), Errno> {
             let n = name.to_string_lossy().to_string();
             self.recorder.borrow_mut().events.push(Event::RemoveDir(n));
+            Ok(())
+        }
+
+        fn rename_child(&self, from: &OsStr, to: &OsStr) -> Result<(), Errno> {
+            if let Some(e) = self.rename_err {
+                return Err(e);
+            }
+            self.recorder.borrow_mut().events.push(Event::Rename(
+                from.to_string_lossy().to_string(),
+                to.to_string_lossy().to_string(),
+            ));
             Ok(())
         }
 
@@ -1717,6 +1905,9 @@ mod tests {
         fn write_all(&mut self, data: &[u8]) -> Result<(), Errno> {
             if let Some(e) = self.write_err {
                 return Err(e);
+            }
+            if self.failing_writes.iter().any(|bad| bad == data) {
+                return Err(Errno::ENOSPC);
             }
             self.recorder
                 .borrow_mut()
@@ -2723,6 +2914,261 @@ mod tests {
                 .events
                 .contains(&Event::Unlink("db".to_string()))
         );
+    }
+
+    fn refresh(fs: &FakeTempFs, old: &[&str], files: &[TempFile]) -> PolicyRefresh {
+        let old: Vec<String> = old.iter().map(|p| p.to_string()).collect();
+        refresh_policy_files_with(
+            fs,
+            &old,
+            Some(files),
+            Some((1000, 2000)),
+            &home_roots().on_mounts(trusted_mounts()),
+        )
+    }
+
+    fn staged_names(rec: &Rc<RefCell<Recorder>>) -> Vec<String> {
+        rec.borrow()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::CreateFile(name, _) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_refresh_renames_a_finished_sibling_over_the_file() {
+        // The file is never absent and never half-written: the workload sees the old content until the rename, then the new.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+
+        let result = refresh(
+            &fs,
+            &["/tmp/aws.json"],
+            &[file("/tmp/aws.json", "new", Some(0o400))],
+        );
+
+        assert_eq!(result.tracked, Some(vec!["/tmp/aws.json".to_string()]));
+        let staged = staged_names(&rec);
+        assert_eq!(staged.len(), 1, "{staged:?}");
+        let staged = staged[0].clone();
+        assert!(staged.starts_with(STAGING_PREFIX), "{staged}");
+        let events = rec.borrow().events.clone();
+        let tail: Vec<Event> = events
+            .iter()
+            .skip_while(|e| !matches!(e, Event::CreateFile(..)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                Event::CreateFile(staged.clone(), 0o400),
+                Event::Write(staged.clone(), b"new".to_vec()),
+                Event::Chmod(staged.clone(), 0o400),
+                Event::Chown(staged.clone(), 1000, 2000),
+                Event::Rename(staged, "aws.json".to_string()),
+            ],
+            "nothing is unlinked: the rename replaces the old file"
+        );
+    }
+
+    #[test]
+    fn a_refresh_removes_only_the_tracked_paths_it_no_longer_lists() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+
+        let result = refresh(
+            &fs,
+            &["/tmp/kept.json", "/tmp/dropped.json"],
+            &[file("/tmp/kept.json", "x", None)],
+        );
+
+        assert_eq!(result.tracked, Some(vec!["/tmp/kept.json".to_string()]));
+        let events = rec.borrow().events.clone();
+        assert!(events.contains(&Event::Unlink("dropped.json".to_string())));
+        assert!(!events.contains(&Event::Unlink("kept.json".to_string())));
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_previous_file_and_says_why() {
+        // A secret whose refresh fails must stay the working secret, not vanish.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.failing_writes.push(b"rotated".to_vec());
+
+        let result = refresh(
+            &fs,
+            &["/tmp/db", "/tmp/api"],
+            &[
+                file("/tmp/db", "rotated", None),
+                file("/tmp/api", "fine", None),
+            ],
+        );
+
+        assert_eq!(
+            result.tracked,
+            Some(vec!["/tmp/db".to_string(), "/tmp/api".to_string()]),
+            "the failed file is still ours on disk"
+        );
+        assert_eq!(result.results[0].path, "/tmp/db");
+        match &result.results[0].outcome {
+            crate::protocol::PolicyFileOutcome::Failed(reason) => {
+                assert!(reason.contains("write /tmp/db"), "{reason}");
+                assert!(!reason.contains("rotated"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(result.results[1], PolicyFileResult::written("/tmp/api"));
+        let events = rec.borrow().events.clone();
+        assert!(
+            !events.contains(&Event::Unlink("db".to_string())),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Rename(_, to) if to == "db")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_unlinks_its_staging_file() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.failing_writes.push(b"x".to_vec());
+
+        refresh(&fs, &[], &[file("/tmp/db", "x", None)]);
+
+        let staged = staged_names(&rec);
+        assert_eq!(staged.len(), 1, "{staged:?}");
+        assert!(
+            rec.borrow()
+                .events
+                .contains(&Event::Unlink(staged[0].clone()))
+        );
+    }
+
+    #[test]
+    fn a_failed_rename_unlinks_its_staging_file_and_says_why() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.rename_err = Some(Errno::EISDIR);
+
+        let result = refresh(&fs, &["/tmp/db"], &[file("/tmp/db", "x", None)]);
+
+        assert_eq!(result.tracked, Some(vec!["/tmp/db".to_string()]));
+        assert!(!result.results[0].is_written());
+        let staged = staged_names(&rec);
+        assert!(
+            rec.borrow()
+                .events
+                .contains(&Event::Unlink(staged[0].clone()))
+        );
+    }
+
+    #[test]
+    fn a_staging_name_that_stays_taken_fails_the_file_and_not_the_frame() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.create_err = Some(Errno::EEXIST);
+
+        let result = refresh(&fs, &[], &[file("/tmp/db", "x", None)]);
+
+        assert_eq!(result.tracked, Some(Vec::new()));
+        assert!(!result.results[0].is_written());
+        assert_eq!(staged_names(&rec).len(), 0);
+    }
+
+    #[test]
+    fn a_file_the_workload_left_at_a_home_path_is_replaced() {
+        // A persistent home can hold a file at the path from an earlier run; the policy file wins over it.
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let mut fs = FakeTempFs::new(rec.clone());
+        fs.existing_dirs.push(".provider".to_string());
+        fs.existing_files.push("config".to_string());
+
+        let result = refresh(&fs, &[], &[file("~/.provider/config", "x", None)]);
+
+        assert_eq!(
+            result.results,
+            vec![PolicyFileResult::written("~/.provider/config")]
+        );
+        assert_eq!(
+            result.tracked,
+            Some(vec!["/home/sandbox/.provider/config".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_refused_secret_costs_only_itself() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+
+        let result = refresh(
+            &fs,
+            &[],
+            &[
+                file("/run/secrets/db", "hunter2", Some(0o400)),
+                file("/tmp/aws.json", "x", None),
+            ],
+        );
+
+        assert_eq!(result.tracked, Some(vec!["/tmp/aws.json".to_string()]));
+        assert_eq!(result.results[0].path, "/run/secrets/db");
+        assert!(!result.results[0].is_written());
+        assert!(result.results[1].is_written());
+    }
+
+    #[test]
+    fn a_result_names_the_path_as_the_frame_spelled_it() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+
+        let result = refresh(&fs, &[], &[file("aws.json", "x", None)]);
+
+        assert_eq!(result.results, vec![PolicyFileResult::written("aws.json")]);
+        assert_eq!(result.tracked, Some(vec!["/tmp/aws.json".to_string()]));
+    }
+
+    #[test]
+    fn invalid_base64_is_refused_without_echoing_any_of_it() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = FakeTempFs::new(rec.clone());
+        let entry = TempFile {
+            path: "/tmp/db".to_string(),
+            content: None,
+            content_b64: Some("hun!er2".to_string()),
+            mode: None,
+            owner: None,
+        };
+
+        let result = refresh(&fs, &[], &[entry]);
+
+        let shown = format!("{:?}", result.results);
+        assert!(shown.contains("contentB64"), "{shown}");
+        assert!(!shown.contains('!') && !shown.contains("33"), "{shown}");
+    }
+
+    #[test]
+    fn a_real_rename_replaces_a_symlink_at_the_target_without_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "untouched").unwrap();
+        std::fs::create_dir(dir.path().join("root")).unwrap();
+        std::fs::write(dir.path().join("root/.staged"), "new").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("root/target")).unwrap();
+
+        let root = RealTempFs.open_root(&dir.path().join("root")).unwrap();
+        root.rename_child(OsStr::new(".staged"), OsStr::new("target"))
+            .unwrap();
+
+        let target = dir.path().join("root/target");
+        assert!(target.symlink_metadata().unwrap().file_type().is_file());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
     }
 
     #[test]
