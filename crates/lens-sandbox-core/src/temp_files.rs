@@ -161,6 +161,13 @@ impl FileRoots {
         }
     }
 
+    /// A request file never lands under `/run/secrets`, which holds only what a policy frame delivers.
+    fn for_requests(sandbox_creds: Option<&SandboxCredentials>) -> Self {
+        let mut roots = Self::for_sandbox(sandbox_creds);
+        roots.roots.retain(|r| r.kind != RootKind::Secrets);
+        roots
+    }
+
     fn on_mounts(mut self, mounts: Option<Arc<MountPoints>>) -> Self {
         self.mounts = mounts;
         self
@@ -272,8 +279,7 @@ impl FileRoots {
             }
         }
 
-        let root = best
-            .ok_or_else(|| format!("temp file path is outside the allowed roots: {requested}"))?;
+        let root = best.ok_or_else(|| outside_the_roots(&absolute, requested))?;
         let components = absolute[root.components.len()..].to_vec();
         if root.kind == RootKind::Secrets && components.len() != 1 {
             return Err(format!(
@@ -318,6 +324,16 @@ impl FileRoots {
 
         join(self.primary(), bytes, requested)
     }
+}
+
+fn outside_the_roots(absolute: &[OsString], requested: &str) -> String {
+    let secrets = Root::fixed(SECRETS_ROOT, RootKind::Secrets).components;
+    if absolute.starts_with(&secrets) {
+        return format!(
+            "temp file path is outside the allowed roots: {requested} ({SECRETS_ROOT} takes only policy-frame files)"
+        );
+    }
+    format!("temp file path is outside the allowed roots: {requested}")
 }
 
 /// An allowed root plus the safe, root-relative component sequence beneath it.
@@ -791,8 +807,9 @@ fn write_temp_files_with(
 /// malformed batch keeps the previous set and returns nothing to the caller.
 /// Request files are tracked by the caller, live for one child process, and a
 /// malformed entry is that request's error to report — so this returns it.
-/// Same roots and ownership hand-over; unlike a policy refresh, the write is
-/// all-or-nothing and never replaces a file already at a path.
+/// Same roots and ownership hand-over, except `/run/secrets`, which takes only
+/// policy-frame files; unlike a policy refresh, the write is all-or-nothing and
+/// never replaces a file already at a path.
 pub fn write_temp_files(
     files: &[TempFile],
     sandbox_creds: Option<&SandboxCredentials>,
@@ -801,7 +818,7 @@ pub fn write_temp_files(
         &RealTempFs,
         files,
         raw_creds(sandbox_creds),
-        &FileRoots::for_sandbox(sandbox_creds),
+        &FileRoots::for_requests(sandbox_creds),
     )
 }
 
@@ -813,7 +830,8 @@ pub fn write_temp_files(
 /// resolves is left in place and said so, not treated as an error — the file
 /// was this process's own, and refusing the rest over one would strand more.
 pub fn remove_temp_files(paths: &[String], sandbox_creds: Option<&SandboxCredentials>) {
-    for reason in remove_temp_files_with(&RealTempFs, paths, &FileRoots::for_sandbox(sandbox_creds))
+    for reason in
+        remove_temp_files_with(&RealTempFs, paths, &FileRoots::for_requests(sandbox_creds))
     {
         tracing::warn!(reason, "temp file left in place: it is no longer removable");
     }
@@ -2786,12 +2804,22 @@ mod tests {
     }
 
     fn write_secret(fs: &FakeTempFs, path: &str) -> Result<Vec<String>, String> {
-        write_temp_files_with(
+        place_secret(fs, path, &tmp().on_mounts(trusted_mounts()))
+    }
+
+    /// A secret goes through the policy refresh, the only path that may place a file under `/run/secrets`.
+    fn place_secret(fs: &FakeTempFs, path: &str, roots: &FileRoots) -> Result<Vec<String>, String> {
+        let refresh = refresh_policy_files_with(
             fs,
-            &[file(path, "hunter2", Some(0o400))],
+            &[],
+            Some(&[file(path, "hunter2", Some(0o400))]),
             Some((1000, 2000)),
-            &tmp().on_mounts(trusted_mounts()),
-        )
+            roots,
+        );
+        match &refresh.results[0].outcome {
+            crate::protocol::PolicyFileOutcome::Written => Ok(refresh.tracked.unwrap_or_default()),
+            crate::protocol::PolicyFileOutcome::Failed(reason) => Err(reason.clone()),
+        }
     }
 
     fn assert_refused_secret(fs: &FakeTempFs, rec: &Rc<RefCell<Recorder>>, reason: &str) {
@@ -2809,13 +2837,18 @@ mod tests {
         let written = write_secret(&fs, "/run/secrets/db").unwrap();
 
         assert_eq!(written, vec!["/run/secrets/db"]);
+        let staged = staged_names(&rec)[0].clone();
         let events = rec.borrow().events.clone();
         assert!(
-            events.contains(&Event::Chmod("db".to_string(), 0o400)),
+            events.contains(&Event::Chmod(staged.clone(), 0o400)),
             "{events:?}"
         );
         assert!(
-            events.contains(&Event::Chown("db".to_string(), 1000, 2000)),
+            events.contains(&Event::Chown(staged.clone(), 1000, 2000)),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&Event::Rename(staged, "db".to_string())),
             "{events:?}"
         );
         assert!(
@@ -2865,13 +2898,7 @@ mod tests {
     fn a_secret_is_refused_when_no_mounts_were_trusted() {
         let rec = Rc::new(RefCell::new(Recorder::default()));
         let fs = secrets_fs(&rec);
-        let err = write_temp_files_with(
-            &fs,
-            &[file("/run/secrets/db", "hunter2", None)],
-            Some((1000, 2000)),
-            &tmp(),
-        )
-        .unwrap_err();
+        let err = place_secret(&fs, "/run/secrets/db", &tmp()).unwrap_err();
         assert!(err.contains("no trusted mounts"), "{err}");
         assert_nothing_created(&rec);
     }
@@ -2885,6 +2912,29 @@ mod tests {
         assert!(tmp().resolve("/run/secrets").is_err());
         assert!(tmp().resolve("/run/other").is_err());
         assert_nothing_created(&rec);
+    }
+
+    #[test]
+    fn a_request_file_is_refused_under_the_policy_frame_only_secrets_root() {
+        let rec = Rc::new(RefCell::new(Recorder::default()));
+        let fs = secrets_fs(&rec);
+        let roots = FileRoots::for_requests(None).on_mounts(trusted_mounts());
+
+        let err = write_temp_files_with(
+            &fs,
+            &[file("/run/secrets/db", "hunter2", None)],
+            Some((1000, 2000)),
+            &roots,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("outside the allowed roots"), "{err}");
+        assert!(
+            err.contains("/run/secrets takes only policy-frame files"),
+            "{err}"
+        );
+        assert_nothing_created(&rec);
+        assert!(roots.resolve("/tmp/db").is_ok());
     }
 
     #[test]
