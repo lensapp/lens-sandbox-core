@@ -4672,6 +4672,8 @@ pub(crate) mod tests {
     /// A `forward` route, end to end. Its own file: this one is long enough.
     #[path = "forward_tests.rs"]
     mod forward;
+    #[path = "signed_door_tests.rs"]
+    mod signed_door;
     use crate::blocked::BlockReason;
     use crate::blocked::tests::assert_blocked;
 
@@ -4947,6 +4949,12 @@ pub(crate) mod tests {
         },
         /// `name` resolves to `to` as well as any literal, and no dial is answered.
         Resolving { name: &'static str, to: IpAddr },
+        /// `name` resolves to `target`, and a dial there reaches `origin`.
+        Serving {
+            name: &'static str,
+            target: SocketAddr,
+            origin: SocketAddr,
+        },
     }
 
     #[async_trait::async_trait]
@@ -4954,6 +4962,7 @@ pub(crate) mod tests {
         async fn resolve(&self, host: &str, port: u16) -> std::io::Result<SocketAddr> {
             let literal = match self {
                 Self::Resolving { name, to } if *name == host => Ok(*to),
+                Self::Serving { name, target, .. } if *name == host => Ok(target.ip()),
                 _ => host
                     .trim_start_matches('[')
                     .trim_end_matches(']')
@@ -4971,7 +4980,9 @@ pub(crate) mod tests {
 
         async fn connect(&self, resolved: SocketAddr) -> std::io::Result<TcpStream> {
             match self {
-                Self::Reaching { target, origin } if *target == resolved => {
+                Self::Reaching { target, origin } | Self::Serving { target, origin, .. }
+                    if *target == resolved =>
+                {
                     TcpStream::connect(origin).await
                 }
                 _ if resolved.ip().is_loopback() => TcpStream::connect(resolved).await,
