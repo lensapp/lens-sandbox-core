@@ -206,7 +206,7 @@ pub enum LlmFormat {
 }
 
 /// Network policy controlling what the sandbox can reach.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicy {
     /// **Deprecated** — use [`egress.http`](Egress::http). Accepted as a
@@ -253,7 +253,7 @@ pub struct NetworkPolicy {
 /// every `tcp` rule carries a port, the two lists can describe the same host
 /// without colliding: `db.internal:5432` in `tcp` leaves `db.internal:443` to
 /// `http`. An overlap on the same port is allowed, and logged at load.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Egress {
     /// Application-layer (hostname + HTTP/TLS) route rules, first match wins.
@@ -284,12 +284,13 @@ pub struct Egress {
     /// of every policy that allows by default.
     ///
     /// [`default_verdict`]: NetworkPolicy::default_verdict
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("default" = []))]
     pub udp: Vec<UdpEgressRule>,
 }
 
 /// A single first-match-wins raw-TCP egress rule.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TcpEgressRule {
     /// Destination as `ip:port`, `cidr:port`, or `hostname:port` (e.g.
@@ -334,7 +335,7 @@ pub struct TcpEgressRule {
 /// - [`binaries`](Self::binaries) needs the sending socket to still be open when
 ///   the datagram is judged. A program that sends and exits at once (statsd,
 ///   syslog) cannot be identified, and fails closed.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UdpEgressRule {
     /// Destination as `ip:port`, `cidr:port`, or `hostname:port`. A port is
@@ -406,7 +407,7 @@ pub enum Scheme {
 }
 
 /// A single first-match-wins route rule.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteRule {
     /// Domain pattern, wildcard (*.github.com), CIDR (10.0.0.0/8), or host:port.
@@ -430,7 +431,8 @@ pub struct RouteRule {
     pub description: Option<String>,
 
     /// When true, the proxy terminates client TLS and forwards through the tunnel.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
     pub tls_terminate: bool,
 
     /// Forwarding config for tunnel-routed connections (mTLS bridge).
@@ -440,7 +442,8 @@ pub struct RouteRule {
 
     /// HTTP-level rules. When present, only matching requests are allowed (deny-by-default).
     /// When absent or empty, all HTTP requests to this destination are allowed.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("default" = []))]
     pub rules: Vec<HttpRule>,
 
     /// Restrict this rule to connections initiated by specific binaries.
@@ -777,7 +780,7 @@ impl std::fmt::Display for GraphqlOperationType {
 }
 
 /// TLS bridge forwarding config for tunnel-routed connections.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ForwardConfig {
     /// Address to dial through the tunnel.
@@ -804,7 +807,7 @@ pub struct ForwardConfig {
 /// A credential delivered to the sandbox. The credential shape is uniform
 /// — what differs is HOW each of its [`injections`](Self::injections) is
 /// applied at the MITM (see [`CredentialInjection`]).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Credential {
     /// Credential identifier.
@@ -851,7 +854,7 @@ pub struct Credential {
 ///   each API domain that replaces the placeholder with the real token.
 /// - **`oauthRefreshAnswer`**: the same answer for an OAuth 2.0 refresh-token
 ///   request (RFC 6749 §6) that carries a placeholder refresh token.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(
     tag = "injectionType",
     rename_all = "camelCase",
@@ -873,7 +876,8 @@ pub enum CredentialInjection {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body_value: Option<String>,
         /// Optional path rules. When empty, inject for all requests.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[schemars(extend("default" = []))]
         rules: Vec<HttpRequestMatch>,
     },
     UriPlaceholder {
@@ -882,7 +886,8 @@ pub enum CredentialInjection {
         /// Resolved credential value used for URI rewriting.
         value: String,
         /// Optional path rules. When empty, rewrite for all requests.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[schemars(extend("default" = []))]
         rules: Vec<HttpRequestMatch>,
     },
     /// Re-signs every request to [`domain`](Self::AwsSigv4::domain). This
@@ -963,6 +968,111 @@ impl CredentialInjection {
             }
             _ => None,
         }
+    }
+}
+
+/// Stands in for a secret wherever it would be printed, and says whether one is armed.
+struct Secret<'a>(&'a str);
+
+impl std::fmt::Debug for Secret<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_empty() {
+            "<unarmed>"
+        } else {
+            "<redacted>"
+        })
+    }
+}
+
+/// Hand-written so no log of a policy prints a credential: every value the
+/// proxy substitutes or hands out renders as `<redacted>`, or `<unarmed>`
+/// while it is empty.
+impl std::fmt::Debug for CredentialInjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Header {
+                domain,
+                header,
+                value,
+                body_field,
+                body_value,
+                rules,
+            } => f
+                .debug_struct("Header")
+                .field("domain", domain)
+                .field("header", header)
+                .field("value", &Secret(value))
+                .field("body_field", body_field)
+                .field("body_value", &body_value.as_deref().map(Secret))
+                .field("rules", rules)
+                .finish(),
+            Self::UriPlaceholder {
+                domain,
+                value,
+                rules,
+            } => f
+                .debug_struct("UriPlaceholder")
+                .field("domain", domain)
+                .field("value", &Secret(value))
+                .field("rules", rules)
+                .finish(),
+            Self::AwsSigv4 {
+                domain,
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => f
+                .debug_struct("AwsSigv4")
+                .field("domain", domain)
+                .field("access_key_id", &Secret(access_key_id))
+                .field("secret_access_key", &Secret(secret_access_key))
+                .field("session_token", &Secret(session_token))
+                .finish(),
+            Self::OauthTokenAnswer {
+                domain,
+                path,
+                client_id,
+                scope,
+                access_token,
+                expires_in,
+            } => f
+                .debug_struct("OauthTokenAnswer")
+                .field("domain", domain)
+                .field("path", path)
+                .field("client_id", client_id)
+                .field("scope", scope)
+                .field("access_token", &Secret(access_token))
+                .field("expires_in", expires_in)
+                .finish(),
+            Self::OauthRefreshAnswer {
+                domain,
+                path,
+                refresh_token,
+                access_token,
+                expires_in,
+            } => f
+                .debug_struct("OauthRefreshAnswer")
+                .field("domain", domain)
+                .field("path", path)
+                .field("refresh_token", &Secret(refresh_token))
+                .field("access_token", &Secret(access_token))
+                .field("expires_in", expires_in)
+                .finish(),
+        }
+    }
+}
+
+/// The client key never renders, so a log of a route cannot leak it.
+impl std::fmt::Debug for ForwardConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForwardConfig")
+            .field("dial_addr", &self.dial_addr)
+            .field("tls_server_name", &self.tls_server_name)
+            .field("upstream_host_header", &self.upstream_host_header)
+            .field("cert_pem", &self.cert_pem)
+            .field("key_pem", &crate::protocol::Redacted)
+            .field("ca_pem", &self.ca_pem)
+            .finish()
     }
 }
 
@@ -1190,6 +1300,116 @@ mod tests {
             creds[0].injections[0],
             CredentialInjection::AwsSigv4 { .. }
         ));
+    }
+
+    #[test]
+    fn no_debug_of_an_injection_prints_the_value_it_substitutes_or_hands_out() {
+        let injections = [
+            CredentialInjection::Header {
+                domain: "api.example.com".into(),
+                header: "Authorization".into(),
+                value: "Bearer sk-live".into(),
+                body_field: Some("token".into()),
+                body_value: Some("sk-live".into()),
+                rules: vec![],
+            },
+            CredentialInjection::UriPlaceholder {
+                domain: "api.example.com".into(),
+                value: "sk-live".into(),
+                rules: vec![],
+            },
+            CredentialInjection::AwsSigv4 {
+                domain: "*.amazonaws.com".into(),
+                access_key_id: "ASIA-sk-live".into(),
+                secret_access_key: "sk-live".into(),
+                session_token: "sk-live".into(),
+            },
+            CredentialInjection::OauthTokenAnswer {
+                domain: "login.example.com".into(),
+                path: "/token".into(),
+                client_id: "client-1".into(),
+                scope: String::new(),
+                access_token: "sk-live".into(),
+                expires_in: 60,
+            },
+            CredentialInjection::OauthRefreshAnswer {
+                domain: "login.example.com".into(),
+                path: "/token".into(),
+                refresh_token: "sk-live".into(),
+                access_token: "sk-live".into(),
+                expires_in: 60,
+            },
+        ];
+        for injection in injections {
+            let shown = format!("{injection:?}");
+            assert!(
+                shown.contains("example.com") || shown.contains("amazonaws.com"),
+                "{shown}"
+            );
+            assert!(shown.contains("<redacted>"), "{shown}");
+            assert!(!shown.contains("sk-live"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn the_debug_of_an_unarmed_injection_says_it_is_unarmed() {
+        let unarmed = CredentialInjection::UriPlaceholder {
+            domain: "api.example.com".into(),
+            value: String::new(),
+            rules: vec![],
+        };
+        assert!(format!("{unarmed:?}").contains("<unarmed>"));
+    }
+
+    #[test]
+    fn no_debug_of_a_credential_or_a_route_prints_its_secret() {
+        let credential = Credential {
+            id: "github".into(),
+            env_var: Some("GITHUB_TOKEN".into()),
+            placeholder: Some("ph-1".into()),
+            injections: vec![CredentialInjection::UriPlaceholder {
+                domain: "api.github.com".into(),
+                value: "sk-live".into(),
+                rules: vec![],
+            }],
+        };
+        let forward = ForwardConfig {
+            dial_addr: "10.0.0.1:443".into(),
+            tls_server_name: "svc".into(),
+            upstream_host_header: None,
+            cert_pem: "CERT".into(),
+            key_pem: "sk-live".into(),
+            ca_pem: None,
+        };
+        for shown in [format!("{credential:?}"), format!("{forward:?}")] {
+            assert!(!shown.contains("sk-live"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_route_and_an_injection_leave_out_what_they_leave_at_its_default() {
+        let route: RouteRule = serde_json::from_str(
+            r#"{"match":"api.example.com","verdict":"allow","transport":"direct"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&route).unwrap(),
+            r#"{"match":"api.example.com","verdict":"allow","transport":"direct"}"#
+        );
+        let egress: Egress = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&egress).unwrap(),
+            r#"{"http":[],"tcp":[]}"#
+        );
+        let injection = CredentialInjection::UriPlaceholder {
+            domain: "api.example.com".into(),
+            value: "v".into(),
+            rules: vec![],
+        };
+        assert_eq!(
+            serde_json::to_string(&injection).unwrap(),
+            r#"{"injectionType":"uriPlaceholder","domain":"api.example.com","value":"v"}"#
+        );
     }
 
     #[test]

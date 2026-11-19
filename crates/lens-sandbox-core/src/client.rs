@@ -841,6 +841,18 @@ fn resolve_default_verdict_transport(
 ///
 /// An absent block is the ordinary case and yields an empty table. Every other
 /// failure is the caller's cue to fail the policy closed.
+fn llm_routing(
+    section: Option<&crate::protocol::LlmSection>,
+) -> Result<crate::llm::LlmRouting, String> {
+    match section.map(|section| &section.0) {
+        None => Ok(crate::llm::LlmRouting::default()),
+        Some(crate::protocol::Section::Received(value)) => parse_llm_routing(value),
+        Some(crate::protocol::Section::Typed(policy)) => {
+            crate::llm::LlmRouting::from_policy(policy)
+        }
+    }
+}
+
 fn parse_llm_routing(value: &serde_json::Value) -> Result<crate::llm::LlmRouting, String> {
     if value.is_null() {
         return Ok(crate::llm::LlmRouting::default());
@@ -987,56 +999,7 @@ async fn write_policy_files(
 }
 
 async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> JudgedPolicy {
-    // Transport wrapper — adds server-only fields to the policy document.
-    // NetworkPolicy is kept as serde_json::Value for fault-tolerant route parsing
-    // (a single bad route should not reject the entire policy message).
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct PolicyMessage {
-        #[serde(default)]
-        proxy_upstream: Option<String>,
-        /// Kept loose so a bad value falls back to tunnel instead of dropping the message.
-        #[serde(default)]
-        proxy_upstream_plain_http: serde_json::Value,
-        #[serde(default)]
-        proxy_ca_cert: Option<String>,
-        #[serde(default)]
-        network: Option<NetworkPolicyRaw>,
-        #[serde(default)]
-        env: Option<HashMap<String, String>>,
-        #[serde(default)]
-        credentials: Option<Vec<crate::policy_schema::Credential>>,
-        /// Kept loose for the reason `network.egress` is: a malformed block must
-        /// fail closed, not abort the typed parse and leave the previous policy
-        /// installed.
-        #[serde(default)]
-        llm: serde_json::Value,
-        #[serde(default)]
-        files: Option<Vec<crate::protocol::TempFile>>,
-        #[serde(default)]
-        files_id: Option<String>,
-    }
-
-    // Loose deserialization — route lists stay as Value so individual route
-    // errors are handled gracefully in parse_proxy_routes / parse_tcp_egress.
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct NetworkPolicyRaw {
-        /// Deprecated. Read only when there is no `egress` block at all — an
-        /// `egress` block supersedes this list entirely.
-        #[serde(default)]
-        allowed_routes: serde_json::Value,
-        /// Kept loose (not `Option<EgressRaw>`): a malformed *shape* (a
-        /// non-object `egress`) must fail closed via `force_deny`, not abort the
-        /// whole typed `PolicyMessage` parse — which would silently retain the
-        /// previous policy. Shape is validated below.
-        #[serde(default)]
-        egress: serde_json::Value,
-        #[serde(default)]
-        default_verdict: Option<String>,
-        #[serde(default)]
-        default_transport: Option<String>,
-    }
+    use crate::protocol::{NetworkPolicyRaw, NetworkSection};
 
     // `deny_unknown_fields` because an absent `http` is a legitimate tcp-only
     // policy: a misspelled key would otherwise read as one, publishing zero
@@ -1165,15 +1128,25 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
         }
     }
 
-    let msg: PolicyMessage = match serde_json::from_str(raw_text) {
+    let msg: crate::protocol::PolicyFrame = match serde_json::from_str(raw_text) {
         Ok(m) => m,
         Err(e) => {
             tracing::error!("Failed to parse policy message: {e}");
             return JudgedPolicy::Malformed(e.to_string());
         }
     };
+    let network = match msg.network.map(NetworkSection::into_received).transpose() {
+        Ok(network) => network,
+        Err(e) => {
+            tracing::error!("Failed to parse policy message: {e}");
+            return JudgedPolicy::Malformed(e.to_string());
+        }
+    };
 
-    let mut policy_env = msg.env.unwrap_or_default();
+    let mut policy_env: HashMap<String, String> = msg
+        .env
+        .map(|env| env.into_iter().collect())
+        .unwrap_or_default();
 
     let Some(state) = proxy_state else {
         tracing::debug!("proxy not enabled — skipping proxy config from policy");
@@ -1229,7 +1202,7 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
     // An llm block the proxy cannot enforce fails the whole policy closed. A
     // route it ignored instead would let the sandbox reach the API the policy
     // meant to redirect, carrying the credential the policy meant to withhold.
-    let llm = match parse_llm_routing(&msg.llm) {
+    let llm = match llm_routing(msg.llm.as_ref()) {
         Ok(llm) => Some(Arc::new(llm)),
         Err(e) => {
             tracing::error!("invalid llm policy: {e}; clearing routes and forcing deny");
@@ -1237,7 +1210,7 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
         }
     };
 
-    match (llm, msg.network) {
+    match (llm, network) {
         (None, _) => force_deny(),
         (Some(llm), Some(network)) => {
             match parse_egress_tables(&network) {
@@ -1729,6 +1702,104 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PolicyFrameError::Malformed(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_network_section_that_is_not_an_object_is_a_frame_it_cannot_read() {
+        let state = test_host_state();
+        let frame = serde_json::json!({"type": "policy", "network": "deny"});
+        let err = apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PolicyFrameError::Malformed(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_default_verdict_that_is_not_text_is_a_frame_it_cannot_read() {
+        let state = test_host_state();
+        let frame = serde_json::json!({"type": "policy", "network": {"defaultVerdict": 5}});
+        let err = apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PolicyFrameError::Malformed(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_llm_block_the_proxy_cannot_enforce_fails_the_policy_closed() {
+        let state = test_host_state();
+        let frame = serde_json::json!({
+            "type": "policy",
+            "network": {"egress": {"http": []}, "defaultVerdict": "allow", "defaultTransport": "direct"},
+            "llm": {"routes": 5}
+        });
+        apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.policy.read().unwrap().default_verdict,
+            crate::routing::Verdict::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_a_sender_built_from_core_s_types_applies() {
+        use crate::policy_schema::{
+            Credential, CredentialInjection, Egress, NetworkPolicy, RouteRule, Transport, Verdict,
+        };
+        let state = test_host_state();
+        let frame = crate::protocol::PolicyFrame {
+            network: Some(
+                NetworkPolicy {
+                    allowed_routes: None,
+                    egress: Some(Egress {
+                        http: vec![RouteRule {
+                            match_pattern: "api.some-provider.example".into(),
+                            verdict: Verdict::Allow,
+                            transport: Transport::Direct,
+                            scheme: None,
+                            description: None,
+                            tls_terminate: false,
+                            forward: None,
+                            rules: Vec::new(),
+                            binaries: None,
+                        }],
+                        tcp: Vec::new(),
+                        udp: Vec::new(),
+                    }),
+                    default_verdict: Verdict::Deny,
+                    default_transport: Transport::Direct,
+                }
+                .into(),
+            ),
+            credentials: Some(vec![Credential {
+                id: "some-provider".into(),
+                env_var: Some("SOME_TOKEN".into()),
+                placeholder: Some("ph-1".into()),
+                injections: vec![CredentialInjection::UriPlaceholder {
+                    domain: "api.some-provider.example".into(),
+                    value: String::new(),
+                    rules: Vec::new(),
+                }],
+            }]),
+            env: Some(std::collections::BTreeMap::from([(
+                "PROJECT".to_string(),
+                "demo".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let applied = apply_policy_frame(&serde_json::to_string(&frame).unwrap(), &state)
+            .await
+            .unwrap();
+
+        assert_eq!(applied.env.get("PROJECT").map(String::as_str), Some("demo"));
+        assert_eq!(
+            applied.env.get("SOME_TOKEN").map(String::as_str),
+            Some("ph-1")
+        );
+        let policy = state.policy.read().unwrap();
+        assert_eq!(policy.routes.len(), 1);
+        assert_eq!(policy.default_verdict, crate::routing::Verdict::Deny);
     }
 
     /// The guest path keeps the files of the last good frame when a frame
