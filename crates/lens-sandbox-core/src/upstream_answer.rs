@@ -82,6 +82,39 @@ impl PendingAudit {
         let _ = held.tx.send(held.event.to_string());
     }
 
+    /// Send the record as a request that reached no origin: an `error` with
+    /// the proxy's own `status`, and `metadata` added to what it carries.
+    /// Returns whether there was a record to send.
+    pub(crate) fn failed(
+        &self,
+        status: u16,
+        metadata: serde_json::Map<String, serde_json::Value>,
+    ) -> bool {
+        let Some(mut held) = self.lock().take() else {
+            return false;
+        };
+        if let Some(event) = held.event.as_object_mut() {
+            event.insert("result".into(), "error".into());
+            event.insert("status_code".into(), status.into());
+            match event
+                .get_mut("metadata")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                Some(existing) => existing.extend(metadata),
+                None => {
+                    event.insert("metadata".into(), metadata.into());
+                }
+            }
+        }
+        let _ = held.tx.send(held.event.to_string());
+        true
+    }
+
+    /// Drop the record unsent: the request is audited by another record.
+    pub(crate) fn discard(&self) {
+        self.lock().take();
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Held>> {
         self.held
             .lock()
@@ -159,6 +192,39 @@ mod tests {
 
     const JSON_402: &str =
         "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\n\r\n";
+
+    #[test]
+    fn a_record_whose_request_reached_no_origin_is_sent_once_as_an_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let audit = PendingAudit::new(
+            tx,
+            serde_json::json!({ "result": "success", "metadata": { "mitm": true } }),
+        );
+        let mut reason = serde_json::Map::new();
+        reason.insert("reason".into(), "dial-failed".into());
+        assert!(audit.failed(502, reason));
+        drop(audit);
+        let sent: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({
+                "result": "error",
+                "status_code": 502,
+                "metadata": { "mitm": true, "reason": "dial-failed" },
+            })
+        );
+        assert!(rx.try_recv().is_err(), "the record is sent once");
+    }
+
+    #[test]
+    fn a_discarded_record_is_never_sent() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let audit = PendingAudit::new(tx, serde_json::json!({ "result": "success" }));
+        audit.discard();
+        assert!(!audit.failed(502, serde_json::Map::new()));
+        drop(audit);
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn only_a_4xx_json_answer_is_read() {

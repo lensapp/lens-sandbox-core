@@ -344,7 +344,13 @@ where
                 .await?;
                 connect_upstream_tls(target_stream, &host, None, None, ctx.extra_ca_certs).await
             };
-            let mut tls_upstream = dial().await?;
+            let mut tls_upstream = match dial().await {
+                Ok(upstream) => upstream,
+                Err(e) => {
+                    answer_failed_dial(&mut tls_client, &meta, ctx, e.as_ref()).await;
+                    return Err(e);
+                }
+            };
             write_request_head_and_body(&mut tls_upstream, &modified, &meta).await?;
             match &meta.redirect {
                 // The answer is in the backend's format and the sandbox is
@@ -403,6 +409,15 @@ where
                                 Some(&crate::blocked::SeenRequest::new(&meta.method, &meta.path)),
                                 ctx.actor,
                             );
+                        } else {
+                            // `dial_upstream_tunnel` has audited the failure
+                            // already; the client is still owed an answer.
+                            meta.audit.discard();
+                            tls_client
+                                .write_all(crate::proxy::BAD_GATEWAY_RESPONSE)
+                                .await
+                                .ok();
+                            tls_client.shutdown().await.ok();
                         }
                         return Err(e);
                     }
@@ -421,6 +436,41 @@ where
     }
 
     Ok(())
+}
+
+/// Tell the client the dial for its request failed, inside the session it sent
+/// the request in, and audit the request as the refusal or the failure it was
+/// rather than the success its record would otherwise say.
+async fn answer_failed_dial<C>(
+    tls_client: &mut C,
+    meta: &RequestMeta,
+    ctx: &MitmContext<'_>,
+    error: &(dyn std::error::Error + 'static),
+) where
+    C: AsyncWrite + Unpin,
+{
+    tracing::warn!(
+        target = %ctx.match_host,
+        method = %meta.method,
+        path = %meta.path,
+        error = %error,
+        "MITM upstream dial failed"
+    );
+    let head = format!("{} {} HTTP/1.1", meta.method, meta.path);
+    let (response, audit) =
+        crate::proxy::dial_failure_response(ctx.state.block_label(), error, ctx.match_host, &head);
+    // The request's own record carries the failure when there is one; it has
+    // gone already when an `llm` route redirected the request.
+    let recorded = audit == crate::proxy::DialAudit::Error(502)
+        && meta
+            .audit
+            .failed(502, crate::proxy::failed_dial_metadata(error));
+    if !recorded {
+        meta.audit.discard();
+        crate::proxy::audit_failed_dial(ctx.state, ctx.match_host, audit, error, ctx.actor);
+    }
+    tls_client.write_all(&response).await.ok();
+    tls_client.shutdown().await.ok();
 }
 
 /// Forward the request through an open tunnel and relay what comes back.

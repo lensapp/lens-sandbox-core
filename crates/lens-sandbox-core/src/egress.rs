@@ -12,8 +12,26 @@ use async_trait::async_trait;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 /// The sockets a judge dials with; the cage it runs in decides how they are built.
+///
+/// Every upstream dial of a door resolves through [`Self::resolve`] and opens
+/// its socket through [`Self::connect`], under the SSRF floor and the
+/// `egress.tcp` table, which run between the two. A host embedder that has a
+/// better resolver than the default can wrap [`HostEgress`], override only
+/// `resolve`, and hand `connect` and `bind_udp` to it, which keeps its refusal
+/// of the host's own addresses; see
+/// [`crate::proxy::ProxyState::for_host_with_egress`].
 #[async_trait]
 pub trait Egress: Send + Sync {
+    /// The address a dial to `host` on `port` goes to.
+    ///
+    /// The default is [`crate::resolver::resolve_first`]: one resolver per
+    /// process, built from `/etc/resolv.conf`, whose queries carry the
+    /// guest's socket mark. That is right inside the guest. On a host it does
+    /// not follow a change of the host's DNS servers, such as a VPN that
+    /// connects, and it does not see a resolver configured outside that file,
+    /// such as macOS split DNS; a host embedder overrides it.
+    ///
+    /// A door gives a resolve [`RESOLVE_TIMEOUT`] to answer.
     async fn resolve(&self, host: &str, port: u16) -> io::Result<SocketAddr> {
         crate::resolver::resolve_first(host, port).await
     }
@@ -23,6 +41,7 @@ pub trait Egress: Send + Sync {
 }
 
 /// A host that judges for a guest with plain sockets and refuses only the host's own addresses, so the embedder's network policy must close an address that forwards to the host.
+#[derive(Debug, Default, Clone, Copy)]
 pub struct HostEgress;
 
 #[async_trait]
@@ -92,7 +111,7 @@ pub async fn connect_tcp_resolve(
     host: &str,
     port: u16,
 ) -> io::Result<TcpStream> {
-    let resolved = egress.resolve(host, port).await?;
+    let resolved = resolve_within(RESOLVE_TIMEOUT, egress, host, port).await?;
     egress.connect(resolved).await
 }
 
@@ -123,7 +142,18 @@ pub async fn connect_tcp_egress_where(
     port: u16,
     admits: impl FnOnce(IpAddr) -> bool + Send,
 ) -> io::Result<TcpStream> {
-    let resolved = egress.resolve(host, port).await?;
+    connect_tcp_egress_within(RESOLVE_TIMEOUT, egress, host, port, admits).await
+}
+
+/// [`connect_tcp_egress_where`], giving the resolve `resolve_limit` to answer.
+pub(crate) async fn connect_tcp_egress_within(
+    resolve_limit: std::time::Duration,
+    egress: &dyn Egress,
+    host: &str,
+    port: u16,
+    admits: impl FnOnce(IpAddr) -> bool + Send,
+) -> io::Result<TcpStream> {
+    let resolved = resolve_within(resolve_limit, egress, host, port).await?;
     if is_disallowed_egress_ip(resolved.ip()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -134,14 +164,16 @@ pub async fn connect_tcp_egress_where(
 }
 
 /// [`connect_tcp_egress_where`] without the SSRF floor, for an address the
-/// server names and the workload cannot influence.
+/// server names and the workload cannot influence. The resolve has
+/// `resolve_limit` to answer.
 pub(crate) async fn connect_tcp_resolve_where(
+    resolve_limit: std::time::Duration,
     egress: &dyn Egress,
     host: &str,
     port: u16,
     admits: impl FnOnce(IpAddr) -> bool + Send,
 ) -> io::Result<TcpStream> {
-    let resolved = egress.resolve(host, port).await?;
+    let resolved = resolve_within(resolve_limit, egress, host, port).await?;
     dial_admitted(egress, resolved, admits).await
 }
 
@@ -161,6 +193,40 @@ async fn dial_admitted(
 
 /// How long an egress dial waits for the destination to answer before it fails as timed out.
 pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long an egress dial waits for its name to resolve before it fails as a
+/// DNS error.
+///
+/// A resolver that answers at all answers in milliseconds. One that does not
+/// is a resolver the host lost, such as the DNS server of a VPN that has just
+/// disconnected, and it would otherwise hold the client until the client's own
+/// timeout and then leave it with nothing to read. 10 s is the whole retry
+/// budget of the default resolver for one nameserver (two attempts of 5 s), so
+/// a slow resolver that still works is not cut off. A dial that resolves still
+/// has [`DIAL_TIMEOUT`] to connect, so a door answers a dead destination
+/// within 40 s at most, and a lost resolver within 10 s, with `502` and the
+/// `Proxy-Status` error type (`dns_error` for a resolve that timed out).
+pub const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`Egress::resolve`], failing as a DNS error when it has not answered within
+/// `limit`.
+pub(crate) async fn resolve_within(
+    limit: std::time::Duration,
+    egress: &dyn Egress,
+    host: &str,
+    port: u16,
+) -> io::Result<SocketAddr> {
+    tokio::time::timeout(limit, egress.resolve(host, port))
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                crate::resolver::ResolveFailed(format!(
+                    "resolve {host}: no answer within {limit:?}"
+                )),
+            ))
+        })
+}
 
 async fn dial_within<T>(
     limit: std::time::Duration,
@@ -271,6 +337,79 @@ mod tests {
         .expect("the dial gives up at its own limit");
         let error = outcome.expect_err("nothing answered");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+    }
+
+    /// A resolver that never answers.
+    struct Silent;
+
+    #[async_trait]
+    impl Egress for Silent {
+        async fn resolve(&self, _host: &str, _port: u16) -> io::Result<SocketAddr> {
+            std::future::pending().await
+        }
+        async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
+            HostEgress.connect(addr).await
+        }
+        async fn bind_udp(&self, local: SocketAddr) -> io::Result<UdpSocket> {
+            HostEgress.bind_udp(local).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resolve_nothing_answers_fails_as_a_dns_error_at_its_deadline() {
+        let outcome = tokio::time::timeout(
+            RESOLVE_TIMEOUT * 2,
+            connect_tcp_egress(&Silent, "api.example.test", 443),
+        )
+        .await
+        .expect("the dial gives up at the resolve deadline");
+        let error = outcome.expect_err("nothing answered");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<crate::resolver::ResolveFailed>()),
+            "a resolve that timed out is a DNS failure: {error:?}"
+        );
+    }
+
+    /// An embedder's resolver in front of [`HostEgress`], as a host that has a
+    /// better resolver than the default builds it.
+    struct Resolving(IpAddr);
+
+    #[async_trait]
+    impl Egress for Resolving {
+        async fn resolve(&self, _host: &str, port: u16) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::new(self.0, port))
+        }
+        async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
+            HostEgress.connect(addr).await
+        }
+        async fn bind_udp(&self, local: SocketAddr) -> io::Result<UdpSocket> {
+            HostEgress.bind_udp(local).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resolver_in_front_of_the_host_egress_keeps_the_floor_and_the_own_address_refusal() {
+        let floor = connect_tcp_egress(&Resolving(Ipv4Addr::LOCALHOST.into()), "a.test", 9)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal_of(&floor),
+            Some(EgressRefused::Floor("127.0.0.1:9".parse().unwrap())),
+            "{floor:?}"
+        );
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own = Resolving(Ipv4Addr::LOCALHOST.into())
+            .connect(l.local_addr().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refusal_of(&own), Some(EgressRefused::OwnAddress(_))),
+            "{own:?}"
+        );
     }
 
     #[tokio::test]
