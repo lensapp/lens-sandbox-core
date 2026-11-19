@@ -4674,6 +4674,8 @@ pub(crate) mod tests {
     mod forward;
     #[path = "signed_door_tests.rs"]
     mod signed_door;
+    #[path = "dial_failure_tests.rs"]
+    mod dial_failure;
     use crate::blocked::BlockReason;
     use crate::blocked::tests::assert_blocked;
 
