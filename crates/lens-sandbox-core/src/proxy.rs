@@ -307,6 +307,10 @@ pub struct ProxyState {
     /// handshake to the forward-proxy upstream before returning an error.
     /// Mutable for tests; production callers leave it at `UPSTREAM_CONNECT_TIMEOUT`.
     pub(crate) upstream_connect_timeout: std::sync::RwLock<Duration>,
+    /// How long an upstream dial waits for its name to resolve before the
+    /// door answers `502` with `dns_error`. Mutable for tests; production
+    /// callers leave it at [`crate::egress::RESOLVE_TIMEOUT`].
+    pub(crate) resolve_timeout: std::sync::RwLock<Duration>,
     /// How long a refused TLS session may take, from its ClientHello to the
     /// answer. Mutable for tests; production callers leave it at
     /// `blocked::DENIED_TUNNEL_TIMEOUT`.
@@ -703,9 +707,31 @@ impl ProxyState {
         ca: Arc<crate::ca::EphemeralCa>,
         bootstrap_dns_allowlist: Vec<String>,
     ) -> Arc<Self> {
-        let state = Self::new(
+        Self::for_host_with_egress(
+            ca,
             bootstrap_dns_allowlist,
             Arc::new(crate::egress::HostEgress),
+        )
+    }
+
+    /// [`Self::for_host`], dialling every upstream through `egress`.
+    ///
+    /// Each door resolves an upstream name with [`crate::egress::Egress::resolve`]
+    /// and opens the socket with [`crate::egress::Egress::connect`]; the SSRF
+    /// floor and the `egress.tcp` table run between the two whatever `egress`
+    /// is. An embedder that has a better resolver than the default, such as the
+    /// system resolver of a Mac, which follows a VPN and its split DNS, wraps
+    /// [`crate::egress::HostEgress`]: it overrides `resolve` and hands
+    /// `connect` and `bind_udp` to `HostEgress`, so the host's own addresses
+    /// stay refused.
+    pub fn for_host_with_egress(
+        ca: Arc<crate::ca::EphemeralCa>,
+        bootstrap_dns_allowlist: Vec<String>,
+        egress: Arc<dyn crate::egress::Egress>,
+    ) -> Arc<Self> {
+        let state = Self::new(
+            bootstrap_dns_allowlist,
+            egress,
             Arc::new(crate::ca::TrustStore::nowhere()),
         );
         let _ = state.ephemeral_ca.set(ca);
@@ -738,6 +764,7 @@ impl ProxyState {
             unarmed_credential_domains: RwLock::new(Vec::new()),
             decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
             upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
+            resolve_timeout: std::sync::RwLock::new(crate::egress::RESOLVE_TIMEOUT),
             denied_tunnel_timeout: std::sync::RwLock::new(crate::blocked::DENIED_TUNNEL_TIMEOUT),
             bootstrap_dns_allowlist: bootstrap_dns_allowlist
                 .into_iter()
@@ -1006,7 +1033,7 @@ const BAD_REQUEST_RESPONSE: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// What a client is told when the destination was admitted but could not be reached.
-const BAD_GATEWAY_RESPONSE: &[u8] =
+pub(crate) const BAD_GATEWAY_RESPONSE: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// What a `CONNECT` client is told when the dial to an admitted destination
@@ -1068,7 +1095,7 @@ fn failed_dial_response(target_host: &str, error: &std::io::Error) -> Vec<u8> {
 /// How a dial refused before it was made is audited: the reason, and the
 /// destination the event names.
 #[derive(Debug, PartialEq, Eq)]
-struct DialRefusal {
+pub(crate) struct DialRefusal {
     reason: &'static str,
     destination: String,
 }
@@ -1100,8 +1127,26 @@ async fn answer_failed_connect_dial(
     let (response, refused) =
         connect_dial_failure_response(state.block_label(), target_host, error);
     let audit = refused.map_or(DialAudit::Error(502), DialAudit::Refused);
-    audit_failed_dial(state, target_host, audit, actor);
+    audit_failed_dial(state, target_host, audit, error, actor);
     client.write_all(&response).await
+}
+
+/// The audit `metadata` of a request whose upstream dial failed: the reason,
+/// which no policy refusal uses, the RFC 9209 error type the client was told
+/// when it was told one, and what failed.
+pub(crate) fn failed_dial_metadata(
+    error: &(dyn std::error::Error + 'static),
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("reason".into(), "dial-failed".into());
+    if let Some(io) = error
+        .downcast_ref::<std::io::Error>()
+        .filter(|io| !is_tls_setup_failure(io))
+    {
+        metadata.insert("proxy_status".into(), dial_proxy_status_error(io).into());
+    }
+    metadata.insert("error".into(), error.to_string().into());
+    metadata
 }
 
 /// The facts every refusal on this door records, collected once.
@@ -1516,10 +1561,30 @@ async fn handle_http_forward(
             {
                 Ok(t) => t,
                 Err(e) => {
-                    emit_http_audit(state, target_host, method, &path, "error", 502, actor);
-                    client
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                        .await?;
+                    tracing::warn!(
+                        target = %target_host,
+                        error = %e,
+                        "HTTP forward proxy DIRECT dial failed"
+                    );
+                    // A dial the floor or an `egress.tcp` rule refused is a
+                    // refusal, as on the `CONNECT` door; anything else is a
+                    // `502` that says why.
+                    if let Some(refused) = dial_refusal(&e, target_host) {
+                        emit_policy_deny_connect(
+                            state,
+                            &refused.destination,
+                            refused.reason,
+                            actor,
+                        );
+                        refusal
+                            .refuse(&mut client, crate::blocked::BlockReason::PolicyDeny)
+                            .await?;
+                    } else {
+                        emit_failed_http_dial(state, target_host, method, &path, &e, actor);
+                        client
+                            .write_all(&failed_dial_response(target_host, &e))
+                            .await?;
+                    }
                     return Err(
                         format!("HTTP forward proxy direct connect to {target_host}: {e}").into(),
                     );
@@ -2433,7 +2498,7 @@ async fn handle_https_forward(
         let (response, audit) =
             dial_failure_response(state.block_label(), e.as_ref(), target_host, &header_str);
         client.write_all(&response).await.ok();
-        audit_failed_dial(state, target_host, audit, actor);
+        audit_failed_dial(state, target_host, audit, e.as_ref(), actor);
     }
     result
 }
@@ -2443,7 +2508,7 @@ async fn handle_https_forward(
 /// in `head` when the dial guard refused the address the name resolved to, as on
 /// the `CONNECT` door, or the upstream proxy refused the destination by its
 /// policy, else 502.
-fn dial_failure_response(
+pub(crate) fn dial_failure_response(
     label: Option<&str>,
     error: &(dyn std::error::Error + 'static),
     target_host: &str,
@@ -2489,20 +2554,40 @@ fn is_tls_setup_failure(error: &std::io::Error) -> bool {
 /// How a failed dial is audited: as the refusal it was, or as an error with
 /// the status the client was told.
 #[derive(Debug, PartialEq, Eq)]
-enum DialAudit {
+pub(crate) enum DialAudit {
     Refused(DialRefusal),
     Error(u16),
 }
 
-fn audit_failed_dial(
+/// Audit a dial to `target_host` that failed with `error`, as `audit` says: a
+/// refusal by the destination it refused, or an error that carries
+/// [`failed_dial_metadata`] when the client was told `502`.
+pub(crate) fn audit_failed_dial(
     state: &Arc<ProxyState>,
     target_host: &str,
     audit: DialAudit,
+    error: &(dyn std::error::Error + 'static),
     actor: &crate::peer_process::ActorContext,
 ) {
     match audit {
         DialAudit::Refused(refusal) => {
             emit_policy_deny_connect(state, &refusal.destination, refusal.reason, actor)
+        }
+        DialAudit::Error(502) => {
+            let host = extract_hostname(target_host);
+            emit_audit_action_with_metadata(
+                state,
+                "error",
+                502,
+                Some(failed_dial_metadata(error).into()),
+                RequestFacts {
+                    action: &format!("CONNECT {target_host}"),
+                    method: "CONNECT",
+                    host: &host,
+                    path: None,
+                },
+                actor,
+            );
         }
         DialAudit::Error(status) => emit_audit(state, target_host, "error", status, actor),
     }
@@ -2853,7 +2938,9 @@ pub(crate) async fn connect_egress_under_policy(
     already_gated: Gated,
 ) -> std::io::Result<TcpStream> {
     let port = extract_port(target_host, default_port);
-    crate::egress::connect_tcp_egress_where(
+    let resolve_limit = *state.resolve_timeout.read().unwrap();
+    crate::egress::connect_tcp_egress_within(
+        resolve_limit,
         state.egress.as_ref(),
         &extract_hostname(target_host),
         port,
@@ -2873,7 +2960,9 @@ pub(crate) async fn connect_forward_under_policy(
     caller: Option<&crate::peer_process::PeerProcess>,
 ) -> std::io::Result<TcpStream> {
     let port = extract_port(dial_addr, 443);
+    let resolve_limit = *state.resolve_timeout.read().unwrap();
     crate::egress::connect_tcp_resolve_where(
+        resolve_limit,
         state.egress.as_ref(),
         &extract_hostname(dial_addr),
         port,
@@ -3188,16 +3277,21 @@ async fn handle_raw_passthrough(
 
     // Raw TCP always egresses directly: SO_MARK bypasses the nftables cage and
     // the bytes are spliced through untouched.
-    let mut upstream = match crate::egress::connect_tcp_egress(
+    // A raw flow has no protocol to say a failure in, so dropping `stream`
+    // on the way out closes it at once.
+    let resolve_limit = *state.resolve_timeout.read().unwrap();
+    let mut upstream = match crate::egress::connect_tcp_egress_within(
+        resolve_limit,
         state.egress.as_ref(),
         &orig_dst.ip().to_string(),
         orig_dst.port(),
+        |_| true,
     )
     .await
     {
         Ok(s) => s,
         Err(e) => {
-            emit_audit(state, &raw_target, "error", 502, actor);
+            audit_failed_dial(state, &raw_target, DialAudit::Error(502), &e, actor);
             return Err(format!("passthrough connect to {raw_target}: {e}").into());
         }
     };
@@ -3433,12 +3527,10 @@ async fn http_forward_raw_passthrough(
         match connect_egress_under_policy(state, target_host, 80, actor.process(), gated).await {
             Ok(s) => s,
             Err(e) => {
-                emit_audit(state, target_host, "error", 502, actor);
-                client
-                .write_all(
-                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await?;
+                let (response, audit) =
+                    dial_failure_response(state.block_label(), &e, target_host, request_head);
+                audit_failed_dial(state, target_host, audit, &e, actor);
+                client.write_all(&response).await?;
                 return Err(format!("raw passthrough connect to {target_host}: {e}").into());
             }
         };
@@ -3499,7 +3591,7 @@ async fn https_forward_raw_passthrough(
         Err(e) => {
             let (response, audit) =
                 dial_failure_response(state.block_label(), e.as_ref(), target_host, request_head);
-            audit_failed_dial(state, target_host, audit, actor);
+            audit_failed_dial(state, target_host, audit, e.as_ref(), actor);
             client.write_all(&response).await?;
             return Err(format!("raw passthrough connect to {target_host}: {e}").into());
         }
@@ -4039,6 +4131,31 @@ pub(crate) fn emit_audit(
             method: "CONNECT",
             host: &host,
             path: None,
+        },
+        actor,
+    );
+}
+
+/// Audit a plain HTTP request whose upstream dial failed with `error`.
+fn emit_failed_http_dial(
+    state: &Arc<ProxyState>,
+    target_host: &str,
+    method: &str,
+    path: &str,
+    error: &std::io::Error,
+    actor: &crate::peer_process::ActorContext,
+) {
+    let host = extract_hostname(target_host);
+    emit_audit_action_with_metadata(
+        state,
+        "error",
+        502,
+        Some(failed_dial_metadata(error).into()),
+        RequestFacts {
+            action: &format!("{method} http://{target_host}{path}"),
+            method,
+            host: &host,
+            path: Some(path),
         },
         actor,
     );
@@ -4669,13 +4786,13 @@ pub(crate) fn extract_port(target: &str, default: u16) -> u16 {
 pub(crate) mod tests {
     use super::*;
 
+    #[path = "dial_failure_tests.rs"]
+    mod dial_failure;
     /// A `forward` route, end to end. Its own file: this one is long enough.
     #[path = "forward_tests.rs"]
     mod forward;
     #[path = "signed_door_tests.rs"]
     mod signed_door;
-    #[path = "dial_failure_tests.rs"]
-    mod dial_failure;
     use crate::blocked::BlockReason;
     use crate::blocked::tests::assert_blocked;
 
