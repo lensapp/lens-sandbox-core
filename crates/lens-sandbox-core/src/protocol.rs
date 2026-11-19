@@ -1,19 +1,23 @@
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::policy_schema::{Credential, LlmPolicy, NetworkPolicy};
 
 /// The protocol date this sandbox binary was built against (YYYY-MM-DD, zero-padded).
 /// Must be >= SANDBOX_MIN_PROTOCOL_DATE in packages/lens-sandbox/src/infra/sandbox-provisioner/types.ts.
 /// Bump to today's date in the same commit as any change to `policy_schema.rs`
 /// or the wire types in this file — an older sandbox must not accept a policy it
 /// cannot enforce.
-pub const SANDBOX_PROTOCOL_DATE: &str = "2026-11-12";
+pub const SANDBOX_PROTOCOL_DATE: &str = "2026-11-19";
 
 /// A file to write before executing a command.
 ///
 /// Exactly one of [`content`](Self::content) and
 /// [`content_b64`](Self::content_b64) must be set; an entry setting both is
 /// rejected and the whole batch fails closed.
-#[derive(Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TempFile {
     /// Path inside the sandbox. Absolute, relative to the primary allowed
@@ -32,6 +36,31 @@ pub struct TempFile {
     /// Who owns the delivered file. Absent means `workload`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<FileOwner>,
+}
+
+impl TempFile {
+    /// A file whose content is text, owned by the workload, with the default mode.
+    pub fn text(path: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            content: Some(content.into()),
+            content_b64: None,
+            mode: None,
+            owner: None,
+        }
+    }
+
+    /// A file whose content is arbitrary bytes, sent as `contentB64`.
+    pub fn bytes(path: impl Into<String>, content: &[u8]) -> Self {
+        use base64::Engine as _;
+        Self {
+            path: path.into(),
+            content: None,
+            content_b64: Some(base64::engine::general_purpose::STANDARD.encode(content)),
+            mode: None,
+            owner: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for TempFile {
@@ -370,10 +399,207 @@ impl CredentialPending {
 /// dialog. The decision gates whether the held request is forwarded; the
 /// real credential value, if any, arrives separately in a `policy` frame
 /// the host must send *before* this decision (see [`CredentialDecisionKind`]).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// A sender serializes it as `{"type":"credential_decision","id":…,"decision":…}`.
+/// The receiver dispatches on `type` before it reads this frame, so reading
+/// does not check it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename = "credential_decision")]
 pub struct CredentialDecision {
     pub id: String,
     pub decision: CredentialDecisionKind,
+}
+
+/// Host-to-guest frame that installs a policy: `{"type":"policy", …}`.
+///
+/// Every section is optional, and the receiver replaces each section a frame
+/// carries, so a section left out is not the same as an empty one. A sender
+/// builds `network` and `llm` from typed values. The receiver reads them
+/// loosely, so a bad section fails the policy closed instead of failing the
+/// parse and leaving the previous policy installed. The receiver dispatches on
+/// `type` before it reads this frame, so reading does not check it.
+#[derive(Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename = "policy", rename_all = "camelCase")]
+pub struct PolicyFrame {
+    /// The oldest protocol date (YYYY-MM-DD) a sandbox must speak to apply
+    /// this frame; see [`SANDBOX_PROTOCOL_DATE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_protocol_date: Option<String>,
+    /// URL of the upstream proxy, which may carry credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_upstream: Option<String>,
+    /// `"tunnel"` or `"forward"`; kept loose so a bad value falls back to
+    /// tunnel instead of dropping the frame.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub proxy_upstream_plain_http: serde_json::Value,
+    /// PEM of extra CA certificates the proxy trusts upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_ca_cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<Vec<Credential>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<TempFile>>,
+    /// Echoed in the [`PolicyFilesReport`] that answers a frame with `files`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_id: Option<String>,
+}
+
+/// The upstream URL and the env values may be secrets, so neither renders.
+impl std::fmt::Debug for PolicyFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicyFrame")
+            .field("min_protocol_date", &self.min_protocol_date)
+            .field(
+                "proxy_upstream",
+                &self.proxy_upstream.as_ref().map(|_| Redacted),
+            )
+            .field("proxy_upstream_plain_http", &self.proxy_upstream_plain_http)
+            .field("proxy_ca_cert", &self.proxy_ca_cert)
+            .field("network", &self.network)
+            .field("credentials", &self.credentials)
+            .field("env", &self.env.as_ref().map(EnvNames))
+            .field("llm", &self.llm)
+            .field("files", &self.files)
+            .field("files_id", &self.files_id)
+            .finish()
+    }
+}
+
+/// The names of an environment, each with its value redacted.
+struct EnvNames<'a>(&'a BTreeMap<String, String>);
+
+impl std::fmt::Debug for EnvNames<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|key| (key, Redacted)))
+            .finish()
+    }
+}
+
+/// A frame section as a sender built it, or as the receiver read it.
+#[derive(Clone)]
+pub(crate) enum Section<T, R> {
+    Typed(T),
+    Received(R),
+}
+
+impl<T: Serialize, R: Serialize> Serialize for Section<T, R> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Typed(typed) => typed.serialize(serializer),
+            Self::Received(received) => received.serialize(serializer),
+        }
+    }
+}
+
+/// Two sections are equal when they serialize to the same JSON, whichever side built them.
+impl<T: Serialize, R: Serialize> PartialEq for Section<T, R> {
+    fn eq(&self, other: &Self) -> bool {
+        match (serde_json::to_value(self), serde_json::to_value(other)) {
+            (Ok(mine), Ok(theirs)) => mine == theirs,
+            _ => false,
+        }
+    }
+}
+
+/// The `network` section of a [`PolicyFrame`].
+///
+/// The receiver reads it loosely: one bad route, a malformed `egress`, or an
+/// unknown default fails the policy closed rather than the frame.
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct NetworkSection(pub(crate) Section<NetworkPolicy, NetworkPolicyRaw>);
+
+impl From<NetworkPolicy> for NetworkSection {
+    fn from(policy: NetworkPolicy) -> Self {
+        Self(Section::Typed(policy))
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkSection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        NetworkPolicyRaw::deserialize(deserializer).map(|raw| Self(Section::Received(raw)))
+    }
+}
+
+impl NetworkSection {
+    /// The section in the loose shape the receiver judges.
+    pub(crate) fn into_received(self) -> Result<NetworkPolicyRaw, serde_json::Error> {
+        match self.0 {
+            Section::Received(raw) => Ok(raw),
+            Section::Typed(policy) => serde_json::from_value(serde_json::to_value(policy)?),
+        }
+    }
+}
+
+/// A received section may hold an mTLS key in a route's `forward`, so only its defaults render.
+impl std::fmt::Debug for NetworkSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Section::Typed(policy) => policy.fmt(f),
+            Section::Received(raw) => f
+                .debug_struct("NetworkPolicyRaw")
+                .field("default_verdict", &raw.default_verdict)
+                .field("default_transport", &raw.default_transport)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// The `network` section as the receiver reads it. Route lists stay JSON, so
+/// one bad route fails the policy closed in the route parse instead of the
+/// whole frame.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NetworkPolicyRaw {
+    /// Deprecated. Read only when there is no `egress` block at all — an
+    /// `egress` block supersedes this list entirely.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub(crate) allowed_routes: serde_json::Value,
+    /// Kept loose (not a typed egress): a malformed *shape* (a non-object
+    /// `egress`) must fail closed, not abort the whole frame parse — which
+    /// would silently retain the previous policy.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub(crate) egress: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_transport: Option<String>,
+}
+
+/// The `llm` section of a [`PolicyFrame`].
+///
+/// The receiver reads it loosely: a block the proxy cannot enforce fails the
+/// policy closed rather than the frame.
+#[derive(Clone, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct LlmSection(pub(crate) Section<LlmPolicy, serde_json::Value>);
+
+impl From<LlmPolicy> for LlmSection {
+    fn from(policy: LlmPolicy) -> Self {
+        Self(Section::Typed(policy))
+    }
+}
+
+impl<'de> Deserialize<'de> for LlmSection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde_json::Value::deserialize(deserializer).map(|raw| Self(Section::Received(raw)))
+    }
+}
+
+impl std::fmt::Debug for LlmSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Section::Typed(policy) => policy.fmt(f),
+            Section::Received(raw) => raw.fmt(f),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -665,5 +891,210 @@ mod tests {
         let d: CredentialDecision = serde_json::from_str(raw).unwrap();
         assert_eq!(d.id, "cred-1");
         assert_eq!(d.decision, CredentialDecisionKind::Allow);
+    }
+
+    #[test]
+    fn a_credential_decision_a_sender_writes_carries_its_frame_type_first() {
+        let decision = CredentialDecision {
+            id: "held-1".into(),
+            decision: CredentialDecisionKind::Deny,
+        };
+        let text = serde_json::to_string(&decision).unwrap();
+        assert_eq!(
+            text,
+            r#"{"type":"credential_decision","id":"held-1","decision":"deny"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<CredentialDecision>(&text).unwrap(),
+            decision
+        );
+    }
+
+    #[test]
+    fn an_empty_policy_frame_is_only_its_type() {
+        let text = serde_json::to_string(&PolicyFrame::default()).unwrap();
+        assert_eq!(text, r#"{"type":"policy"}"#);
+    }
+
+    #[test]
+    fn a_policy_frame_reads_without_its_type_as_the_receiver_always_has() {
+        let frame: PolicyFrame = serde_json::from_str(r#"{"env":{"A":"1"}}"#).unwrap();
+        assert_eq!(
+            frame.env,
+            Some(BTreeMap::from([("A".to_string(), "1".to_string())]))
+        );
+    }
+
+    fn header(domain: &str, value: &str) -> crate::policy_schema::CredentialInjection {
+        crate::policy_schema::CredentialInjection::Header {
+            domain: domain.into(),
+            header: "Authorization".into(),
+            value: value.into(),
+            body_field: None,
+            body_value: None,
+            rules: Vec::new(),
+        }
+    }
+
+    fn sender_frame() -> PolicyFrame {
+        use crate::policy_schema::{
+            CredentialInjection, Egress, RouteRule, TcpEgressRule, Transport, Verdict,
+        };
+        PolicyFrame {
+            proxy_ca_cert: Some("PEM".into()),
+            network: Some(
+                NetworkPolicy {
+                    allowed_routes: None,
+                    egress: Some(Egress {
+                        http: vec![RouteRule {
+                            match_pattern: "api.some-provider.example".into(),
+                            verdict: Verdict::Allow,
+                            transport: Transport::Direct,
+                            scheme: None,
+                            description: None,
+                            tls_terminate: false,
+                            forward: None,
+                            rules: Vec::new(),
+                            binaries: None,
+                        }],
+                        tcp: vec![TcpEgressRule {
+                            match_pattern: "db.internal:5432".into(),
+                            verdict: Verdict::Allow,
+                            binaries: None,
+                            description: None,
+                        }],
+                        udp: Vec::new(),
+                    }),
+                    default_verdict: Verdict::Deny,
+                    default_transport: Transport::Direct,
+                }
+                .into(),
+            ),
+            credentials: Some(vec![Credential {
+                id: "some-provider".into(),
+                env_var: Some("SOME_TOKEN".into()),
+                placeholder: Some("ph-1".into()),
+                injections: vec![
+                    header("api.some-provider.example", "Bearer real"),
+                    CredentialInjection::UriPlaceholder {
+                        domain: "api.some-provider.example".into(),
+                        value: "real".into(),
+                        rules: Vec::new(),
+                    },
+                    CredentialInjection::OauthTokenAnswer {
+                        domain: "login.some-provider.example".into(),
+                        path: "/token".into(),
+                        client_id: "client-1".into(),
+                        scope: String::new(),
+                        access_token: "ph-access".into(),
+                        expires_in: 3600,
+                    },
+                    CredentialInjection::OauthRefreshAnswer {
+                        domain: "login.some-provider.example".into(),
+                        path: "/token".into(),
+                        refresh_token: "ph-refresh".into(),
+                        access_token: "ph-access".into(),
+                        expires_in: 3600,
+                    },
+                ],
+            }]),
+            env: Some(BTreeMap::from([
+                ("B".to_string(), "2".to_string()),
+                ("A".to_string(), "1".to_string()),
+            ])),
+            files: Some(vec![
+                TempFile::text("~/.some-provider/config.json", "{}"),
+                TempFile {
+                    mode: Some(0o600),
+                    owner: Some(FileOwner::Root),
+                    ..TempFile::bytes("~/.some-provider/seal.bin", &[0, 1])
+                },
+            ]),
+            files_id: Some("3".into()),
+            ..PolicyFrame::default()
+        }
+    }
+
+    #[test]
+    fn a_sender_s_policy_frame_has_one_spelling_on_the_wire() {
+        let expected = concat!(
+            r#"{"type":"policy","proxyCaCert":"PEM","#,
+            r#""network":{"egress":{"#,
+            r#""http":[{"match":"api.some-provider.example","verdict":"allow","transport":"direct"}],"#,
+            r#""tcp":[{"match":"db.internal:5432","verdict":"allow"}]},"#,
+            r#""defaultVerdict":"deny","defaultTransport":"direct"},"#,
+            r#""credentials":[{"id":"some-provider","envVar":"SOME_TOKEN","placeholder":"ph-1","injections":["#,
+            r#"{"injectionType":"header","domain":"api.some-provider.example","header":"Authorization","value":"Bearer real"},"#,
+            r#"{"injectionType":"uriPlaceholder","domain":"api.some-provider.example","value":"real"},"#,
+            r#"{"injectionType":"oauthTokenAnswer","domain":"login.some-provider.example","path":"/token","clientId":"client-1","scope":"","accessToken":"ph-access","expiresIn":3600},"#,
+            r#"{"injectionType":"oauthRefreshAnswer","domain":"login.some-provider.example","path":"/token","refreshToken":"ph-refresh","accessToken":"ph-access","expiresIn":3600}]}],"#,
+            r#""env":{"A":"1","B":"2"},"#,
+            r#""files":[{"path":"~/.some-provider/config.json","content":"{}"},"#,
+            r#"{"path":"~/.some-provider/seal.bin","contentB64":"AAE=","mode":384,"owner":"root"}],"#,
+            r#""filesId":"3"}"#
+        );
+        assert_eq!(serde_json::to_string(&sender_frame()).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_policy_frame_reads_back_as_the_frame_its_sender_built() {
+        let frame = sender_frame();
+        let text = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<PolicyFrame>(&text).unwrap(), frame);
+    }
+
+    #[test]
+    fn a_typed_network_section_reads_as_the_loose_shape_the_receiver_judges() {
+        let received = sender_frame().network.unwrap().into_received().unwrap();
+        assert_eq!(received.default_verdict.as_deref(), Some("deny"));
+        assert_eq!(received.default_transport.as_deref(), Some("direct"));
+        assert_eq!(
+            received.egress["http"][0]["match"],
+            "api.some-provider.example"
+        );
+        assert!(received.allowed_routes.is_null());
+    }
+
+    #[test]
+    fn a_typed_llm_section_equals_the_same_section_received() {
+        let policy: LlmPolicy = serde_json::from_str(r#"{"backends":[],"routes":[]}"#).unwrap();
+        let typed = LlmSection::from(policy);
+        let received: LlmSection =
+            serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
+        assert_eq!(typed, received);
+    }
+
+    #[test]
+    fn no_debug_of_a_policy_frame_prints_a_secret() {
+        let frame = PolicyFrame {
+            proxy_upstream: Some("http://user:upstream-pass@proxy:3128".into()),
+            env: Some(BTreeMap::from([(
+                "PGPASSWORD".to_string(),
+                "hunter2".to_string(),
+            )])),
+            ..sender_frame()
+        };
+        let shown = format!("{frame:?}");
+        assert!(shown.contains("PGPASSWORD"), "{shown}");
+        for secret in [
+            "hunter2",
+            "upstream-pass",
+            "Bearer real",
+            "ph-access",
+            "AAE=",
+        ] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+    }
+
+    #[test]
+    fn no_debug_of_a_received_network_section_prints_a_route() {
+        let frame: PolicyFrame = serde_json::from_str(
+            r#"{"network":{"egress":{"http":[{"match":"x","forward":{"keyPem":"PRIVATE"}}]},"defaultVerdict":"deny"}}"#,
+        )
+        .unwrap();
+        let shown = format!("{frame:?}");
+        assert!(shown.contains("deny"), "{shown}");
+        assert!(!shown.contains("PRIVATE"), "{shown}");
     }
 }
