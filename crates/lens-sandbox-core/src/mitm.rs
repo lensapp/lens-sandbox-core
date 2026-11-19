@@ -445,7 +445,7 @@ async fn answer_failed_dial<C>(
     tls_client: &mut C,
     meta: &RequestMeta,
     ctx: &MitmContext<'_>,
-    error: &(dyn std::error::Error + 'static),
+    error: &(dyn std::error::Error + Send + Sync + 'static),
 ) where
     C: AsyncWrite + Unpin,
 {
