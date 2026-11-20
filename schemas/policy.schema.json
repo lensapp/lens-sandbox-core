@@ -98,7 +98,7 @@
       ]
     },
     "CredentialInjection": {
-      "description": "How a credential applies to outbound requests on a specific domain.\nTagged at the JSON level by `injectionType` — each variant carries the\nfields it actually needs, required at compile time.\n\n- **`header`**: replace an HTTP header on matching requests. The MITM\n  substitutes [`value`] into [`header`]. When `bodyField` and `bodyValue`\n  are set, the same requests also get `bodyValue` written into that field\n  of a `application/x-www-form-urlencoded` body — for an API that reads its\n  token from the body before the header.\n- **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder\n  patterns in the request URI to the real credential value.\n- **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with\n  `placeholder` on the parent [`Credential`]) and re-sign with the real\n  STS credentials below. Real creds live only in sandbox-core process\n  memory — they never touch the sandbox filesystem.\n- **`oauthTokenAnswer`**: answer an OAuth 2.0 client-credentials token\n  request (RFC 6749 §4.4) in the proxy with a placeholder access token, so\n  the request never leaves the sandbox. Paired with a `header` injection on\n  each API domain that replaces the placeholder with the real token.\n- **`oauthRefreshAnswer`**: the same answer for an OAuth 2.0 refresh-token\n  request (RFC 6749 §6) that carries a placeholder refresh token.",
+      "description": "How a credential applies to outbound requests on a specific domain.\nTagged at the JSON level by `injectionType` — each variant carries the\nfields it actually needs, required at compile time.\n\n- **`header`**: replace an HTTP header on matching requests. The MITM\n  substitutes [`value`] into [`header`]. When `bodyField` and `bodyValue`\n  are set, the same requests also get `bodyValue` written into that field\n  of a `application/x-www-form-urlencoded` body — for an API that reads its\n  token from the body before the header.\n- **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder\n  patterns in the request URI to the real credential value.\n- **`authorizationPlaceholder`**: fill the parent credential's\n  `placeholder` where it is the whole token of an `Authorization` header,\n  and leave every other request unchanged.\n- **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with\n  `placeholder` on the parent [`Credential`]) and re-sign with the real\n  STS credentials below. Real creds live only in sandbox-core process\n  memory — they never touch the sandbox filesystem.\n- **`oauthTokenAnswer`**: answer an OAuth 2.0 client-credentials token\n  request (RFC 6749 §4.4) in the proxy with a placeholder access token, so\n  the request never leaves the sandbox. Paired with a `header` injection on\n  each API domain that replaces the placeholder with the real token.\n- **`oauthRefreshAnswer`**: the same answer for an OAuth 2.0 refresh-token\n  request (RFC 6749 §6) that carries a placeholder refresh token.",
       "oneOf": [
         {
           "type": "object",
@@ -170,6 +170,34 @@
             },
             "value": {
               "description": "Resolved credential value used for URI rewriting.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "injectionType",
+            "domain",
+            "value"
+          ]
+        },
+        {
+          "description": "Fills the parent credential's `placeholder` in the `Authorization`\nheader of a request to [`domain`](Self::AuthorizationPlaceholder::domain):\n`Bearer <placeholder>` becomes `Bearer <value>`, and `Basic` whose\npassword is the placeholder becomes `Basic` of `<username>:<value>`,\nwhatever user the request named. A request whose `Authorization` does\nnot carry the placeholder, or that has none, is forwarded unchanged.",
+          "type": "object",
+          "properties": {
+            "domain": {
+              "description": "Domain this injection applies to.",
+              "type": "string"
+            },
+            "injectionType": {
+              "type": "string",
+              "const": "authorizationPlaceholder"
+            },
+            "username": {
+              "description": "User name a filled `Basic` header carries.",
+              "type": "string",
+              "default": ""
+            },
+            "value": {
+              "description": "Resolved credential value that replaces the placeholder.",
               "type": "string"
             }
           },

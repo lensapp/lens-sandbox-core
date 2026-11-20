@@ -345,6 +345,7 @@ async fn a_request_held_at_the_credential_gate_is_signed_with_the_keys_policy_se
             host_state.credential_injections.write().unwrap().insert(
                 TEST_HOSTNAME.to_string(),
                 vec![CredentialInjection {
+                    fills: None,
                     header: "X-Api-Key".to_string(),
                     value: "real-api-key".to_string(),
                     body: None,

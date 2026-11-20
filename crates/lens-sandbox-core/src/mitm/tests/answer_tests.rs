@@ -8,6 +8,7 @@ const HOST: &str = "inference.lns.run";
 
 fn bearer(value: &str) -> Vec<CredentialInjection> {
     vec![CredentialInjection {
+        fills: None,
         header: "Authorization".to_string(),
         value: format!("Bearer {value}"),
         body: None,

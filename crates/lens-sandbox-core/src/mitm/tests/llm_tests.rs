@@ -209,6 +209,7 @@ async fn run_on(
     state.credential_injections.write().unwrap().insert(
         BACKEND_HOST.to_string(),
         vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer real-vllm-key".to_string(),
             body: None,
@@ -274,6 +275,7 @@ async fn run_on(
     let test_actor = crate::peer_process::ActorContext::resolve("10.0.0.5:44000".parse().unwrap());
     // The credential the sandbox holds for the API it thinks it is calling.
     let front_injections = vec![CredentialInjection {
+        fills: None,
         header: "x-api-key".to_string(),
         value: "sk-ant-sandbox-key".to_string(),
         body: None,
