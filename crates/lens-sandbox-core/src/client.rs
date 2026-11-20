@@ -564,6 +564,7 @@ fn answered_placeholders(
         } => vec![access_token.as_str(), refresh_token.as_str()],
         crate::policy_schema::CredentialInjection::Header { .. }
         | crate::policy_schema::CredentialInjection::UriPlaceholder { .. }
+        | crate::policy_schema::CredentialInjection::AuthorizationPlaceholder { .. }
         | crate::policy_schema::CredentialInjection::AwsSigv4 { .. } => vec![],
     });
     // An unarmed answer has no access token yet, and an empty string is no
@@ -625,6 +626,7 @@ fn apply_injection(
                 .entry(domain.to_lowercase())
                 .or_default()
                 .push(crate::proxy::CredentialInjection {
+                    fills: None,
                     header: header.clone(),
                     value: value.clone(),
                     body,
@@ -655,6 +657,35 @@ fn apply_injection(
                 .entry(domain)
                 .or_default()
                 .push((placeholder.to_string(), value.clone()));
+        }
+        crate::policy_schema::CredentialInjection::AuthorizationPlaceholder {
+            domain,
+            username,
+            value,
+        } => {
+            let Some(placeholder) = cred_placeholder.filter(|p| !p.is_empty()) else {
+                tracing::error!(
+                    cred_id,
+                    domain = %domain,
+                    "dropping authorizationPlaceholder injection: parent credential has no placeholder"
+                );
+                return;
+            };
+            state
+                .injection_map
+                .entry(domain.to_lowercase())
+                .or_default()
+                .push(crate::proxy::CredentialInjection {
+                    header: "Authorization".to_string(),
+                    value: value.clone(),
+                    body: None,
+                    rules: Vec::new(),
+                    fills: Some(crate::proxy::AuthorizationFill {
+                        placeholder: placeholder.to_string(),
+                        username: username.clone(),
+                    }),
+                });
+            *state.header_count += 1;
         }
         crate::policy_schema::CredentialInjection::OauthTokenAnswer {
             domain,
@@ -1636,6 +1667,72 @@ mod tests {
             state.policy.read().unwrap().default_verdict,
             crate::routing::Verdict::Allow
         );
+    }
+
+    fn hub_fill_frame(placeholder: Option<&str>, value: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "policy",
+            "credentials": [{
+                "id": "hub",
+                "envVar": "SOME_HUB_TOKEN",
+                "placeholder": placeholder,
+                "injections": [{
+                    "injectionType": "authorizationPlaceholder",
+                    "domain": "Hub.Some-Hub.example",
+                    "username": "some-fleet/some-sub",
+                    "value": value
+                }]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn given_an_authorization_placeholder_when_the_policy_applies_then_the_host_fills_that_placeholder()
+     {
+        let state = test_host_state();
+        let frame = hub_fill_frame(Some("some_PLACEHOLDER"), "some-login");
+
+        apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap();
+
+        let injections = crate::proxy::collect_header_injections(&state, "hub.some-hub.example");
+        assert_eq!(injections.len(), 1);
+        assert_eq!(injections[0].value, "some-login");
+        assert_eq!(
+            injections[0].fills,
+            Some(crate::proxy::AuthorizationFill {
+                placeholder: "some_PLACEHOLDER".to_string(),
+                username: "some-fleet/some-sub".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_authorization_placeholder_whose_credential_has_no_placeholder_when_the_policy_applies_then_nothing_is_filled()
+     {
+        let state = test_host_state();
+        let frame = hub_fill_frame(None, "some-login");
+
+        apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap();
+
+        assert!(crate::proxy::collect_header_injections(&state, "hub.some-hub.example").is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_an_authorization_placeholder_with_no_value_when_the_policy_applies_then_its_domain_is_gated()
+     {
+        let state = test_host_state();
+        let frame = hub_fill_frame(Some("some_PLACEHOLDER"), "");
+
+        apply_policy_frame(&frame.to_string(), &state)
+            .await
+            .unwrap();
+
+        assert!(state.intercept_for_unarmed("hub.some-hub.example"));
+        assert!(crate::proxy::collect_header_injections(&state, "hub.some-hub.example").is_empty());
     }
 
     /// The embedder's proxy shares no filesystem with the workload, so a file

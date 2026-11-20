@@ -213,6 +213,7 @@ async fn a_forwarded_request_reaches_the_route_address_with_its_client_certifica
 
 fn bearer(token: &str) -> Vec<CredentialInjection> {
     vec![CredentialInjection {
+        fills: None,
         header: "Authorization".to_string(),
         value: format!("Bearer {token}"),
         body: None,
@@ -353,6 +354,7 @@ async fn a_connect_to_a_forwarded_host_gets_its_credentials_and_its_client_certi
     state.credential_injections.write().unwrap().insert(
         HOST.to_string(),
         vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer real-token".to_string(),
             body: None,

@@ -201,6 +201,17 @@ pub struct CredentialInjection {
     /// Optional path rules. When present, only inject for matching requests.
     /// When empty, inject for all requests to the domain.
     pub rules: Vec<crate::policy_schema::HttpRequestMatch>,
+    /// When set, `value` is the bare secret, and only an `Authorization`
+    /// header that carries this placeholder changes.
+    pub fills: Option<AuthorizationFill>,
+}
+
+/// The placeholder an `authorizationPlaceholder` injection fills, and the
+/// user name a filled `Basic` header carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationFill {
+    pub placeholder: String,
+    pub username: String,
 }
 
 /// Client certificate configuration for mTLS upstream connections.
@@ -7552,6 +7563,7 @@ pub(crate) mod tests {
         state.credential_injections.write().unwrap().insert(
             "10.0.0.5".to_string(),
             vec![CredentialInjection {
+                fills: None,
                 header: "X-Api-Key".to_string(),
                 value: "some-key".to_string(),
                 body: None,
@@ -10475,6 +10487,7 @@ pub(crate) mod tests {
         state.credential_injections.write().unwrap().insert(
             "api.some-provider.example".to_string(),
             vec![CredentialInjection {
+                fills: None,
                 header: "Authorization".to_string(),
                 value: "Bearer some-token".to_string(),
                 body: None,
@@ -10527,6 +10540,7 @@ pub(crate) mod tests {
         state.credential_injections.write().unwrap().insert(
             "api.example.com".to_string(),
             vec![CredentialInjection {
+                fills: None,
                 header: "Authorization".to_string(),
                 value: "Bearer xoxb-real".to_string(),
                 body: Some(crate::body_field::BodyField {

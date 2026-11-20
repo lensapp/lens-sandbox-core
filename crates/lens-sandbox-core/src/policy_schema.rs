@@ -844,6 +844,9 @@ pub struct Credential {
 ///   token from the body before the header.
 /// - **`uriPlaceholder`**: rewrite `__lens_cred:<name>__` placeholder
 ///   patterns in the request URI to the real credential value.
+/// - **`authorizationPlaceholder`**: fill the parent credential's
+///   `placeholder` where it is the whole token of an `Authorization` header,
+///   and leave every other request unchanged.
 /// - **`awsSigv4`**: strip the fake AWS SigV4 signature (the SDK signs with
 ///   `placeholder` on the parent [`Credential`]) and re-sign with the real
 ///   STS credentials below. Real creds live only in sandbox-core process
@@ -889,6 +892,21 @@ pub enum CredentialInjection {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[schemars(extend("default" = []))]
         rules: Vec<HttpRequestMatch>,
+    },
+    /// Fills the parent credential's `placeholder` in the `Authorization`
+    /// header of a request to [`domain`](Self::AuthorizationPlaceholder::domain):
+    /// `Bearer <placeholder>` becomes `Bearer <value>`, and `Basic` whose
+    /// password is the placeholder becomes `Basic` of `<username>:<value>`,
+    /// whatever user the request named. A request whose `Authorization` does
+    /// not carry the placeholder, or that has none, is forwarded unchanged.
+    AuthorizationPlaceholder {
+        /// Domain this injection applies to.
+        domain: String,
+        /// User name a filled `Basic` header carries.
+        #[serde(default)]
+        username: String,
+        /// Resolved credential value that replaces the placeholder.
+        value: String,
     },
     /// Re-signs every request to [`domain`](Self::AwsSigv4::domain). This
     /// variant takes no path rules: signing is decided by domain alone, and a
@@ -962,6 +980,7 @@ impl CredentialInjection {
         match self {
             CredentialInjection::Header { domain, value, .. }
             | CredentialInjection::UriPlaceholder { domain, value, .. }
+            | CredentialInjection::AuthorizationPlaceholder { domain, value, .. }
                 if value.is_empty() =>
             {
                 Some(domain)
@@ -1015,6 +1034,16 @@ impl std::fmt::Debug for CredentialInjection {
                 .field("domain", domain)
                 .field("value", &Secret(value))
                 .field("rules", rules)
+                .finish(),
+            Self::AuthorizationPlaceholder {
+                domain,
+                username,
+                value,
+            } => f
+                .debug_struct("AuthorizationPlaceholder")
+                .field("domain", domain)
+                .field("username", username)
+                .field("value", &Secret(value))
                 .finish(),
             Self::AwsSigv4 {
                 domain,
@@ -1384,6 +1413,20 @@ mod tests {
         for shown in [format!("{credential:?}"), format!("{forward:?}")] {
             assert!(!shown.contains("sk-live"), "{shown}");
         }
+    }
+
+    #[test]
+    fn given_an_authorization_placeholder_when_it_is_printed_then_its_login_is_redacted() {
+        let injection = CredentialInjection::AuthorizationPlaceholder {
+            domain: "hub.some-hub.example".into(),
+            username: "some-user".into(),
+            value: "lnshub_pat_live".into(),
+        };
+
+        let shown = format!("{injection:?}");
+
+        assert!(!shown.contains("lnshub_pat_live"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
     }
 
     #[test]

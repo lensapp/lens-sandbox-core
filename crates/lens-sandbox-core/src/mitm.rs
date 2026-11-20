@@ -130,8 +130,10 @@ impl Resend {
         let sent = matching_injections(&self.head, &self.sent);
         let now = matching_injections(&self.head, &current);
         let renewed = sent.iter().any(|old| {
-            now.iter()
-                .any(|new| new.header.eq_ignore_ascii_case(&old.header) && new.value != old.value)
+            (old.fills.is_none() || carries_the_fill(&self.head, old))
+                && now.iter().any(|new| {
+                    new.header.eq_ignore_ascii_case(&old.header) && new.value != old.value
+                })
         });
         // A credential that travels in the body went into the body read the
         // first time, so the body would still carry the old value.
@@ -2368,11 +2370,13 @@ pub(crate) fn scan_for_unarmed_placeholders(
     header_block: &str,
 ) -> Vec<UnarmedPlaceholderMatch> {
     let index = state.placeholder_index.read().unwrap();
+    let passwords = basic_passwords(header_block);
     let mut matches: Vec<UnarmedPlaceholderMatch> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (placeholder, credential_id) in index.iter() {
         if !placeholder.is_empty()
-            && header_block.contains(placeholder.as_str())
+            && (header_block.contains(placeholder.as_str())
+                || passwords.iter().any(|password| password == placeholder))
             && seen.insert(credential_id.as_str())
         {
             matches.push(UnarmedPlaceholderMatch {
@@ -2415,11 +2419,12 @@ pub(crate) fn inject_headers(header_block: &str, injections: &[CredentialInjecti
     let request_line = lines.first().unwrap_or(&"");
     let matching_injections = matching_injections(header_block, injections);
 
+    let (fills, sets): (Vec<&CredentialInjection>, Vec<&CredentialInjection>) = matching_injections
+        .into_iter()
+        .partition(|inj| inj.fills.is_some());
+
     // Build a set of header names we're injecting (lowercased)
-    let inject_names: HashSet<String> = matching_injections
-        .iter()
-        .map(|inj| inj.header.to_lowercase())
-        .collect();
+    let inject_names: HashSet<String> = sets.iter().map(|inj| inj.header.to_lowercase()).collect();
 
     // Detect HTTP/1.1 upgrade. If the client asked to upgrade we preserve the
     // existing Connection: upgrade line and skip the Connection: close
@@ -2446,11 +2451,14 @@ pub(crate) fn inject_headers(header_block: &str, injections: &[CredentialInjecti
         if name == "connection" && !is_upgrade {
             continue;
         }
-        result.push(line.to_string());
+        let filled = (name == "authorization")
+            .then(|| fills.iter().find_map(|inj| filled_authorization(line, inj)))
+            .flatten();
+        result.push(filled.unwrap_or_else(|| line.to_string()));
     }
 
     // Add injected headers (sanitize CRLF to prevent header injection)
-    for inj in matching_injections {
+    for inj in sets {
         let sanitized_value = inj.value.replace(['\r', '\n'], "");
         result.push(format!("{}: {sanitized_value}", inj.header));
     }
@@ -2459,6 +2467,64 @@ pub(crate) fn inject_headers(header_block: &str, injections: &[CredentialInjecti
     }
 
     result.join("\r\n")
+}
+
+/// The `Authorization` line with `inj`'s placeholder filled, or `None` when
+/// the line does not carry the placeholder as its whole Bearer token or Basic
+/// password.
+fn filled_authorization(line: &str, inj: &CredentialInjection) -> Option<String> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let fill = inj.fills.as_ref()?;
+    let (name, value) = line.split_once(':')?;
+    let (scheme, token) = value.trim().split_once(' ')?;
+    let token = token.trim();
+    let secret = inj.value.replace(['\r', '\n'], "");
+    let filled = if scheme.eq_ignore_ascii_case("bearer") && token == fill.placeholder {
+        format!("Bearer {secret}")
+    } else if scheme.eq_ignore_ascii_case("basic") {
+        if basic_password(token)? != fill.placeholder {
+            return None;
+        }
+        let username = fill.username.replace(['\r', '\n'], "");
+        format!("Basic {}", BASE64.encode(format!("{username}:{secret}")))
+    } else {
+        return None;
+    };
+    Some(format!("{name}: {filled}"))
+}
+
+/// The password of a `Basic` token, or `None` when it is not base64 of `user:password`.
+fn basic_password(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let decoded = String::from_utf8(BASE64.decode(token.trim()).ok()?).ok()?;
+    decoded
+        .split_once(':')
+        .map(|(_, password)| password.to_string())
+}
+
+/// The passwords of the `Basic` `Authorization` headers in `header_block`.
+fn basic_passwords(header_block: &str) -> Vec<String> {
+    header_block
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+        .filter_map(|(_, value)| value.trim().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+        .filter_map(|(_, token)| basic_password(token))
+        .collect()
+}
+
+/// Whether some `Authorization` header of `header_block` carries `inj`'s placeholder.
+fn carries_the_fill(header_block: &str, inj: &CredentialInjection) -> bool {
+    header_block
+        .split("\r\n")
+        .skip(1)
+        .any(|line| filled_authorization(line, inj).is_some())
 }
 
 /// Rewrite `__lens_cred:<name>__` placeholders in the request line only.
@@ -2711,6 +2777,7 @@ mod tests {
         let headers =
             "GET /api HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: old\r\nAccept: */*";
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "token ghp_new".to_string(),
             body: None,
@@ -2727,6 +2794,7 @@ mod tests {
     fn inject_headers_adds_new() {
         let headers = "GET /api HTTP/1.1\r\nHost: api.github.com";
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer sk-xxx".to_string(),
             body: None,
@@ -2741,6 +2809,7 @@ mod tests {
     fn inject_headers_sanitizes_crlf() {
         let headers = "GET / HTTP/1.1\r\nHost: evil.com";
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "token abc\r\nEvil: injected".to_string(),
             body: None,
@@ -2765,12 +2834,14 @@ mod tests {
         let headers = "POST /v1/chat HTTP/1.1\r\nHost: api.openai.com";
         let injections = vec![
             CredentialInjection {
+                fills: None,
                 header: "Authorization".to_string(),
                 value: "Bearer sk-test".to_string(),
                 body: None,
                 rules: vec![],
             },
             CredentialInjection {
+                fills: None,
                 header: "X-Custom".to_string(),
                 value: "custom-value".to_string(),
                 body: None,
@@ -2790,6 +2861,7 @@ mod tests {
         let headers = "GET /v1/clusters/abc/proxy/api HTTP/1.1\r\nHost: lens.example.com\r\nAuthorization: Bearer lnsc_token";
         // This injection only applies to /v1/projects/*/llm/** paths
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
             body: None,
@@ -2812,6 +2884,7 @@ mod tests {
             "POST /v1/projects/123/llm/bedrock/us-east-1/invoke HTTP/1.1\r\nHost: lens.example.com";
         // This injection only applies to /v1/projects/*/llm/* paths
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
             body: None,
@@ -2832,6 +2905,7 @@ mod tests {
         // Global LLM endpoint (auto-resolve project)
         let headers = "POST /v1/llm/bedrock/us-east-1/invoke HTTP/1.1\r\nHost: lens.example.com";
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
             body: None,
@@ -2858,6 +2932,7 @@ mod tests {
         // Kubernetes proxy endpoint - should NOT get sandbox token
         let headers = "GET /v1/clusters/abc/proxy/api/v1/nodes HTTP/1.1\r\nHost: lens.example.com\r\nAuthorization: Bearer lnsc_cluster_token";
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer sandbox_token".to_string(),
             body: None,
@@ -2885,6 +2960,7 @@ mod tests {
         // Exact-path rule must still match when the request carries a query string.
         let headers = "GET /repos/foo?admin=true HTTP/1.1\r\nHost: api.github.com";
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer ghp_token".to_string(),
             body: None,
@@ -2908,6 +2984,7 @@ mod tests {
         // credentials on `/admin/secret`. Normalization resolves `..` first.
         let headers = "GET /repos/foo/../../admin/secret HTTP/1.1\r\nHost: api.github.com";
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer ghp_token".to_string(),
             body: None,
@@ -2927,6 +3004,7 @@ mod tests {
     fn inject_headers_case_insensitive_replace() {
         let headers = "GET / HTTP/1.1\r\nauthorization: old-value";
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer new-value".to_string(),
             body: None,
@@ -3090,6 +3168,10 @@ mod tests {
     /// Re-signing a request for a host whose credential is a signing key.
     #[path = "signing_tests.rs"]
     mod signing;
+
+    /// Filling a placeholder in the `Authorization` header, and leaving every other request alone.
+    #[path = "authorization_fill_tests.rs"]
+    mod authorization_fill;
 
     /// Shared harness for MITM integration tests.
     /// Spins up: TLS upstream server ← upstream TLS ← MITM ← client TLS.
@@ -3329,6 +3411,7 @@ mod tests {
     async fn mitm_tunnel_injects_and_replaces_header() {
         let (headers, response, audits) = run_mitm_harness(
             vec![CredentialInjection {
+                fills: None,
                 header: "x-api-key".to_string(),
                 value: "secret-injected-key".to_string(),
                 body: None,
@@ -3354,6 +3437,7 @@ mod tests {
     async fn mitm_direct_sets_tunnel_false_in_audit() {
         let (_headers, _response, audits) = run_mitm_harness(
             vec![CredentialInjection {
+                fills: None,
                 header: "Authorization".to_string(),
                 value: "Bearer sk-test".to_string(),
                 body: None,
@@ -3373,12 +3457,14 @@ mod tests {
         let (headers, _response, _audits) = run_mitm_harness(
             vec![
                 CredentialInjection {
+                    fills: None,
                     header: "x-api-key".to_string(),
                     value: "key-123".to_string(),
                     body: None,
                     rules: vec![],
                 },
                 CredentialInjection {
+                    fills: None,
                     header: "Authorization".to_string(),
                     value: "Bearer token-456".to_string(),
                     body: None,
@@ -3404,6 +3490,7 @@ mod tests {
 
     fn slack_injection(rules: Vec<crate::policy_schema::HttpRequestMatch>) -> CredentialInjection {
         CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer xoxb-real".to_string(),
             body: Some(crate::body_field::BodyField {
@@ -4247,6 +4334,7 @@ mod tests {
         }];
         let (headers, response, _audits) = run_mitm_harness_with_rules(
             vec![CredentialInjection {
+                fills: None,
                 header: "Authorization".to_string(),
                 value: "Bearer my-token".to_string(),
                 body: None,
@@ -6150,6 +6238,7 @@ mod tests {
     fn inject_headers_still_injects_credentials_for_upgrade_request() {
         let headers = "GET /ws HTTP/1.1\r\nHost: api.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
         let injections = vec![CredentialInjection {
+            fills: None,
             header: "Authorization".to_string(),
             value: "Bearer token-xyz".to_string(),
             body: None,
@@ -6453,6 +6542,7 @@ mod tests {
             HostResponse::ArmAndAllow {
                 domain: "test.example.com".to_string(),
                 injection: CredentialInjection {
+                    fills: None,
                     header: "Authorization".to_string(),
                     value: "Bearer real-secret".to_string(),
                     body: None,
@@ -6508,6 +6598,7 @@ mod tests {
             HostResponse::ArmAndAllow {
                 domain: "*.example.com".to_string(),
                 injection: CredentialInjection {
+                    fills: None,
                     header: "Authorization".to_string(),
                     value: "Bearer real-secret".to_string(),
                     body: None,
@@ -6551,6 +6642,7 @@ mod tests {
             HostResponse::ArmAndAllow {
                 domain: "test.example.com:8443".to_string(),
                 injection: CredentialInjection {
+                    fills: None,
                     header: "Authorization".to_string(),
                     value: "Bearer real-secret".to_string(),
                     body: None,
@@ -6842,6 +6934,7 @@ mod tests {
                     let cred = v["credentialId"].as_str().unwrap().to_string();
                     let injection = if cred == "github" {
                         CredentialInjection {
+                            fills: None,
                             header: "Authorization".into(),
                             value: "Bearer real-github".into(),
                             body: None,
@@ -6849,6 +6942,7 @@ mod tests {
                         }
                     } else {
                         CredentialInjection {
+                            fills: None,
                             header: "X-OpenAI-Key".into(),
                             value: "real-openai".into(),
                             body: None,

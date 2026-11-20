@@ -10,7 +10,7 @@ use crate::policy_schema::{Credential, LlmPolicy, NetworkPolicy};
 /// Bump to today's date in the same commit as any change to `policy_schema.rs`
 /// or the wire types in this file — an older sandbox must not accept a policy it
 /// cannot enforce.
-pub const SANDBOX_PROTOCOL_DATE: &str = "2026-11-19";
+pub const SANDBOX_PROTOCOL_DATE: &str = "2026-11-20";
 
 /// A file to write before executing a command.
 ///
