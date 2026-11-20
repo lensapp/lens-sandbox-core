@@ -897,12 +897,12 @@ pub enum CredentialInjection {
     /// header of a request to [`domain`](Self::AuthorizationPlaceholder::domain):
     /// `Bearer <placeholder>` becomes `Bearer <value>`, and `Basic` whose
     /// password is the placeholder becomes `Basic` of `<username>:<value>`,
-    /// whatever user the request named. A request whose `Authorization` does
+    /// or of the request's own user when `username` is empty. A request whose `Authorization` does
     /// not carry the placeholder, or that has none, is forwarded unchanged.
     AuthorizationPlaceholder {
         /// Domain this injection applies to.
         domain: String,
-        /// User name a filled `Basic` header carries.
+        /// User name a filled `Basic` header carries; empty keeps the request's own.
         #[serde(default)]
         username: String,
         /// Resolved credential value that replaces the placeholder.

@@ -132,7 +132,9 @@ impl Resend {
         let renewed = sent.iter().any(|old| {
             (old.fills.is_none() || carries_the_fill(&self.head, old))
                 && now.iter().any(|new| {
-                    new.header.eq_ignore_ascii_case(&old.header) && new.value != old.value
+                    new.header.eq_ignore_ascii_case(&old.header)
+                        && new.fills == old.fills
+                        && new.value != old.value
                 })
         });
         // A credential that travels in the body went into the body read the
@@ -2478,16 +2480,24 @@ fn filled_authorization(line: &str, inj: &CredentialInjection) -> Option<String>
 
     let fill = inj.fills.as_ref()?;
     let (name, value) = line.split_once(':')?;
+    if !name.trim().eq_ignore_ascii_case("authorization") {
+        return None;
+    }
     let (scheme, token) = value.trim().split_once(' ')?;
     let token = token.trim();
     let secret = inj.value.replace(['\r', '\n'], "");
     let filled = if scheme.eq_ignore_ascii_case("bearer") && token == fill.placeholder {
         format!("Bearer {secret}")
     } else if scheme.eq_ignore_ascii_case("basic") {
-        if basic_password(token)? != fill.placeholder {
+        let (user, password) = basic_credentials(token)?;
+        if password != fill.placeholder {
             return None;
         }
-        let username = fill.username.replace(['\r', '\n'], "");
+        let username = if fill.username.is_empty() {
+            user
+        } else {
+            fill.username.replace(['\r', '\n'], "")
+        };
         format!("Basic {}", BASE64.encode(format!("{username}:{secret}")))
     } else {
         return None;
@@ -2495,15 +2505,15 @@ fn filled_authorization(line: &str, inj: &CredentialInjection) -> Option<String>
     Some(format!("{name}: {filled}"))
 }
 
-/// The password of a `Basic` token, or `None` when it is not base64 of `user:password`.
-fn basic_password(token: &str) -> Option<String> {
+/// The user and the password of a `Basic` token, or `None` when it is not base64 of `user:password`.
+fn basic_credentials(token: &str) -> Option<(String, String)> {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
     let decoded = String::from_utf8(BASE64.decode(token.trim()).ok()?).ok()?;
     decoded
         .split_once(':')
-        .map(|(_, password)| password.to_string())
+        .map(|(user, password)| (user.to_string(), password.to_string()))
 }
 
 /// The passwords of the `Basic` `Authorization` headers in `header_block`.
@@ -2515,7 +2525,7 @@ fn basic_passwords(header_block: &str) -> Vec<String> {
         .filter(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
         .filter_map(|(_, value)| value.trim().split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
-        .filter_map(|(_, token)| basic_password(token))
+        .filter_map(|(_, token)| basic_credentials(token).map(|(_, password)| password))
         .collect()
 }
 
