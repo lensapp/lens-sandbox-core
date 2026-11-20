@@ -242,3 +242,48 @@ fn given_a_renewed_login_when_a_request_carried_the_registry_jwt_then_it_is_not_
 
     assert!(carried.renewed_head(&state).is_none());
 }
+
+#[test]
+fn given_a_basic_placeholder_and_no_stored_user_when_the_request_passes_then_it_keeps_the_users_own_name()
+ {
+    let head = request("/token", Some(&basic("alice", PLACEHOLDER)));
+
+    let sent = inject_headers(&head, &fill(""));
+
+    assert_eq!(authorizations(&sent), [basic("alice", LOGIN)]);
+}
+
+#[test]
+fn given_a_renewed_login_when_the_placeholder_was_in_another_header_then_the_request_is_not_sent_again()
+ {
+    let state = with_the_fill("lnshub_pat_renewed");
+    let head = format!(
+        "{}\r\nX-Something: {}",
+        request("/v2/", Some("Bearer eyJhbGciOiJIUzI1NiJ9.e30.c2ln")),
+        basic("x", PLACEHOLDER)
+    );
+
+    assert!(resend(head).renewed_head(&state).is_none());
+}
+
+#[test]
+fn given_another_credentials_fill_was_renewed_when_a_request_carried_this_placeholder_then_it_is_not_sent_again()
+ {
+    let (state, _rx) = crate::proxy::tests::test_state();
+    let mut other = fill("some-user");
+    other[0].value = "some-other-login".to_string();
+    other[0].fills = Some(crate::proxy::AuthorizationFill {
+        placeholder: "other_PLACEHOLDER".to_string(),
+        username: "some-user".to_string(),
+    });
+    let mut both = fill("some-user");
+    both.extend(other);
+    state
+        .credential_injections
+        .write()
+        .unwrap()
+        .insert("hub.some-hub.example".to_string(), both);
+    let carried = resend(request("/token", Some(&basic("x", PLACEHOLDER))));
+
+    assert!(carried.renewed_head(&state).is_none());
+}

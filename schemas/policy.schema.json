@@ -180,7 +180,7 @@
           ]
         },
         {
-          "description": "Fills the parent credential's `placeholder` in the `Authorization`\nheader of a request to [`domain`](Self::AuthorizationPlaceholder::domain):\n`Bearer <placeholder>` becomes `Bearer <value>`, and `Basic` whose\npassword is the placeholder becomes `Basic` of `<username>:<value>`,\nwhatever user the request named. A request whose `Authorization` does\nnot carry the placeholder, or that has none, is forwarded unchanged.",
+          "description": "Fills the parent credential's `placeholder` in the `Authorization`\nheader of a request to [`domain`](Self::AuthorizationPlaceholder::domain):\n`Bearer <placeholder>` becomes `Bearer <value>`, and `Basic` whose\npassword is the placeholder becomes `Basic` of `<username>:<value>`,\nor of the request's own user when `username` is empty. A request whose `Authorization` does\nnot carry the placeholder, or that has none, is forwarded unchanged.",
           "type": "object",
           "properties": {
             "domain": {
@@ -192,7 +192,7 @@
               "const": "authorizationPlaceholder"
             },
             "username": {
-              "description": "User name a filled `Basic` header carries.",
+              "description": "User name a filled `Basic` header carries; empty keeps the request's own.",
               "type": "string",
               "default": ""
             },
