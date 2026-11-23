@@ -114,6 +114,7 @@ fn intercept(state: &Arc<ProxyState>) {
             }],
             scheme: None,
             binaries: None,
+            refusal: None,
         });
 }
 

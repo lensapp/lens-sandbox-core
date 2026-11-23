@@ -1859,6 +1859,7 @@ mod tests {
                             forward: None,
                             rules: Vec::new(),
                             binaries: None,
+                            refusal: None,
                         }],
                         tcp: Vec::new(),
                         udp: Vec::new(),

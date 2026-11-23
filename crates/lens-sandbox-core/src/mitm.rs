@@ -397,7 +397,7 @@ where
                             let reason = crate::blocked::BlockReason::UpstreamPolicy;
                             let refusal = crate::blocked::response(
                                 ctx.state.block_label(),
-                                reason,
+                                reason.clone(),
                                 &meta.method,
                                 target_host,
                                 &meta.path,
@@ -409,7 +409,7 @@ where
                             crate::proxy::emit_refused_https(
                                 ctx.state,
                                 &target,
-                                reason,
+                                &reason,
                                 Some(&crate::blocked::SeenRequest::new(&meta.method, &meta.path)),
                                 ctx.actor,
                             );

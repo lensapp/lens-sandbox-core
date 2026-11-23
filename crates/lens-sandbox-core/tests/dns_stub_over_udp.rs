@@ -124,6 +124,7 @@ fn state_with_allow(patterns: &[&str]) -> Arc<ProxyState> {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         })
         .collect();
     state.policy.write().unwrap().routes = rules;
