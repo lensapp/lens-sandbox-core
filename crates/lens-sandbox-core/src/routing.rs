@@ -31,6 +31,9 @@ pub struct RouteRule {
     /// caller; see [`find_matching_route`] for the fail-closed semantics of a
     /// host match that the filter excludes.
     pub binaries: Option<Vec<PathBuf>>,
+    /// What the client is told when this rule denies it; `None` is
+    /// `policy-deny`. Only a checked `deny` rule of `egress.http` carries one.
+    pub refusal: Option<crate::policy_schema::Refusal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +130,17 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
 
         let binaries = raw.binaries.map(parse_binaries).transpose()?;
 
+        if let Some(refusal) = &raw.refusal {
+            if verdict != Verdict::Deny {
+                return Err(format!(
+                    "route {} carries a refusal, which only a deny rule gives",
+                    raw.match_pattern
+                ));
+            }
+            crate::blocked::check_note(&refusal.note)
+                .map_err(|e| format!("route {}: {e}", raw.match_pattern))?;
+        }
+
         Ok(RouteRule {
             matcher,
             verdict,
@@ -135,6 +149,7 @@ impl TryFrom<crate::policy_schema::RouteRule> for RouteRule {
             http_rules,
             scheme: raw.scheme,
             binaries,
+            refusal: raw.refusal,
         })
     }
 }
@@ -360,6 +375,7 @@ fn parse_port_scoped_egress(
             http_rules: Vec::new(),
             scheme: None,
             binaries,
+            refusal: None,
         });
     }
     Ok(out)
@@ -1820,6 +1836,73 @@ mod tests {
         assert_eq!(routes[2].verdict, Verdict::Deny);
         assert!(matches!(routes[0].matcher, RouteMatcher::Cidr(_)));
         assert!(matches!(routes[1].matcher, RouteMatcher::Domain(_)));
+    }
+
+    #[test]
+    fn a_deny_rule_carries_the_refusal_it_gives() {
+        let routes = parse_routes(
+            r#"[{
+                "match": "api.github.com",
+                "verdict": "deny",
+                "transport": "direct",
+                "refusal": {
+                    "reason": "connector-elsewhere",
+                    "note": "Connector github-acme, connection acme/app, works only on the fleets of acme"
+                }
+            }, {"match": "*.sketchy.com", "verdict": "deny", "transport": "direct"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            routes[0].refusal,
+            Some(crate::policy_schema::Refusal {
+                reason: crate::policy_schema::RefusalReason::ConnectorElsewhere,
+                note:
+                    "Connector github-acme, connection acme/app, works only on the fleets of acme"
+                        .to_string(),
+            })
+        );
+        assert_eq!(routes[1].refusal, None);
+    }
+
+    #[test]
+    fn a_refusal_that_cannot_be_given_fails_the_policy() {
+        for (verdict, refusal, why) in [
+            (
+                "allow",
+                r#"{"reason": "connector-elsewhere", "note": "elsewhere"}"#,
+                "an allow refuses nothing",
+            ),
+            (
+                "ask",
+                r#"{"reason": "connector-elsewhere", "note": "elsewhere"}"#,
+                "an ask refuses nothing until it is answered",
+            ),
+            (
+                "deny",
+                r#"{"reason": "connector-elsewhere", "note": "works\r\nX-Injected: 1"}"#,
+                "a note that breaks the body",
+            ),
+            (
+                "deny",
+                r#"{"reason": "connector-elsewhere", "note": ""}"#,
+                "an empty note",
+            ),
+            (
+                "deny",
+                r#"{"reason": "ask-declined", "note": "elsewhere"}"#,
+                "a reason a policy cannot give",
+            ),
+            (
+                "deny",
+                r#"{"reason": "connector-elsewhere", "note": "elsewhere", "extra": 1}"#,
+                "an unknown key",
+            ),
+        ] {
+            let json = format!(
+                r#"[{{"match": "api.github.com", "verdict": "{verdict}", "transport": "direct", "refusal": {refusal}}}]"#
+            );
+            assert!(parse_routes(&json).is_err(), "{why}: {json}");
+        }
     }
 
     #[test]

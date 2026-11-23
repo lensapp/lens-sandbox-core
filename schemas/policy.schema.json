@@ -845,6 +845,37 @@
         "defaultTransport"
       ]
     },
+    "Refusal": {
+      "description": "What a `deny` rule tells the client it refused: the reason code its\nresponse carries in `X-Sandbox-Blocked`, and a note its body adds.",
+      "type": "object",
+      "properties": {
+        "note": {
+          "description": "One clause the body adds after the reason, and ends with a full stop:\n1 to 256 bytes of printable ASCII and spaces, with no surrounding spaces\nand no full stop of its own. Anything else fails the policy. The\nworkload reads it, so it names nothing the workload may not know.",
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "reason": {
+          "description": "The reason code, from the fixed set a policy may give.",
+          "$ref": "#/$defs/RefusalReason"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "note"
+      ]
+    },
+    "RefusalReason": {
+      "description": "A reason code a `deny` rule may give. The set is fixed, and a client\nmatches on the code.",
+      "oneOf": [
+        {
+          "description": "`connector-elsewhere`: a connector the sandbox was granted serves the\ndestination, and its connection works only somewhere else.",
+          "type": "string",
+          "const": "connector-elsewhere"
+        }
+      ]
+    },
     "RouteRule": {
       "description": "A single first-match-wins route rule.",
       "type": "object",
@@ -880,6 +911,17 @@
         "match": {
           "description": "Domain pattern, wildcard (*.github.com), CIDR (10.0.0.0/8), or host:port.",
           "type": "string"
+        },
+        "refusal": {
+          "description": "How the client is told this rule refused it, in place of `policy-deny`.\nOnly a `deny` rule may carry it; on any other verdict it fails the\npolicy.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Refusal"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "rules": {
           "description": "HTTP-level rules. When present, only matching requests are allowed (deny-by-default).\nWhen absent or empty, all HTTP requests to this destination are allowed.",

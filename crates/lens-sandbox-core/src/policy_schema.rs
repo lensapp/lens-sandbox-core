@@ -468,6 +468,38 @@ pub struct RouteRule {
     /// everyone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binaries: Option<Vec<String>>,
+
+    /// How the client is told this rule refused it, in place of `policy-deny`.
+    /// Only a `deny` rule may carry it; on any other verdict it fails the
+    /// policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<Refusal>,
+}
+
+/// What a `deny` rule tells the client it refused: the reason code its
+/// response carries in `X-Sandbox-Blocked`, and a note its body adds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Refusal {
+    /// The reason code, from the fixed set a policy may give.
+    pub reason: RefusalReason,
+
+    /// One clause the body adds after the reason, and ends with a full stop:
+    /// 1 to 256 bytes of printable ASCII and spaces, with no surrounding spaces
+    /// and no full stop of its own. Anything else fails the policy. The
+    /// workload reads it, so it names nothing the workload may not know.
+    #[schemars(length(min = 1, max = 256))]
+    pub note: String,
+}
+
+/// A reason code a `deny` rule may give. The set is fixed, and a client
+/// matches on the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RefusalReason {
+    /// `connector-elsewhere`: a connector the sandbox was granted serves the
+    /// destination, and its connection works only somewhere else.
+    ConnectorElsewhere,
 }
 
 /// A request restriction within a route rule: the method and path it covers,

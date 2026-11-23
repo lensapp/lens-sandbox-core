@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 
 /// Why policy refused a request. The set is fixed: a consumer matches on
 /// [`BlockReason::code`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlockReason {
     /// A rule, or the default verdict, denies the request.
     PolicyDeny,
@@ -39,17 +39,43 @@ pub(crate) enum BlockReason {
     CredentialGate,
     /// The upstream proxy refused the destination by its own policy.
     UpstreamPolicy,
+    /// A rule refuses the destination because a connector the sandbox was
+    /// granted serves it, and its connection works only elsewhere; `note`,
+    /// from the rule, says which and where (see [`check_note`]).
+    ConnectorElsewhere { note: String },
 }
 
 impl BlockReason {
     /// The value of `X-Sandbox-Blocked`, and the one the body names.
-    pub(crate) fn code(self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::PolicyDeny => "policy-deny",
             Self::BinaryNotAllowed => "binary-not-allowed",
             Self::AskDeclined => "ask-declined",
             Self::CredentialGate => "credential-gate",
             Self::UpstreamPolicy => "upstream-policy",
+            Self::ConnectorElsewhere { .. } => "connector-elsewhere",
+        }
+    }
+
+    /// The refusal a rule's deny gives: the rule's own, or `policy-deny`.
+    pub(crate) fn of_rule(refusal: Option<&crate::policy_schema::Refusal>) -> Self {
+        use crate::policy_schema::RefusalReason;
+        match refusal {
+            None => Self::PolicyDeny,
+            Some(refusal) => match refusal.reason {
+                RefusalReason::ConnectorElsewhere => Self::ConnectorElsewhere {
+                    note: refusal.note.clone(),
+                },
+            },
+        }
+    }
+
+    /// The clause the body adds after the reason, if any.
+    fn note(&self) -> Option<&str> {
+        match self {
+            Self::ConnectorElsewhere { note } => Some(note),
+            _ => None,
         }
     }
 }
@@ -61,6 +87,9 @@ pub(crate) const BLOCKED_FIELD: &str = "X-Sandbox-Blocked";
 /// Longest method, host or path the body repeats. A real one is far shorter,
 /// and the client sent it, so the body never has to carry more of it than this.
 const MAX_FIELD_BYTES: usize = 256;
+
+/// Longest note a rule's refusal may carry.
+pub(crate) const MAX_NOTE_BYTES: usize = 256;
 
 /// Longest product label an embedder may set. It is a product name, and it goes
 /// into the status line.
@@ -83,12 +112,33 @@ pub(crate) fn check_label(label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Check a rule's note for [`response`]: printable ASCII and spaces, not
+/// blank, no surrounding spaces, no final full stop (the body adds one), at
+/// most [`MAX_NOTE_BYTES`]. Anything else could break the body line it is
+/// written into.
+pub(crate) fn check_note(note: &str) -> Result<(), String> {
+    if note.is_empty() || note.len() > MAX_NOTE_BYTES {
+        return Err(format!(
+            "a refusal note must be 1 to {MAX_NOTE_BYTES} bytes long"
+        ));
+    }
+    if note.trim() != note || !note.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+        return Err(
+            "a refusal note must be printable ASCII, with no surrounding spaces".to_string(),
+        );
+    }
+    if note.ends_with('.') {
+        return Err("a refusal note must not end with a full stop".to_string());
+    }
+    Ok(())
+}
+
 /// The response for a refused request: `method` to `host` at `path`, as the
 /// client sent them. `path` may carry a query string; it is dropped. A refused
 /// `CONNECT` passes its `host:port` target and an empty path. `label` names the
 /// embedding product in the status line and the body; it has passed
 /// [`check_label`] on its way in (see `ProxyState::set_block_label`), so it is
-/// written verbatim.
+/// written verbatim, as a rule's note, which passed [`check_note`], is.
 pub(crate) fn response(
     label: Option<&str>,
     reason: BlockReason,
@@ -111,8 +161,11 @@ pub(crate) fn response(
     };
     let code = reason.code();
     let by = label.map_or_else(String::new, |label| format!("{label} "));
+    let note = reason
+        .note()
+        .map_or_else(String::new, |note| format!(" {note}."));
     let body = format!(
-        "Blocked by {by}sandbox egress policy: {method} {shown} (reason: {code}). \
+        "Blocked by {by}sandbox egress policy: {method} {shown} (reason: {code}).{note} \
          This is not a response from {hostname}.\n"
     );
     // The `Proxy-Status` member names the intermediary with a token, which a
@@ -368,6 +421,12 @@ pub(crate) mod tests {
             (BlockReason::AskDeclined, "ask-declined"),
             (BlockReason::CredentialGate, "credential-gate"),
             (BlockReason::UpstreamPolicy, "upstream-policy"),
+            (
+                BlockReason::ConnectorElsewhere {
+                    note: "elsewhere".to_string(),
+                },
+                "connector-elsewhere",
+            ),
         ] {
             let text = String::from_utf8(response(None, reason, "GET", "h.example", "/")).unwrap();
             assert_eq!(parse(&text).1, Some(code));
@@ -403,6 +462,52 @@ pub(crate) mod tests {
         let (_, body) = text.split_once("\r\n\r\n").unwrap();
         assert_eq!(body.lines().count(), 1, "{body}");
         assert!(body.len() < 1000, "{body}");
+    }
+
+    #[test]
+    fn a_rule_s_note_follows_its_reason() {
+        let reason = BlockReason::ConnectorElsewhere {
+            note: "Connector github-acme, connection acme/app, works only on the fleets of acme"
+                .to_string(),
+        };
+        let text = String::from_utf8(response(
+            None,
+            reason.clone(),
+            "GET",
+            "api.github.com:443",
+            "/repos/acme/app?token=secret",
+        ))
+        .unwrap();
+        assert_blocked(
+            &text,
+            reason,
+            "Blocked by sandbox egress policy: GET api.github.com/repos/acme/app \
+             (reason: connector-elsewhere). Connector github-acme, connection acme/app, \
+             works only on the fleets of acme. This is not a response from api.github.com.",
+        );
+        assert!(text.contains(
+            "Proxy-Status: sandbox; error=http_request_denied; details=\"connector-elsewhere\"\r\n"
+        ));
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
+    }
+
+    #[test]
+    fn a_note_that_could_break_the_body_is_refused() {
+        assert!(check_note("github-acme (acme/app) works only on the fleets of acme").is_ok());
+        assert!(check_note(&"x".repeat(MAX_NOTE_BYTES)).is_ok());
+        for bad in [
+            "",
+            " works elsewhere",
+            "works elsewhere ",
+            "works elsewhere.",
+            "works\r\nX-Injected: 1",
+            "works\telsewhere",
+            "wörks elsewhere",
+            &"x".repeat(MAX_NOTE_BYTES + 1),
+        ] {
+            assert!(check_note(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

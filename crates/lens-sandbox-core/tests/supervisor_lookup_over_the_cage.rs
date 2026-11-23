@@ -100,6 +100,7 @@ fn fenced_state() -> Arc<ProxyState> {
         http_rules: Vec::new(),
         scheme: None,
         binaries: Some(vec![PathBuf::from(FENCED_BINARY)]),
+        refusal: None,
     }];
     state
 }

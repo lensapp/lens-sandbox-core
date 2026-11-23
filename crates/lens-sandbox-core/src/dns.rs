@@ -697,6 +697,7 @@ mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         }
     }
 
@@ -953,6 +954,7 @@ mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         };
         let state = state_with_routes(Vec::new());
         let packet = make_query("h.internal", RecordType::A);
@@ -1140,6 +1142,7 @@ mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         };
         let state = state_with_routes(vec![rule("*")]);
         state.policy.write().unwrap().tcp_egress = vec![tcp_deny];
@@ -1168,6 +1171,7 @@ mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         }]);
 
         // Sanity: the single-question form of the allowed name classifies as
@@ -1214,6 +1218,7 @@ mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         }]);
         let packet = make_query("127.0.0.1.nip.io", RecordType::A);
         match classify_query(&packet, &state, None) {
@@ -1407,6 +1412,7 @@ mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         }]);
         state
             .gate_resolved_hosts
@@ -1542,6 +1548,7 @@ mod tests {
                 http_rules: Vec::new(),
                 scheme: None,
                 binaries: None,
+                refusal: None,
             },
             RouteRule {
                 matcher: RouteMatcher::Domain("*.example.com".to_string()),
@@ -1551,6 +1558,7 @@ mod tests {
                 http_rules: Vec::new(),
                 scheme: None,
                 binaries: None,
+                refusal: None,
             },
         ]);
         let packet = make_query("evil.example.com", RecordType::A);
@@ -1675,6 +1683,7 @@ mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         }]);
         let packet = make_query("evil.example", RecordType::A);
         assert!(matches!(
@@ -1698,6 +1707,7 @@ mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         }]);
         let packet = make_query("ask.example", RecordType::A);
         assert!(matches!(
@@ -1721,6 +1731,7 @@ mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         }]);
         let packet = make_query("10.1.2.3", RecordType::A);
         assert!(matches!(

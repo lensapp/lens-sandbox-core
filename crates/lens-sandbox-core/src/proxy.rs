@@ -1002,8 +1002,15 @@ pub async fn serve_explicit(
 }
 
 /// The effective policy decision for a target: `(verdict, transport,
-/// tls_terminate, http_rules)`.
-type RouteDecision = (Verdict, Transport, bool, Vec<HttpRule>);
+/// tls_terminate, http_rules, refusal)`, where `refusal` is what a deny tells
+/// the client.
+type RouteDecision = (
+    Verdict,
+    Transport,
+    bool,
+    Vec<HttpRule>,
+    crate::blocked::BlockReason,
+);
 
 /// Resolve `host` against the route table for `caller`, collapsing the
 /// lock-guarded lookup the three proxy handlers share. Returns the effective
@@ -1027,10 +1034,17 @@ fn resolve_route(
             rule.transport,
             rule.tls_terminate,
             rule.http_rules.clone(),
+            crate::blocked::BlockReason::of_rule(rule.refusal.as_ref()),
         )),
         RouteOutcome::NoMatch {
             binary_filtered: false,
-        } => Some((default_verdict, default_transport, false, Vec::new())),
+        } => Some((
+            default_verdict,
+            default_transport,
+            false,
+            Vec::new(),
+            crate::blocked::BlockReason::PolicyDeny,
+        )),
         // Host matched but the rule's `binaries` filter excluded the caller:
         // fail closed rather than fall through to the default action.
         RouteOutcome::NoMatch {
@@ -1310,7 +1324,7 @@ async fn handle_http_forward(
     // since the request came in as an absolute-form http:// URL). It comes
     // first because whether the route carries HTTP rules decides how the head
     // below is framed.
-    let (verdict, transport, _tls_terminate, domain_http_rules) = match resolve_route(
+    let (verdict, transport, _tls_terminate, domain_http_rules, refused_as) = match resolve_route(
         state,
         target_host,
         Scheme::Http,
@@ -1525,9 +1539,7 @@ async fn handle_http_forward(
 
     let effective_transport = match verdict {
         Verdict::Deny => {
-            refusal
-                .refuse(&mut client, crate::blocked::BlockReason::PolicyDeny)
-                .await?;
+            refusal.refuse(&mut client, refused_as).await?;
             tracing::info!(target = %target_host, method = %method, "HTTP forward proxy DENIED");
             emit_policy_deny_http(state, target_host, method, &path, "policy-deny", actor);
             return Ok(());
@@ -2205,7 +2217,7 @@ async fn refuse_connect(
                 config,
                 state.block_label(),
                 target_host,
-                reason,
+                reason.clone(),
                 session_bound,
             )
             .await
@@ -2213,7 +2225,7 @@ async fn refuse_connect(
         Err(_) => client
             .write_all(&crate::blocked::response(
                 state.block_label(),
-                reason,
+                reason.clone(),
                 "CONNECT",
                 target_host,
                 "",
@@ -2223,7 +2235,7 @@ async fn refuse_connect(
             .map_err(Into::into),
     };
     let seen = answered.as_ref().ok().and_then(Option::as_ref);
-    emit_refused_https(state, target_host, reason, seen, actor);
+    emit_refused_https(state, target_host, &reason, seen, actor);
     answered.map(|_| ())
 }
 
@@ -2252,7 +2264,7 @@ async fn admit_https_destination(
 ) -> Result<HttpsAdmission, crate::blocked::BlockReason> {
     // Find the matching route rule (first match wins, preserving order/specificity).
     // CONNECT is always HTTPS — plain HTTP uses the absolute-form forward path.
-    let Some((verdict, transport, tls_terminate, http_rules)) =
+    let Some((verdict, transport, tls_terminate, http_rules, refused_as)) =
         resolve_route(state, target_host, Scheme::Https, actor.process())
     else {
         tracing::info!(target = %target_host, "proxy DENIED (binary not allowed)");
@@ -2263,7 +2275,7 @@ async fn admit_https_destination(
     match verdict {
         Verdict::Deny => {
             tracing::info!(target = %target_host, "proxy DENIED");
-            return Err(crate::blocked::BlockReason::PolicyDeny);
+            return Err(refused_as);
         }
         Verdict::Ask if deferred => {
             tracing::info!(target = %target_host, "proxy ADMITTED for token answers (forwarded requests are gated)");
@@ -2417,7 +2429,7 @@ async fn handle_https_forward(
         Ok(admission) => admission,
         Err(reason) => {
             // Audited by its destination, as the `CONNECT` it stands for.
-            emit_refused_https(state, target_host, reason, None, actor);
+            emit_refused_https(state, target_host, &reason, None, actor);
             client
                 .write_all(&refusal_for_head(
                     state.block_label(),
@@ -3694,7 +3706,7 @@ async fn handle_transparent_tls(
         return Ok(());
     }
 
-    let (verdict, transport, _tls_terminate, domain_http_rules) = match resolve_route(
+    let (verdict, transport, _tls_terminate, domain_http_rules, refused_as) = match resolve_route(
         state,
         &target_host,
         Scheme::Https,
@@ -3717,14 +3729,7 @@ async fn handle_transparent_tls(
     let deferred = verdict == Verdict::Ask && defers_to_token_answers(state, &target_host);
     let effective_transport = match verdict {
         Verdict::Deny => {
-            return refuse_transparent_tls(
-                start,
-                &target_host,
-                crate::blocked::BlockReason::PolicyDeny,
-                state,
-                &actor,
-            )
-            .await;
+            return refuse_transparent_tls(start, &target_host, refused_as, state, &actor).await;
         }
         Verdict::Ask if deferred => {
             tracing::info!(target = %target_host, "transparent TLS ADMITTED for token answers (forwarded requests are gated)");
@@ -3832,14 +3837,14 @@ async fn handle_transparent_tls(
                                 tls_client,
                                 state.block_label(),
                                 &sni,
-                                reason,
+                                reason.clone(),
                             ),
                         )
                         .await;
                         emit_refused_https(
                             state,
                             &target_host,
-                            reason,
+                            &reason,
                             seen.ok().flatten().as_ref(),
                             &actor,
                         );
@@ -3874,7 +3879,7 @@ async fn refuse_transparent_tls(
         Ok(config) => {
             let answer = async {
                 let tls = start.into_stream(config).await.ok()?;
-                crate::blocked::answer_tls(tls, state.block_label(), &sni, reason).await
+                crate::blocked::answer_tls(tls, state.block_label(), &sni, reason.clone()).await
             };
             let bound = *state.denied_tunnel_timeout.read().unwrap();
             let seen = tokio::time::timeout(bound, answer).await;
@@ -3883,7 +3888,7 @@ async fn refuse_transparent_tls(
         Err(e) => Err(e),
     };
     let seen = answered.as_ref().ok().and_then(Option::as_ref);
-    emit_refused_https(state, target_host, reason, seen, actor);
+    emit_refused_https(state, target_host, &reason, seen, actor);
     answered.map(|_| ())
 }
 
@@ -4283,13 +4288,14 @@ pub(crate) fn emit_policy_deny_connect(
 pub(crate) fn emit_refused_https(
     state: &Arc<ProxyState>,
     target_host: &str,
-    reason: crate::blocked::BlockReason,
+    reason: &crate::blocked::BlockReason,
     seen: Option<&crate::blocked::SeenRequest>,
     actor: &crate::peer_process::ActorContext,
 ) {
     use crate::blocked::BlockReason;
     let reason = match reason {
         BlockReason::PolicyDeny | BlockReason::BinaryNotAllowed => Some(reason.code()),
+        BlockReason::ConnectorElsewhere { .. } => Some(BlockReason::PolicyDeny.code()),
         BlockReason::UpstreamPolicy => None,
         BlockReason::AskDeclined | BlockReason::CredentialGate => return,
     };
@@ -5295,6 +5301,7 @@ pub(crate) mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+            refusal: None,
         }];
 
         let curl = crate::peer_process::PeerProcess {
@@ -5976,6 +5983,7 @@ pub(crate) mod tests {
                 http_rules: Vec::new(),
                 scheme: None,
                 binaries: None,
+                refusal: None,
             },
         ];
         pin_dns_answers(&state, &[ip], "db.example.com", 300, 0);
@@ -6006,6 +6014,7 @@ pub(crate) mod tests {
                 http_rules: Vec::new(),
                 scheme: None,
                 binaries: None,
+                refusal: None,
             },
             fqdn_rule("db.example.com", 5432, Verdict::Deny),
         ];
@@ -6802,6 +6811,7 @@ pub(crate) mod tests {
                 http_rules: Vec::new(),
                 scheme: None,
                 binaries: None,
+                refusal: None,
             });
     }
 
@@ -6830,6 +6840,7 @@ pub(crate) mod tests {
                 }],
                 scheme: None,
                 binaries: None,
+                refusal: None,
             });
     }
 
@@ -6858,6 +6869,7 @@ pub(crate) mod tests {
                 }],
                 scheme: None,
                 binaries: None,
+                refusal: None,
             });
     }
 
@@ -6918,6 +6930,7 @@ pub(crate) mod tests {
                 ],
                 scheme: None,
                 binaries: None,
+                refusal: None,
             });
     }
 
@@ -7220,6 +7233,7 @@ pub(crate) mod tests {
                 http_rules: Vec::new(),
                 scheme: None,
                 binaries: None,
+                refusal: None,
             });
     }
 
@@ -7253,6 +7267,7 @@ pub(crate) mod tests {
                 http_rules: Vec::new(),
                 scheme: None,
                 binaries: None,
+                refusal: None,
             });
         let fake_upstream = tokio::spawn(async move {
             let (mut conn, _) = listener.accept().await.unwrap();
@@ -7318,6 +7333,7 @@ pub(crate) mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: None,
+            refusal: None,
         }];
         tokio::spawn(async move {
             while let Ok((mut conn, _)) = listener.accept().await {
@@ -7597,6 +7613,7 @@ pub(crate) mod tests {
             http_rules: Vec::new(),
             scheme,
             binaries: None,
+            refusal: None,
         };
         let (outer, _outer_rx) = test_state();
         {
@@ -8231,6 +8248,7 @@ pub(crate) mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+            refusal: None,
         }];
         assert_blocked(
             &plain_http_answer(&state).await,
@@ -9362,6 +9380,7 @@ pub(crate) mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+            refusal: None,
         }];
         let (client, server) = socket_pair().await;
         let state_for_handler = state.clone();
@@ -9532,6 +9551,7 @@ pub(crate) mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+            refusal: None,
         }];
         assert_blocked(
             &transparent_tls_answer(&state).await,
@@ -9731,6 +9751,7 @@ pub(crate) mod tests {
             http_rules: Vec::new(),
             scheme: None,
             binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+            refusal: None,
         }];
         refused_connect_sending(&state, GET_A_B).await;
         assert_eq!(
@@ -9780,6 +9801,7 @@ pub(crate) mod tests {
                     http_rules: Vec::new(),
                     scheme: None,
                     binaries: Some(vec![std::path::PathBuf::from("/usr/bin/curl")]),
+                    refusal: None,
                 }];
             }
             let (stream, handler) = transparent_tls_connection(&state).await;
@@ -11062,6 +11084,144 @@ pub(crate) mod tests {
         );
     }
 
+    const ELSEWHERE_NOTE: &str =
+        "Connector example-acme, connection acme/app, works only on the fleets of acme";
+
+    /// A policy whose only rule for `api.example.test` denies it, saying the
+    /// connector that serves it works elsewhere, as an embedder sends it.
+    fn install_connector_elsewhere(state: &Arc<ProxyState>) {
+        let routes = crate::routing::parse_proxy_routes(&serde_json::json!([{
+            "match": "api.example.test",
+            "verdict": "deny",
+            "transport": "direct",
+            "refusal": { "reason": "connector-elsewhere", "note": ELSEWHERE_NOTE }
+        }]))
+        .unwrap();
+        let mut policy = state.policy.write().unwrap();
+        policy.routes = routes.into_iter().map(|parsed| parsed.rule).collect();
+        policy.default_verdict = Verdict::Deny;
+    }
+
+    fn connector_elsewhere() -> BlockReason {
+        BlockReason::ConnectorElsewhere {
+            note: ELSEWHERE_NOTE.to_string(),
+        }
+    }
+
+    /// The refusal of a rule's deny is still audited as a policy deny.
+    fn assert_audited_as_policy_deny(rx: &mut mpsc::UnboundedReceiver<String>) {
+        let refusals = drain_audit_lines(rx);
+        assert!(
+            refusals
+                .iter()
+                .any(|e| e["result"] == "failure" && e["metadata"]["reason"] == "policy-deny"),
+            "{refusals:?}"
+        );
+        assert!(
+            !refusals.iter().any(|e| e.to_string().contains("acme/app")),
+            "{refusals:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_s_refusal_answers_an_absolute_https_request() {
+        let (state, mut rx) = test_state();
+        install_connector_elsewhere(&state);
+        let (mut client, server) = socket_pair().await;
+        let _handler = https_forward(&state, server, WGET_HTTPS_HEAD);
+
+        assert_blocked(
+            &read_response(&mut client).await,
+            connector_elsewhere(),
+            "Blocked by sandbox egress policy: GET api.example.test/v1/things \
+             (reason: connector-elsewhere). Connector example-acme, connection acme/app, \
+             works only on the fleets of acme. This is not a response from api.example.test.",
+        );
+        assert_audited_as_policy_deny(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn a_rule_s_refusal_answers_inside_a_refused_tunnel() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let (state, mut rx) = test_state();
+        install_connector_elsewhere(&state);
+        let (client, server) = socket_pair().await;
+        let state_for_handler = state.clone();
+        let handler = tokio::spawn(async move {
+            handle_connect(
+                server,
+                "api.example.test:443",
+                &test_actor(),
+                &state_for_handler,
+            )
+            .await
+        });
+        assert_blocked(
+            &request_in_refused_tunnel(&state, client, "api.example.test").await,
+            connector_elsewhere(),
+            "Blocked by sandbox egress policy: GET api.example.test/v1/foo \
+             (reason: connector-elsewhere). Connector example-acme, connection acme/app, \
+             works only on the fleets of acme. This is not a response from api.example.test.",
+        );
+        handler.await.unwrap().unwrap();
+        assert_audited_as_policy_deny(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn a_rule_s_refusal_answers_a_plain_http_request() {
+        let (state, mut rx) = test_state();
+        install_connector_elsewhere(&state);
+        assert_blocked(
+            &plain_http_answer(&state).await,
+            connector_elsewhere(),
+            "Blocked by sandbox egress policy: GET api.example.test/v1/x \
+             (reason: connector-elsewhere). Connector example-acme, connection acme/app, \
+             works only on the fleets of acme. This is not a response from api.example.test.",
+        );
+        assert_audited_as_policy_deny(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn a_rule_s_refusal_answers_a_transparent_tls_request() {
+        let (state, mut rx) = test_state();
+        install_connector_elsewhere(&state);
+        assert_blocked(
+            &transparent_tls_answer(&state).await,
+            connector_elsewhere(),
+            "Blocked by sandbox egress policy: GET api.example.test/v1/foo \
+             (reason: connector-elsewhere). Connector example-acme, connection acme/app, \
+             works only on the fleets of acme. This is not a response from api.example.test.",
+        );
+        assert_audited_as_policy_deny(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn a_rule_before_the_refusing_one_still_decides() {
+        let (state, _rx) = test_state();
+        install_connector_elsewhere(&state);
+        state.policy.write().unwrap().routes.insert(
+            0,
+            crate::routing::RouteRule {
+                matcher: crate::routing::RouteMatcher::Domain("api.example.test".to_string()),
+                verdict: Verdict::Deny,
+                transport: Transport::Direct,
+                tls_terminate: false,
+                http_rules: Vec::new(),
+                scheme: None,
+                binaries: None,
+                refusal: None,
+            },
+        );
+        assert_blocked(
+            &plain_http_answer(&state).await,
+            BlockReason::PolicyDeny,
+            "Blocked by sandbox egress policy: GET api.example.test/v1/x (reason: policy-deny). \
+             This is not a response from api.example.test.",
+        );
+    }
+
     #[tokio::test]
     async fn a_route_that_denies_refuses_an_absolute_https_request_with_403() {
         let (state, mut rx) = test_state();
@@ -11109,6 +11269,7 @@ pub(crate) mod tests {
                 }],
                 scheme: None,
                 binaries: None,
+                refusal: None,
             });
     }
 
