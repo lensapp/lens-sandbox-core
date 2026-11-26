@@ -1207,22 +1207,6 @@ impl RequestFacts<'_, '_> {
         reason.into()
     }
 
-    /// Answer a request whose body could not be read as it declared with
-    /// `400`: it is malformed, not refused by policy.
-    async fn reject_unreadable_body<C>(
-        &self,
-        tls_client: &mut C,
-        reason: &str,
-    ) -> Box<dyn std::error::Error + Send + Sync>
-    where
-        C: AsyncWrite + Unpin,
-    {
-        self.record_refusal("body_read_failed", reason, 400);
-        tls_client.write_all(BAD_REQUEST).await.ok();
-        tls_client.shutdown().await.ok();
-        reason.into()
-    }
-
     /// Refuse a request that carries a placeholder it may not carry here:
     /// record why, tell the client, and end the session. Nothing is dialled.
     async fn refuse_placeholder<C>(
@@ -1383,64 +1367,26 @@ impl RequestFacts<'_, '_> {
 }
 
 /// Refuse a request that carries a placeholder the policy does not let it
-/// carry to this host (see [`crate::placeholder_guard`]). The head is always
-/// scanned, and a body the pipeline holds. A small body the proxy can read is
-/// read for the scan, and kept in `buffered_body`, only where a granted
-/// placeholder would be off its hosts: a body nothing needs is streamed.
+/// carry to this host (see [`crate::placeholder_guard`]). Only the head is
+/// scanned, where a credential is used: a placeholder quoted in a body is data.
 async fn guard_placeholders<C>(
     tls_client: &mut C,
     facts: &RequestFacts<'_, '_>,
-    body_mode: BodyFraming,
-    buffered_body: &mut Option<Vec<u8>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let host = facts.ctx.match_host;
-    let read_for_scan = buffered_body.is_none()
-        && body_is_scanned(facts.head, body_mode)
-        && facts
-            .ctx
-            .state
-            .granted_placeholders
-            .read()
-            .unwrap()
-            .any_off_host(host);
-    if read_for_scan {
-        let read = crate::http_body::read_for_inspection(
-            tls_client,
-            facts.head,
-            body_mode,
-            crate::http_body::MAX_INSPECT_BYTES,
-        )
-        .await;
-        match read {
-            Ok(body) => *buffered_body = Some(body),
-            Err(reason) => return Err(facts.reject_unreadable_body(tls_client, &reason).await),
-        }
-    }
-    let refusal = facts.ctx.state.granted_placeholders.read().unwrap().judge(
-        facts.head,
-        buffered_body.as_deref(),
-        host,
-    );
+    let refusal = facts
+        .ctx
+        .state
+        .granted_placeholders
+        .read()
+        .unwrap()
+        .judge(facts.head, facts.ctx.match_host);
     match refusal {
         None => Ok(()),
         Some(refusal) => Err(facts.refuse_placeholder(tls_client, refusal).await),
     }
-}
-
-const BAD_REQUEST: &[u8] =
-    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-
-/// Whether the placeholder scan reads this request's body: one of a known
-/// length the proxy would read for a rule, neither compressed nor multipart.
-fn body_is_scanned(head: &str, body_mode: BodyFraming) -> bool {
-    let small = matches!(
-        body_mode,
-        BodyFraming::Fixed(len) if len > 0 && len <= crate::http_body::MAX_INSPECT_BYTES as u64
-    );
-    small && crate::http_body::ensure_body_is_readable(head).is_ok()
 }
 
 /// Send this request to the backend an `llm` route names, if one claims it.
@@ -1750,7 +1696,7 @@ where
         }
     }
 
-    guard_placeholders(&mut tls_client, &facts, body_mode, &mut buffered_body).await?;
+    guard_placeholders(&mut tls_client, &facts).await?;
 
     // A token request the policy holds an answer for is answered here with a
     // placeholder, and nothing of it is forwarded. See `crate::token_answer`.
@@ -6721,12 +6667,7 @@ mod tests {
                 "GET /collect HTTP/1.1\r\nHost: test.example.com\r\n\
                  Authorization: Bearer {placeholder}\r\n\r\n"
             ),
-            format!(
-                "POST /collect HTTP/1.1\r\nHost: test.example.com\r\n\
-                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n\
-                 {{\"token\":\"{placeholder}\"}}",
-                placeholder.len() + 12
-            ),
+            format!("GET /collect?token={placeholder} HTTP/1.1\r\nHost: test.example.com\r\n\r\n"),
         ] {
             let (upstream_headers, client_response, events) = run_gate_harness_granted(
                 placeholder,
@@ -6762,6 +6703,37 @@ mod tests {
             assert_eq!(refused["metadata"]["credential_id"], "github");
             assert_eq!(refused["host"], "test.example.com");
         }
+    }
+
+    #[tokio::test]
+    async fn a_model_call_that_quotes_a_placeholder_in_its_body_is_forwarded() {
+        let placeholder = "github_LNSPLACEHOLDER0000000000";
+        let body = format!(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":\"GITHUB_TOKEN={placeholder} \
+             old_LNSPLACEHOLDER0000000000\"}}]}}"
+        );
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: test.example.com\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (upstream_headers, client_response, events) = run_gate_harness_granted(
+            placeholder,
+            "github",
+            &["api.github.com"],
+            request.into_bytes(),
+            HostResponse::Deny,
+            "test.example.com:443",
+        )
+        .await;
+        assert!(
+            upstream_headers.starts_with("POST /v1/messages HTTP/1.1"),
+            "a placeholder quoted in data is not a credential used: {upstream_headers} {events:?}"
+        );
+        assert!(
+            client_response.starts_with("HTTP/1.1 200 OK"),
+            "{client_response}"
+        );
     }
 
     #[tokio::test]

@@ -4,10 +4,10 @@
 //!
 //! A placeholder is worthless off its hosts, so the guard protects no secret:
 //! it gives the workload a clear refusal instead of the service's confusing
-//! one, and keeps the placeholder off the wire. The scan is best-effort. It
-//! reads the head and a body the door already holds, each as sent and
-//! percent-decoded, and every base64 run in them decoded; a compressed or
-//! opaque body is not scanned.
+//! one, and keeps the placeholder off the wire. The scan is best-effort and
+//! reads only where a credential is used: the request line and the headers,
+//! as sent, percent-decoded, and with every base64 run decoded. A body is
+//! never scanned, because a placeholder quoted in a prompt or a log is data.
 
 use std::collections::HashMap;
 
@@ -50,19 +50,10 @@ impl Granted {
         entry.hosts.extend(hosts.iter().cloned());
     }
 
-    /// Whether a placeholder the policy granted would be off its hosts on a
-    /// request to `host`, so a body to it is worth reading for the scan.
-    pub(crate) fn any_off_host(&self, host: &str) -> bool {
-        self.placeholders
-            .values()
-            .any(|granted| granted.is_off_host(host))
-    }
-
     /// Why this request to `host` (as `injection_matches` reads it) is refused,
-    /// or `None` when it carries no placeholder off its hosts. `body` is the
-    /// body the door holds, already known to be uncompressed.
-    pub(crate) fn judge(&self, head: &str, body: Option<&[u8]>, host: &str) -> Option<Refusal> {
-        let views = views(head, body);
+    /// or `None` when its head carries no placeholder it may not carry there.
+    pub(crate) fn judge(&self, head: &str, host: &str) -> Option<Refusal> {
+        let views = views(head);
         let mut off_host: Vec<&str> = self
             .placeholders
             .iter()
@@ -152,20 +143,13 @@ pub(crate) fn has_placeholder_shape(text: &str) -> bool {
 /// shortest placeholder a document may declare (16 characters).
 const MIN_BASE64_RUN: usize = 20;
 
-/// The texts a request is scanned as: the head and the body as sent, each
-/// percent-decoded, and every base64 run in those decoded.
-fn views(head: &str, body: Option<&[u8]>) -> Vec<String> {
-    let mut sent = vec![head.to_string()];
-    if let Some(body) = body {
-        sent.push(String::from_utf8_lossy(body).into_owned());
-    }
-    let mut views = Vec::with_capacity(sent.len() * 2);
-    for text in sent {
-        let decoded = crate::proxy::percent_decode(&text);
-        if decoded != text {
-            views.push(decoded);
-        }
-        views.push(text);
+/// The texts a request head is scanned as: as sent, percent-decoded, and
+/// every base64 run in those decoded, which covers a `Basic` password.
+fn views(head: &str) -> Vec<String> {
+    let mut views = vec![head.to_string()];
+    let decoded = crate::proxy::percent_decode(head);
+    if decoded != head {
+        views.push(decoded);
     }
     let decoded: Vec<String> = views
         .iter()
@@ -217,14 +201,14 @@ mod tests {
     #[test]
     fn a_placeholder_on_its_own_host_passes() {
         let head = format!("GET /user HTTP/1.1\r\nAuthorization: Bearer {GITHUB}");
-        assert_eq!(github().judge(&head, None, "api.github.com:443"), None);
+        assert_eq!(github().judge(&head, "api.github.com:443"), None);
     }
 
     #[test]
     fn a_placeholder_in_a_header_off_its_hosts_is_refused_with_its_credential() {
         let head = head(&format!("Authorization: Bearer {GITHUB}"));
         assert_eq!(
-            github().judge(&head, None, "evil.example:443"),
+            github().judge(&head, "evil.example:443"),
             off_host("github")
         );
     }
@@ -232,37 +216,28 @@ mod tests {
     #[test]
     fn a_placeholder_in_the_url_off_its_hosts_is_refused() {
         let head = format!("GET /collect?t={GITHUB} HTTP/1.1\r\nHost: evil.example");
-        assert_eq!(
-            github().judge(&head, None, "evil.example"),
-            off_host("github")
-        );
+        assert_eq!(github().judge(&head, "evil.example"), off_host("github"));
     }
 
     #[test]
     fn a_percent_encoded_placeholder_is_found() {
         let encoded = GITHUB.replace('_', "%5F");
         let head = format!("GET /collect?t={encoded} HTTP/1.1\r\nHost: evil.example");
-        assert_eq!(
-            github().judge(&head, None, "evil.example"),
-            off_host("github")
-        );
+        assert_eq!(github().judge(&head, "evil.example"), off_host("github"));
     }
 
     #[test]
-    fn a_placeholder_in_a_body_is_found_as_sent_percent_encoded_and_in_base64() {
-        let standard = base64::engine::general_purpose::STANDARD.encode(GITHUB);
+    fn a_placeholder_in_a_header_is_found_percent_encoded_and_in_base64() {
         let url_safe =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("token:{GITHUB}"));
-        for body in [
-            format!("{{\"token\":\"{GITHUB}\"}}"),
-            format!("token={}", GITHUB.replace('_', "%5f")),
-            format!("{{\"blob\":\"{standard}\"}}"),
-            format!("blob={url_safe}&a=1"),
+        for header in [
+            format!("X-Token: {}", GITHUB.replace('_', "%5f")),
+            format!("X-Blob: {url_safe}"),
         ] {
             assert_eq!(
-                github().judge(&head(""), Some(body.as_bytes()), "evil.example"),
+                github().judge(&head(&header), "evil.example"),
                 off_host("github"),
-                "{body}"
+                "{header}"
             );
         }
     }
@@ -272,15 +247,7 @@ mod tests {
         let basic =
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{GITHUB}"));
         let head = head(&format!("Authorization: Basic {basic}"));
-        assert_eq!(
-            github().judge(&head, None, "evil.example"),
-            off_host("github")
-        );
-    }
-
-    #[test]
-    fn a_body_the_door_does_not_hold_is_not_scanned() {
-        assert_eq!(github().judge(&head(""), None, "evil.example"), None);
+        assert_eq!(github().judge(&head, "evil.example"), off_host("github"));
     }
 
     #[test]
@@ -288,7 +255,7 @@ mod tests {
         let mut granted = Granted::default();
         granted.grant(GITHUB, "github", &[]);
         let head = head(&format!("Authorization: Bearer {GITHUB}"));
-        assert_eq!(granted.judge(&head, None, "evil.example"), None);
+        assert_eq!(granted.judge(&head, "evil.example"), None);
     }
 
     #[test]
@@ -302,23 +269,15 @@ mod tests {
         );
         let carrying = |placeholder: &str| head(&format!("X-Token: {placeholder}"));
         assert_eq!(
-            granted.judge(&carrying(GITHUB), None, "sts.amazonaws.com:443"),
+            granted.judge(&carrying(GITHUB), "sts.amazonaws.com:443"),
             None
         );
         assert_eq!(
-            granted.judge(
-                &carrying("db_LNSPLACEHOLDER0000000000"),
-                None,
-                "db.example:5432"
-            ),
+            granted.judge(&carrying("db_LNSPLACEHOLDER0000000000"), "db.example:5432"),
             None
         );
         assert_eq!(
-            granted.judge(
-                &carrying("db_LNSPLACEHOLDER0000000000"),
-                None,
-                "db.example:6543"
-            ),
+            granted.judge(&carrying("db_LNSPLACEHOLDER0000000000"), "db.example:6543"),
             off_host("db")
         );
     }
@@ -328,12 +287,9 @@ mod tests {
         let mut granted = github();
         granted.grant(GITHUB, "github-app", &["uploads.github.com".to_string()]);
         let head = head(&format!("Authorization: Bearer {GITHUB}"));
-        assert_eq!(granted.judge(&head, None, "uploads.github.com"), None);
-        assert_eq!(granted.judge(&head, None, "api.github.com"), None);
-        assert_eq!(
-            granted.judge(&head, None, "evil.example"),
-            off_host("github-app")
-        );
+        assert_eq!(granted.judge(&head, "uploads.github.com"), None);
+        assert_eq!(granted.judge(&head, "api.github.com"), None);
+        assert_eq!(granted.judge(&head, "evil.example"), off_host("github-app"));
     }
 
     #[test]
@@ -347,19 +303,7 @@ mod tests {
         let head = head(&format!(
             "X-A: gitlab_LNSPLACEHOLDER000000000\r\nX-B: {GITHUB}"
         ));
-        assert_eq!(
-            granted.judge(&head, None, "evil.example"),
-            off_host("github")
-        );
-    }
-
-    #[test]
-    fn a_body_is_worth_reading_only_where_a_granted_placeholder_is_off_its_hosts() {
-        let mut granted = github();
-        granted.grant("hub_LNSPLACEHOLDER0000000000", "hub", &[]);
-        assert!(granted.any_off_host("evil.example:443"));
-        assert!(!granted.any_off_host("api.github.com:443"));
-        assert!(!Granted::default().any_off_host("evil.example:443"));
+        assert_eq!(granted.judge(&head, "evil.example"), off_host("github"));
     }
 
     fn no_grant() -> Option<Refusal> {
@@ -369,26 +313,15 @@ mod tests {
     #[test]
     fn a_placeholder_no_grant_holds_is_refused_wherever_it_is_carried() {
         let revoked = "gitlab_LNSPLACEHOLDER0000000000";
-        let in_base64 = base64::engine::general_purpose::STANDARD.encode(revoked);
-        for (head, body) in [
-            (format!("GET / HTTP/1.1\r\nPRIVATE-TOKEN: {revoked}"), None),
-            (format!("GET /api?private_token={revoked} HTTP/1.1"), None),
-            (
-                format!("GET /api?t={} HTTP/1.1", revoked.replace('_', "%5F")),
-                None,
-            ),
-            (head(""), Some(format!("{{\"token\":\"{revoked}\"}}"))),
-            (head(""), Some(format!("blob={in_base64}"))),
-            (
-                "GET / HTTP/1.1\r\nX-Token: lnsk_lnsplaceholder2222222222".to_string(),
-                None,
-            ),
+        let in_basic = base64::engine::general_purpose::STANDARD.encode(format!("u:{revoked}"));
+        for head in [
+            format!("GET / HTTP/1.1\r\nPRIVATE-TOKEN: {revoked}"),
+            format!("GET /api?private_token={revoked} HTTP/1.1"),
+            format!("GET /api?t={} HTTP/1.1", revoked.replace('_', "%5F")),
+            format!("GET / HTTP/1.1\r\nAuthorization: Basic {in_basic}"),
+            "GET / HTTP/1.1\r\nX-Token: lnsk_lnsplaceholder2222222222".to_string(),
         ] {
-            assert_eq!(
-                github().judge(&head, body.as_deref().map(str::as_bytes), "gitlab.com"),
-                no_grant(),
-                "{head} {body:?}"
-            );
+            assert_eq!(github().judge(&head, "gitlab.com"), no_grant(), "{head}");
         }
     }
 
@@ -396,8 +329,8 @@ mod tests {
     fn a_value_without_the_placeholder_shape_passes_untouched() {
         let head = "GET /lensapp/lns-sandbox HTTP/1.1\r\nAuthorization: Bearer glpat-real-token-0000\r\n\
                     X-Doc: placeholder lns";
-        assert_eq!(github().judge(head, None, "gitlab.com"), None);
-        assert_eq!(Granted::default().judge(head, None, "gitlab.com"), None);
+        assert_eq!(github().judge(head, "gitlab.com"), None);
+        assert_eq!(Granted::default().judge(head, "gitlab.com"), None);
     }
 
     #[test]
@@ -408,7 +341,7 @@ mod tests {
             "GET / HTTP/1.1\r\nX-Note: some-LnsPlaceholder-0000000000 in mixed case",
         ] {
             assert_eq!(
-                Granted::default().judge(head, None, "api.github.com"),
+                Granted::default().judge(head, "api.github.com"),
                 None,
                 "{head}"
             );
@@ -422,7 +355,7 @@ mod tests {
         let head = format!(
             "GET /user HTTP/1.1\r\nAuthorization: Bearer {GITHUB}\r\nX-Hub: hub_LNSPLACEHOLDER0000000000"
         );
-        assert_eq!(granted.judge(&head, None, "api.github.com"), None);
+        assert_eq!(granted.judge(&head, "api.github.com"), None);
     }
 
     #[test]
@@ -430,15 +363,15 @@ mod tests {
         let head = format!(
             "GET /user HTTP/1.1\r\nAuthorization: Bearer {GITHUB}\r\nX-Old: old_LNSPLACEHOLDER0000000000"
         );
-        assert_eq!(github().judge(&head, None, "api.github.com"), no_grant());
+        assert_eq!(github().judge(&head, "api.github.com"), no_grant());
     }
 
     #[test]
     fn a_revoked_grant_leaves_its_placeholder_refused() {
         let head = format!("GET /user HTTP/1.1\r\nAuthorization: Bearer {GITHUB}");
-        assert_eq!(github().judge(&head, None, "api.github.com"), None);
+        assert_eq!(github().judge(&head, "api.github.com"), None);
         assert_eq!(
-            Granted::default().judge(&head, None, "api.github.com"),
+            Granted::default().judge(&head, "api.github.com"),
             no_grant()
         );
     }
@@ -448,17 +381,14 @@ mod tests {
         let head = head(&format!(
             "X-A: old_LNSPLACEHOLDER0000000000\r\nX-B: {GITHUB}"
         ));
-        assert_eq!(
-            github().judge(&head, None, "evil.example"),
-            off_host("github")
-        );
+        assert_eq!(github().judge(&head, "evil.example"), off_host("github"));
     }
 
     #[test]
     fn an_empty_placeholder_is_never_granted() {
         let mut granted = Granted::default();
         granted.grant("", "empty", &["api.example".to_string()]);
-        assert_eq!(granted.judge(&head(""), None, "evil.example"), None);
+        assert_eq!(granted.judge(&head(""), "evil.example"), None);
     }
 
     #[test]
