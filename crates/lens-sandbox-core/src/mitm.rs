@@ -1238,6 +1238,9 @@ impl RequestFacts<'_, '_> {
                 crate::blocked::BlockReason::placeholder_off_host(&credential, self.target_host),
                 Some(credential),
             ),
+            crate::placeholder_guard::Refusal::NoGrant => {
+                (crate::blocked::BlockReason::PlaceholderNoGrant, None)
+            }
         };
         let code = block.code();
         tracing::info!(
@@ -3361,6 +3364,13 @@ mod tests {
         is_tunnel: bool,
     ) -> (String, String, Vec<serde_json::Value>) {
         let (state, audit_rx) = crate::proxy::tests::test_state();
+        for (placeholder, _) in &placeholder_map {
+            state.granted_placeholders.write().unwrap().grant(
+                placeholder,
+                "uri",
+                &["test.example.com".to_string()],
+            );
+        }
         let policy = HarnessPolicy {
             injections,
             http_rules,
@@ -6755,6 +6765,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_placeholder_no_grant_holds_is_refused_and_never_sent() {
+        let request = "GET /user HTTP/1.1\r\nHost: test.example.com\r\n\
+                       Authorization: Bearer old_LNSPLACEHOLDER0000000000\r\n\r\n";
+        let (upstream_headers, client_response, events) = run_gate_harness_granted(
+            "github_LNSPLACEHOLDER0000000000",
+            "github",
+            &["test.example.com"],
+            request.as_bytes().to_vec(),
+            HostResponse::Deny,
+            "test.example.com:443",
+        )
+        .await;
+        assert!(upstream_headers.is_empty(), "{upstream_headers}");
+        let (_, reason, line) = crate::blocked::tests::parse(&client_response);
+        assert_eq!(reason, Some("placeholder-no-grant"));
+        assert!(line.contains("the grant is gone."), "{line}");
+        let refused = events
+            .iter()
+            .find(|e| e["type"] == "audit_event" && e["result"] == "failure")
+            .unwrap_or_else(|| panic!("no refusal audited: {events:?}"));
+        assert_eq!(refused["metadata"]["reason"], "placeholder-no-grant");
+        assert!(
+            refused["metadata"].get("credential_id").is_none(),
+            "{refused}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_granted_placeholder_on_its_own_host_still_reaches_the_credential_gate() {
         let placeholder = "github_LNSPLACEHOLDER0000000000";
         let request = format!(
@@ -7164,6 +7202,9 @@ mod tests {
             let mut idx = state.placeholder_index.write().unwrap();
             idx.insert(github_ph.into(), "github".into());
             idx.insert(openai_ph.into(), "openai".into());
+            let mut granted = state.granted_placeholders.write().unwrap();
+            granted.grant(github_ph, "github", &["test.example.com".to_string()]);
+            granted.grant(openai_ph, "openai", &["test.example.com".to_string()]);
         }
         state.decision_timeout_override(Duration::from_secs(1));
 

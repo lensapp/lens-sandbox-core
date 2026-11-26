@@ -4303,7 +4303,8 @@ pub(crate) fn emit_refused_https(
         BlockReason::UpstreamPolicy => None,
         BlockReason::AskDeclined
         | BlockReason::CredentialGate
-        | BlockReason::PlaceholderOffHost { .. } => return,
+        | BlockReason::PlaceholderOffHost { .. }
+        | BlockReason::PlaceholderNoGrant => return,
     };
     let Some(request) = seen else {
         match reason {

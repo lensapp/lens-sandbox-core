@@ -46,6 +46,9 @@ pub(crate) enum BlockReason {
     /// The request carries a granted placeholder to a host its credential
     /// does not name; `note` names the credential and the host.
     PlaceholderOffHost { note: String },
+    /// The request carries a value with LNS's placeholder shape that no
+    /// current grant holds.
+    PlaceholderNoGrant,
 }
 
 impl BlockReason {
@@ -59,6 +62,7 @@ impl BlockReason {
             Self::UpstreamPolicy => "upstream-policy",
             Self::ConnectorElsewhere { .. } => "connector-elsewhere",
             Self::PlaceholderOffHost { .. } => "placeholder-off-host",
+            Self::PlaceholderNoGrant => "placeholder-no-grant",
         }
     }
 
@@ -92,6 +96,9 @@ impl BlockReason {
     fn note(&self) -> Option<&str> {
         match self {
             Self::ConnectorElsewhere { note } | Self::PlaceholderOffHost { note } => Some(note),
+            Self::PlaceholderNoGrant => {
+                Some("The placeholder it carries matches no current grant: the grant is gone")
+            }
             _ => None,
         }
     }
@@ -463,6 +470,7 @@ pub(crate) mod tests {
                 BlockReason::placeholder_off_host("github", "evil.example:443"),
                 "placeholder-off-host",
             ),
+            (BlockReason::PlaceholderNoGrant, "placeholder-no-grant"),
         ] {
             let text = String::from_utf8(response(None, reason, "GET", "h.example", "/")).unwrap();
             assert_eq!(parse(&text).1, Some(code));
@@ -547,6 +555,26 @@ pub(crate) mod tests {
              only on its own hosts, not on evil.example. This is not a response from evil.example.",
         );
         assert!(check_note(reason.note().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_placeholder_no_grant_holds_says_the_grant_is_gone() {
+        let text = String::from_utf8(response(
+            None,
+            BlockReason::PlaceholderNoGrant,
+            "GET",
+            "gitlab.com:443",
+            "/api/v4/user",
+        ))
+        .unwrap();
+        assert_blocked(
+            &text,
+            BlockReason::PlaceholderNoGrant,
+            "Blocked by sandbox egress policy: GET gitlab.com/api/v4/user \
+             (reason: placeholder-no-grant). The placeholder it carries matches no current \
+             grant: the grant is gone. This is not a response from gitlab.com.",
+        );
+        assert!(check_note(BlockReason::PlaceholderNoGrant.note().unwrap()).is_ok());
     }
 
     #[test]
