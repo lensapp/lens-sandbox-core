@@ -1075,13 +1075,8 @@ fn connect_dial_failure_response(
 ) -> (Vec<u8>, Option<DialRefusal>) {
     match dial_refusal(error, target_host) {
         Some(audited) => {
-            let refusal = crate::blocked::response(
-                label,
-                crate::blocked::BlockReason::PolicyDeny,
-                "CONNECT",
-                target_host,
-                "",
-            );
+            let refusal =
+                crate::blocked::response(label, audited.block_reason(), "CONNECT", target_host, "");
             (refusal, Some(audited))
         }
         None => (failed_dial_response(target_host, error), None),
@@ -1094,10 +1089,14 @@ fn dial_refusal(error: &std::io::Error, target_host: &str) -> Option<DialRefusal
     Some(match crate::egress::refusal_of(error)? {
         crate::egress::EgressRefused::Floor(_) | crate::egress::EgressRefused::OwnAddress(_) => {
             DialRefusal {
-                reason: "blocked-destination",
+                reason: BLOCKED_DESTINATION,
                 destination: target_host.to_string(),
             }
         }
+        crate::egress::EgressRefused::InstanceMetadata(_) => DialRefusal {
+            reason: INSTANCE_METADATA,
+            destination: target_host.to_string(),
+        },
         crate::egress::EgressRefused::Rule(resolved) => DialRefusal {
             reason: "policy-deny",
             destination: resolved.to_string(),
@@ -1127,6 +1126,44 @@ fn failed_dial_response(target_host: &str, error: &std::io::Error) -> Vec<u8> {
 pub(crate) struct DialRefusal {
     reason: &'static str,
     destination: String,
+}
+
+impl DialRefusal {
+    /// What the client is told: the metadata floor says so, every other refusal is `policy-deny`.
+    fn block_reason(&self) -> crate::blocked::BlockReason {
+        if self.reason == INSTANCE_METADATA {
+            crate::blocked::BlockReason::InstanceMetadata
+        } else {
+            crate::blocked::BlockReason::PolicyDeny
+        }
+    }
+}
+
+/// The audit reason of a destination no sandbox egress reaches: loopback, unspecified, or the host's own address.
+const BLOCKED_DESTINATION: &str = "blocked-destination";
+
+/// The audit reason, and the `X-Sandbox-Blocked` code, of the metadata floor.
+const INSTANCE_METADATA: &str = "instance-metadata";
+
+/// How a target [`validate_connect_target`] refused is audited and answered.
+fn floor_refusal(target: &str) -> (&'static str, crate::blocked::BlockReason) {
+    if target_is_instance_metadata(target) {
+        (
+            INSTANCE_METADATA,
+            crate::blocked::BlockReason::InstanceMetadata,
+        )
+    } else {
+        (BLOCKED_DESTINATION, crate::blocked::BlockReason::PolicyDeny)
+    }
+}
+
+/// Whether `target` (`host`, `host:port` or `[v6]:port`) names an instance metadata service by its address or its name.
+fn target_is_instance_metadata(target: &str) -> bool {
+    let hostname = target_hostname(target);
+    crate::egress::is_instance_metadata_name(hostname)
+        || hostname
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(crate::egress::is_instance_metadata)
 }
 
 /// The RFC 9209 `Proxy-Status` error type of a dial that failed.
@@ -1284,10 +1321,9 @@ async fn handle_http_forward(
 
     // Validate target: reject CRLF injection and loopback/link-local targets
     if let Err(e) = validate_connect_target(target_host) {
-        emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
-        refusal
-            .refuse(&mut client, crate::blocked::BlockReason::PolicyDeny)
-            .await?;
+        let (reason, block) = floor_refusal(target_host);
+        emit_policy_deny_connect(state, target_host, reason, actor);
+        refusal.refuse(&mut client, block).await?;
         return Err(e);
     }
 
@@ -1603,9 +1639,7 @@ async fn handle_http_forward(
                             refused.reason,
                             actor,
                         );
-                        refusal
-                            .refuse(&mut client, crate::blocked::BlockReason::PolicyDeny)
-                            .await?;
+                        refusal.refuse(&mut client, refused.block_reason()).await?;
                     } else {
                         emit_failed_http_dial(state, target_host, method, &path, &e, actor);
                         client
@@ -1847,11 +1881,12 @@ async fn handle_connect(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Validate target: reject CRLF injection and loopback/link-local targets
     if let Err(e) = validate_connect_target(target_host) {
-        emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
+        let (reason, block) = floor_refusal(target_host);
+        emit_policy_deny_connect(state, target_host, reason, actor);
         client
             .write_all(&crate::blocked::response(
                 state.block_label(),
-                crate::blocked::BlockReason::PolicyDeny,
+                block,
                 "CONNECT",
                 target_host,
                 "",
@@ -2391,11 +2426,12 @@ async fn handle_https_forward(
 
     // Validate target: reject CRLF injection and loopback/link-local targets
     if let Err(e) = validate_connect_target(target_host) {
-        emit_policy_deny_connect(state, target_host, "blocked-destination", actor);
+        let (reason, block) = floor_refusal(target_host);
+        emit_policy_deny_connect(state, target_host, reason, actor);
         client
             .write_all(&refusal_for_head(
                 state.block_label(),
-                crate::blocked::BlockReason::PolicyDeny,
+                block,
                 target_host,
                 &header_str,
             ))
@@ -2556,12 +2592,7 @@ pub(crate) fn dial_failure_response(
     };
     match dial_refusal(error, target_host) {
         Some(refusal) => (
-            refusal_for_head(
-                label,
-                crate::blocked::BlockReason::PolicyDeny,
-                target_host,
-                head,
-            ),
+            refusal_for_head(label, refusal.block_reason(), target_host, head),
             DialAudit::Refused(refusal),
         ),
         None => (
@@ -3288,7 +3319,7 @@ async fn handle_raw_passthrough(
     // cloud metadata, bypassing the cage. Reject before any dial, regardless of
     // verdict — this is not policy, it is a hard floor.
     if let Err(e) = validate_connect_target(&raw_target) {
-        emit_policy_deny_connect(state, &raw_target, "blocked-destination", actor);
+        emit_policy_deny_connect(state, &raw_target, floor_refusal(&raw_target).0, actor);
         tracing::debug!(target = %raw_target, "raw passthrough blocked: {e}");
         return Ok(());
     }
@@ -3672,7 +3703,12 @@ async fn handle_transparent_tls(
     let target_host = format!("{sni}:{}", orig_dst.port());
 
     if let Err(e) = validate_connect_target(&target_host) {
-        emit_transparent_deny(state, orig_dst, &format!("blocked-target: {e}"));
+        let reason = if target_is_instance_metadata(&target_host) {
+            INSTANCE_METADATA.to_string()
+        } else {
+            format!("blocked-target: {e}")
+        };
+        emit_transparent_deny(state, orig_dst, &reason);
         drop(start);
         return Ok(());
     }
@@ -3980,6 +4016,18 @@ async fn handle_transparent_http(
     // loopback target in the Host header should never reach routing, and
     // the transparent TLS branch already validates at the same stage.
     if let Err(e) = validate_connect_target(&target_host) {
+        if target_is_instance_metadata(&target_host) {
+            emit_transparent_deny(state, orig_dst, INSTANCE_METADATA);
+            stream
+                .write_all(&refusal_for_head(
+                    state.block_label(),
+                    crate::blocked::BlockReason::InstanceMetadata,
+                    &target_host,
+                    &header_str,
+                ))
+                .await?;
+            return Ok(());
+        }
         emit_transparent_deny(state, orig_dst, &format!("blocked-target: {e}"));
         stream
             .write_all(
@@ -4298,7 +4346,9 @@ pub(crate) fn emit_refused_https(
 ) {
     use crate::blocked::BlockReason;
     let reason = match reason {
-        BlockReason::PolicyDeny | BlockReason::BinaryNotAllowed => Some(reason.code()),
+        BlockReason::PolicyDeny | BlockReason::BinaryNotAllowed | BlockReason::InstanceMetadata => {
+            Some(reason.code())
+        }
         BlockReason::ConnectorElsewhere { .. } => Some(BlockReason::PolicyDeny.code()),
         BlockReason::UpstreamPolicy => None,
         BlockReason::AskDeclined
@@ -4445,17 +4495,10 @@ fn validate_connect_target(target: &str) -> Result<(), Box<dyn std::error::Error
         return Err("CONNECT target contains CRLF".into());
     }
 
-    // Reject loopback and link-local targets.
-    // Handle bracketed IPv6 like [::1]:22
-    let hostname = if target.starts_with('[') {
-        target
-            .split(']')
-            .next()
-            .unwrap_or(target)
-            .trim_start_matches('[')
-    } else {
-        target.split(':').next().unwrap_or(target)
-    };
+    if target_is_instance_metadata(target) {
+        return Err("CONNECT to instance metadata denied".into());
+    }
+    let hostname = target_hostname(target);
     // Block localhost hostnames (not just IPs)
     let lower = hostname.to_ascii_lowercase();
     if lower == "localhost" || lower.ends_with(".localhost") {
@@ -4469,6 +4512,19 @@ fn validate_connect_target(target: &str) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
+}
+
+/// The host of a `CONNECT`-style target, without its port or the brackets of an IPv6 literal.
+fn target_hostname(target: &str) -> &str {
+    if target.starts_with('[') {
+        target
+            .split(']')
+            .next()
+            .unwrap_or(target)
+            .trim_start_matches('[')
+    } else {
+        target.split(':').next().unwrap_or(target)
+    }
 }
 
 /// A parsed incoming proxy request — either CONNECT tunnel or HTTP forward proxy.
@@ -8809,7 +8865,7 @@ pub(crate) mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| e["metadata"]["reason"] == "blocked-destination"),
+                .any(|e| e["metadata"]["reason"] == "instance-metadata"),
             "the floor must refuse it; got {events:#?}"
         );
         assert!(
@@ -11454,10 +11510,6 @@ pub(crate) mod tests {
                 b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
                 "127.0.0.1",
             ),
-            (
-                b"GET https://169.254.169.254/latest HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n",
-                "169.254.169.254",
-            ),
         ] {
             let request_line = String::from_utf8_lossy(request);
             let response = proxy_door_answer(&state, request).await;
@@ -11479,6 +11531,129 @@ pub(crate) mod tests {
                 "no card may be raised for a blocked destination; got {events:#?}"
             );
         }
+    }
+
+    fn assert_refused_as_instance_metadata(
+        response: &str,
+        events: &[serde_json::Value],
+        host: &str,
+        what: &str,
+    ) {
+        let (status, reason, line) = crate::blocked::tests::parse(response);
+        assert_eq!(
+            status, "HTTP/1.1 403 Forbidden by sandbox policy",
+            "{what}: {response}"
+        );
+        assert_eq!(reason, Some("instance-metadata"), "{what}: {response}");
+        assert!(
+            line.contains("Instance metadata is never reachable from a sandbox."),
+            "{what}: {line}"
+        );
+        assert!(
+            events.iter().any(|e| e["host"] == host
+                && e["result"] == "failure"
+                && e["metadata"]["reason"] == "instance-metadata"),
+            "{what} must be audited as instance metadata; got {events:#?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["type"] == "request_pending"),
+            "no card may be raised for the metadata floor; got {events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_metadata_floor_is_refused_as_instance_metadata_on_every_door() {
+        let (state, mut rx) = test_state();
+        install_catch_all_allow(&state);
+        for (request, host) in [
+            (
+                &b"CONNECT 168.63.129.16:443 HTTP/1.1\r\nHost: 168.63.129.16:443\r\n\r\n"[..],
+                "168.63.129.16",
+            ),
+            (
+                b"CONNECT metadata.google.internal:80 HTTP/1.1\r\n\r\n",
+                "metadata.google.internal",
+            ),
+            (
+                b"GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n",
+                "169.254.169.254",
+            ),
+            (
+                b"GET https://100.100.100.200/latest/meta-data/ HTTP/1.1\r\nHost: 100.100.100.200\r\n\r\n",
+                "100.100.100.200",
+            ),
+        ] {
+            let what = String::from_utf8_lossy(request).into_owned();
+            let response = proxy_door_answer(&state, request).await;
+            let events = drain_audit_lines(&mut rx);
+            assert_refused_as_instance_metadata(&response, &events, host, &what);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_that_resolves_to_the_metadata_floor_is_refused_at_the_dial() {
+        let (state, mut rx) = test_state_on(TestNetwork::Resolving {
+            name: "wire.example",
+            to: "168.63.129.16".parse().unwrap(),
+        });
+        install_catch_all_allow(&state);
+        let response = proxy_door_answer(
+            &state,
+            b"GET http://wire.example/machine HTTP/1.1\r\nHost: wire.example\r\n\r\n",
+        )
+        .await;
+        let events = drain_audit_lines(&mut rx);
+        assert_refused_as_instance_metadata(&response, &events, "wire.example", "a rebound name");
+    }
+
+    #[tokio::test]
+    async fn the_transparent_door_refuses_the_metadata_floor_with_403() {
+        let (state, mut rx) = test_state();
+        install_catch_all_allow(&state);
+        let (mut client, server) = socket_pair().await;
+        let dst: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        let state_for_handler = state.clone();
+        tokio::spawn(
+            async move { serve_egress(server, dst, test_actor(), state_for_handler).await },
+        );
+        client
+            .write_all(b"GET /latest/meta-data/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_response(&mut client).await;
+        let events = drain_audit_lines(&mut rx);
+        assert_eq!(
+            crate::blocked::tests::parse(&response).1,
+            Some("instance-metadata"),
+            "{response}"
+        );
+        assert!(
+            events.iter().any(|e| e["result"] == "failure"
+                && e["metadata"]["reason"] == "instance-metadata"),
+            "{events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_tcp_rule_opens_the_metadata_floor() {
+        let (state, mut rx) = test_state();
+        install_tcp_rules(
+            &state,
+            r#"[{"match": "168.63.129.16:80", "verdict": "allow"}]"#,
+        );
+        let dst: SocketAddr = "168.63.129.16:80".parse().unwrap();
+        let decision = tcp_egress_verdict(&state, "168.63.129.16", 80, None).expect("the rule");
+        let (_client, server) = socket_pair().await;
+        handle_raw_passthrough(server, dst, &decision, &state, &test_actor())
+            .await
+            .unwrap();
+        let events = drain_audit(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["metadata"]["reason"] == "instance-metadata"),
+            "the floor must refuse it whatever the rule says; got {events:#?}"
+        );
     }
 
     #[tokio::test]

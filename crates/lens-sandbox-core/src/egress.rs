@@ -84,8 +84,40 @@ pub fn is_link_local(ip: IpAddr) -> bool {
     }
 }
 
+/// Instance metadata services outside the link-local ranges: Azure's
+/// WireServer, Alibaba Cloud's metadata service, and the IPv6 addresses of
+/// AWS's metadata service and its EKS Pod Identity agent.
+const METADATA_ADDRESSES: [IpAddr; 4] = [
+    IpAddr::V4(std::net::Ipv4Addr::new(168, 63, 129, 16)),
+    IpAddr::V4(std::net::Ipv4Addr::new(100, 100, 100, 200)),
+    IpAddr::V6(std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)),
+    IpAddr::V6(std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x23)),
+];
+
+/// The names of instance metadata services, refused wherever they resolve.
+const METADATA_NAMES: [&str; 1] = ["metadata.google.internal"];
+
+/// Whether `ip` is on the metadata floor: link-local, or a named instance
+/// metadata address. A guest that reached one would take its host's cloud
+/// identity, so no rule opens it.
+pub fn is_instance_metadata(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    is_link_local(ip) || METADATA_ADDRESSES.contains(&ip)
+}
+
+/// Whether `host`, a name with or without its port, names an instance
+/// metadata service.
+pub fn is_instance_metadata_name(host: &str) -> bool {
+    let name = crate::proxy::extract_hostname(host);
+    let name = name.trim_end_matches('.');
+    METADATA_NAMES
+        .iter()
+        .any(|metadata| metadata.eq_ignore_ascii_case(name))
+}
+
 /// Whether `ip` is a destination the sandbox must never reach directly:
-/// loopback, unspecified (`0.0.0.0` / `::`), or link-local. Canonicalizes first
+/// loopback, unspecified (`0.0.0.0` / `::`), or on the metadata floor
+/// ([`is_instance_metadata`]), link-local included. Canonicalizes first
 /// so an IPv4-mapped IPv6 form (`::ffff:127.0.0.1`) — which the raw
 /// `is_loopback`/`is_link_local` checks miss but Linux still routes to the host
 /// — is judged as its IPv4 form. Shared by every egress enforcement point (the
@@ -94,7 +126,7 @@ pub fn is_link_local(ip: IpAddr) -> bool {
 /// reaching a private DB is the whole point of raw egress.
 pub fn is_disallowed_egress_ip(ip: IpAddr) -> bool {
     let ip = ip.to_canonical();
-    ip.is_loopback() || ip.is_unspecified() || is_link_local(ip)
+    ip.is_loopback() || ip.is_unspecified() || is_instance_metadata(ip)
 }
 
 /// Resolve `host` (see [`crate::resolver`]) and connect to it on `port`.
@@ -154,6 +186,12 @@ pub(crate) async fn connect_tcp_egress_within(
     admits: impl FnOnce(IpAddr) -> bool + Send,
 ) -> io::Result<TcpStream> {
     let resolved = resolve_within(resolve_limit, egress, host, port).await?;
+    if is_instance_metadata(resolved.ip()) || is_instance_metadata_name(host) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            EgressRefused::InstanceMetadata(resolved),
+        ));
+    }
     if is_disallowed_egress_ip(resolved.ip()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -245,12 +283,15 @@ async fn dial_within<T>(
 /// error kind: `connect` itself can fail with `PermissionDenied`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressRefused {
-    /// Loopback, link-local or unspecified, which no sandbox egress reaches.
+    /// Loopback or unspecified, which no sandbox egress reaches.
     Floor(SocketAddr),
     /// An address the caller's `admits` check refused, such as an `egress.tcp` rule.
     Rule(SocketAddr),
     /// The host's own address, which a host judging for a guest never dials.
     OwnAddress(SocketAddr),
+    /// An instance metadata service, by its address or its name, which no
+    /// sandbox egress reaches and no rule opens.
+    InstanceMetadata(SocketAddr),
 }
 
 impl std::fmt::Display for EgressRefused {
@@ -262,6 +303,9 @@ impl std::fmt::Display for EgressRefused {
                 resolved.ip()
             ),
             Self::Rule(resolved) => write!(f, "egress to {} denied by policy", resolved.ip()),
+            Self::InstanceMetadata(resolved) => {
+                write!(f, "egress to {} (instance metadata) denied", resolved.ip())
+            }
             Self::OwnAddress(resolved) => write!(
                 f,
                 "egress to {} (the host's own address) denied",
@@ -295,6 +339,93 @@ mod tests {
         assert!(!is_link_local("10.20.0.5".parse().unwrap()));
         assert!(!is_link_local("169.253.0.1".parse().unwrap()));
         assert!(!is_link_local("fec0::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn the_metadata_floor_is_link_local_and_the_named_addresses() {
+        for ip in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "169.254.0.23",
+            "fe80::1",
+            "168.63.129.16",
+            "100.100.100.200",
+            "fd00:ec2::254",
+            "fd00:ec2::23",
+            "::ffff:168.63.129.16",
+            "::ffff:169.254.169.254",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_instance_metadata(ip), "{ip}");
+            assert!(is_disallowed_egress_ip(ip), "{ip}");
+        }
+        for ip in [
+            "168.63.129.17",
+            "100.100.100.201",
+            "100.64.0.1",
+            "fd00:ec2::253",
+            "10.0.0.5",
+            "127.0.0.1",
+        ] {
+            assert!(!is_instance_metadata(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn the_metadata_floor_names_the_gcp_metadata_server() {
+        for name in [
+            "metadata.google.internal",
+            "Metadata.Google.Internal.",
+            "metadata.google.internal:80",
+        ] {
+            assert!(is_instance_metadata_name(name), "{name}");
+        }
+        for name in [
+            "metadata.google.internal.example",
+            "google.internal",
+            "example.com",
+        ] {
+            assert!(!is_instance_metadata_name(name), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_rule_opens_the_metadata_floor() {
+        for address in ["168.63.129.16", "100.100.100.200", "169.254.169.254"] {
+            let ip: IpAddr = address.parse().unwrap();
+            let error = connect_tcp_egress_where(&Resolving(ip), "allowed.example", 80, |_| true)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{address}");
+            assert_eq!(
+                refusal_of(&error),
+                Some(EgressRefused::InstanceMetadata(SocketAddr::new(ip, 80))),
+                "{address}: {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("egress to {address} (instance metadata) denied")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_metadata_server_s_name_is_refused_wherever_it_resolves() {
+        let error = connect_tcp_egress(
+            &Resolving("10.0.0.9".parse().unwrap()),
+            "metadata.google.internal",
+            80,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_of(&error),
+            Some(EgressRefused::InstanceMetadata(
+                "10.0.0.9:80".parse().unwrap()
+            )),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

@@ -346,7 +346,12 @@ fn decide(
     // reach the host's own metadata surface. A rule cannot grant this.
     if crate::egress::is_disallowed_egress_ip(datagram.dst.ip()) {
         let actor = ActorContext::resolve_udp(datagram.src);
-        crate::proxy::emit_policy_deny_connect(state, &target, "blocked-destination", &actor);
+        let reason = if crate::egress::is_instance_metadata(datagram.dst.ip()) {
+            "instance-metadata"
+        } else {
+            "blocked-destination"
+        };
+        crate::proxy::emit_policy_deny_connect(state, &target, reason, &actor);
         cache.insert(datagram, Disposition::Reject, generation);
         return Disposition::Reject;
     }
@@ -734,6 +739,29 @@ mod tests {
             disposition_for(&state, "169.254.169.254:123").await,
             Disposition::Reject
         );
+    }
+
+    #[tokio::test]
+    async fn the_metadata_floor_refuses_a_named_address_whatever_the_rule_says() {
+        let (state, mut rx) = crate::proxy::tests::test_state();
+        let rules = r#"[{"match": "168.63.129.16:123", "verdict": "allow"}, {"match": "100.100.100.200:80", "verdict": "allow"}]"#;
+        apply_network_policy(
+            &state,
+            NetworkPolicy {
+                udp_egress: parse_udp_egress(&serde_json::from_str(rules).unwrap()).unwrap(),
+                ..Default::default()
+            },
+        );
+        for target in ["168.63.129.16:123", "100.100.100.200:80"] {
+            assert_eq!(
+                disposition_for(&state, target).await,
+                Disposition::Reject,
+                "{target}"
+            );
+            let event: serde_json::Value =
+                serde_json::from_str(&rx.try_recv().expect("the refusal is audited")).unwrap();
+            assert_eq!(event["metadata"]["reason"], "instance-metadata", "{event}");
+        }
     }
 
     #[tokio::test]

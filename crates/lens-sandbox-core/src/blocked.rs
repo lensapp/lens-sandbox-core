@@ -49,6 +49,8 @@ pub(crate) enum BlockReason {
     /// The request carries a value with LNS's placeholder shape that no
     /// current grant holds.
     PlaceholderNoGrant,
+    /// The destination is an instance metadata service, which no rule opens.
+    InstanceMetadata,
 }
 
 impl BlockReason {
@@ -63,6 +65,7 @@ impl BlockReason {
             Self::ConnectorElsewhere { .. } => "connector-elsewhere",
             Self::PlaceholderOffHost { .. } => "placeholder-off-host",
             Self::PlaceholderNoGrant => "placeholder-no-grant",
+            Self::InstanceMetadata => "instance-metadata",
         }
     }
 
@@ -99,6 +102,7 @@ impl BlockReason {
             Self::PlaceholderNoGrant => {
                 Some("The placeholder it carries matches no current grant: the grant is gone")
             }
+            Self::InstanceMetadata => Some("Instance metadata is never reachable from a sandbox"),
             _ => None,
         }
     }
@@ -471,6 +475,7 @@ pub(crate) mod tests {
                 "placeholder-off-host",
             ),
             (BlockReason::PlaceholderNoGrant, "placeholder-no-grant"),
+            (BlockReason::InstanceMetadata, "instance-metadata"),
         ] {
             let text = String::from_utf8(response(None, reason, "GET", "h.example", "/")).unwrap();
             assert_eq!(parse(&text).1, Some(code));
