@@ -1004,18 +1004,6 @@ pub enum CredentialInjection {
 }
 
 impl CredentialInjection {
-    /// The domain this injection serves, armed or not.
-    pub(crate) fn domain(&self) -> &str {
-        match self {
-            CredentialInjection::Header { domain, .. }
-            | CredentialInjection::UriPlaceholder { domain, .. }
-            | CredentialInjection::AuthorizationPlaceholder { domain, .. }
-            | CredentialInjection::AwsSigv4 { domain, .. }
-            | CredentialInjection::OauthTokenAnswer { domain, .. }
-            | CredentialInjection::OauthRefreshAnswer { domain, .. } => domain,
-        }
-    }
-
     /// The domain this injection targets while it carries no resolved secret
     /// (`value` empty) — the credential-gate trigger for an unarmed
     /// credential. `None` for armed injections and for `awsSigv4`, whose
