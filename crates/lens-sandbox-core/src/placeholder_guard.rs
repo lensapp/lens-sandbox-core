@@ -84,10 +84,9 @@ impl Granted {
             .then_some(Refusal::NoGrant)
     }
 
-    /// Whether `view` holds the placeholder marker anywhere outside a
-    /// placeholder the policy granted.
+    /// Whether `view` holds a token with LNS's placeholder shape outside
+    /// every placeholder the policy granted.
     fn carries_one_no_grant_holds(&self, view: &str) -> bool {
-        let lower = view.to_ascii_lowercase();
         let granted: Vec<(usize, usize)> = self
             .placeholders
             .keys()
@@ -96,8 +95,7 @@ impl Granted {
                     .map(|(at, found)| (at, at + found.len()))
             })
             .collect();
-        lower.match_indices(PLACEHOLDER_MARKER).any(|(at, _)| {
-            let end = at + PLACEHOLDER_MARKER.len();
+        placeholder_tokens(view).any(|(at, end)| {
             !granted
                 .iter()
                 .any(|&(start, stop)| start <= at && end <= stop)
@@ -116,14 +114,38 @@ impl Placeholder {
     }
 }
 
-/// What every placeholder LNS ships carries, in any case: a value with it
-/// that no grant holds is one whose grant is gone. A workload's own
-/// credential never carries it, so it passes untouched.
-const PLACEHOLDER_MARKER: &str = "lnsplaceholder";
+/// The marker every placeholder LNS issues carries, in the case it is issued
+/// in. A workload's own credential never carries it, so it passes untouched.
+const PLACEHOLDER_MARKERS: [&str; 2] = ["LNSPLACEHOLDER", "lnsplaceholder"];
+
+/// The shortest placeholder a document may declare.
+const MIN_PLACEHOLDER_LEN: usize = 16;
+
+/// The byte ranges of the tokens in `text` that have LNS's placeholder shape:
+/// a word (letters, digits, `_`) of placeholder length that carries the marker
+/// as issued. Prose that only names the marker carries none.
+fn placeholder_tokens(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(move |c: char| !is_word(c))
+        .map(|(at, separator)| (at, at + separator.len()))
+        .chain(std::iter::once((text.len(), text.len())))
+        .scan(0, |start, (at, next)| {
+            let token = (*start, at);
+            *start = next;
+            Some(token)
+        })
+        .filter(move |&(start, end)| {
+            let token = &text[start..end];
+            token.len() >= MIN_PLACEHOLDER_LEN
+                && PLACEHOLDER_MARKERS
+                    .iter()
+                    .any(|marker| token.contains(marker))
+        })
+}
 
 /// Whether `text` carries LNS's placeholder shape.
 pub(crate) fn has_placeholder_shape(text: &str) -> bool {
-    text.to_ascii_lowercase().contains(PLACEHOLDER_MARKER)
+    placeholder_tokens(text).next().is_some()
 }
 
 /// Shortest run of the base64 alphabet that is decoded: the base64 of the
@@ -358,7 +380,7 @@ mod tests {
             (head(""), Some(format!("{{\"token\":\"{revoked}\"}}"))),
             (head(""), Some(format!("blob={in_base64}"))),
             (
-                "GET / HTTP/1.1\r\nX-Token: some-lnsplaceholder-value".to_string(),
+                "GET / HTTP/1.1\r\nX-Token: lnsk_lnsplaceholder2222222222".to_string(),
                 None,
             ),
         ] {
@@ -376,6 +398,21 @@ mod tests {
                     X-Doc: placeholder lns";
         assert_eq!(github().judge(head, None, "gitlab.com"), None);
         assert_eq!(Granted::default().judge(head, None, "gitlab.com"), None);
+    }
+
+    #[test]
+    fn prose_that_mentions_the_marker_carries_no_placeholder() {
+        for head in [
+            "GET /search/issues?q=lnsplaceholder HTTP/1.1\r\nHost: api.github.com",
+            "GET / HTTP/1.1\r\nX-Note: the LNSPLACEHOLDER marker, the LnsPlaceholder word",
+            "GET / HTTP/1.1\r\nX-Note: some-LnsPlaceholder-0000000000 in mixed case",
+        ] {
+            assert_eq!(
+                Granted::default().judge(head, None, "api.github.com"),
+                None,
+                "{head}"
+            );
+        }
     }
 
     #[test]
