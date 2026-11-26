@@ -550,6 +550,19 @@ enum JudgedPolicy {
 /// The placeholders this credential's token answers hand out or match, once
 /// each, other than its own: another credential may own one of them, and then
 /// that credential gates it.
+/// The domain an injection serves, armed or not.
+fn injection_domain(inj: &crate::policy_schema::CredentialInjection) -> &str {
+    use crate::policy_schema::CredentialInjection;
+    match inj {
+        CredentialInjection::Header { domain, .. }
+        | CredentialInjection::UriPlaceholder { domain, .. }
+        | CredentialInjection::AuthorizationPlaceholder { domain, .. }
+        | CredentialInjection::AwsSigv4 { domain, .. }
+        | CredentialInjection::OauthTokenAnswer { domain, .. }
+        | CredentialInjection::OauthRefreshAnswer { domain, .. } => domain,
+    }
+}
+
 fn answered_placeholders(
     cred: &crate::policy_schema::Credential,
 ) -> std::collections::BTreeSet<&str> {
@@ -1457,7 +1470,7 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
             let hosts: Vec<String> = cred
                 .injections
                 .iter()
-                .map(|inj| inj.domain().to_lowercase())
+                .map(|inj| injection_domain(inj).to_lowercase())
                 .collect();
             for placeholder in cred
                 .placeholder
