@@ -11585,7 +11585,9 @@ pub(crate) mod tests {
         );
         assert_eq!(reason, Some("instance-metadata"), "{what}: {response}");
         assert!(
-            line.contains("Instance metadata is never reachable from a sandbox."),
+            line.contains(
+                "Link-local and instance metadata addresses are never reachable from a sandbox."
+            ),
             "{what}: {line}"
         );
         assert!(
@@ -11598,6 +11600,19 @@ pub(crate) mod tests {
             !events.iter().any(|e| e["type"] == "request_pending"),
             "no card may be raised for the metadata floor; got {events:#?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_link_local_device_is_refused_in_words_that_name_link_local() {
+        let (state, mut rx) = test_state();
+        install_catch_all_allow(&state);
+        let response = proxy_door_answer(
+            &state,
+            b"GET http://169.254.10.20/ HTTP/1.1\r\nHost: 169.254.10.20\r\n\r\n",
+        )
+        .await;
+        let events = drain_audit_lines(&mut rx);
+        assert_refused_as_instance_metadata(&response, &events, "169.254.10.20", "a printer");
     }
 
     #[tokio::test]
