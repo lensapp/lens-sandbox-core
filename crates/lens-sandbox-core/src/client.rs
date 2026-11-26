@@ -1404,6 +1404,7 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
         let mut aws_config_map: HashMap<String, crate::aws_sigv4::AwsSigv4Config> = HashMap::new();
         let mut aws_domains: Vec<String> = Vec::new();
         let mut placeholder_index: HashMap<String, String> = HashMap::new();
+        let mut granted = crate::placeholder_guard::Granted::default();
         let mut answered: Vec<(String, String)> = Vec::new();
         let mut unarmed_domains: Vec<String> = Vec::new();
         let mut header_count = 0;
@@ -1453,6 +1454,19 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
                     "duplicate placeholder across credentials; later credential wins"
                 );
             }
+            let hosts: Vec<String> = cred
+                .injections
+                .iter()
+                .map(|inj| inj.domain().to_lowercase())
+                .collect();
+            for placeholder in cred
+                .placeholder
+                .iter()
+                .map(String::as_str)
+                .chain(answered_placeholders(cred))
+            {
+                granted.grant(placeholder, &cred.id, &hosts);
+            }
             answered.extend(
                 answered_placeholders(cred)
                     .into_iter()
@@ -1466,6 +1480,7 @@ async fn judge_policy(raw_text: &str, proxy_state: &Option<Arc<ProxyState>>) -> 
 
         *state.credential_injections.write().unwrap() = injection_map;
         *state.placeholder_index.write().unwrap() = placeholder_index;
+        *state.granted_placeholders.write().unwrap() = granted;
         *state.unarmed_credential_domains.write().unwrap() = unarmed_domains;
         tracing::info!(
             count = header_count,
@@ -3277,6 +3292,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["api-client"]
         );
+
+        let granted = state.granted_placeholders.read().unwrap();
+        for placeholder in ["__lens_cred:api-client__", "placeholder-token"] {
+            let carrying = format!("GET / HTTP/1.1\r\nX-Token: {placeholder}");
+            for own in ["api.example.com:443", "login.example.com:443"] {
+                assert_eq!(
+                    granted.judge(&carrying, None, own),
+                    None,
+                    "{placeholder} {own}"
+                );
+            }
+            assert_eq!(
+                granted.judge(&carrying, None, "evil.example:443"),
+                Some(crate::placeholder_guard::Refusal::OffHost {
+                    credential: "api-client".to_string()
+                }),
+                "{placeholder}"
+            );
+        }
     }
 
     // A credential with no injections at all declares no domain, so there is

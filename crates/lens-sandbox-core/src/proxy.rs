@@ -302,6 +302,9 @@ pub struct ProxyState {
     /// request and emit `credential_pending`. Updated atomically on every
     /// policy apply.
     pub placeholder_index: RwLock<HashMap<String, String>>,
+    /// Every placeholder the policy granted, with the hosts its credential
+    /// names; the MITM refuses one it finds on a request to another host.
+    pub(crate) granted_placeholders: RwLock<crate::placeholder_guard::Granted>,
     /// Domain patterns of credential injections that are still unarmed
     /// (empty `value`), sourced from [`crate::policy_schema::CredentialInjection::unarmed_domain`]
     /// on each policy apply. A CONNECT target matching any of these is MITM'd
@@ -772,6 +775,7 @@ impl ProxyState {
             pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
             credential_pending: std::sync::Mutex::new(crate::gate::PendingTable::new()),
             placeholder_index: RwLock::new(HashMap::new()),
+            granted_placeholders: RwLock::new(crate::placeholder_guard::Granted::default()),
             unarmed_credential_domains: RwLock::new(Vec::new()),
             decision_timeout: std::sync::RwLock::new(crate::gate::DECISION_TIMEOUT),
             upstream_connect_timeout: std::sync::RwLock::new(UPSTREAM_CONNECT_TIMEOUT),
@@ -4297,7 +4301,9 @@ pub(crate) fn emit_refused_https(
         BlockReason::PolicyDeny | BlockReason::BinaryNotAllowed => Some(reason.code()),
         BlockReason::ConnectorElsewhere { .. } => Some(BlockReason::PolicyDeny.code()),
         BlockReason::UpstreamPolicy => None,
-        BlockReason::AskDeclined | BlockReason::CredentialGate => return,
+        BlockReason::AskDeclined
+        | BlockReason::CredentialGate
+        | BlockReason::PlaceholderOffHost { .. } => return,
     };
     let Some(request) = seen else {
         match reason {
@@ -4749,7 +4755,7 @@ fn get_or_build_sandbox_tls_connector(state: &ProxyState) -> tokio_rustls::TlsCo
 }
 
 /// Decode percent-encoded strings (e.g. `%2F` → `/`).
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars();
     while let Some(c) = chars.next() {

@@ -43,6 +43,9 @@ pub(crate) enum BlockReason {
     /// granted serves it, and its connection works only elsewhere; `note`,
     /// from the rule, says which and where (see [`check_note`]).
     ConnectorElsewhere { note: String },
+    /// The request carries a granted placeholder to a host its credential
+    /// does not name; `note` names the credential and the host.
+    PlaceholderOffHost { note: String },
 }
 
 impl BlockReason {
@@ -55,6 +58,7 @@ impl BlockReason {
             Self::CredentialGate => "credential-gate",
             Self::UpstreamPolicy => "upstream-policy",
             Self::ConnectorElsewhere { .. } => "connector-elsewhere",
+            Self::PlaceholderOffHost { .. } => "placeholder-off-host",
         }
     }
 
@@ -71,10 +75,23 @@ impl BlockReason {
         }
     }
 
+    /// The refusal of a request that carries the placeholder of `credential`
+    /// to `host`. The credential's id comes from the policy and the host from
+    /// the client, so each is cut to what a note may carry.
+    pub(crate) fn placeholder_off_host(credential: &str, host: &str) -> Self {
+        Self::PlaceholderOffHost {
+            note: format!(
+                "The placeholder of credential {} works only on its own hosts, not on {}",
+                printable_word(credential),
+                printable_word(&crate::proxy::extract_hostname(host)),
+            ),
+        }
+    }
+
     /// The clause the body adds after the reason, if any.
     fn note(&self) -> Option<&str> {
         match self {
-            Self::ConnectorElsewhere { note } => Some(note),
+            Self::ConnectorElsewhere { note } | Self::PlaceholderOffHost { note } => Some(note),
             _ => None,
         }
     }
@@ -332,6 +349,21 @@ fn redact_placeholders(path: &str) -> String {
     out
 }
 
+/// Longest credential id or host a note names, so the note stays within
+/// [`MAX_NOTE_BYTES`] whatever the policy or the client sent.
+const MAX_NOTE_WORD_BYTES: usize = 64;
+
+/// One word for a note: visible ASCII, a final full stop dropped, at most
+/// [`MAX_NOTE_WORD_BYTES`].
+fn printable_word(word: &str) -> String {
+    let word: String = word
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .take(MAX_NOTE_WORD_BYTES)
+        .collect();
+    word.trim_end_matches('.').to_string()
+}
+
 /// Keep visible ASCII and cap the length, so nothing the client sent can break
 /// the line or stretch it.
 fn printable(field: &str) -> String {
@@ -427,6 +459,10 @@ pub(crate) mod tests {
                 },
                 "connector-elsewhere",
             ),
+            (
+                BlockReason::placeholder_off_host("github", "evil.example:443"),
+                "placeholder-off-host",
+            ),
         ] {
             let text = String::from_utf8(response(None, reason, "GET", "h.example", "/")).unwrap();
             assert_eq!(parse(&text).1, Some(code));
@@ -490,6 +526,42 @@ pub(crate) mod tests {
         ));
         let (head, body) = text.split_once("\r\n\r\n").unwrap();
         assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
+    }
+
+    #[test]
+    fn a_placeholder_off_its_hosts_names_its_credential_and_the_host() {
+        let reason = BlockReason::placeholder_off_host("github", "evil.example:443");
+        let text = String::from_utf8(response(
+            None,
+            reason.clone(),
+            "POST",
+            "evil.example:443",
+            "/upload",
+        ))
+        .unwrap();
+        assert_blocked(
+            &text,
+            reason.clone(),
+            "Blocked by sandbox egress policy: POST evil.example/upload \
+             (reason: placeholder-off-host). The placeholder of credential github works \
+             only on its own hosts, not on evil.example. This is not a response from evil.example.",
+        );
+        assert!(check_note(reason.note().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_credential_or_host_that_could_break_the_note_is_cut_to_one_word() {
+        let reason = BlockReason::placeholder_off_host(
+            &format!("git hub\r\nX: 1{}.", "x".repeat(300)),
+            "evil.example.",
+        );
+        let note = reason.note().unwrap();
+        assert!(check_note(note).is_ok(), "{note}");
+        assert!(
+            note.starts_with("The placeholder of credential git?hub??X:?1x"),
+            "{note}"
+        );
+        assert!(note.ends_with("not on evil.example"), "{note}");
     }
 
     #[test]
