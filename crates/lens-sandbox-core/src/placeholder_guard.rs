@@ -1,5 +1,6 @@
 //! The placeholder guards: a request that carries a granted placeholder to a
-//! host its credential does not name is refused before it leaves.
+//! host its credential does not name, or a value with LNS's placeholder shape
+//! that no grant holds, is refused before it leaves.
 //!
 //! A placeholder is worthless off its hosts, so the guard protects no secret:
 //! it gives the workload a clear refusal instead of the service's confusing
@@ -16,6 +17,9 @@ pub(crate) enum Refusal {
     /// The request carries the placeholder of `credential` to a host that
     /// credential does not name.
     OffHost { credential: String },
+    /// The request carries a value with LNS's placeholder shape that no
+    /// current grant holds: its grant is gone.
+    NoGrant,
 }
 
 /// The placeholders a policy granted: each one's credential, and the hosts
@@ -69,8 +73,34 @@ impl Granted {
             .map(|(_, granted)| granted.credential.as_str())
             .collect();
         off_host.sort_unstable();
-        off_host.first().map(|credential| Refusal::OffHost {
-            credential: (*credential).to_string(),
+        if let Some(credential) = off_host.first() {
+            return Some(Refusal::OffHost {
+                credential: (*credential).to_string(),
+            });
+        }
+        views
+            .iter()
+            .any(|view| self.carries_one_no_grant_holds(view))
+            .then_some(Refusal::NoGrant)
+    }
+
+    /// Whether `view` holds the placeholder marker anywhere outside a
+    /// placeholder the policy granted.
+    fn carries_one_no_grant_holds(&self, view: &str) -> bool {
+        let lower = view.to_ascii_lowercase();
+        let granted: Vec<(usize, usize)> = self
+            .placeholders
+            .keys()
+            .flat_map(|placeholder| {
+                view.match_indices(placeholder.as_str())
+                    .map(|(at, found)| (at, at + found.len()))
+            })
+            .collect();
+        lower.match_indices(PLACEHOLDER_MARKER).any(|(at, _)| {
+            let end = at + PLACEHOLDER_MARKER.len();
+            !granted
+                .iter()
+                .any(|&(start, stop)| start <= at && end <= stop)
         })
     }
 }
@@ -85,6 +115,11 @@ impl Placeholder {
                 .any(|pattern| crate::routing::injection_matches(pattern, host))
     }
 }
+
+/// What every placeholder LNS ships carries, in any case: a value with it
+/// that no grant holds is one whose grant is gone. A workload's own
+/// credential never carries it, so it passes untouched.
+const PLACEHOLDER_MARKER: &str = "lnsplaceholder";
 
 /// Shortest run of the base64 alphabet that is decoded: the base64 of the
 /// shortest placeholder a document may declare (16 characters).
@@ -298,6 +333,83 @@ mod tests {
         assert!(granted.any_off_host("evil.example:443"));
         assert!(!granted.any_off_host("api.github.com:443"));
         assert!(!Granted::default().any_off_host("evil.example:443"));
+    }
+
+    fn no_grant() -> Option<Refusal> {
+        Some(Refusal::NoGrant)
+    }
+
+    #[test]
+    fn a_placeholder_no_grant_holds_is_refused_wherever_it_is_carried() {
+        let revoked = "gitlab_LNSPLACEHOLDER0000000000";
+        let in_base64 = base64::engine::general_purpose::STANDARD.encode(revoked);
+        for (head, body) in [
+            (format!("GET / HTTP/1.1\r\nPRIVATE-TOKEN: {revoked}"), None),
+            (format!("GET /api?private_token={revoked} HTTP/1.1"), None),
+            (
+                format!("GET /api?t={} HTTP/1.1", revoked.replace('_', "%5F")),
+                None,
+            ),
+            (head(""), Some(format!("{{\"token\":\"{revoked}\"}}"))),
+            (head(""), Some(format!("blob={in_base64}"))),
+            (
+                "GET / HTTP/1.1\r\nX-Token: some-lnsplaceholder-value".to_string(),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                github().judge(&head, body.as_deref().map(str::as_bytes), "gitlab.com"),
+                no_grant(),
+                "{head} {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_without_the_placeholder_shape_passes_untouched() {
+        let head = "GET /lensapp/lns-sandbox HTTP/1.1\r\nAuthorization: Bearer glpat-real-token-0000\r\n\
+                    X-Doc: placeholder lns";
+        assert_eq!(github().judge(head, None, "gitlab.com"), None);
+        assert_eq!(Granted::default().judge(head, None, "gitlab.com"), None);
+    }
+
+    #[test]
+    fn a_granted_placeholder_is_not_taken_for_one_no_grant_holds() {
+        let mut granted = github();
+        granted.grant("hub_LNSPLACEHOLDER0000000000", "hub", &[]);
+        let head = format!(
+            "GET /user HTTP/1.1\r\nAuthorization: Bearer {GITHUB}\r\nX-Hub: hub_LNSPLACEHOLDER0000000000"
+        );
+        assert_eq!(granted.judge(&head, None, "api.github.com"), None);
+    }
+
+    #[test]
+    fn a_granted_placeholder_beside_one_no_grant_holds_does_not_cover_it() {
+        let head = format!(
+            "GET /user HTTP/1.1\r\nAuthorization: Bearer {GITHUB}\r\nX-Old: old_LNSPLACEHOLDER0000000000"
+        );
+        assert_eq!(github().judge(&head, None, "api.github.com"), no_grant());
+    }
+
+    #[test]
+    fn a_revoked_grant_leaves_its_placeholder_refused() {
+        let head = format!("GET /user HTTP/1.1\r\nAuthorization: Bearer {GITHUB}");
+        assert_eq!(github().judge(&head, None, "api.github.com"), None);
+        assert_eq!(
+            Granted::default().judge(&head, None, "api.github.com"),
+            no_grant()
+        );
+    }
+
+    #[test]
+    fn a_placeholder_off_its_hosts_is_named_before_one_no_grant_holds() {
+        let head = head(&format!(
+            "X-A: old_LNSPLACEHOLDER0000000000\r\nX-B: {GITHUB}"
+        ));
+        assert_eq!(
+            github().judge(&head, None, "evil.example"),
+            off_host("github")
+        );
     }
 
     #[test]
