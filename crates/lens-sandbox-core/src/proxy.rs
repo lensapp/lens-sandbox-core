@@ -3702,13 +3702,18 @@ async fn handle_transparent_tls(
 
     let target_host = format!("{sni}:{}", orig_dst.port());
 
+    if target_is_instance_metadata(&target_host) {
+        return refuse_transparent_tls(
+            start,
+            &target_host,
+            crate::blocked::BlockReason::InstanceMetadata,
+            state,
+            &actor,
+        )
+        .await;
+    }
     if let Err(e) = validate_connect_target(&target_host) {
-        let reason = if target_is_instance_metadata(&target_host) {
-            INSTANCE_METADATA.to_string()
-        } else {
-            format!("blocked-target: {e}")
-        };
-        emit_transparent_deny(state, orig_dst, &reason);
+        emit_transparent_deny(state, orig_dst, &format!("blocked-target: {e}"));
         drop(start);
         return Ok(());
     }
@@ -9589,6 +9594,40 @@ pub(crate) mod tests {
                 async move { handle_transparent_tls(server, orig_dst, actor, &state).await },
             );
         (client, handler)
+    }
+
+    #[tokio::test]
+    async fn a_transparent_tls_connection_to_a_metadata_name_is_answered_inside_the_session() {
+        let (state, mut rx) = test_state();
+        install_catch_all_allow(&state);
+        let (stream, handler) = transparent_tls_connection(&state).await;
+        let client_state = state.clone();
+        let client = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut tls =
+                sandbox_tls_client(&client_state, stream, "metadata.google.internal").await;
+            tls.write_all(
+                b"GET /computeMetadata/v1/ HTTP/1.1\r\nHost: metadata.google.internal\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut response = Vec::new();
+            let _ = tls.read_to_end(&mut response).await;
+            String::from_utf8(response).unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("the refusal does not dial")
+            .unwrap()
+            .unwrap();
+        let response = client.await.unwrap();
+        let events = drain_audit_lines(&mut rx);
+        assert_refused_as_instance_metadata(
+            &response,
+            &events,
+            "metadata.google.internal",
+            "a metadata name in the SNI",
+        );
     }
 
     #[tokio::test]
