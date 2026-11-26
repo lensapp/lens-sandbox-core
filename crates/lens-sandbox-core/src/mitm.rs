@@ -1207,6 +1207,84 @@ impl RequestFacts<'_, '_> {
         reason.into()
     }
 
+    /// Answer a request whose body could not be read as it declared with
+    /// `400`: it is malformed, not refused by policy.
+    async fn reject_unreadable_body<C>(
+        &self,
+        tls_client: &mut C,
+        reason: &str,
+    ) -> Box<dyn std::error::Error + Send + Sync>
+    where
+        C: AsyncWrite + Unpin,
+    {
+        self.record_refusal("body_read_failed", reason, 400);
+        tls_client.write_all(BAD_REQUEST).await.ok();
+        tls_client.shutdown().await.ok();
+        reason.into()
+    }
+
+    /// Refuse a request that carries a placeholder it may not carry here:
+    /// record why, tell the client, and end the session. Nothing is dialled.
+    async fn refuse_placeholder<C>(
+        &self,
+        tls_client: &mut C,
+        refusal: crate::placeholder_guard::Refusal,
+    ) -> Box<dyn std::error::Error + Send + Sync>
+    where
+        C: AsyncWrite + Unpin,
+    {
+        let (block, credential) = match refusal {
+            crate::placeholder_guard::Refusal::OffHost { credential } => (
+                crate::blocked::BlockReason::placeholder_off_host(&credential, self.target_host),
+                Some(credential),
+            ),
+        };
+        let code = block.code();
+        tracing::info!(
+            target_host = %self.target_host,
+            method = %self.method,
+            path = %self.path,
+            credential_id = ?credential,
+            reason = code,
+            "request carries a placeholder it may not carry here"
+        );
+        if let Some(tx) = self.ctx.audit_tx {
+            let mut metadata = serde_json::json!({
+                "host": self.target_host,
+                "mitm": true,
+                "tunnel": self.is_tunnel,
+                "reason": code,
+            });
+            if let (Some(credential), Some(object)) = (credential, metadata.as_object_mut()) {
+                object.insert("credential_id".into(), credential.into());
+            }
+            let event = serde_json::json!({
+                "type": "audit_event",
+                "source": "sandbox-proxy",
+                "action": format!("{} {}{}", self.method, self.target_host, self.path),
+                "method": self.method,
+                "host": self.target_host,
+                "path": self.path,
+                "result": "failure",
+                "status_code": 403,
+                "metadata": metadata,
+            });
+            send_audit(tx, event, self.ctx.actor);
+        }
+        tls_client
+            .write_all(&crate::blocked::response(
+                self.ctx.state.block_label(),
+                block,
+                self.method,
+                self.target_host,
+                self.path,
+            ))
+            .await
+            .ok();
+        tls_client.shutdown().await.ok();
+        code.into()
+    }
+
     /// Refuse this request with the status the signer gave, as AWS itself
     /// would answer a request it cannot authenticate.
     async fn refuse_signing<C>(
@@ -1299,6 +1377,67 @@ impl RequestFacts<'_, '_> {
         tls_client.shutdown().await.ok();
         "OAuth token request answered by the proxy".into()
     }
+}
+
+/// Refuse a request that carries a placeholder the policy does not let it
+/// carry to this host (see [`crate::placeholder_guard`]). The head is always
+/// scanned, and a body the pipeline holds. A small body the proxy can read is
+/// read for the scan, and kept in `buffered_body`, only where a granted
+/// placeholder would be off its hosts: a body nothing needs is streamed.
+async fn guard_placeholders<C>(
+    tls_client: &mut C,
+    facts: &RequestFacts<'_, '_>,
+    body_mode: BodyFraming,
+    buffered_body: &mut Option<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let host = facts.ctx.match_host;
+    let read_for_scan = buffered_body.is_none()
+        && body_is_scanned(facts.head, body_mode)
+        && facts
+            .ctx
+            .state
+            .granted_placeholders
+            .read()
+            .unwrap()
+            .any_off_host(host);
+    if read_for_scan {
+        let read = crate::http_body::read_for_inspection(
+            tls_client,
+            facts.head,
+            body_mode,
+            crate::http_body::MAX_INSPECT_BYTES,
+        )
+        .await;
+        match read {
+            Ok(body) => *buffered_body = Some(body),
+            Err(reason) => return Err(facts.reject_unreadable_body(tls_client, &reason).await),
+        }
+    }
+    let refusal = facts.ctx.state.granted_placeholders.read().unwrap().judge(
+        facts.head,
+        buffered_body.as_deref(),
+        host,
+    );
+    match refusal {
+        None => Ok(()),
+        Some(refusal) => Err(facts.refuse_placeholder(tls_client, refusal).await),
+    }
+}
+
+const BAD_REQUEST: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+/// Whether the placeholder scan reads this request's body: one of a known
+/// length the proxy would read for a rule, neither compressed nor multipart.
+fn body_is_scanned(head: &str, body_mode: BodyFraming) -> bool {
+    let small = matches!(
+        body_mode,
+        BodyFraming::Fixed(len) if len > 0 && len <= crate::http_body::MAX_INSPECT_BYTES as u64
+    );
+    small && crate::http_body::ensure_body_is_readable(head).is_ok()
 }
 
 /// Send this request to the backend an `llm` route names, if one claims it.
@@ -1607,6 +1746,8 @@ where
             buffered_body = Some(body);
         }
     }
+
+    guard_placeholders(&mut tls_client, &facts, body_mode, &mut buffered_body).await?;
 
     // A token request the policy holds an answer for is answered here with a
     // placeholder, and nothing of it is forwarded. See `crate::token_answer`.
@@ -6369,6 +6510,27 @@ mod tests {
         response: HostResponse,
         match_host: &str,
     ) -> (String, String, Vec<serde_json::Value>) {
+        run_gate_harness_granted(
+            placeholder,
+            credential_id,
+            &[],
+            request,
+            response,
+            match_host,
+        )
+        .await
+    }
+
+    /// [`run_gate_harness`], with the placeholder granted to the credential on
+    /// `hosts` as a policy grants it.
+    async fn run_gate_harness_granted(
+        placeholder: &str,
+        credential_id: &str,
+        hosts: &[&str],
+        request: Vec<u8>,
+        response: HostResponse,
+        match_host: &str,
+    ) -> (String, String, Vec<serde_json::Value>) {
         use tokio::net::TcpListener;
 
         rustls::crypto::ring::default_provider()
@@ -6386,6 +6548,12 @@ mod tests {
             .write()
             .unwrap()
             .insert(placeholder.to_string(), credential_id.to_string());
+        let hosts: Vec<String> = hosts.iter().map(|host| (*host).to_string()).collect();
+        state
+            .granted_placeholders
+            .write()
+            .unwrap()
+            .grant(placeholder, credential_id, &hosts);
         // 1s decision timeout keeps deny-path tests snappy.
         state.decision_timeout_override(Duration::from_secs(1));
 
@@ -6533,6 +6701,80 @@ mod tests {
 
         let events = std::mem::take(&mut *events_sink.lock().unwrap());
         (upstream_headers, client_response, events)
+    }
+
+    #[tokio::test]
+    async fn a_granted_placeholder_off_its_hosts_is_refused_and_never_sent() {
+        let placeholder = "github_LNSPLACEHOLDER0000000000";
+        for request in [
+            format!(
+                "GET /collect HTTP/1.1\r\nHost: test.example.com\r\n\
+                 Authorization: Bearer {placeholder}\r\n\r\n"
+            ),
+            format!(
+                "POST /collect HTTP/1.1\r\nHost: test.example.com\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n\
+                 {{\"token\":\"{placeholder}\"}}",
+                placeholder.len() + 12
+            ),
+        ] {
+            let (upstream_headers, client_response, events) = run_gate_harness_granted(
+                placeholder,
+                "github",
+                &["api.github.com"],
+                request.clone().into_bytes(),
+                HostResponse::Deny,
+                "test.example.com:443",
+            )
+            .await;
+            assert!(upstream_headers.is_empty(), "{request}: {upstream_headers}");
+            let (status, reason, line) = crate::blocked::tests::parse(&client_response);
+            assert_eq!(status, "HTTP/1.1 403 Forbidden by sandbox policy");
+            assert_eq!(reason, Some("placeholder-off-host"));
+            assert!(
+                line.contains(
+                    "The placeholder of credential github works only on its own hosts, \
+                     not on test.example.com."
+                ),
+                "{line}"
+            );
+            assert!(!client_response.contains(placeholder), "{client_response}");
+            assert!(
+                events.iter().all(|e| e["type"] != "credential_pending"),
+                "an off-host placeholder is refused, not asked about: {events:?}"
+            );
+            let refused = events
+                .iter()
+                .find(|e| e["type"] == "audit_event" && e["result"] == "failure")
+                .unwrap_or_else(|| panic!("no refusal audited: {events:?}"));
+            assert_eq!(refused["status_code"], 403);
+            assert_eq!(refused["metadata"]["reason"], "placeholder-off-host");
+            assert_eq!(refused["metadata"]["credential_id"], "github");
+            assert_eq!(refused["host"], "test.example.com");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_granted_placeholder_on_its_own_host_still_reaches_the_credential_gate() {
+        let placeholder = "github_LNSPLACEHOLDER0000000000";
+        let request = format!(
+            "GET /issues HTTP/1.1\r\nHost: test.example.com\r\n\
+             Authorization: Bearer {placeholder}\r\n\r\n"
+        );
+        let (_, client_response, events) = run_gate_harness_granted(
+            placeholder,
+            "github",
+            &["test.example.com"],
+            request.into_bytes(),
+            HostResponse::Deny,
+            "test.example.com:443",
+        )
+        .await;
+        assert_eq!(
+            crate::blocked::tests::parse(&client_response).1,
+            Some("credential-gate")
+        );
+        assert!(events.iter().any(|e| e["type"] == "credential_pending"));
     }
 
     #[tokio::test]
