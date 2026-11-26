@@ -85,14 +85,19 @@ impl BlockReason {
     /// The refusal of a request that carries the placeholder of `credential`
     /// to `host`. The credential's id comes from the policy and the host from
     /// the client, so each is cut to what a note may carry.
+    /// A credential an embedder names by its placeholder is not named, so the
+    /// body never repeats a placeholder.
     pub(crate) fn placeholder_off_host(credential: &str, host: &str) -> Self {
-        Self::PlaceholderOffHost {
-            note: format!(
-                "The placeholder of credential {} works only on its own hosts, not on {}",
+        let host = printable_word(&crate::proxy::extract_hostname(host));
+        let note = if crate::placeholder_guard::has_placeholder_shape(credential) {
+            format!("The placeholder works only on its own hosts, not on {host}")
+        } else {
+            format!(
+                "The placeholder of credential {} works only on its own hosts, not on {host}",
                 printable_word(credential),
-                printable_word(&crate::proxy::extract_hostname(host)),
-            ),
-        }
+            )
+        };
+        Self::PlaceholderOffHost { note }
     }
 
     /// The clause the body adds after the reason, if any.
@@ -580,6 +585,16 @@ pub(crate) mod tests {
              grant: the grant is gone. This is not a response from gitlab.com.",
         );
         assert!(check_note(BlockReason::PlaceholderNoGrant.note().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_credential_named_by_its_placeholder_is_not_named() {
+        let reason =
+            BlockReason::placeholder_off_host("gh_LNSPLACEHOLDER0000000000", "evil.example:443");
+        assert_eq!(
+            reason.note(),
+            Some("The placeholder works only on its own hosts, not on evil.example")
+        );
     }
 
     #[test]

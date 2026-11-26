@@ -121,6 +121,11 @@ impl Placeholder {
 /// credential never carries it, so it passes untouched.
 const PLACEHOLDER_MARKER: &str = "lnsplaceholder";
 
+/// Whether `text` carries LNS's placeholder shape.
+pub(crate) fn has_placeholder_shape(text: &str) -> bool {
+    text.to_ascii_lowercase().contains(PLACEHOLDER_MARKER)
+}
+
 /// Shortest run of the base64 alphabet that is decoded: the base64 of the
 /// shortest placeholder a document may declare (16 characters).
 const MIN_BASE64_RUN: usize = 20;
