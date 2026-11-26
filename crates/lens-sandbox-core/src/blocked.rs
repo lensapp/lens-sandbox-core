@@ -49,7 +49,8 @@ pub(crate) enum BlockReason {
     /// The request carries a value with LNS's placeholder shape that no
     /// current grant holds.
     PlaceholderNoGrant,
-    /// The destination is an instance metadata service, which no rule opens.
+    /// The destination is on the metadata floor, a link-local address or an
+    /// instance metadata service, which no rule opens.
     InstanceMetadata,
 }
 
@@ -107,7 +108,9 @@ impl BlockReason {
             Self::PlaceholderNoGrant => {
                 Some("The placeholder it carries matches no current grant: the grant is gone")
             }
-            Self::InstanceMetadata => Some("Instance metadata is never reachable from a sandbox"),
+            Self::InstanceMetadata => Some(
+                "Link-local and instance metadata addresses are never reachable from a sandbox",
+            ),
             _ => None,
         }
     }
