@@ -3297,14 +3297,10 @@ mod tests {
         for placeholder in ["__lens_cred:api-client__", "placeholder-token"] {
             let carrying = format!("GET / HTTP/1.1\r\nX-Token: {placeholder}");
             for own in ["api.example.com:443", "login.example.com:443"] {
-                assert_eq!(
-                    granted.judge(&carrying, None, own),
-                    None,
-                    "{placeholder} {own}"
-                );
+                assert_eq!(granted.judge(&carrying, own), None, "{placeholder} {own}");
             }
             assert_eq!(
-                granted.judge(&carrying, None, "evil.example:443"),
+                granted.judge(&carrying, "evil.example:443"),
                 Some(crate::placeholder_guard::Refusal::OffHost {
                     credential: "api-client".to_string()
                 }),
